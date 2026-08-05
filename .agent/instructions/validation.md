@@ -2,9 +2,24 @@
 
 ## Current Command Status
 
-This repository is specification-first and does not yet define `package.json` scripts. Do not invent command names or claim executable validation beyond what exists.
+`package.json` defines the canonical scripts (backed by the committed `package-lock.json`). Prefer them over ad hoc commands. Do not claim executable validation beyond what these run.
 
-When the package is initialized, record the exact canonical commands in this file. Prefer package scripts backed by the committed lockfile. Separate fast hermetic validation from live-upstream, end-to-end OpenCode, load, and release-gate suites.
+| Command | Category | Notes |
+| --- | --- | --- |
+| `npm run format:check` | Formatting | Prettier check (scoped away from `.agent/` and the spec) |
+| `npm run format` | Formatting | Prettier write |
+| `npm run lint` | Lint | ESLint flat config, typed rules |
+| `npm run typecheck` | Types | `tsc -p tsconfig.test.json --noEmit` over sources and tests |
+| `npm run test` | Unit + integration | Vitest (`test/unit`, `test/integration`) |
+| `npm run test:unit` | Unit | Vitest `test/unit` only |
+| `npm run test:integration` | Integration | Vitest `test/integration` only (in-process `inject`, no socket) |
+| `npm run test:coverage` | Coverage | Vitest with V8 coverage |
+| `npm run build` | Build | `tsc -p tsconfig.json`, emits `dist/` |
+| `npm run test:build` | Build smoke | Imports compiled `dist/*.js`; asserts no listening socket |
+| `npm run validate` | Aggregate | format check → lint → typecheck → test → build → test:build |
+| `npm run dev` / `npm start` | Run | Local watch run / run compiled `dist/index.js` |
+
+`validate` is hermetic. Contract, OpenAI-compatibility, adversarial, load, live-upstream, end-to-end OpenCode, and Docker/live checks are **not implemented yet** and must not be added to `validate` until their suites and gates exist. Keep fast hermetic validation separate from those.
 
 ## Validation Order
 

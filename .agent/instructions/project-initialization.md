@@ -2,7 +2,23 @@
 
 ## Purpose
 
-Use this guide while turning the specification-only repository into the strict TypeScript reference implementation. `.agent/docs/tech-software-spec.md` sections 7, 26, 29, and 31 own the stack, planned structure, test strategy, and packaging requirements.
+Use this guide while extending the runnable foundation into the strict TypeScript reference implementation. `.agent/docs/tech-software-spec.md` sections 7, 26, 29, and 31 own the stack, planned structure, test strategy, and packaging requirements.
+
+## Implemented Decisions (foundation)
+
+The initial scaffold is in place. The concrete choices made are:
+
+- **Runtime:** Node.js 24 LTS. `.nvmrc` pins major `24`; `package.json` `engines` requires `>=24 <25`; `.npmrc` sets `engine-strict=true` and `save-exact=true`.
+- **Package manager:** npm, with `packageManager` pinned and a single committed `package-lock.json`.
+- **Module system:** ESM (`"type": "module"`) with TypeScript `NodeNext` module/resolution; relative imports use explicit `.js` extensions.
+- **Language:** strict TypeScript with `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`, `noImplicitReturns`, `noFallthroughCasesInSwitch`, `noPropertyAccessFromIndexSignature`, `useUnknownInCatchVariables`, and `noEmitOnError`. Production build (`tsconfig.json`) emits `src/` to `dist/`; `tsconfig.test.json` type-checks sources and tests with no emit.
+- **Schema validation:** TypeBox (the `typebox` package) with `@fastify/type-provider-typebox`, used for configuration, model-file, and route response schemas. Do not introduce a second validation library.
+- **HTTP/logging:** Fastify and Pino.
+- **Tooling:** Vitest (+ V8 coverage), ESLint flat config with typed `typescript-eslint` rules, and Prettier (scoped so `.agent/` docs and the specification are not reformatted).
+- **Packaging/CI:** multi-stage Dockerfile pinned to a Node 24 bookworm-slim digest running as non-root `node`; Compose publishing to host loopback only; GitHub Actions running `npm run validate` plus a no-push Docker build, with actions pinned to commit SHAs.
+- **Model-config safety limits and diagnostics:** the model file is bounded by `MODEL_CONFIG_LIMITS` in `src/config/schema.ts` (documented in spec section 24.1). Configuration and startup diagnostics are value-free (a single fixed internal message for unexpected startup errors; stable field/reason pairs for configuration issues), and log records are recursively sanitized with bounded depth/width/length. Do not weaken these limits or reintroduce library error text into diagnostics.
+
+Note: TypeScript is pinned within the range supported by `typescript-eslint`. Still planned: the OpenAI, CollectivIQ, generation, prompts, and tools modules, and the contract/compatibility/adversarial/load test suites.
 
 ## Initialization Principles
 

@@ -4,6 +4,16 @@
 
 Read `.agent/docs/tech-software-spec.md` sections 19, 21–23, 24, 31, 33, and 34 before security-sensitive changes. Prompt/tool work also requires the tool-calling guide; upstream work requires the upstream guide.
 
+## Implemented Foundation Controls
+
+These controls exist today and must be preserved:
+
+- **Bounded model configuration** — `MODEL_CONFIG_LIMITS` in `src/config/schema.ts` (spec section 24.1): file byte cap (checked before and after read), regular-file requirement, strict UTF-8 decode, YAML alias/duplicate-key rejection, and bounds on model/source counts, string lengths, timeouts, polling, and prompt bytes. Blank/whitespace-padded ids and sources are rejected.
+- **Value-free diagnostics** — configuration errors are stable allowlisted field/reason pairs (no ids, unknown field names, submitted values, file contents, library text, or paths); an unexpected startup failure prints only `gateway failed to start (internal error)`.
+- **Recursive bounded log sanitization** — `src/shared/redaction.ts` (`sanitizeLogValue`) plus the logger's `formatters` and `logMethod` hook sanitize every record, child binding, and Error argument, with Pino redact paths as additional defense. Never bypass the logger with a second Pino configuration; never emit `Error.message`/stack/cause.
+
+When changing any of the above, update spec section 24.1, `README.md`, and `SECURITY.md` together.
+
 ## Secrets and Authentication
 
 - `COLLECTIVIQ_API_KEY` authenticates upstream; gateway keys authenticate clients. Never conflate or forward them.

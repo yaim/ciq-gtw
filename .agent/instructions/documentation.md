@@ -17,14 +17,15 @@ Documentation is part of the product contract. Update it in the same change as b
 | Security, privacy, retention, and deployment controls | `.agent/docs/tech-software-spec.md` sections 21–22 and 31 | `.agent/instructions/security.md` |
 | Runtime config, observability, health, and lifecycle | `.agent/docs/tech-software-spec.md` sections 15–19, 23–24, 28, and 31 | `.agent/instructions/operations.md` |
 | Test strategy and release evidence | `.agent/docs/tech-software-spec.md` sections 29–30 | `.agent/instructions/validation.md` |
+| Operator setup, supported scope, local run, configuration, Docker usage | `README.md` | `.agent/instructions/operations.md`, `.agent/instructions/project-initialization.md` |
+| Vulnerability reporting and supported security/deployment posture | `SECURITY.md` | `.agent/instructions/security.md` |
 | Ephemeral task notes and handoffs | `.agent/sessions/` | `.agent/sessions/README.md` |
 
-The specification currently owns both decisions and detailed design because the project has not yet been scaffolded. As durable user/operator documents are introduced, update this map rather than letting ownership become implicit.
+The specification still owns product decisions and detailed design. `README.md` and `SECURITY.md` now exist as current owner documents (rows above) and must be kept in sync with implemented reality; they must not claim unimplemented behavior. As further durable user/operator documents are introduced, update this map rather than letting ownership become implicit.
 
-Expected future owner documents from specification section 26 include:
+Still-expected owner documents from specification section 26:
 
-- `README.md` for supported scope, setup, configuration examples, local run, and OpenCode smoke usage;
-- `SECURITY.md` for vulnerability reporting and the supported security/deployment posture;
+- OpenCode smoke usage in `README.md`, added when the completion path exists;
 - targeted runbooks for production operations during phase 4.
 
 Do not create empty owner docs just to satisfy the planned tree.

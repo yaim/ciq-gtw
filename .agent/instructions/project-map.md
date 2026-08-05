@@ -2,7 +2,9 @@
 
 ## Source of Truth
 
-Read `.agent/docs/tech-software-spec.md` sections 5–8, 15, 26, 27, and 36 for architectural principles, components, request state, planned paths, orchestration, and the final design. The paths described below are planned until they exist.
+Read `.agent/docs/tech-software-spec.md` sections 5–8, 15, 26, 27, and 36 for architectural principles, components, request state, planned paths, orchestration, and the final design.
+
+**Implemented today (foundation):** `src/index.ts`, `src/server.ts`, `src/api/health-route.ts` (`/healthz`, `/readyz`, and the injected readiness state), `src/config/schema.ts`, `src/config/load.ts`, `src/observability/logger.ts`, and `src/shared/redaction.ts`, with tests under `test/`. **Still planned:** everything else below — `src/api/` auth/errors/model/chat routes, `src/openai/`, `src/collectiviq/`, `src/generation/`, `src/prompts/`, and `src/tools/`. The boundary ownership rules below apply as those modules are created.
 
 ## Request Flow
 

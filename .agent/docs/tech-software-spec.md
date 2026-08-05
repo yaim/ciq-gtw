@@ -2001,6 +2001,36 @@ Invalid configuration must terminate the process with a non-zero exit code.
 
 Secrets must be redacted from startup output.
 
+### 24.1 Model-configuration safety limits (initial implementation)
+
+The runnable foundation enforces the following conservative, non-overridable
+limits on the model configuration file. They are initial implementation limits
+chosen for safety; relaxing or making any of them configurable requires a
+documented configuration-contract and security review.
+
+| Limit | Value |
+| --- | ---: |
+| Model file size (bytes) | 1,048,576 |
+| Virtual models | 1–64 |
+| Selected sources per model | 1–32 |
+| Model id length (characters) | 1–128 |
+| Display-name length (characters) | 1–256 |
+| Source / answer-source length (characters) | 1–128 |
+| `requestTimeoutMs` | 1,000–600,000 |
+| `pollIntervalMs` | 100–60,000 |
+| `maxPollIntervalMs` | 100–60,000 |
+| `maximumPromptBytes` | 1,024–67,108,864 |
+
+Additional enforced rules: the path must be a regular file; the file size is
+checked before and after reading; contents are decoded as strict UTF-8; YAML
+aliases and duplicate keys are rejected; the model map must be non-empty; model
+ids, display names, and source names must be non-empty and free of
+leading/trailing whitespace (case-sensitive); and
+`pollIntervalMs ≤ maxPollIntervalMs ≤ requestTimeoutMs`. Validation errors must
+remain value-free (stable field/reason pairs; no ids, unknown field names,
+submitted values, file contents, library messages, or filesystem paths). The
+authoritative constants live in `src/config/schema.ts` (`MODEL_CONFIG_LIMITS`).
+
 ---
 
 ## 25. OpenCode Configuration

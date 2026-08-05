@@ -27,7 +27,8 @@ When instructions conflict, follow this order:
 - Input is text-only in the initial release. Responses support non-streamed output and buffered synthetic SSE streaming.
 - Prompt content, source code, file paths, tool arguments/results, and model answers are neither logged nor retained by default.
 - Emulated tool calling is experimental until all release gates in `.agent/docs/tech-software-spec.md` section 30 pass.
-- The project is currently specification-first. Paths in the recommended project structure are planned until they actually exist; do not assume scaffolding or package scripts have already been created.
+- The project has a runnable foundation: configuration loading/validation, a Fastify server construction factory, `/healthz` and `/readyz` routes, credential-redacting logging, graceful shutdown, tests, Docker packaging, and CI. The completion, upstream, prompt, tool, streaming, and Redis features remain unimplemented; those paths in the recommended project structure are still planned until they actually exist.
+- Implemented source lives under `src/` (`index.ts`, `server.ts`, `api/health-route.ts`, `config/`, `observability/logger.ts`, `shared/redaction.ts`); tests under `test/`. Package scripts, `package.json`, and `package-lock.json` exist — inspect them rather than assuming.
 
 ## Read First
 
@@ -70,9 +71,9 @@ Use `.agent/sessions/<branch-or-task>/<worker-id>/` only for ephemeral collabora
 
 ## Command Policy
 
-The repository does not yet define package scripts. Once `package.json` exists, prefer its scripts and the locked package manager over ad hoc tool commands. Inspect the file before citing or running a script.
+`package.json` defines the canonical scripts; prefer them and the locked package manager (npm, `packageManager` pinned) over ad hoc tool commands. Inspect the file before citing or running a script. The default aggregate check is `npm run validate` (format check, lint, typecheck, tests, build, compiled-import smoke test).
 
-Expected validation categories are type checking, formatting/linting, unit tests, contract tests, compatibility tests, integration tests, and build/package checks. Their canonical command names must be documented in `package.json` and `.agent/instructions/validation.md` when established.
+Implemented canonical scripts: `dev`, `build`, `start`, `typecheck`, `lint`, `format`, `format:check`, `test`, `test:unit`, `test:integration`, `test:coverage`, `test:build`, `validate`. Contract, compatibility, adversarial, and load suites are not implemented yet and must not be added to the default `validate` script; see `.agent/instructions/validation.md`.
 
 Do not claim a command exists or passed when it was unavailable. Do not install dependencies, regenerate a lockfile broadly, or choose package versions as a side effect of unrelated work.
 
