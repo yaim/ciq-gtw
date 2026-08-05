@@ -1,0 +1,46 @@
+# Keep the build context minimal and free of secrets, local config, and
+# artifacts. Only package manifests, .npmrc, tsconfig.json, and src/ are needed.
+.git
+.github
+.gitignore
+node_modules
+dist
+coverage
+.nyc_output
+.vitest
+
+# Tests and tooling are not needed in the image
+test
+vitest.config.ts
+eslint.config.mjs
+prettier.config.mjs
+.prettierignore
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+config/models.yaml
+config/*.local.yaml
+config/*.local.yml
+config/*.local.json
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Agent, editor, and OS files
+.agent
+.claude
+.vscode
+.idea
+.DS_Store
+*.log
+
+# Documentation not required at build time
+README.md
+SECURITY.md
+AGENTS.md
+CLAUDE.md
+compose.yaml
+compose.override.yaml

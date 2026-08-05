@@ -1,0 +1,27 @@
+# Local Docker deployment for the CollectivIQ gateway scaffold.
+#
+# The container binds HOST=0.0.0.0 internally, but the port is published ONLY to
+# host loopback (127.0.0.1). Credentials are supplied through environment
+# interpolation (from your shell or a local .env); no functional secret is
+# stored in this file. The `:?` guards fail fast when a required secret is unset.
+
+services:
+  gateway:
+    build: .
+    image: collectiviq-gateway:local
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8787:8787"
+    environment:
+      ENVIRONMENT: "production"
+      HOST: "0.0.0.0"
+      PORT: "8787"
+      COLLECTIVIQ_BASE_URL: "https://api.prod.collectiviq.ai"
+      COLLECTIVIQ_API_KEY: "${COLLECTIVIQ_API_KEY:?set COLLECTIVIQ_API_KEY in your shell or .env}"
+      COLLECTIVIQ_GATEWAY_KEYS: "${COLLECTIVIQ_GATEWAY_KEYS:?set COLLECTIVIQ_GATEWAY_KEYS in your shell or .env}"
+      MODEL_CONFIG_PATH: "/app/config/models.yaml"
+      LOG_LEVEL: "info"
+      LOG_CONTENT: "false"
+    volumes:
+      # Provide your own model file (copied from config/models.example.yaml).
+      - "./config/models.yaml:/app/config/models.yaml:ro"
