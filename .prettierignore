@@ -1,0 +1,14 @@
+# Dependencies and generated output
+node_modules/
+dist/
+coverage/
+package-lock.json
+
+# Local editor/tooling state that this project does not own
+.claude/
+
+# Agent documentation and the large specification are owned elsewhere and
+# must not be reformatted as a side effect of code formatting.
+.agent/
+AGENTS.md
+CLAUDE.md

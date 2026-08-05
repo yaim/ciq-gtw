@@ -1,0 +1,49 @@
+# Example virtual model configuration for the CollectivIQ gateway scaffold.
+#
+# Copy this file to config/models.yaml (git-ignored) and adjust for your
+# deployment. Model IDs and the source names under `selectedLlms` /
+# `answerSource` are configurable examples only; they are NOT verified against
+# any CollectivIQ account and carry no context-window or token-limit claims.
+#
+# All examples set toolMode: disabled because emulated/native tool calling is
+# not implemented in this foundation.
+
+models:
+  collectiviq-consensus:
+    displayName: CollectivIQ Consensus
+    selectedLlms:
+      - gpt
+      - claude
+      - gemini
+    generateCombined: true
+    answerSource: combined
+    toolMode: disabled
+    requestTimeoutMs: 90000
+    pollIntervalMs: 2000
+    maxPollIntervalMs: 5000
+    maximumPromptBytes: 6291456
+
+  collectiviq-coder:
+    displayName: CollectivIQ Coder
+    selectedLlms:
+      - gpt
+      - claude
+    generateCombined: true
+    answerSource: combined
+    toolMode: disabled
+    requestTimeoutMs: 90000
+    pollIntervalMs: 2000
+    maxPollIntervalMs: 5000
+    maximumPromptBytes: 6291456
+
+  collectiviq-fast:
+    displayName: CollectivIQ Fast
+    selectedLlms:
+      - gpt
+    generateCombined: false
+    answerSource: gpt
+    toolMode: disabled
+    requestTimeoutMs: 60000
+    pollIntervalMs: 2000
+    maxPollIntervalMs: 5000
+    maximumPromptBytes: 6291456

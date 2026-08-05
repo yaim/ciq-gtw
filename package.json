@@ -1,0 +1,46 @@
+{
+  "name": "collectiviq-gateway",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenAI-compatible gateway between OpenCode and CollectivIQ (runnable foundation).",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "packageManager": "npm@11.17.0",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch --env-file-if-exists=.env src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.test.json --noEmit",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run",
+    "test:unit": "vitest run test/unit",
+    "test:integration": "vitest run test/integration",
+    "test:coverage": "vitest run --coverage",
+    "test:build": "node test/smoke/import-built.mjs",
+    "validate": "npm run format:check && npm run lint && npm run typecheck && npm run test && npm run build && npm run test:build"
+  },
+  "dependencies": {
+    "@fastify/type-provider-typebox": "6.1.0",
+    "fastify": "5.11.2",
+    "pino": "10.3.1",
+    "typebox": "1.3.10",
+    "yaml": "2.9.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "24.13.3",
+    "@vitest/coverage-v8": "4.1.10",
+    "eslint": "10.8.0",
+    "prettier": "3.9.6",
+    "tsx": "4.23.7",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.66.0",
+    "vitest": "4.1.10"
+  }
+}
