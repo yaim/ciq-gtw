@@ -13,6 +13,7 @@ Documentation is part of the product contract. Update it in the same change as b
 | Initialization and planned source layout | `.agent/docs/tech-software-spec.md` sections 7 and 26 | `.agent/instructions/project-initialization.md`, `.agent/instructions/project-map.md` |
 | OpenAI compatibility implementation rules | `.agent/docs/tech-software-spec.md` sections 8–9, 14, and 20 | `.agent/instructions/openai-compatibility.md` |
 | CollectivIQ provisional contract and discovery questions | `.agent/docs/tech-software-spec.md` sections 2.1, 10, 13, 32 phase 0, and 35 | `.agent/instructions/upstream-integration.md` |
+| Grounded CollectivIQ upstream contract (OpenAPI source metadata, evidence states, request contracts, capability matrix, drift history, fixture references) | `.agent/docs/collectiviq-upstream-contract.md` | `.agent/instructions/upstream-integration.md`, `.agent/docs/tech-software-spec.md` sections 2.1 and 10 |
 | Tool protocol and release policy | `.agent/docs/tech-software-spec.md` sections 11.2, 12, 21.4–21.5, and 30 | `.agent/instructions/tool-calling.md` |
 | Security, privacy, retention, and deployment controls | `.agent/docs/tech-software-spec.md` sections 21–22 and 31 | `.agent/instructions/security.md` |
 | Runtime config, observability, health, and lifecycle | `.agent/docs/tech-software-spec.md` sections 15–19, 23–24, 28, and 31 | `.agent/instructions/operations.md` |

@@ -4,7 +4,11 @@
 
 Read `.agent/docs/tech-software-spec.md` sections 5–8, 15, 26, 27, and 36 for architectural principles, components, request state, planned paths, orchestration, and the final design.
 
-**Implemented today (foundation):** `src/index.ts`, `src/server.ts`, `src/api/health-route.ts` (`/healthz`, `/readyz`, and the injected readiness state), `src/config/schema.ts`, `src/config/load.ts`, `src/observability/logger.ts`, and `src/shared/redaction.ts`, with tests under `test/`. **Still planned:** everything else below — `src/api/` auth/errors/model/chat routes, `src/openai/`, `src/collectiviq/`, `src/generation/`, `src/prompts/`, and `src/tools/`. The boundary ownership rules below apply as those modules are created.
+**Implemented today (foundation):** `src/index.ts`, `src/server.ts`, `src/api/health-route.ts` (`/healthz`, `/readyz`, and the injected readiness state), `src/config/schema.ts`, `src/config/load.ts`, `src/observability/logger.ts`, and `src/shared/redaction.ts`, with tests under `test/`.
+
+**Implemented (upstream boundary, offline Phase 0):** `src/collectiviq/` — the production adapter (`adapter.ts`), bounded transport (`http.ts`, including the discovery-only any-status `observeUpstreamJson` that is not exported from `index.ts`), shared pure request builders (`requests.ts`), provisional response validators (`validation.ts`), normalized error model (`errors.ts`), fixed endpoint paths (`endpoints.ts`), adapter types/capabilities (`types.ts`), value-free correlation (`correlation.ts`), and the opt-in **staged discovery session** plus SSE evidence and sanitized structural capture (`discovery.ts` — `DiscoverySessionRunner`, `readSseEvidence`, strict `exitCodeForBaseline`; thin `discovery-cli.ts`; `structural-capture.ts`). Discovery captures raw upstream structure, retains correlation ids privately, keeps a truthful cleanup ledger, and gates every destructive delete on approval. The filtered OpenAPI snapshot lives at `contract/collectiviq/`, its tooling at `scripts/openapi/`, and hermetic contract tests at `test/contract/`. **This boundary is not yet wired into any route, generation, or completion path.**
+
+**Still planned:** everything else below — `src/api/` auth/errors/model/chat routes, `src/openai/`, `src/generation/`, `src/prompts/`, and `src/tools/`. The boundary ownership rules below apply as those modules are created.
 
 ## Request Flow
 

@@ -3,11 +3,15 @@
 A local or privately hosted HTTP service that will sit between OpenCode and
 CollectivIQ, exposing a bounded OpenAI Chat Completions-compatible profile.
 
-> **Status: runnable foundation only.** This repository currently provides a
-> secure, validated service skeleton. It does **not** implement chat
-> completions, model listing, CollectivIQ upstream calls, prompt serialization,
-> tool calling, streaming, or Redis. Those remain planned per
-> [`.agent/docs/tech-software-spec.md`](.agent/docs/tech-software-spec.md).
+> **Status: runnable foundation plus an offline upstream adapter boundary.**
+> This repository provides a secure, validated service skeleton and an
+> OpenAPI-grounded CollectivIQ adapter with hermetic contract tests. It does
+> **not** yet implement chat completions, model listing, live CollectivIQ calls,
+> prompt serialization, tool calling, streaming, or Redis, and the adapter is
+> **not wired into any request path**. Those remain planned per
+> [`.agent/docs/tech-software-spec.md`](.agent/docs/tech-software-spec.md). The
+> grounded upstream contract is documented in
+> [`.agent/docs/collectiviq-upstream-contract.md`](.agent/docs/collectiviq-upstream-contract.md).
 
 ## What works today
 
@@ -18,12 +22,21 @@ CollectivIQ, exposing a bounded OpenAI Chat Completions-compatible profile.
 - Credential-redacting Pino logging with content logging off by default.
 - Graceful `SIGINT`/`SIGTERM` shutdown.
 - Docker packaging and GitHub Actions CI.
+- An OpenAPI-grounded CollectivIQ **adapter boundary** (`src/collectiviq/`) for
+  the three core operations, with a bounded/cancellation-aware transport, a
+  normalized content-free error model (with method-aware retry metadata),
+  provisional response validation, an opt-in staged discovery session/CLI
+  (preflight by default), a committed filtered OpenAPI snapshot
+  (`contract/collectiviq/`), and hermetic mock-server contract tests
+  (`test/contract/`). **Not wired into any route or completion path.**
 
 ## What is not implemented yet
 
 `GET /v1/models`, `GET /v1/models/:model`, `POST /v1/chat/completions`,
-`GET /metrics`, gateway authentication, the CollectivIQ adapter, prompt
-construction, emulated/native tool calling, and synthetic SSE streaming.
+`GET /metrics`, gateway authentication, prompt construction, emulated/native
+tool calling, synthetic SSE streaming, polling, generation orchestration, and
+any live CollectivIQ call. The adapter exists but is not connected to a public
+endpoint, and all upstream response shapes are provisional until live discovery.
 
 ## Prerequisites
 
@@ -78,15 +91,57 @@ Individual checks:
 | `npm run format:check`     | Prettier formatting check                     |
 | `npm run lint`             | ESLint (typed rules)                          |
 | `npm run typecheck`        | Strict `tsc --noEmit` over sources and tests  |
-| `npm test`                 | Vitest unit + integration suites              |
+| `npm test`                 | Vitest unit + integration + contract suites   |
 | `npm run test:unit`        | Unit tests only                               |
 | `npm run test:integration` | Server integration tests only                 |
+| `npm run test:contract`    | Hermetic upstream contract tests (mock HTTP)  |
 | `npm run test:coverage`    | Tests with V8 coverage                        |
 | `npm run build`            | Compile to `dist/`                            |
 | `npm run test:build`       | Import compiled output; assert no open socket |
 
 `validate` is hermetic: it makes no network, live-upstream, Docker, or load
-checks.
+checks. The contract suite runs against a local mock HTTP server.
+
+## CollectivIQ contract tooling
+
+The upstream contract is grounded in the published OpenAPI document and captured
+as a deterministic, filtered snapshot at
+[`contract/collectiviq/openapi-filtered.json`](contract/collectiviq/openapi-filtered.json)
+(nine allowlisted operations only; the full 422-path document is never
+committed). See
+[`.agent/docs/collectiviq-upstream-contract.md`](.agent/docs/collectiviq-upstream-contract.md).
+
+These commands need network access and are **excluded from `validate` and CI**:
+
+| Command                            | Purpose                                                                 |
+| ---------------------------------- | ----------------------------------------------------------------------- |
+| `npm run contract:openapi:check`   | Fetch the public OpenAPI doc and report drift vs the committed snapshot |
+| `npm run contract:openapi:refresh` | Fetch and write a review candidate under `.agent/sessions/` (untracked) |
+| `npm run contract:discovery`       | Opt-in live discovery (requires credentials + explicit approval)        |
+
+`contract:discovery` is **not** run as part of this stage. It runs a single
+bounded `baseline` session against a **fixed** destination origin
+(`https://api.prod.collectiviq.ai`) — no origin, path, thread-id, or run-id may
+be supplied. The **default invocation is preflight only**: it validates the
+model selection (`CIQ_DISCOVERY_SINGLE_LLM`, `CIQ_DISCOVERY_COMBINED_LLMS`) and
+reports bounded projected operation counts and which approvals are set, **without
+reading the credential or making any network request**. Authenticated execution
+requires `--execute-approved`; deleting session-owned threads requires
+`--cleanup-approved` (never automatic); the not-found probe requires
+`--observe-not-found-approved` **and** `--cleanup-approved` (these invariants are
+also re-checked inside the runner before any request). Token-inspection and abort
+discovery are disabled until request correlation is safely established. Evidence
+is captured from the **raw** upstream body for any status (so run ids and error
+shapes survive) and immediately reduced to sanitized structure; correlation ids
+stay private and are reported only as a value-free
+`matched`/`not-matched`/`not-observed` comparison. Cleanup reports a truthful
+`attempted`/`succeeded`/`failed`/`remaining` ledger, and the exit code follows
+strict session completeness. Output is limited to sanitized structural captures
+(constant type markers only — no credentials, content, value lengths, identifiers,
+headers, or raw bodies) stamped with an `evidenceFormatVersion`; nothing is
+written unless `--write` is passed (sanitized captures under
+`.agent/sessions/` only). Thread and run identifiers stay in memory and are never
+printed or persisted.
 
 ## Docker
 

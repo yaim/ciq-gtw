@@ -13,13 +13,23 @@
 | `npm run test` | Unit + integration | Vitest (`test/unit`, `test/integration`) |
 | `npm run test:unit` | Unit | Vitest `test/unit` only |
 | `npm run test:integration` | Integration | Vitest `test/integration` only (in-process `inject`, no socket) |
+| `npm run test:contract` | Upstream contract | Vitest `test/contract` only (hermetic mock HTTP server, no network) |
 | `npm run test:coverage` | Coverage | Vitest with V8 coverage |
 | `npm run build` | Build | `tsc -p tsconfig.json`, emits `dist/` |
 | `npm run test:build` | Build smoke | Imports compiled `dist/*.js`; asserts no listening socket |
 | `npm run validate` | Aggregate | format check → lint → typecheck → test → build → test:build |
 | `npm run dev` / `npm start` | Run | Local watch run / run compiled `dist/index.js` |
 
-`validate` is hermetic. Contract, OpenAI-compatibility, adversarial, load, live-upstream, end-to-end OpenCode, and Docker/live checks are **not implemented yet** and must not be added to `validate` until their suites and gates exist. Keep fast hermetic validation separate from those.
+`validate` is hermetic. The upstream contract suite (`test/contract`) is now
+implemented and hermetic (a local mock HTTP server; no network, credentials, or
+CollectivIQ calls); it runs as part of `npm run test` and therefore inside
+`validate`, and `npm run test:contract` runs it in isolation. The network-only
+`contract:openapi:refresh` and `contract:openapi:check` commands and the opt-in
+`contract:discovery` command must **never** be added to `validate` or CI.
+OpenAI-compatibility, adversarial, load, live-upstream, end-to-end OpenCode, and
+Docker/live checks are **not implemented yet** and must not be added to
+`validate` until their suites and gates exist. Keep fast hermetic validation
+separate from those.
 
 ## Validation Order
 
@@ -42,7 +52,7 @@ Cover deterministic policies without sockets: public validation/normalization, s
 
 ### Upstream contract
 
-Use a mock HTTP CollectivIQ server. Exercise multipart/query/header behavior, schema/status validation, auth/quota/protocol mapping, empty/partial/duplicate responses, selection ordering, oversize bodies, timeouts, resets, retry limits, and cancellation.
+Use a mock HTTP CollectivIQ server. Exercise multipart/query/header behavior, schema/status validation, auth/quota/protocol mapping, empty/partial/duplicate responses, selection ordering, oversize bodies, timeouts, resets, retry limits, and cancellation. The implemented `test/contract` suite also covers **method-aware retryability** (idempotent-`GET`-only retryable; `POST`/`DELETE` never), **`detail`-any-value failure** for `process_message`, the **bounded OpenAPI fetch** (fixed origin, content-type/`Content-Length` guards, incremental cap, deadline/cancellation, strict UTF-8 — via injected transport), the **shared request builders** and the **discovery-only any-status observation path** (`observeUpstreamJson` parses non-2xx JSON while production `requestUpstreamJson` still discards non-2xx bodies), and the **discovery boundaries**: preflight makes no network call and reads no credential; deterministic model modes/projected counts and **duplicate-rejection**; runner-level **canonical** selection re-validation before any request (trim single/combined, reject comma-in-element and post-trim duplicates, no caller-array mutation); **raw evidence capture** (process_message run id, auth/validation/not-found error shapes) reduced to value-free structure with `evidenceFormatVersion`, while **required 2xx stages must still pass the production normalizer** (`normalizeCreateThread`/`normalizeProcessMessage`/`normalizeGetMessages`) to be marked successful — a malformed 2xx create/submit/messages body is a failed observation (raw structure retained, safe `UpstreamError` code only) and drives a non-zero exit; **private, value-free correlation targeting the combined-stage request pair** (normalized combined thread id + validated combined submission run candidates only; run resets on a new combined thread; the run dimension matches when **any** requested run candidate — `run_id` or `combined_run_id`, deduped — appears in the observed set; `matched`/`not-matched`/`not-observed`); structural-capture no-value/no-length/safe-name guarantees and descriptor-safe array length (proxy `get` never invoked); **hardened SSE evidence** (non-2xx rejected, content-type gate, LF/CRLF split, strict UTF-8 finalized at EOF, unterminated-record bound, `completed`/`eof`/`timeout`/`event-limit`/`body-limit`/`malformed-utf8`/`invalid-content-type`/`cancelled`/`stream-error` terminations); a **truthful cleanup ledger** and not-found first-delete-failure behavior; **strict exit completeness**; cleanup/not-found approvals; and token/abort unreachability.
 
 Live observations are not tests until converted to sanitized deterministic fixtures. Live tests must be opt-in and never use repository/customer content.
 

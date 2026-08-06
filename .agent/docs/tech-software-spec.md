@@ -70,7 +70,7 @@ GET  /get_messages
 GET  /user/events
 ```
 
-The supplied sample indicates that `create_thread` and `process_message` accept `multipart/form-data`.
+The supplied sample indicated that `create_thread` and `process_message` accept `multipart/form-data`. The published OpenAPI document (`3.1.0`, retrieved 2026-08-05) corrects this: `POST /create_thread` accepts **`application/x-www-form-urlencoded`**, while `POST /process_message` accepts `multipart/form-data`. See [`collectiviq-upstream-contract.md`](collectiviq-upstream-contract.md) for the full grounded contract, evidence states, and the committed filtered snapshot.
 
 The sample also indicates that a returned message may contain:
 
@@ -960,14 +960,18 @@ For each completion:
 ```http
 POST {COLLECTIVIQ_BASE_URL}/create_thread
 Authorization: Bearer {COLLECTIVIQ_API_KEY}
-Content-Type: multipart/form-data
+Content-Type: application/x-www-form-urlencoded
 ```
 
-Form field:
+Form fields (per the published OpenAPI document):
 
 ```text
-thread_title=OpenCode request <short-request-id>
+thread_title=<generic content-free title>
+is_title_from_user=false
 ```
+
+`project_id` (`integer | null`) is documented and optional; the gateway omits
+it. This endpoint is `application/x-www-form-urlencoded`, not multipart.
 
 The title must not contain:
 
@@ -1007,7 +1011,15 @@ prompt=<serialized prompt>
 thread_id=<thread id>
 selected_llms=<comma-separated model identifiers>
 generate_combined=true|false
+llms_explicitly_set=true
 ```
+
+`llms_explicitly_set` (documented type `string | null`, default `"false"`) is
+sent as `"true"` because the gateway configuration explicitly selects the
+models. Its runtime effect is provisional until verified by live discovery. The
+gateway does not send the documented `files`, `client_timezone`,
+`client_location`, `clarification_origin_run_id`, `suppress_user_bubble`,
+`response_format`, or `tier` fields.
 
 An HTTP success status is not sufficient. The response body must be checked for error objects such as:
 
@@ -1023,6 +1035,11 @@ An HTTP success status is not sufficient. The response body must be checked for 
 GET {COLLECTIVIQ_BASE_URL}/get_messages?thread_id=<encoded thread id>
 Authorization: Bearer {COLLECTIVIQ_API_KEY}
 ```
+
+The OpenAPI document marks `thread_id` as an optional query parameter, but the
+gateway always requires and sends a non-empty `thread_id`. The document also
+declares an optional `since_id` parameter, which the initial gateway
+intentionally omits so full thread history is returned.
 
 Expected provisional response:
 
@@ -2455,6 +2472,24 @@ Deliverables:
 Exit criterion:
 
 * upstream adapter contract tests reflect real responses.
+
+Current status (offline portion complete): the OpenAPI-grounded adapter
+boundary (`src/collectiviq/`), the shared request builders (`requests.ts`) reused
+by production and discovery, the filtered contract snapshot
+(`contract/collectiviq/openapi-filtered.json`), the hermetic mock-server
+contract tests (`test/contract/`), and the opt-in discovery session/CLI exist and
+pass `validate`. The staged discovery session captures evidence from the **raw**
+upstream body (any status) via a discovery-only observation path — so run ids and
+error shapes survive as value-free sanitized structure (`evidenceFormatVersion`
+2) — retains correlation ids only in private memory (emitted solely as a
+`matched`/`not-matched`/`not-observed` comparison; no capability flag is
+auto-flipped), keeps a truthful cleanup ledger, gates every destructive delete on
+explicit approval, and exits on strict session completeness. None of it is wired
+into any public completion path. All runtime response shapes remain provisional;
+the contract tests use synthetic fixtures, not live responses. Phase 0 is **not
+complete**: it exits only after approved live discovery captures sanitized
+fixtures that reflect real responses. See
+[`collectiviq-upstream-contract.md`](collectiviq-upstream-contract.md).
 
 ### Phase 1 — Text gateway
 
