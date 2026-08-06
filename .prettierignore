@@ -4,6 +4,11 @@ dist/
 coverage/
 package-lock.json
 
+# Deterministic OpenAPI contract snapshot: its byte layout is owned by the
+# extraction tooling (stable key ordering) so the `contract:openapi:check`
+# diff stays exact. Prettier must not reformat it.
+contract/collectiviq/openapi-filtered.json
+
 # Local editor/tooling state that this project does not own
 .claude/
 
