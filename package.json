@@ -21,9 +21,13 @@
     "test": "vitest run",
     "test:unit": "vitest run test/unit",
     "test:integration": "vitest run test/integration",
+    "test:contract": "vitest run test/contract",
     "test:coverage": "vitest run --coverage",
     "test:build": "node test/smoke/import-built.mjs",
-    "validate": "npm run format:check && npm run lint && npm run typecheck && npm run test && npm run build && npm run test:build"
+    "validate": "npm run format:check && npm run lint && npm run typecheck && npm run test && npm run build && npm run test:build",
+    "contract:openapi:refresh": "tsx scripts/openapi/refresh.ts",
+    "contract:openapi:check": "tsx scripts/openapi/check.ts",
+    "contract:discovery": "tsx src/collectiviq/discovery-cli.ts"
   },
   "dependencies": {
     "@fastify/type-provider-typebox": "6.1.0",
