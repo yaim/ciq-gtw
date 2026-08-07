@@ -78,7 +78,6 @@ describe("strict baseline exit policy", () => {
 
   it("returns non-zero when a required positive stage failed", () => {
     for (const stage of [
-      "available_llms",
       "single_thread_create",
       "single_submit",
       "combined_thread_create",
@@ -88,6 +87,42 @@ describe("strict baseline exit policy", () => {
       const report = withObservation(completeReport(), stage, { ok: false });
       expect(exitCodeForBaseline(report)).toBe(1);
     }
+  });
+
+  it("accepts a 403 model-inventory restriction but rejects other failures", () => {
+    // A 2xx success and an authenticated 403 are both complete inventory outcomes.
+    expect(exitCodeForBaseline(completeReport())).toBe(0);
+    const forbidden = withObservation(completeReport(), "available_llms", {
+      ok: false,
+      status: 403,
+      errorCode: "upstream_authentication_failed",
+    });
+    expect(exitCodeForBaseline(forbidden)).toBe(0);
+
+    // 401, 429, 5xx, and transport/timeout failures (no status) all fail completeness.
+    const rejected: Array<Partial<DiscoveryObservation>> = [
+      { ok: false, status: 401, errorCode: "upstream_authentication_failed" },
+      { ok: false, status: 429, errorCode: "upstream_quota_exceeded" },
+      { ok: false, status: 500, errorCode: "upstream_unexpected_error" },
+      { ok: false, status: null, errorCode: "upstream_network_error" },
+      { ok: false, status: null, errorCode: "upstream_timeout" },
+      // A malformed 2xx inventory (the structural gate rejected it) is reachable
+      // through the runner and is not a valid success.
+      { ok: false, status: 200, errorCode: "invalid_upstream_response" },
+    ];
+    for (const patch of rejected) {
+      expect(exitCodeForBaseline(withObservation(completeReport(), "available_llms", patch))).toBe(
+        1,
+      );
+    }
+  });
+
+  it("returns non-zero when the model-inventory observation is missing", () => {
+    const report: DiscoveryBaselineReport = {
+      ...completeReport(),
+      observations: completeReport().observations.filter((o) => o.stage !== "available_llms"),
+    };
+    expect(exitCodeForBaseline(report)).toBe(1);
   });
 
   it("returns non-zero when the auth probe did not yield an authentication failure", () => {
@@ -154,7 +189,14 @@ describe("strict baseline exit policy", () => {
         errorCode: "upstream_unexpected_error",
         structure: {},
       },
-      cleanup: { attempted: 2, succeeded: 2, failed: 0, remaining: 0 },
+      cleanup: {
+        attempted: 2,
+        succeeded: 2,
+        failed: 0,
+        remaining: 0,
+        journalPersistenceFailed: 0,
+        attempts: [],
+      },
     };
     expect(exitCodeForBaseline(report)).toBe(0);
   });
@@ -163,21 +205,75 @@ describe("strict baseline exit policy", () => {
     expect(
       exitCodeForBaseline({
         ...completeReport(),
-        cleanup: { attempted: 2, succeeded: 1, failed: 1, remaining: 1 },
+        cleanup: {
+          attempted: 2,
+          succeeded: 1,
+          failed: 1,
+          remaining: 1,
+          journalPersistenceFailed: 0,
+          attempts: [],
+        },
       }),
     ).toBe(1);
     expect(
       exitCodeForBaseline({
         ...completeReport(),
-        cleanup: { attempted: 2, succeeded: 1, failed: 1, remaining: 0 },
+        cleanup: {
+          attempted: 2,
+          succeeded: 1,
+          failed: 1,
+          remaining: 0,
+          journalPersistenceFailed: 0,
+          attempts: [],
+        },
       }),
     ).toBe(1);
     expect(
       exitCodeForBaseline({
         ...completeReport(),
-        cleanup: { attempted: 2, succeeded: 2, failed: 0, remaining: 0 },
+        cleanup: {
+          attempted: 2,
+          succeeded: 2,
+          failed: 0,
+          remaining: 0,
+          journalPersistenceFailed: 0,
+          attempts: [],
+        },
       }),
     ).toBe(0);
+  });
+
+  it("returns non-zero when a cleanup DELETE succeeded but its journal removal failed", () => {
+    // HTTP DELETEs all succeeded (failed: 0, remaining: 0) yet the journal removal
+    // could not be persisted — still an incomplete, non-zero result.
+    expect(
+      exitCodeForBaseline({
+        ...completeReport(),
+        cleanup: {
+          attempted: 2,
+          succeeded: 2,
+          failed: 0,
+          remaining: 0,
+          journalPersistenceFailed: 1,
+          attempts: [
+            {
+              phase: "final-cleanup",
+              ok: true,
+              status: 200,
+              errorCode: null,
+              journalPersisted: false,
+            },
+            {
+              phase: "final-cleanup",
+              ok: true,
+              status: 200,
+              errorCode: null,
+              journalPersisted: true,
+            },
+          ],
+        },
+      }),
+    ).toBe(1);
   });
 });
 

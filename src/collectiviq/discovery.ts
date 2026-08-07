@@ -32,6 +32,12 @@
  *   status/error code — never raw bodies, headers, IDs, prompts, or answers.
  */
 import {
+  observeThreadDeletion,
+  type DiscoveryCleanupAttempt,
+  type DiscoveryCleanupPhase,
+  type DiscoveryCleanupReport,
+} from "./cleanup.js";
+import {
   classifyCorrelation,
   extractCorrelationCandidates,
   type CorrelationCandidates,
@@ -40,6 +46,7 @@ import {
 import { deleteThreadPath, ENDPOINTS } from "./endpoints.js";
 import { upstreamErrorForStatus, type UpstreamErrorCode, UpstreamError } from "./errors.js";
 import { observeUpstreamJson } from "./http.js";
+import type { RecoveryJournalSink } from "./recovery-journal.js";
 import {
   buildCreateThreadRequest,
   buildGetMessagesRequest,
@@ -130,21 +137,19 @@ export interface DiscoveryPreflightReport {
   readonly projectedCounts: DiscoveryProjectedCounts;
   readonly cleanupApproved: boolean;
   readonly notFoundObservationApproved: boolean;
+  /** Reported for transparency; preflight never creates or reads the journal. */
+  readonly recoveryJournalApproved: boolean;
 }
 
-/**
- * Sanitized cleanup outcome: bounded counts only, never ids or bodies.
- * `attempted`/`succeeded`/`failed` are cumulative across every session-owned
- * DELETE that counts as cleanup work (including the not-found probe's first
- * deletion, but never its second already-deleted observation). `remaining` is
- * the number of session-owned threads still undeleted when the session ended.
- */
-export interface DiscoveryCleanupReport {
-  readonly attempted: number;
-  readonly succeeded: number;
-  readonly failed: number;
-  readonly remaining: number;
-}
+// The sanitized cleanup outcome (cumulative bounded counts plus value-free
+// per-attempt diagnostics) is defined in `cleanup.ts` and shared with the
+// recovery command; re-export it so existing importers of `discovery.js` are
+// unaffected.
+export type {
+  DiscoveryCleanupAttempt,
+  DiscoveryCleanupPhase,
+  DiscoveryCleanupReport,
+} from "./cleanup.js";
 
 /** The bounded termination reasons for the SSE evidence probe. */
 export type SseTermination =
@@ -295,6 +300,41 @@ export function projectCounts(selection: DiscoveryModelSelection): DiscoveryProj
   };
 }
 
+/**
+ * A FATAL, content-free discovery failure raised when the recovery journal
+ * cannot durably persist a session-owned thread id. It aborts the whole run
+ * before any further upstream request. It carries no path, id, or filesystem
+ * detail, and its `name` stays the generic `"Error"` so an accidental log emits
+ * nothing sensitive.
+ */
+class JournalPersistenceError extends Error {
+  constructor() {
+    super("recovery journal persistence failed");
+    this.name = "Error";
+  }
+}
+
+/**
+ * Minimal, content-free structural gate for a SUCCESSFUL `available_llms` body.
+ * Valid only when the top level is a non-null, non-array object with an own
+ * `llms` property that is itself a non-null, non-array object holding at least
+ * one entry, and every entry is a non-null, non-array object. Extra top-level
+ * and per-model-descriptor properties are allowed (forward compatible). No
+ * account-specific model value is required, inspected, or retained.
+ */
+function isValidAvailableLlms(json: unknown): boolean {
+  if (typeof json !== "object" || json === null || Array.isArray(json)) return false;
+  // Require an OWN `llms` property; a prototype-inherited value must not pass.
+  if (!Object.hasOwn(json, "llms")) return false;
+  const llms = (json as Record<string, unknown>)["llms"];
+  if (typeof llms !== "object" || llms === null || Array.isArray(llms)) return false;
+  const entries = Object.values(llms as Record<string, unknown>);
+  if (entries.length === 0) return false;
+  return entries.every(
+    (entry) => typeof entry === "object" && entry !== null && !Array.isArray(entry),
+  );
+}
+
 // --- Observation builders ----------------------------------------------------
 
 /** Build a sanitized observation from a raw (any-status) JSON observation. */
@@ -338,7 +378,11 @@ function unavailableObservation(stage: DiscoveryStage): DiscoveryObservation {
  */
 export function buildPreflightReport(
   env: NodeJS.ProcessEnv,
-  approvals: { cleanupApproved: boolean; notFoundObservationApproved: boolean },
+  approvals: {
+    cleanupApproved: boolean;
+    notFoundObservationApproved: boolean;
+    recoveryJournalApproved?: boolean;
+  },
 ): DiscoveryPreflightReport {
   const selection = buildModelSelection(env);
   return {
@@ -347,6 +391,7 @@ export function buildPreflightReport(
     projectedCounts: projectCounts(selection),
     cleanupApproved: approvals.cleanupApproved,
     notFoundObservationApproved: approvals.notFoundObservationApproved,
+    recoveryJournalApproved: approvals.recoveryJournalApproved ?? false,
   };
 }
 
@@ -363,12 +408,30 @@ export interface DiscoveryBaselineReport {
   readonly cleanup: DiscoveryCleanupReport | null;
   /** Value-free thread/run correlation of the SSE stream with request ids. */
   readonly correlation: CorrelationReport;
+  /**
+   * Set to a fixed, content-free reason when the run aborted early. The only
+   * current reason is a fatal recovery-journal persistence failure after a
+   * thread was created upstream; an aborted run is always a non-zero result.
+   */
+  readonly aborted?: "journal-persistence-failed";
 }
 
 export interface ExecuteBaselineOptions {
   readonly selection: DiscoveryModelSelection;
   readonly cleanupApproved: boolean;
   readonly observeNotFoundApproved: boolean;
+  /**
+   * Must be `true`. Authenticated execution requires explicit recovery-journal
+   * approval so session-owned thread ids stay recoverable; a run without it is
+   * rejected before any request. Re-checked here (not only in CLI parsing).
+   */
+  readonly recoveryJournalApproved: boolean;
+  /**
+   * The approved recovery journal sink. Required for authenticated execution
+   * (this flow always creates threads): supplied by the CLI (file-backed) or a
+   * test (in-memory). A run is rejected before any request when it is omitted.
+   */
+  readonly recoveryJournal?: RecoveryJournalSink;
   readonly signal?: AbortSignal;
 }
 
@@ -399,6 +462,16 @@ export class DiscoverySessionRunner {
   #cleanupAttempted = 0;
   #cleanupSucceeded = 0;
   #cleanupFailed = 0;
+  /** Count of successful DELETEs whose journal removal could not be persisted. */
+  #journalPersistenceFailed = 0;
+  /** Value-free per-attempt cleanup diagnostics, in issue order. */
+  readonly #cleanupAttempts: DiscoveryCleanupAttempt[] = [];
+  /**
+   * The approved recovery journal for this run. Its presence is required for
+   * authenticated execution; created thread ids are recorded immediately and
+   * dropped only after a confirmed successful deletion.
+   */
+  #journal: RecoveryJournalSink | null = null;
 
   constructor(
     config: CollectivIQTransportConfig,
@@ -427,9 +500,56 @@ export class DiscoverySessionRunner {
     if (options.observeNotFoundApproved && !options.cleanupApproved) {
       throw new Error("not-found observation requires cleanup approval");
     }
+    // Recovery-journal approval AND a concrete journal sink are both mandatory
+    // for authenticated execution (this flow always creates threads, so their ids
+    // must be durably recoverable). Re-checked here, independent of the CLI parser.
+    if (options.recoveryJournalApproved !== true) {
+      throw new Error("authenticated baseline requires recovery-journal approval");
+    }
+    if (options.recoveryJournal === undefined) {
+      throw new Error("authenticated baseline requires a recovery journal");
+    }
+    this.#journal = options.recoveryJournal;
+    // Verify journal writability up front so a non-writable journal fails the run
+    // BEFORE any thread is created upstream (init throwing here makes zero
+    // network calls).
+    await this.#journal.init();
 
     const observations: DiscoveryObservation[] = [];
+    try {
+      return await this.#runBaselineSequence(observations, selection, options);
+    } catch (error) {
+      if (!(error instanceof JournalPersistenceError)) throw error;
+      // Fatal recovery-journal persistence failure: no further requests. Attempt
+      // the approved cleanup of the in-memory-owned thread(s) so nothing is
+      // orphaned, then return a content-free aborted report (always non-zero).
+      let cleanup: DiscoveryCleanupReport | null = null;
+      if (options.cleanupApproved) cleanup = await this.cleanup(options.signal);
+      return {
+        session: DISCOVERY_SESSION,
+        destinationOrigin: this.#config.baseUrl,
+        evidenceFormatVersion: STRUCTURAL_CAPTURE_FORMAT,
+        observations,
+        notFound: null,
+        notFoundRequested: options.observeNotFoundApproved,
+        cleanup,
+        correlation: NO_CORRELATION,
+        aborted: "journal-persistence-failed",
+      };
+    }
+  }
 
+  /**
+   * The full bounded baseline request sequence. Separated from {@link
+   * executeBaseline} so a fatal {@link JournalPersistenceError} thrown mid-run
+   * can be caught and converted into a content-free aborted report. Pushes each
+   * sanitized observation into the shared `observations` array as it runs.
+   */
+  async #runBaselineSequence(
+    observations: DiscoveryObservation[],
+    selection: DiscoveryModelSelection,
+    options: ExecuteBaselineOptions,
+  ): Promise<DiscoveryBaselineReport> {
     // 1. Model listing structure.
     observations.push(await this.#availableLlms(options.signal));
     // 2. Safe auth + validation error shapes (raw error bodies captured).
@@ -490,6 +610,21 @@ export class DiscoverySessionRunner {
       cleanup = await this.cleanup(options.signal);
     }
 
+    // Persist the final journal state: remove it when nothing remains owned,
+    // otherwise leave the remaining ids for the recovery command. This is a
+    // redundant flush — every meaningful transition already persisted durable-first
+    // (recordCreated/recordDeleted) — so a finalize failure cannot lose data and
+    // must NOT turn a completed run into a rejection. Any such failure is caught
+    // (content-free); the run's non-zero signalling comes from the cleanup report's
+    // `journalPersistenceFailed`, not from finalize.
+    if (this.#journal !== null) {
+      try {
+        await this.#journal.finalize();
+      } catch {
+        // Redundant-flush failure; the durable state is already correct.
+      }
+    }
+
     return {
       session: DISCOVERY_SESSION,
       destinationOrigin: this.#config.baseUrl,
@@ -530,6 +665,18 @@ export class DiscoverySessionRunner {
       const raw = await this.#observe("GET", ENDPOINTS.availableLlms, {
         ...(signal ? { signal } : {}),
       });
+      // A 2xx response is a valid inventory only when it passes the minimal
+      // structural gate; a malformed 2xx body is an invalid upstream response
+      // (never a silent success), while its sanitized structure is still kept.
+      if (raw.ok && !isValidAvailableLlms(raw.json)) {
+        return {
+          stage: "available_llms",
+          ok: false,
+          status: raw.status,
+          errorCode: new UpstreamError("upstream_protocol").code,
+          structure: captureStructure(raw.json, this.#captureLimits),
+        };
+      }
       return observationFromRaw("available_llms", raw, this.#captureLimits);
     } catch (error) {
       return errorObservation("available_llms", error);
@@ -613,10 +760,26 @@ export class DiscoverySessionRunner {
         });
         return null;
       }
+      // Take in-memory ownership FIRST so the created thread can always be cleaned
+      // up, even if durable journal persistence then fails.
       this.#createdThreadIds.add(threadId);
+      // Record the newly owned id durably before continuing, so a later crash or
+      // failed cleanup leaves it recoverable. A persistence failure here is FATAL:
+      // the thread exists upstream but is not durably journaled, so the run must
+      // abort immediately (no further requests) rather than proceed.
+      if (this.#journal !== null) {
+        try {
+          await this.#journal.recordCreated(threadId);
+        } catch {
+          throw new JournalPersistenceError();
+        }
+      }
       observations.push({ stage, ok: true, status: raw.status, errorCode: null, structure });
       return threadId;
     } catch (error) {
+      // A fatal journal-persistence failure must propagate to abort the run; it is
+      // never downgraded to a per-stage observation.
+      if (error instanceof JournalPersistenceError) throw error;
       observations.push(errorObservation(stage, error));
       return null;
     }
@@ -736,28 +899,57 @@ export class DiscoverySessionRunner {
   }
 
   /**
-   * Delete a session-owned thread as CLEANUP work. Counts every attempt, marks
-   * success only on a 2xx response, removes ownership ONLY after a confirmed
-   * success, and retains ownership on any failure so final cleanup can retry.
+   * Delete a session-owned thread as CLEANUP work in a given phase. Counts every
+   * attempt, records a value-free attempt summary (phase + ok + safe status/code
+   * so a `403` is distinguishable from a timeout/network failure), and marks HTTP
+   * success only on a 2xx response.
+   *
+   * On a confirmed HTTP deletion the thread is dropped from the in-memory
+   * upstream-ownership ledger REGARDLESS of whether the journal removal persists;
+   * a journal-removal failure is caught (never surfacing a raw filesystem error),
+   * counted in `#journalPersistenceFailed`, and recorded as `journalPersisted:
+   * false`. The stale journal entry then converges safely through recovery's
+   * exact-404 handling. On an HTTP failure ownership is retained (so cleanup can
+   * retry) and no journal removal is attempted (`journalPersisted: null`).
    */
-  async #deleteOwnedThread(threadId: string, signal?: AbortSignal): Promise<boolean> {
+  async #deleteOwnedThread(
+    threadId: string,
+    phase: DiscoveryCleanupPhase,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
     this.#cleanupAttempted += 1;
-    let ok: boolean;
-    try {
-      const raw = await this.#observe("DELETE", deleteThreadPath(threadId), {
-        ...(signal ? { signal } : {}),
-      });
-      ok = raw.ok;
-    } catch {
-      ok = false;
-    }
-    if (ok) {
+    const diagnostics = await observeThreadDeletion(this.#config, threadId, this.#timeouts, signal);
+    let journalPersisted: boolean | null;
+    if (diagnostics.ok) {
       this.#cleanupSucceeded += 1;
+      // Drop upstream ownership on confirmed HTTP deletion, before (and regardless
+      // of) the journal removal, so a journal fault cannot resurrect the thread.
       this.#createdThreadIds.delete(threadId);
+      if (this.#journal === null) {
+        journalPersisted = true;
+      } else {
+        try {
+          await this.#journal.recordDeleted(threadId);
+          journalPersisted = true;
+        } catch {
+          // Journal removal failed: retain the (now stale) journal for recovery,
+          // count it, and never expose the raw filesystem error.
+          journalPersisted = false;
+          this.#journalPersistenceFailed += 1;
+        }
+      }
     } else {
       this.#cleanupFailed += 1;
+      journalPersisted = null;
     }
-    return ok;
+    this.#cleanupAttempts.push({
+      phase,
+      ok: diagnostics.ok,
+      status: diagnostics.status,
+      errorCode: diagnostics.errorCode,
+      journalPersisted,
+    });
+    return diagnostics.ok;
   }
 
   /**
@@ -772,7 +964,7 @@ export class DiscoverySessionRunner {
     const [threadId] = [...this.#createdThreadIds];
     if (threadId === undefined) return unavailableObservation("not_found");
 
-    const firstOk = await this.#deleteOwnedThread(threadId, signal);
+    const firstOk = await this.#deleteOwnedThread(threadId, "not-found-initial", signal);
     if (!firstOk) {
       // First deletion failed: ownership retained, skip the second DELETE, and
       // report the stage as incomplete (status null) so exit policy fails.
@@ -798,13 +990,20 @@ export class DiscoverySessionRunner {
    */
   async cleanup(signal?: AbortSignal): Promise<DiscoveryCleanupReport> {
     for (const threadId of [...this.#createdThreadIds]) {
-      await this.#deleteOwnedThread(threadId, signal);
+      await this.#deleteOwnedThread(threadId, "final-cleanup", signal);
     }
+    return this.#cleanupReport();
+  }
+
+  /** Build the value-free cumulative cleanup report from the shared ledger. */
+  #cleanupReport(): DiscoveryCleanupReport {
     return {
       attempted: this.#cleanupAttempted,
       succeeded: this.#cleanupSucceeded,
       failed: this.#cleanupFailed,
       remaining: this.#createdThreadIds.size,
+      journalPersistenceFailed: this.#journalPersistenceFailed,
+      attempts: [...this.#cleanupAttempts],
     };
   }
 
@@ -937,12 +1136,15 @@ export class DiscoverySessionRunner {
  * authentication/validation errors are NOT themselves session failures.
  */
 export function exitCodeForBaseline(report: DiscoveryBaselineReport): number {
+  // A fatal early abort (e.g. a recovery-journal persistence failure) is always
+  // a non-zero result regardless of which stages happened to complete first.
+  if (report.aborted !== undefined) return 1;
+
   const byStage = new Map<DiscoveryStage, DiscoveryObservation>(
     report.observations.map((o) => [o.stage, o]),
   );
 
   const requiredOk: DiscoveryStage[] = [
-    "available_llms",
     "single_thread_create",
     "single_submit",
     "combined_thread_create",
@@ -953,6 +1155,18 @@ export function exitCodeForBaseline(report: DiscoveryBaselineReport): number {
     const observation = byStage.get(stage);
     if (observation === undefined || !observation.ok) return 1;
   }
+
+  // Model inventory completeness: a 2xx success is complete, and exactly a `403`
+  // normalized to the authentication/authorization category is accepted as an
+  // observed inventory-access restriction for an otherwise-successful core
+  // baseline. Every other outcome — `401`, `429`, `5xx`, a transport/timeout
+  // failure (no status), a missing observation, or any other error — still fails
+  // completeness. The stage is never removed or allowed to fail silently.
+  const llms = byStage.get("available_llms");
+  if (llms === undefined) return 1;
+  const llmsAccepted =
+    llms.ok || (llms.status === 403 && llms.errorCode === "upstream_authentication_failed");
+  if (!llmsAccepted) return 1;
 
   const auth = byStage.get("auth_error");
   if (auth === undefined || auth.errorCode !== "upstream_authentication_failed") return 1;
@@ -969,7 +1183,12 @@ export function exitCodeForBaseline(report: DiscoveryBaselineReport): number {
     if (report.notFound === null || report.notFound.status === null) return 1;
   }
 
-  if (report.cleanup !== null && (report.cleanup.failed > 0 || report.cleanup.remaining > 0)) {
+  if (
+    report.cleanup !== null &&
+    (report.cleanup.failed > 0 ||
+      report.cleanup.remaining > 0 ||
+      report.cleanup.journalPersistenceFailed > 0)
+  ) {
     return 1;
   }
 

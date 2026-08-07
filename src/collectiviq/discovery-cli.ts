@@ -21,7 +21,7 @@
  */
 import { mkdirSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 import {
   buildModelSelection,
   buildPreflightReport,
@@ -33,6 +33,7 @@ import {
   type DiscoveryPreflightReport,
   type DiscoverySession,
 } from "./discovery.js";
+import { defaultDiscoveryJournalDir, FileRecoveryJournal } from "./recovery-journal.js";
 import type { CollectivIQTransportConfig } from "./types.js";
 
 // Re-exported so the CLI remains the single entry point operators (and tests)
@@ -44,6 +45,7 @@ export interface DiscoveryCliArgs {
   readonly executeApproved: boolean;
   readonly cleanupApproved: boolean;
   readonly observeNotFoundApproved: boolean;
+  readonly recoveryJournalApproved: boolean;
   readonly write: boolean;
 }
 
@@ -56,6 +58,7 @@ export function parseDiscoveryArgs(argv: readonly string[]): DiscoveryCliArgs {
   let executeApproved = false;
   let cleanupApproved = false;
   let observeNotFoundApproved = false;
+  let recoveryJournalApproved = false;
   let write = false;
 
   for (const arg of argv) {
@@ -69,6 +72,10 @@ export function parseDiscoveryArgs(argv: readonly string[]): DiscoveryCliArgs {
     }
     if (arg === "--observe-not-found-approved") {
       observeNotFoundApproved = true;
+      continue;
+    }
+    if (arg === "--recovery-journal-approved") {
+      recoveryJournalApproved = true;
       continue;
     }
     if (arg === "--write") {
@@ -90,12 +97,18 @@ export function parseDiscoveryArgs(argv: readonly string[]): DiscoveryCliArgs {
   if (observeNotFoundApproved && !cleanupApproved) {
     throw new Error("--observe-not-found-approved requires --cleanup-approved");
   }
+  // Authenticated execution must keep session-owned threads recoverable, so the
+  // recovery journal must be explicitly approved.
+  if (executeApproved && !recoveryJournalApproved) {
+    throw new Error("--execute-approved requires --recovery-journal-approved");
+  }
 
   return {
     session: DISCOVERY_SESSION,
     executeApproved,
     cleanupApproved,
     observeNotFoundApproved,
+    recoveryJournalApproved,
     write,
   };
 }
@@ -121,7 +134,7 @@ function emit<T>(value: T): void {
 }
 
 function persist(session: DiscoverySession, report: unknown): void {
-  const dir = resolve(fileURLToPath(new URL("../../.agent/sessions/discovery", import.meta.url)));
+  const dir = defaultDiscoveryJournalDir();
   mkdirSync(dir, { recursive: true });
   writeFileSync(resolve(dir, `${session}.json`), JSON.stringify(report, null, 2) + "\n", "utf8");
 }
@@ -130,10 +143,11 @@ async function main(): Promise<void> {
   const args = parseDiscoveryArgs(process.argv.slice(2));
 
   if (!args.executeApproved) {
-    // PREFLIGHT ONLY: no credential read, no network request.
+    // PREFLIGHT ONLY: no credential read, no network request, no journal I/O.
     const report: DiscoveryPreflightReport = buildPreflightReport(process.env, {
       cleanupApproved: args.cleanupApproved,
       notFoundObservationApproved: args.observeNotFoundApproved,
+      recoveryJournalApproved: args.recoveryJournalApproved,
     });
     emit(report);
     return;
@@ -142,11 +156,16 @@ async function main(): Promise<void> {
   const selection = buildModelSelection(process.env);
   const config = buildExecutionConfig(process.env);
   const runner = new DiscoverySessionRunner(config);
+  // Parsing already required recovery-journal approval alongside execution; keep
+  // session-owned ids recoverable through the file-backed journal.
+  const journal = new FileRecoveryJournal(defaultDiscoveryJournalDir(), DISCOVERY_ORIGIN);
 
   const report: DiscoveryBaselineReport = await runner.executeBaseline({
     selection,
     cleanupApproved: args.cleanupApproved,
     observeNotFoundApproved: args.observeNotFoundApproved,
+    recoveryJournalApproved: args.recoveryJournalApproved,
+    recoveryJournal: journal,
   });
 
   // Report the fixed destination origin rather than any configured value.

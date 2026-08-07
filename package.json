@@ -27,7 +27,8 @@
     "validate": "npm run format:check && npm run lint && npm run typecheck && npm run test && npm run build && npm run test:build",
     "contract:openapi:refresh": "tsx scripts/openapi/refresh.ts",
     "contract:openapi:check": "tsx scripts/openapi/check.ts",
-    "contract:discovery": "tsx src/collectiviq/discovery-cli.ts"
+    "contract:discovery": "tsx src/collectiviq/discovery-cli.ts",
+    "contract:discovery:cleanup": "tsx src/collectiviq/discovery-recovery-cli.ts"
   },
   "dependencies": {
     "@fastify/type-provider-typebox": "6.1.0",

@@ -14,6 +14,7 @@ import {
   type DiscoverySseLimits,
 } from "../../src/collectiviq/discovery.js";
 import { parseDiscoveryArgs } from "../../src/collectiviq/discovery-cli.js";
+import { InMemoryRecoveryJournal } from "../../src/collectiviq/recovery-journal.js";
 import {
   replyJson,
   startMockServer,
@@ -23,6 +24,28 @@ import {
 } from "./support/mock-server.js";
 import { TEST_API_KEY } from "./support/adapter.js";
 import type { FetchLike } from "../../src/collectiviq/types.js";
+
+/**
+ * Run a baseline with recovery-journal approval and a synthetic in-memory
+ * journal, so existing scenarios exercise the new mandatory approval without
+ * touching disk. Tests that need to inspect the journal pass their own via
+ * `runner.executeBaseline` directly.
+ */
+function baseline(
+  r: DiscoverySessionRunner,
+  opts: {
+    selection: DiscoveryModelSelection;
+    cleanupApproved: boolean;
+    observeNotFoundApproved: boolean;
+    signal?: AbortSignal;
+  },
+): Promise<Awaited<ReturnType<DiscoverySessionRunner["executeBaseline"]>>> {
+  return r.executeBaseline({
+    ...opts,
+    recoveryJournalApproved: true,
+    recoveryJournal: new InMemoryRecoveryJournal(),
+  });
+}
 
 let server: MockServer | undefined;
 afterEach(async () => {
@@ -44,7 +67,9 @@ function baselineHandler(options: { deleteStatus?: number } = {}): MockHandler {
       if (typeof authz === "string" && authz.trim() === "Bearer") {
         return replyJson(res, { error: "denied" }, 401);
       }
-      return replyJson(res, { models: [{ name: "SECRET-MODEL", id: "m-SECRET" }] });
+      // A structurally-valid inventory: an `llms` object whose entries are objects.
+      // Values are still content the capture must mask.
+      return replyJson(res, { llms: { "m-SECRET": { display: "SECRET-MODEL" } } });
     }
     if (req.path === "/get_messages") {
       const threadId = req.query.get("thread_id");
@@ -123,7 +148,7 @@ describe("discovery preflight", () => {
   it("reports projected counts, fixed origin, and approvals without ids", () => {
     const report = buildPreflightReport(
       { CIQ_DISCOVERY_SINGLE_LLM: "m1", CIQ_DISCOVERY_COMBINED_LLMS: "a,b,c" },
-      { cleanupApproved: true, notFoundObservationApproved: false },
+      { cleanupApproved: true, notFoundObservationApproved: false, recoveryJournalApproved: true },
     );
     expect(report.session).toBe("baseline");
     expect(report.destinationOrigin).toBe(DISCOVERY_ORIGIN);
@@ -137,6 +162,9 @@ describe("discovery preflight", () => {
     });
     expect(report.cleanupApproved).toBe(true);
     expect(report.notFoundObservationApproved).toBe(false);
+    // Preflight reports the recovery-journal approval boolean for transparency,
+    // but performs no journal I/O (covered by the credential/no-network test).
+    expect(report.recoveryJournalApproved).toBe(true);
     const serialized = JSON.stringify(report);
     expect(serialized).not.toContain("m1");
     expect(serialized).not.toContain("a,b,c");
@@ -208,7 +236,7 @@ describe("discovery baseline execution", () => {
     server = await startMockServer(baselineHandler());
     const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
 
-    const report = await runner.executeBaseline({
+    const report = await baseline(runner, {
       selection: { single: "solo", combined: ["a", "b", "c"] },
       cleanupApproved: false,
       observeNotFoundApproved: false,
@@ -236,7 +264,7 @@ describe("discovery baseline execution", () => {
   it("captures raw process_message run_id structurally (name kept, value gone)", async () => {
     server = await startMockServer(baselineHandler());
     const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
-    const report = await runner.executeBaseline({
+    const report = await baseline(runner, {
       selection: { single: "solo", combined: ["a"] },
       cleanupApproved: false,
       observeNotFoundApproved: false,
@@ -251,7 +279,7 @@ describe("discovery baseline execution", () => {
   it("captures raw auth and validation error bodies structurally", async () => {
     server = await startMockServer(baselineHandler());
     const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
-    const report = await runner.executeBaseline({
+    const report = await baseline(runner, {
       selection: { single: "solo", combined: ["a"] },
       cleanupApproved: false,
       observeNotFoundApproved: false,
@@ -270,19 +298,29 @@ describe("discovery baseline execution", () => {
   it("cleans up only session-owned threads when approved, reporting remaining", async () => {
     server = await startMockServer(baselineHandler());
     const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
-    const report = await runner.executeBaseline({
+    const report = await baseline(runner, {
       selection: { single: "solo", combined: ["a"] },
       cleanupApproved: true,
       observeNotFoundApproved: false,
     });
-    expect(report.cleanup).toEqual({ attempted: 2, succeeded: 2, failed: 0, remaining: 0 });
+    expect(report.cleanup).toEqual({
+      attempted: 2,
+      succeeded: 2,
+      failed: 0,
+      remaining: 0,
+      journalPersistenceFailed: 0,
+      attempts: [
+        { phase: "final-cleanup", ok: true, status: 200, errorCode: null, journalPersisted: true },
+        { phase: "final-cleanup", ok: true, status: 200, errorCode: null, journalPersisted: true },
+      ],
+    });
     expect(runner.pendingThreadCount()).toBe(0);
   });
 
   it("reports failure and retains ownership when an approved cleanup delete fails", async () => {
     server = await startMockServer(baselineHandler({ deleteStatus: 500 }));
     const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
-    const report = await runner.executeBaseline({
+    const report = await baseline(runner, {
       selection: { single: "solo", combined: ["a"] },
       cleanupApproved: true,
       observeNotFoundApproved: false,
@@ -290,19 +328,389 @@ describe("discovery baseline execution", () => {
     expect(report.cleanup?.attempted).toBe(2);
     expect(report.cleanup?.failed).toBe(2);
     expect(report.cleanup?.remaining).toBe(2);
+    // The failed deletes retain their HTTP status and safe error code (value-free).
+    expect(report.cleanup?.attempts).toEqual([
+      {
+        phase: "final-cleanup",
+        ok: false,
+        status: 500,
+        errorCode: "upstream_unexpected_error",
+        journalPersisted: null,
+      },
+      {
+        phase: "final-cleanup",
+        ok: false,
+        status: 500,
+        errorCode: "upstream_unexpected_error",
+        journalPersisted: null,
+      },
+    ]);
+    expect(report.cleanup?.journalPersistenceFailed).toBe(0);
     expect(runner.pendingThreadCount()).toBe(2);
   });
 
   it("does not clean up when cleanup is not approved", async () => {
     server = await startMockServer(baselineHandler());
     const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
-    const report = await runner.executeBaseline({
+    const report = await baseline(runner, {
       selection: { single: "solo", combined: ["a"] },
       cleanupApproved: false,
       observeNotFoundApproved: false,
     });
     expect(report.cleanup).toBeNull();
     expect(runner.pendingThreadCount()).toBe(2);
+  });
+});
+
+// --- Recovery-journal integration --------------------------------------------
+
+describe("discovery recovery-journal integration", () => {
+  it("rejects a run without recovery-journal approval before any request", async () => {
+    const fetch = vi.fn<FetchLike>();
+    const runner = new DiscoverySessionRunner({
+      baseUrl: "https://api.prod.collectiviq.ai",
+      apiKey: TEST_API_KEY,
+      fetch,
+    });
+    await expect(
+      runner.executeBaseline({
+        selection: { single: "solo", combined: ["a"] },
+        cleanupApproved: false,
+        observeNotFoundApproved: false,
+        recoveryJournalApproved: false,
+      }),
+    ).rejects.toThrow();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("rejects an approved run that supplies no journal sink before any request", async () => {
+    const fetch = vi.fn<FetchLike>();
+    const runner = new DiscoverySessionRunner({
+      baseUrl: "https://api.prod.collectiviq.ai",
+      apiKey: TEST_API_KEY,
+      fetch,
+    });
+    await expect(
+      runner.executeBaseline({
+        selection: { single: "solo", combined: ["a"] },
+        cleanupApproved: false,
+        observeNotFoundApproved: false,
+        recoveryJournalApproved: true,
+        // No recoveryJournal sink: this creating flow must be rejected.
+      }),
+    ).rejects.toThrow();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("initializes the journal before the first request and fails closed if init throws", async () => {
+    const fetch = vi.fn<FetchLike>();
+    const runner = new DiscoverySessionRunner({
+      baseUrl: "https://api.prod.collectiviq.ai",
+      apiKey: TEST_API_KEY,
+      fetch,
+    });
+    const journal = new InMemoryRecoveryJournal();
+    journal.init = (): Promise<void> => Promise.reject(new Error("journal not writable"));
+    await expect(
+      runner.executeBaseline({
+        selection: { single: "solo", combined: ["a"] },
+        cleanupApproved: false,
+        observeNotFoundApproved: false,
+        recoveryJournalApproved: true,
+        recoveryJournal: journal,
+      }),
+    ).rejects.toThrow();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("records created ids and drops them after a successful cleanup", async () => {
+    server = await startMockServer(baselineHandler());
+    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const journal = new InMemoryRecoveryJournal();
+    const report = await runner.executeBaseline({
+      selection: { single: "solo", combined: ["a"] },
+      cleanupApproved: true,
+      observeNotFoundApproved: false,
+      recoveryJournalApproved: true,
+      recoveryJournal: journal,
+    });
+    expect(journal.initialized).toBe(true);
+    // Two threads created then both deleted: the journal ends empty.
+    expect(journal.ownedThreadIds()).toEqual([]);
+    expect(report.cleanup?.remaining).toBe(0);
+  });
+
+  it("retains ids in the journal when cleanup fails, so they stay recoverable", async () => {
+    server = await startMockServer(baselineHandler({ deleteStatus: 500 }));
+    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const journal = new InMemoryRecoveryJournal();
+    const report = await runner.executeBaseline({
+      selection: { single: "solo", combined: ["a"] },
+      cleanupApproved: true,
+      observeNotFoundApproved: false,
+      recoveryJournalApproved: true,
+      recoveryJournal: journal,
+    });
+    // Both deletes fail, so both ids remain in the journal for recovery.
+    expect(journal.ownedThreadIds()).toHaveLength(2);
+    expect(report.cleanup?.remaining).toBe(2);
+  });
+
+  it("retains only the undeleted id in the journal when cleanup partially fails", async () => {
+    // First delete (single thread) succeeds; the second (combined thread) fails.
+    let nextThread = 1000;
+    let deletes = 0;
+    const handler: MockHandler = (req, res) => {
+      if (req.path === "/available_llms") return replyJson(res, { models: [] });
+      if (req.path === "/get_messages") {
+        return req.query.get("thread_id") === null
+          ? replyJson(res, { detail: "x" }, 422)
+          : replyJson(res, { messages: [] });
+      }
+      if (req.path === "/create_thread") {
+        nextThread += 1;
+        return replyJson(res, { thread_id: nextThread });
+      }
+      if (req.path === "/process_message") return replyJson(res, {});
+      if (req.path.startsWith("/delete_thread/")) {
+        deletes += 1;
+        return replyJson(res, {}, deletes === 1 ? 200 : 500);
+      }
+      if (req.path === "/user/events") {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end();
+        return;
+      }
+      return replyJson(res, {}, 404);
+    };
+    server = await startMockServer(handler);
+    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const journal = new InMemoryRecoveryJournal();
+    const report = await runner.executeBaseline({
+      selection: { single: "solo", combined: ["a"] },
+      cleanupApproved: true,
+      observeNotFoundApproved: false,
+      recoveryJournalApproved: true,
+      recoveryJournal: journal,
+    });
+    expect(report.cleanup?.succeeded).toBe(1);
+    expect(report.cleanup?.failed).toBe(1);
+    expect(journal.ownedThreadIds()).toHaveLength(1);
+  });
+});
+
+// --- available_llms structural gate ------------------------------------------
+
+describe("discovery available_llms structural gate", () => {
+  it("accepts a well-formed llms inventory as a successful observation", async () => {
+    server = await startMockServer(baselineHandler());
+    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const report = await baseline(runner, {
+      selection: { single: "solo", combined: ["a"] },
+      cleanupApproved: false,
+      observeNotFoundApproved: false,
+    });
+    const llms = report.observations.find((o) => o.stage === "available_llms");
+    expect(llms?.ok).toBe(true);
+    expect(llms?.status).toBe(200);
+    expect(llms?.errorCode).toBeNull();
+  });
+
+  it("rejects a malformed 2xx inventory as invalid_upstream_response and fails completeness", async () => {
+    // Every other stage is a valid happy path; only the inventory is malformed.
+    const malformed = [
+      { models: [] }, // no `llms` property
+      { llms: [] }, // `llms` is an array
+      { llms: {} }, // `llms` has no entries
+      { llms: { "m-1": 5 } }, // an entry is not an object
+      { llms: { "m-1": null } }, // an entry is null
+    ];
+    for (const body of malformed) {
+      const s = await startMockServer(regressionHandler({ available: () => ({ body }) }));
+      try {
+        const runner = new DiscoverySessionRunner({ baseUrl: s.baseUrl, apiKey: TEST_API_KEY });
+        const report = await baseline(runner, {
+          selection: { single: "solo", combined: ["a"] },
+          cleanupApproved: false,
+          observeNotFoundApproved: false,
+        });
+        const llms = report.observations.find((o) => o.stage === "available_llms");
+        expect(llms?.ok).toBe(false);
+        expect(llms?.status).toBe(200);
+        expect(llms?.errorCode).toBe("invalid_upstream_response");
+        // The sanitized structure is still retained (value-free).
+        expect(llms?.structure).not.toBeNull();
+        expect(exitCodeForBaseline(report)).not.toBe(0);
+      } finally {
+        await s.close();
+      }
+    }
+  });
+
+  it("rejects an inherited (non-own) llms property", async () => {
+    // Pollute Object.prototype so every parsed object INHERITS a valid-looking
+    // `llms`; a body without its OWN `llms` must still be rejected. Restored in
+    // `finally` so no other test observes the pollution.
+    Object.defineProperty(Object.prototype, "llms", {
+      value: { "m-inherited": {} },
+      configurable: true,
+      enumerable: false,
+      writable: true,
+    });
+    server = await startMockServer(regressionHandler({ available: () => ({ body: {} }) }));
+    try {
+      const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+      const report = await baseline(runner, {
+        selection: { single: "solo", combined: ["a"] },
+        cleanupApproved: false,
+        observeNotFoundApproved: false,
+      });
+      const llms = report.observations.find((o) => o.stage === "available_llms");
+      expect(llms?.ok).toBe(false);
+      expect(llms?.errorCode).toBe("invalid_upstream_response");
+      expect(exitCodeForBaseline(report)).not.toBe(0);
+    } finally {
+      delete (Object.prototype as Record<string, unknown>)["llms"];
+    }
+  });
+});
+
+// --- Fatal recovery-journal persistence failure ------------------------------
+
+describe("discovery fatal journal-persistence abort", () => {
+  it("aborts after a failed recordCreated: one create, no submit, cleanup attempted, content-free", async () => {
+    server = await startMockServer(baselineHandler());
+    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const journal = new InMemoryRecoveryJournal();
+    // Persisting the first created id fails durably; the injected message must
+    // never appear in the sanitized report.
+    journal.recordCreated = (): Promise<void> =>
+      Promise.reject(new Error("SECRET-JOURNAL-PATH /Users/x/.agent"));
+
+    const report = await runner.executeBaseline({
+      selection: { single: "solo", combined: ["a"] },
+      cleanupApproved: true,
+      observeNotFoundApproved: false,
+      recoveryJournalApproved: true,
+      recoveryJournal: journal,
+    });
+
+    // The run aborted with a fixed, content-free reason and is non-zero.
+    expect(report.aborted).toBe("journal-persistence-failed");
+    expect(exitCodeForBaseline(report)).not.toBe(0);
+
+    // Exactly one thread was created; no submission and no second create ran.
+    const creates = server.requests.filter((r) => r.path === "/create_thread");
+    expect(creates).toHaveLength(1);
+    expect(server.requests.some((r) => r.path === "/process_message")).toBe(false);
+    // Cleanup of the in-memory-owned thread was attempted (the created id 1001).
+    const deletes = server.requests.filter((r) => r.method === "DELETE").map((r) => r.path);
+    expect(deletes).toEqual(["/delete_thread/1001"]);
+    // No aborted-stage success observation was recorded for the created thread.
+    expect(report.observations.some((o) => o.stage === "single_thread_create" && o.ok)).toBe(false);
+    expect(report.observations.some((o) => o.stage === "combined_thread_create")).toBe(false);
+
+    // Neither the created id nor the injected filesystem error text leaks.
+    const serialized = JSON.stringify(report);
+    expect(serialized).not.toContain("1001");
+    expect(serialized).not.toContain("SECRET-JOURNAL-PATH");
+    expect(serialized).not.toContain(".agent");
+  });
+
+  it("still returns a structured abort report when the cleanup DELETE's journal removal also fails", async () => {
+    server = await startMockServer(baselineHandler());
+    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const journal = new InMemoryRecoveryJournal();
+    // BOTH the create-time record and the cleanup-time removal fail durably.
+    journal.recordCreated = (): Promise<void> =>
+      Promise.reject(new Error("SECRET-CREATE /Users/x/.agent/a"));
+    journal.recordDeleted = (): Promise<void> =>
+      Promise.reject(new Error("SECRET-DELETE /Users/x/.agent/b"));
+
+    // Must resolve with a structured report, NOT reject.
+    const report = await runner.executeBaseline({
+      selection: { single: "solo", combined: ["a"] },
+      cleanupApproved: true,
+      observeNotFoundApproved: false,
+      recoveryJournalApproved: true,
+      recoveryJournal: journal,
+    });
+
+    expect(report.aborted).toBe("journal-persistence-failed");
+    expect(exitCodeForBaseline(report)).not.toBe(0);
+
+    // Exactly one create, one cleanup DELETE, no submission, no second create.
+    expect(server.requests.filter((r) => r.path === "/create_thread")).toHaveLength(1);
+    expect(server.requests.some((r) => r.path === "/process_message")).toBe(false);
+    const deletes = server.requests.filter((r) => r.method === "DELETE").map((r) => r.path);
+    expect(deletes).toEqual(["/delete_thread/1001"]);
+
+    // The cleanup DELETE succeeded over HTTP but its journal removal did not.
+    expect(report.cleanup?.succeeded).toBe(1);
+    expect(report.cleanup?.failed).toBe(0);
+    expect(report.cleanup?.remaining).toBe(0);
+    expect(report.cleanup?.journalPersistenceFailed).toBe(1);
+    expect(report.cleanup?.attempts).toEqual([
+      { phase: "final-cleanup", ok: true, status: 200, errorCode: null, journalPersisted: false },
+    ]);
+    // The thread is dropped from the in-memory ledger despite the journal failure.
+    expect(runner.pendingThreadCount()).toBe(0);
+
+    // No raw injected error, path, or id leaks.
+    const serialized = JSON.stringify(report);
+    for (const leak of ["1001", "SECRET-CREATE", "SECRET-DELETE", ".agent"]) {
+      expect(serialized).not.toContain(leak);
+    }
+  });
+
+  it("keeps a normal cleanup structured and non-zero when a journal removal fails", async () => {
+    // No abort (recordCreated succeeds); a full baseline runs, then each cleanup
+    // DELETE's journal removal fails. The run must still return a structured,
+    // non-zero report rather than reject.
+    server = await startMockServer(baselineHandler());
+    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const journal = new InMemoryRecoveryJournal();
+    journal.recordDeleted = (): Promise<void> =>
+      Promise.reject(new Error("SECRET-DELETE /Users/x/.agent"));
+
+    const report = await runner.executeBaseline({
+      selection: { single: "solo", combined: ["a"] },
+      cleanupApproved: true,
+      observeNotFoundApproved: false,
+      recoveryJournalApproved: true,
+      recoveryJournal: journal,
+    });
+
+    expect(report.aborted).toBeUndefined();
+    expect(report.cleanup?.succeeded).toBe(2);
+    expect(report.cleanup?.failed).toBe(0);
+    expect(report.cleanup?.remaining).toBe(0);
+    expect(report.cleanup?.journalPersistenceFailed).toBe(2);
+    expect(report.cleanup?.attempts.every((a) => a.ok && a.journalPersisted === false)).toBe(true);
+    expect(exitCodeForBaseline(report)).not.toBe(0);
+    expect(runner.pendingThreadCount()).toBe(0);
+    expect(JSON.stringify(report)).not.toContain("SECRET-DELETE");
+  });
+
+  it("makes zero network calls when journal init fails before any create", async () => {
+    const fetch = vi.fn<FetchLike>();
+    const runner = new DiscoverySessionRunner({
+      baseUrl: "https://api.prod.collectiviq.ai",
+      apiKey: TEST_API_KEY,
+      fetch,
+    });
+    const journal = new InMemoryRecoveryJournal();
+    journal.init = (): Promise<void> => Promise.reject(new Error("not writable"));
+    await expect(
+      runner.executeBaseline({
+        selection: { single: "solo", combined: ["a"] },
+        cleanupApproved: true,
+        observeNotFoundApproved: false,
+        recoveryJournalApproved: true,
+        recoveryJournal: journal,
+      }),
+    ).rejects.toThrow();
+    expect(fetch).not.toHaveBeenCalled();
   });
 });
 
@@ -317,7 +725,7 @@ describe("discovery runner approval invariants", () => {
       fetch,
     });
     await expect(
-      runner.executeBaseline({
+      baseline(runner, {
         selection: { single: "solo", combined: ["a"] },
         cleanupApproved: false,
         observeNotFoundApproved: true,
@@ -334,7 +742,7 @@ describe("discovery runner approval invariants", () => {
       fetch,
     });
     await expect(
-      runner.executeBaseline({
+      baseline(runner, {
         selection: { single: "solo", combined: ["a", "a"] },
         cleanupApproved: false,
         observeNotFoundApproved: false,
@@ -350,7 +758,7 @@ describe("discovery not-found observation", () => {
   it("re-deletes the same session-owned id and never a guessed id", async () => {
     server = await startMockServer(baselineHandler());
     const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
-    const report = await runner.executeBaseline({
+    const report = await baseline(runner, {
       selection: { single: "solo", combined: ["a"] },
       cleanupApproved: true,
       observeNotFoundApproved: true,
@@ -366,15 +774,32 @@ describe("discovery not-found observation", () => {
     expect(deletePaths.filter((p) => p === "/delete_thread/1001")).toHaveLength(2);
     expect(deletePaths.some((p) => p.includes("nonexistent"))).toBe(false);
     // The second (already-deleted) observation is NOT counted as cleanup work:
-    // one first-delete (1001) + one final cleanup (1002) = two attempts.
-    expect(report.cleanup).toEqual({ attempted: 2, succeeded: 2, failed: 0, remaining: 0 });
+    // one first-delete (1001) + one final cleanup (1002) = two attempts, and the
+    // phases are reported accurately.
+    expect(report.cleanup).toEqual({
+      attempted: 2,
+      succeeded: 2,
+      failed: 0,
+      remaining: 0,
+      journalPersistenceFailed: 0,
+      attempts: [
+        {
+          phase: "not-found-initial",
+          ok: true,
+          status: 200,
+          errorCode: null,
+          journalPersisted: true,
+        },
+        { phase: "final-cleanup", ok: true, status: 200, errorCode: null, journalPersisted: true },
+      ],
+    });
   });
 
   it("skips the second delete and retains ownership when the first delete fails", async () => {
     // Every delete returns 500, so the not-found first deletion fails.
     server = await startMockServer(baselineHandler({ deleteStatus: 500 }));
     const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
-    const report = await runner.executeBaseline({
+    const report = await baseline(runner, {
       selection: { single: "solo", combined: ["a"] },
       cleanupApproved: true,
       observeNotFoundApproved: true,
@@ -395,6 +820,7 @@ describe("discovery not-found observation", () => {
       parseDiscoveryArgs([
         "--session=baseline",
         "--execute-approved",
+        "--recovery-journal-approved",
         "--cleanup-approved",
         "--observe-not-found-approved",
       ]).observeNotFoundApproved,
@@ -408,7 +834,7 @@ describe("discovery token/abort unreachability", () => {
   it("never touches token or abort endpoints and exposes no such method", async () => {
     server = await startMockServer(baselineHandler());
     const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
-    await runner.executeBaseline({
+    await baseline(runner, {
       selection: { single: "solo", combined: ["a", "b"] },
       cleanupApproved: true,
       observeNotFoundApproved: true,
@@ -635,7 +1061,7 @@ describe("discovery SSE non-2xx handling", () => {
     };
     server = await startMockServer(handler);
     const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
-    const report = await runner.executeBaseline({
+    const report = await baseline(runner, {
       selection: { single: "solo", combined: ["a"] },
       cleanupApproved: false,
       observeNotFoundApproved: false,
@@ -652,6 +1078,7 @@ describe("discovery SSE non-2xx handling", () => {
 /** A baseline-valid mock whose create/process/messages/SSE can be overridden. */
 function regressionHandler(
   o: {
+    available?: () => { body: unknown; status?: number };
     create?: (n: number) => { body: unknown; status?: number };
     process?: (n: number) => { body: unknown; status?: number };
     messages?: () => { body: unknown; status?: number };
@@ -662,7 +1089,10 @@ function regressionHandler(
   let procN = 0;
   let threadSeq = 1000;
   return (req, res) => {
-    if (req.path === "/available_llms") return replyJson(res, { models: [] });
+    if (req.path === "/available_llms") {
+      const a = o.available?.() ?? { body: { llms: { "m-1": {} } } };
+      return replyJson(res, a.body, a.status ?? 200);
+    }
     if (req.path === "/get_messages") {
       if (req.query.get("thread_id") === null) return replyJson(res, { detail: "x" }, 422);
       const m = o.messages?.() ?? { body: { messages: [] } };
@@ -709,7 +1139,7 @@ describe("discovery production-normalization gate", () => {
       regressionHandler({ create: () => ({ body: { meta: { thread_id: 123 } } }) }),
     );
     const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
-    const report = await runner.executeBaseline({
+    const report = await baseline(runner, {
       selection: OK_SELECTION,
       cleanupApproved: false,
       observeNotFoundApproved: false,
@@ -738,7 +1168,7 @@ describe("discovery production-normalization gate", () => {
       }),
     );
     const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
-    const report = await runner.executeBaseline({
+    const report = await baseline(runner, {
       selection: OK_SELECTION,
       cleanupApproved: false,
       observeNotFoundApproved: false,
@@ -758,7 +1188,7 @@ describe("discovery production-normalization gate", () => {
   it("fails messages on a 2xx body without a valid messages array, keeping raw structure", async () => {
     server = await startMockServer(regressionHandler({ messages: () => ({ body: {} }) }));
     const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
-    const report = await runner.executeBaseline({
+    const report = await baseline(runner, {
       selection: OK_SELECTION,
       cleanupApproved: false,
       observeNotFoundApproved: false,
@@ -776,7 +1206,7 @@ describe("discovery production-normalization gate", () => {
       regressionHandler({ messages: () => ({ body: { messages: [{ nope: 1 }] } }) }),
     );
     const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
-    const report = await runner.executeBaseline({
+    const report = await baseline(runner, {
       selection: OK_SELECTION,
       cleanupApproved: false,
       observeNotFoundApproved: false,
@@ -799,7 +1229,7 @@ describe("discovery combined-stage SSE correlation", () => {
       }),
     );
     const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
-    const report = await runner.executeBaseline({
+    const report = await baseline(runner, {
       selection: OK_SELECTION,
       cleanupApproved: false,
       observeNotFoundApproved: false,
@@ -819,7 +1249,7 @@ describe("discovery combined-stage SSE correlation", () => {
       }),
     );
     const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
-    const report = await runner.executeBaseline({
+    const report = await baseline(runner, {
       selection: OK_SELECTION,
       cleanupApproved: false,
       observeNotFoundApproved: false,
@@ -838,7 +1268,7 @@ describe("discovery combined-stage SSE correlation", () => {
       }),
     );
     const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
-    const report = await runner.executeBaseline({
+    const report = await baseline(runner, {
       selection: OK_SELECTION,
       cleanupApproved: false,
       observeNotFoundApproved: false,
@@ -856,7 +1286,7 @@ describe("discovery combined-stage SSE correlation", () => {
       }),
     );
     const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
-    const report = await runner.executeBaseline({
+    const report = await baseline(runner, {
       selection: OK_SELECTION,
       cleanupApproved: false,
       observeNotFoundApproved: false,
@@ -875,7 +1305,7 @@ describe("discovery combined-stage SSE correlation", () => {
       }),
     );
     const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
-    const report = await runner.executeBaseline({
+    const report = await baseline(runner, {
       selection: OK_SELECTION,
       cleanupApproved: false,
       observeNotFoundApproved: false,
@@ -897,7 +1327,7 @@ describe("discovery combined-stage SSE correlation", () => {
       }),
     );
     const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
-    const report = await runner.executeBaseline({
+    const report = await baseline(runner, {
       selection: OK_SELECTION,
       cleanupApproved: false,
       observeNotFoundApproved: false,
@@ -917,7 +1347,7 @@ describe("discovery canonical runner selection", () => {
     server = await startMockServer(regressionHandler());
     const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
     const combined = [" a ", "b "];
-    await runner.executeBaseline({
+    await baseline(runner, {
       selection: { single: " solo ", combined },
       cleanupApproved: false,
       observeNotFoundApproved: false,
@@ -950,7 +1380,7 @@ describe("discovery canonical runner selection", () => {
         fetch,
       });
       await expect(
-        runner.executeBaseline({
+        baseline(runner, {
           selection,
           cleanupApproved: false,
           observeNotFoundApproved: false,
@@ -970,12 +1400,14 @@ describe("discovery CLI argument parsing", () => {
       executeApproved: false,
       cleanupApproved: false,
       observeNotFoundApproved: false,
+      recoveryJournalApproved: false,
       write: false,
     });
     expect(
       parseDiscoveryArgs([
         "--session=baseline",
         "--execute-approved",
+        "--recovery-journal-approved",
         "--cleanup-approved",
         "--write",
       ]),
@@ -984,8 +1416,22 @@ describe("discovery CLI argument parsing", () => {
       executeApproved: true,
       cleanupApproved: true,
       observeNotFoundApproved: false,
+      recoveryJournalApproved: true,
       write: true,
     });
+  });
+
+  it("requires recovery-journal approval whenever execution is approved", () => {
+    expect(() =>
+      parseDiscoveryArgs(["--session=baseline", "--execute-approved", "--cleanup-approved"]),
+    ).toThrow();
+    expect(
+      parseDiscoveryArgs([
+        "--session=baseline",
+        "--execute-approved",
+        "--recovery-journal-approved",
+      ]).recoveryJournalApproved,
+    ).toBe(true);
   });
 
   it("rejects unknown sessions, unknown args, and a missing session", () => {
