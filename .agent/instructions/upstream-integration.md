@@ -48,11 +48,43 @@ contracts, the capability matrix, and open questions.
   selection is canonicalized (trimmed, comma-in-element and post-trim duplicates
   rejected) before any fetch, without mutating the caller's array. Cleanup is a
   truthful ledger
-  (`attempted`/`succeeded`/`failed`/`remaining`); the not-found probe re-deletes
+  (`attempted`/`succeeded`/`failed`/`remaining`, HTTP DELETE outcomes only) plus
+  `journalPersistenceFailed` and bounded value-free per-attempt summaries
+  (`phase`/`ok`/status/`errorCode`/`journalPersisted` — `true`/`false`/`null`;
+  shared `observeThreadDeletion` in `cleanup.ts`) so a cleanup `403` is
+  distinguishable from a timeout/network failure. A confirmed HTTP DELETE drops
+  the thread from the in-memory ledger even if its journal removal fails (stale
+  journal converges via recovery's exact-`404`); `journalPersistenceFailed > 0` is
+  a non-zero-exit condition. The not-found probe re-deletes
   the same session-owned id and, on a first-delete failure, retains ownership and
-  records the failure. Exit code follows strict session completeness.
-  Token-inspection and abort discovery are disabled. None of it is wired into a
-  public completion path yet.
+  records the failure. Exit code follows strict session completeness, which now
+  requires an `available_llms` observation and accepts either a **structurally
+  valid** `2xx` (top level a non-null, non-array object with an own `llms` object
+  holding at least one object entry; no model value inspected; extra properties
+  allowed) or exactly a `403` (observed inventory-access restriction), still
+  failing on `401`/`429`/`5xx`/transport/timeout/missing/malformed — a malformed
+  `2xx` body is a **failed** observation (`invalid_upstream_response`) that drives
+  a non-zero exit. If a created thread's id cannot be durably persisted to the
+  recovery journal, the run **aborts immediately** (no further upstream request),
+  still attempts cleanup for the already-owned thread, and exits non-zero with a
+  content-free `aborted: "journal-persistence-failed"` result. Authenticated
+  execution additionally requires `--recovery-journal-approved`, which enables a
+  content-free recovery journal (`recovery-journal.ts`, ignored
+  `.agent/sessions/discovery/`: version + fixed origin + at most two thread ids
+  only) that survives a leak and is maintained **independently of `--write`**
+  (durable-first sink transitions); the recovery-only
+  `npm run contract:discovery:cleanup` command (`discovery-recovery-cli.ts`,
+  network-only, **never in `validate`/CI**) deletes only journal-listed ids under
+  all three approvals, resolves an id on a `2xx` (`deleted`) **or** an exact `404`
+  (`already_absent`) so recovery converges after a crash between a successful
+  delete and the journal update (other statuses/transport/timeout stay
+  unresolved), and reports
+  `{ attempted, resolved, unresolved, remaining, attempts }` (no longer
+  `succeeded`/`failed`), exiting non-zero when `unresolved > 0 || remaining > 0`.
+  Token-inspection and abort discovery are disabled. One
+  authorized baseline ran on 2026-08-06 and **failed strict completeness (exited
+  non-zero)**; its evidence is observed-once (not verified) and no fixture was
+  promoted. None of it is wired into a public completion path yet.
 - Error retryability is **method-aware**: only an idempotent `GET` network or
   selected-transient (502/503/504) failure is retryable; every `POST`/`DELETE`
   failure is non-retryable. The method is carried through the error factory. A
@@ -63,8 +95,11 @@ contracts, the capability matrix, and open questions.
   `is_title_from_user=false`); `POST /process_message` is `multipart/form-data`
   and includes `llms_explicitly_set=true`; `GET /get_messages` documents an
   optional `since_id` that the gateway omits and an optional `thread_id` that the
-  gateway always requires. Every declared `200` success schema is empty, so all
-  response shapes remain provisional until live discovery.
+  gateway always requires. Every declared `200` success schema is empty, so
+  response shapes are provisional except where the 2026-08-06 authorized baseline
+  observed them once (below); observed-once is not verified, and mappings stay
+  provisional where observed field names diverge from the gateway's assumptions
+  (e.g. `create_time`/`updated_at` vs the provisional `created_at`).
 
 ## Adapter Boundary
 

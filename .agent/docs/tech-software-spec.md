@@ -2473,21 +2473,42 @@ Exit criterion:
 
 * upstream adapter contract tests reflect real responses.
 
-Current status (offline portion complete): the OpenAPI-grounded adapter
-boundary (`src/collectiviq/`), the shared request builders (`requests.ts`) reused
-by production and discovery, the filtered contract snapshot
-(`contract/collectiviq/openapi-filtered.json`), the hermetic mock-server
-contract tests (`test/contract/`), and the opt-in discovery session/CLI exist and
-pass `validate`. The staged discovery session captures evidence from the **raw**
-upstream body (any status) via a discovery-only observation path — so run ids and
-error shapes survive as value-free sanitized structure (`evidenceFormatVersion`
-2) — retains correlation ids only in private memory (emitted solely as a
-`matched`/`not-matched`/`not-observed` comparison; no capability flag is
-auto-flipped), keeps a truthful cleanup ledger, gates every destructive delete on
-explicit approval, and exits on strict session completeness. None of it is wired
-into any public completion path. All runtime response shapes remain provisional;
-the contract tests use synthetic fixtures, not live responses. Phase 0 is **not
-complete**: it exits only after approved live discovery captures sanitized
+Current status (offline portion complete; one authorized live baseline ran and
+failed): the OpenAPI-grounded adapter boundary (`src/collectiviq/`), the shared
+request builders (`requests.ts`) reused by production and discovery, the filtered
+contract snapshot (`contract/collectiviq/openapi-filtered.json`), the hermetic
+mock-server contract tests (`test/contract/`), and the opt-in discovery
+session/CLI exist and pass `validate`. The staged discovery session captures
+evidence from the **raw** upstream body (any status) via a discovery-only
+observation path — so run ids and error shapes survive as value-free sanitized
+structure (`evidenceFormatVersion` 2) — retains correlation ids only in private
+memory (emitted solely as a `matched`/`not-matched`/`not-observed` comparison; no
+capability flag is auto-flipped), keeps a truthful cleanup ledger, gates every
+destructive delete on explicit approval, and exits on strict session
+completeness. None of it is wired into any public completion path.
+
+On 2026-08-06 an explicitly approved authenticated `baseline` run was executed
+once and **exited non-zero** (failed strict completeness). Its value-free
+observed-once (not verified) facts: `create_thread` → `200` (numeric
+`thread_id`); `process_message` → `202` with `thread_id`/`combined_run_id`/
+`status`/`has_rag_files` and no `detail` (a run identifier is present; the
+`status` meaning and accepted-vs-failed semantics are unknown; idempotency
+unresolved); `get_messages` → `200` (`messages` array accepted, but observed
+`create_time`/`updated_at` diverge from the provisional `created_at` mapping, so
+message-metadata mapping stays provisional); empty-bearer auth probe `401` and
+no-`thread_id` validation probe `400` (expected failures); authenticated
+`/available_llms` → `403` (reason unknown, no causal claim); SSE `/user/events`
+`200`/`text/event-stream` with thread+run correlation matched once (scope and
+repeatability unknown); and cleanup where all three DELETEs failed leaving two
+threads that the user then manually deleted (the old report did not capture delete
+status, so no `403` claim and no claim that deletion works). A remediation has
+since landed: value-free per-attempt cleanup diagnostics, a content-free recovery
+journal, a recovery-only `contract:discovery:cleanup` command, and an
+`available_llms` completeness policy that accepts a `403` as an observed
+inventory-access restriction. **No live capture was promoted**; the contract tests
+still use synthetic fixtures, all runtime response shapes remain provisional or
+observed-once, and capability flags remain `false`. Phase 0 is **not complete**:
+it exits only after approved, repeatable live discovery captures sanitized
 fixtures that reflect real responses. See
 [`collectiviq-upstream-contract.md`](collectiviq-upstream-contract.md).
 
@@ -2670,26 +2691,40 @@ Mitigation:
 
 ## 35. Open Questions Requiring CollectivIQ Confirmation
 
-Before declaring production readiness, obtain answers to:
+Before declaring production readiness, obtain answers to the following. The
+2026-08-06 authorized baseline supplied value-free **observed-once (not verified)**
+partial evidence for some items, noted inline; observed-once does not resolve a
+question. None of these is verified.
 
 1. Is there official API documentation?
-2. What are the precise schemas for all four demonstrated endpoints?
-3. What HTTP status codes represent authentication, quota, and validation failures?
-4. Is `process_message` idempotent?
-5. Is there a job or message identifier in its response?
-6. How can the gateway distinguish accepted work from failed work?
-7. Does `get_messages` return messages in chronological order?
-8. Can it paginate?
-9. Can a thread be deleted?
+2. What are the precise schemas for all four demonstrated endpoints? (**Partially
+   observed once:** `create_thread` `200`, `process_message` `202`, `get_messages`
+   `200`; structure-only, not verified.)
+3. What HTTP status codes represent authentication, quota, and validation
+   failures? (**Observed once:** `401` empty-bearer auth, `400` missing-parameter
+   validation, and a `403` from authenticated `/available_llms`; quota `429`
+   unobserved.)
+4. Is `process_message` idempotent? (**Unresolved.**)
+5. Is there a job or message identifier in its response? (**Observed once:** a run
+   identifier `combined_run_id` was present in the `202`.)
+6. How can the gateway distinguish accepted work from failed work? (**Observed
+   once:** a `status` field was present, but its meaning is **unknown**.)
+7. Does `get_messages` return messages in chronological order? (**Unresolved.**)
+8. Can it paginate? (**Unresolved.**)
+9. Can a thread be deleted? (**Unresolved:** cleanup DELETEs failed and two
+   threads leaked, then were manually deleted; the old report did not capture
+   delete status, so no `403` claim and no claim that deletion works.)
 10. What is the maximum prompt size?
 11. What are account and model rate limits?
-12. Does `/user/events` include `thread_id`?
-13. Is `/user/events` account-wide or connection-specific?
+12. Does `/user/events` include `thread_id`? (**Observed once:** thread
+    correlation matched once.)
+13. Is `/user/events` account-wide or connection-specific? (**Unknown.**)
 14. Does CollectivIQ support native tools or function calling?
 15. Can tool results be sent back as structured messages?
 16. Can the API receive system and developer messages separately?
 17. Can the API return token usage?
-18. What does `percent_usage` mean?
+18. What does `percent_usage` mean? (**Observed once as null;** meaning still
+    **unknown**.)
 19. Which values are currently valid for `selected_llms`?
 20. Does `generate_combined=false` guarantee exactly one selected-model response?
 21. What completion signal exists if a selected model fails?

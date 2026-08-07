@@ -83,13 +83,18 @@ exist today are:
   past 16 MiB before buffering the whole body, cancels the reader/response on
   overflow/timeout/decode failure, and decodes strict UTF-8. No credentials are
   sent; the command stays out of `validate`/CI.
-- **Discovery tooling (opt-in, not run).** The staged live-discovery session/CLI
+- **Discovery tooling (opt-in; one authorized baseline run on 2026-08-06).** One
+  explicitly approved authenticated `baseline` run was executed on 2026-08-06; it
+  failed strict completeness (exited non-zero), its evidence is observed-once and
+  sanitized (not verified), and no live capture was promoted. The staged
+  live-discovery session/CLI
   runs one bounded `baseline` session against a **fixed** destination origin
   (no origin/path/thread-id/run-id injection). Its **default is preflight only**:
   it validates the model selection and reports bounded projected counts and
   approval flags **without reading the credential or making any network
   request**; it opens no socket and reads no credentials on import. Authenticated
-  execution requires `--execute-approved`; selection and approval invariants
+  execution requires `--execute-approved` **and** `--recovery-journal-approved`;
+  selection and approval invariants
   (single non-empty/comma-free; combined 1–32 unique, duplicates rejected;
   not-found requires cleanup) are re-checked inside the runner before any request.
   Evidence is captured from the **raw** upstream body for any status via a
@@ -101,21 +106,89 @@ exist today are:
   `matched`/`not-matched`/`not-observed` comparison; capability flags are never
   auto-flipped. Deleting session-owned threads requires `--cleanup-approved`
   (never automatic); cleanup reports a truthful cumulative
-  `attempted`/`succeeded`/`failed`/`remaining` ledger and the exit code follows
-  strict session completeness. The not-found probe requires
+  `attempted`/`succeeded`/`failed`/`remaining` ledger (HTTP DELETE outcomes only)
+  plus `journalPersistenceFailed` and a bounded list of value-free per-attempt
+  summaries (`phase`, `ok`, HTTP status or null, safe `errorCode` or null, and
+  `journalPersisted` — `true`/`false`/`null` — no id, path, body, or message;
+  shared `observeThreadDeletion` in `cleanup.ts`) so a cleanup `403` is
+  distinguishable from a timeout/network failure. A thread is dropped from the
+  in-memory ownership ledger on a confirmed HTTP DELETE even if its journal
+  removal then fails (`journalPersisted: false`), so a fault cannot resurrect it;
+  the stale journal converges through recovery's exact-`404` handling, and any
+  such failure (`journalPersistenceFailed > 0`) is a non-zero-exit condition. The
+  exit code follows strict session completeness. Strict completeness requires an `available_llms` observation and
+  accepts either a **structurally valid** `2xx` success (top level a non-null,
+  non-array object with an own `llms` object holding at least one object entry; no
+  model value inspected or retained; extra properties allowed) or exactly a `403`
+  normalized to the authentication/authorization category (an observed
+  inventory-access restriction), still failing on `401`/`429`/`5xx`/transport/
+  timeout/missing/malformed; a malformed `2xx` body is a **failed** observation
+  (`invalid_upstream_response`), never a silent success. The not-found probe
+  requires
   `--observe-not-found-approved` **and** `--cleanup-approved`, counts its first
   delete as cleanup, re-deletes the **same** already-deleted session-owned id
   (never a guessed id) as the uncounted observation, and on a first-delete failure
   retains ownership, skips the second delete, and keeps the recorded failure.
-  Token-inspection and abort discovery are disabled. Thread/run identifiers stay
-  in memory and are never printed or persisted. Observations are sanitized
+  Token-inspection and abort discovery are disabled. Run identifiers stay in
+  memory and are never printed or persisted; thread identifiers stay in memory
+  except that, when `--recovery-journal-approved` is set, at most two are written
+  content-free to the recovery journal (below) purely for recovery. Observations
+  are sanitized
   structural captures (constant type markers only — no values, value lengths,
   unsafe field names, or identifiers; array length read via an own data
   descriptor, never a `get` trap) stamped with an `evidenceFormatVersion`;
   SSE evidence rejects non-2xx before parsing, finalizes the fatal UTF-8 decoder
   at EOF, bounds unterminated records, and distinguishes cancellation/timeout/
-  stream-error. Nothing is written unless `--write` is passed (under the untracked
-  `.agent/sessions/`). It must not be run without explicit approval.
+  stream-error. `--write` controls ONLY whether the sanitized baseline evidence
+  report is persisted (under the untracked `.agent/sessions/`); an approved
+  authenticated run maintains the separate ID-only recovery journal (below)
+  independently of `--write`, and preflight performs no journal I/O. It must not
+  be run without explicit approval.
+- **Recovery journal (`recovery-journal.ts`).** A private on-disk journal at a
+  fixed path under the ignored `.agent/sessions/discovery/`
+  (`recovery-journal.json`), separate from the sanitized `baseline.json`, records
+  **only** a format version (1), the fixed destination origin, and at most two
+  normalized thread ids — never credentials, model ids, run ids, prompts, titles,
+  answers, bodies, statuses, timestamps, or account/user data. It is written
+  atomically (private temp file, mode `0600`, `O_NOFOLLOW`, then rename) and
+  rejects symlinks, non-regular files, wrong origin, malformed JSON, unsupported
+  version, duplicate ids, more than two ids, empty ids, oversized ids, and
+  oversized files. Authenticated execution requires `--recovery-journal-approved`
+  (re-checked in the runner) and verifies writability before the first request;
+  each created thread id is recorded immediately and dropped only after a
+  confirmed deletion; the journal is removed when empty and retains ids if cleanup
+  fails. Preflight does no journal I/O. The journal is maintained **independently
+  of `--write`** — `--write` governs only the sanitized baseline evidence report,
+  while an authenticated approved run always maintains the id-only journal — and
+  its sink transitions are **durable-first** (on-disk state persisted before the
+  in-memory ledger changes). If a created thread's id cannot be durably persisted
+  (`recordCreated` fails), the run **aborts immediately** with no further upstream
+  request; the created thread is placed in the ownership ledger **before** the
+  journal write so cleanup is still attempted, the result is a content-free
+  `aborted: "journal-persistence-failed"`, and the exit is non-zero. A journal
+  **initialization** failure (before any create) makes zero network calls. No
+  filesystem path, id, or raw error is ever serialized.
+- **Recovery-only cleanup command (`discovery-recovery-cli.ts`).**
+  `npm run contract:discovery:cleanup` is network-only, opt-in, and **excluded
+  from `validate`/CI**. It targets the fixed origin only, reads thread ids **only**
+  from the validated recovery journal (at most two), takes no id/path/URL argument,
+  reads no model-selection variables, and requires `--execute-approved`,
+  `--cleanup-approved`, and `--recovery-journal-approved`. It refuses a
+  missing/empty/invalid journal, deletes through the same percent-encoded fixed
+  delete path and bounded transport, and resolves a journal-owned id on a `2xx`
+  (`deleted`) **or** an exact `404` (`already_absent`) so recovery converges
+  across a crash between a successful delete and the journal update; every other
+  status (e.g. `403`, `410`), transport failure, or timeout stays unresolved for a
+  later run. A `404` is still recorded in per-attempt diagnostics as a non-`2xx`
+  response (`ok: false`, `status: 404`), never relabeled as HTTP success; the
+  recovery classification is separate (`resolved` with `resolution`
+  `"deleted" | "already_absent"`). An id is removed from the journal only after
+  the resolved state is durably persisted; if that write fails the id stays
+  pending and the run exits non-zero. The value-free recovery report is
+  `{ attempted, resolved, unresolved, remaining, attempts: [{ ok, status,
+errorCode, resolved, resolution, persisted }] }` (no longer `succeeded`/
+  `failed`), and it exits non-zero when `unresolved > 0 || remaining > 0`. It must
+  not be run without explicit approval.
 
 ## Current limitations
 

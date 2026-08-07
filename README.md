@@ -36,7 +36,10 @@ CollectivIQ, exposing a bounded OpenAI Chat Completions-compatible profile.
 `GET /metrics`, gateway authentication, prompt construction, emulated/native
 tool calling, synthetic SSE streaming, polling, generation orchestration, and
 any live CollectivIQ call. The adapter exists but is not connected to a public
-endpoint, and all upstream response shapes are provisional until live discovery.
+endpoint. One authorized authenticated discovery baseline ran on 2026-08-06 and
+**failed strict completeness (exited non-zero)**; its evidence is observed-once
+and sanitized, not verified, and no live capture was promoted. Upstream response
+shapes are therefore provisional or observed-once, and Phase 0 is not complete.
 
 ## Prerequisites
 
@@ -113,35 +116,72 @@ committed). See
 
 These commands need network access and are **excluded from `validate` and CI**:
 
-| Command                            | Purpose                                                                 |
-| ---------------------------------- | ----------------------------------------------------------------------- |
-| `npm run contract:openapi:check`   | Fetch the public OpenAPI doc and report drift vs the committed snapshot |
-| `npm run contract:openapi:refresh` | Fetch and write a review candidate under `.agent/sessions/` (untracked) |
-| `npm run contract:discovery`       | Opt-in live discovery (requires credentials + explicit approval)        |
+| Command                              | Purpose                                                                                                            |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
+| `npm run contract:openapi:check`     | Fetch the public OpenAPI doc and report drift vs the committed snapshot                                            |
+| `npm run contract:openapi:refresh`   | Fetch and write a review candidate under `.agent/sessions/` (untracked)                                            |
+| `npm run contract:discovery`         | Opt-in live discovery (requires credentials + explicit approval)                                                   |
+| `npm run contract:discovery:cleanup` | Recovery-only: delete leaked session threads listed in the recovery journal (requires credentials + all approvals) |
 
-`contract:discovery` is **not** run as part of this stage. It runs a single
+One authorized `contract:discovery` baseline was run on 2026-08-06; it **failed
+strict completeness (exited non-zero)**, its evidence is observed-once and
+sanitized (not verified), and no live capture was promoted, so Phase 0 is not
+complete. It runs a single
 bounded `baseline` session against a **fixed** destination origin
 (`https://api.prod.collectiviq.ai`) — no origin, path, thread-id, or run-id may
 be supplied. The **default invocation is preflight only**: it validates the
 model selection (`CIQ_DISCOVERY_SINGLE_LLM`, `CIQ_DISCOVERY_COMBINED_LLMS`) and
 reports bounded projected operation counts and which approvals are set, **without
 reading the credential or making any network request**. Authenticated execution
-requires `--execute-approved`; deleting session-owned threads requires
-`--cleanup-approved` (never automatic); the not-found probe requires
-`--observe-not-found-approved` **and** `--cleanup-approved` (these invariants are
-also re-checked inside the runner before any request). Token-inspection and abort
-discovery are disabled until request correlation is safely established. Evidence
+requires `--execute-approved` **and** `--recovery-journal-approved`; deleting
+session-owned threads requires `--cleanup-approved` (never automatic); the
+not-found probe requires `--observe-not-found-approved` **and**
+`--cleanup-approved` (these invariants are also re-checked inside the runner
+before any request). `--recovery-journal-approved` enables a private, content-free
+recovery journal under the ignored `.agent/sessions/discovery/` that records at
+most two created thread ids (format version + fixed origin + ids only — no
+credentials, run ids, content, or timestamps) so a leaked thread can be recovered;
+each id is recorded immediately and dropped after a confirmed deletion. If a run
+leaves threads behind, `npm run contract:discovery:cleanup` (network-only, opt-in,
+excluded from `validate`/CI; requires `--execute-approved`, `--cleanup-approved`,
+and `--recovery-journal-approved`) deletes only the ids in that journal.
+Token-inspection and abort discovery are disabled until request correlation is
+safely established. Evidence
 is captured from the **raw** upstream body for any status (so run ids and error
 shapes survive) and immediately reduced to sanitized structure; correlation ids
 stay private and are reported only as a value-free
 `matched`/`not-matched`/`not-observed` comparison. Cleanup reports a truthful
-`attempted`/`succeeded`/`failed`/`remaining` ledger, and the exit code follows
-strict session completeness. Output is limited to sanitized structural captures
-(constant type markers only — no credentials, content, value lengths, identifiers,
-headers, or raw bodies) stamped with an `evidenceFormatVersion`; nothing is
-written unless `--write` is passed (sanitized captures under
-`.agent/sessions/` only). Thread and run identifiers stay in memory and are never
-printed or persisted.
+`attempted`/`succeeded`/`failed`/`remaining` ledger (HTTP DELETE outcomes only)
+plus `journalPersistenceFailed` and a bounded list of value-free per-attempt
+summaries (phase, `ok`, HTTP status or null, safe error code or null, and
+`journalPersisted` — `true`/`false`/`null` — no ids, paths, or bodies) so a
+cleanup `403` is distinguishable from a timeout/network failure. A thread is
+dropped from the in-memory ledger on a confirmed HTTP DELETE even when its
+journal removal fails (the stale journal converges through recovery's exact-`404`
+handling); any such `journalPersistenceFailed > 0` is a non-zero-exit condition.
+The exit code follows strict session completeness. Strict completeness also requires an `available_llms` observation
+and accepts either a **structurally valid** `2xx` success (top level a non-null,
+non-array object with an own `llms` object holding at least one object entry;
+extra properties allowed and no model value inspected) or exactly a `403` (an
+observed inventory-access restriction) for that endpoint; a malformed `2xx` body
+is a **failed** observation (`invalid_upstream_response`) that drives a non-zero
+exit. If a thread is created upstream but its id cannot be durably persisted to
+the recovery journal, the run **aborts immediately** — no further upstream
+request — attempts cleanup for the already-owned thread, and exits non-zero with a
+content-free `aborted: "journal-persistence-failed"` result. The recovery-only
+`contract:discovery:cleanup` command resolves a journal-owned id on a `2xx`
+(`deleted`) **or** an exact `404` (`already_absent`) so recovery converges after a
+crash between a successful delete and the journal update, and reports
+`{ attempted, resolved, unresolved, remaining, attempts }` (exit non-zero when
+`unresolved > 0 || remaining > 0`). Output is limited to sanitized structural
+captures (constant type markers only — no credentials, content, value lengths,
+identifiers, headers, or raw bodies) stamped with an `evidenceFormatVersion`;
+`--write` governs only whether a sanitized baseline evidence report is persisted
+under `.agent/sessions/`. Run identifiers stay in memory and are never printed or
+persisted; thread identifiers stay in memory except that, when
+`--recovery-journal-approved` is set, at most two are written content-free to the
+recovery journal (independently of `--write`, durable-first) purely for recovery
+and removed after confirmed deletion.
 
 ## Docker
 
