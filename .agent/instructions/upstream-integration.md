@@ -14,9 +14,9 @@ first; it is the owner document for source metadata, evidence states, request
 contracts, the capability matrix, and open questions.
 
 - The filtered, deterministic snapshot lives at
-  `contract/collectiviq/openapi-filtered.json` (nine allowlisted operations plus
-  transitively referenced schemas; the full 422-path document is never
-  committed).
+  `contract/collectiviq/openapi-filtered.json` (ten allowlisted operations —
+  including `POST /login` for the OAuth2 password mode — plus transitively
+  referenced schemas; the full 422-path document is never committed).
 - `npm run contract:openapi:refresh` writes a review candidate under
   `.agent/sessions/`; `npm run contract:openapi:check` reports drift against the
   committed snapshot. Both need network access and are excluded from `validate`.
@@ -81,10 +81,13 @@ contracts, the capability matrix, and open questions.
   unresolved), and reports
   `{ attempted, resolved, unresolved, remaining, attempts }` (no longer
   `succeeded`/`failed`), exiting non-zero when `unresolved > 0 || remaining > 0`.
-  Token-inspection and abort discovery are disabled. One
-  authorized baseline ran on 2026-08-06 and **failed strict completeness (exited
-  non-zero)**; its evidence is observed-once (not verified) and no fixture was
-  promoted. None of it is wired into a public completion path yet.
+  Token-inspection and abort discovery are disabled. Two
+  authorized baselines ran — on 2026-08-06 and 2026-08-07 — and **both failed
+  strict completeness (exited non-zero)**; their evidence is observed-once (not
+  verified; corroboration across the two runs is not verification) and no fixture
+  was promoted. The 2026-08-07 run observed `DELETE` returning HTTP `403`, leaving
+  two recovery-journal-owned threads unresolved. None of it is wired into a public
+  completion path yet.
 - Error retryability is **method-aware**: only an idempotent `GET` network or
   selected-transient (502/503/504) failure is retryable; every `POST`/`DELETE`
   failure is non-retryable. The method is carried through the error factory. A
@@ -96,8 +99,9 @@ contracts, the capability matrix, and open questions.
   and includes `llms_explicitly_set=true`; `GET /get_messages` documents an
   optional `since_id` that the gateway omits and an optional `thread_id` that the
   gateway always requires. Every declared `200` success schema is empty, so
-  response shapes are provisional except where the 2026-08-06 authorized baseline
-  observed them once (below); observed-once is not verified, and mappings stay
+  response shapes are provisional except where the 2026-08-06 and 2026-08-07
+  authorized baselines observed them once (below); observed-once is not verified,
+  and mappings stay
   provisional where observed field names diverge from the gateway's assumptions
   (e.g. `create_time`/`updated_at` vs the provisional `created_at`).
 
@@ -106,7 +110,9 @@ contracts, the capability matrix, and open questions.
 Only the CollectivIQ adapter may know:
 
 - endpoint paths and query/form field names;
-- bearer authentication mechanics;
+- dual-mode credential-provider mechanics (`auth.ts`): the static-bearer and
+  OAuth2 password-exchange (`POST /login`) providers, the per-request lease, and
+  its `401`-invalidation / no-replay / `403`-non-invalidation behaviour;
 - multipart request encoding;
 - raw status and error bodies;
 - provisional response JSON shapes;
@@ -114,7 +120,7 @@ Only the CollectivIQ adapter may know:
 
 All response bodies are untrusted. Validate them at runtime, ignore unexpected fields, and return normalized typed results or normalized error categories.
 
-Never expose or log the authorization header, API key, serialized prompt, raw production body, answer content, or other content-bearing diagnostic data.
+Never expose or log the authorization header, the upstream credentials (API key, username, password), any minted `access_token`/refresh token, the serialized prompt, raw production body, answer content, or other content-bearing diagnostic data.
 
 ## Per-Completion Workflow
 

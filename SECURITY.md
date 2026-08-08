@@ -27,9 +27,12 @@ features are not implemented, and the upstream adapter is not wired into any
 request path, so those runtime controls are not yet active. The controls that
 exist today are:
 
-- **Credential separation.** `COLLECTIVIQ_API_KEY` (upstream) and
-  `COLLECTIVIQ_GATEWAY_KEYS` (clients) are distinct and never conflated or
-  forwarded. Both are redacted from logs.
+- **Credential separation.** The upstream credentials — `COLLECTIVIQ_API_KEY`
+  (bearer mode) or `COLLECTIVIQ_USERNAME`/`COLLECTIVIQ_PASSWORD` (the offline,
+  unverified OAuth2 password mode, selected by `COLLECTIVIQ_AUTH_MODE`) — and the
+  client `COLLECTIVIQ_GATEWAY_KEYS` are distinct and never conflated or forwarded.
+  All of them are redacted from logs (including any minted `access_token`). The
+  inactive mode's credentials are ignored.
 - **Content-free logging by default.** Prompts, answers, request bodies, tool
   arguments/results, source, and file paths are never logged. `LOG_CONTENT=true`
   is accepted only when `ENVIRONMENT=development`, and even then this scaffold
@@ -63,8 +66,21 @@ exist today are:
   body, and Fastify automatic request logging is disabled.
 - **Non-root container.** The image runs as the unprivileged `node` user, is
   pinned to a base-image digest, and contains no secrets.
-- **Upstream adapter boundary (offline).** `src/collectiviq/` attaches the
-  `COLLECTIVIQ_API_KEY` bearer only in the transport and never logs it; it
+- **Upstream authentication (offline; dual-mode).** A shared credential provider
+  (`src/collectiviq/auth.ts`) supplies a per-request lease bearer token used by
+  the transport, SSE, deletion, and recovery paths, and never logs it. `bearer`
+  mode uses the static `COLLECTIVIQ_API_KEY`; the offline, unverified `password`
+  mode performs a bounded **unauthenticated** `POST /login` (20 s deadlines,
+  64 KiB cap, strict UTF-8, JSON, exactly HTTP `200`, `redirect: "error"`,
+  no `Authorization` header) that mints a short-lived token held **in memory
+  only**, with single-flight coalescing, generation-safe invalidation, and a hard
+  two-login budget for discovery/recovery. A `401` invalidates the lease (no
+  replay); a `403` does not. A refresh token, if returned, is ignored and never
+  retained; `/auth/refresh` is not implemented. **Residual risk:** the username
+  and password remain resident in process/config memory so a later login can run,
+  and a JavaScript string's bytes cannot be deterministically erased.
+- **Upstream adapter boundary (offline).** `src/collectiviq/` attaches the lease
+  bearer token only in the transport and never logs it; it
   enforces per-operation header/body deadlines, incremental response-size caps
   (the body is bounded before it is parsed), strict UTF-8 decoding, and JSON
   content-type checks, composes client cancellation with deadlines, and never
@@ -83,10 +99,14 @@ exist today are:
   past 16 MiB before buffering the whole body, cancels the reader/response on
   overflow/timeout/decode failure, and decodes strict UTF-8. No credentials are
   sent; the command stays out of `validate`/CI.
-- **Discovery tooling (opt-in; one authorized baseline run on 2026-08-06).** One
-  explicitly approved authenticated `baseline` run was executed on 2026-08-06; it
-  failed strict completeness (exited non-zero), its evidence is observed-once and
-  sanitized (not verified), and no live capture was promoted. The staged
+- **Discovery tooling (opt-in; two authorized baseline runs, 2026-08-06 and
+  2026-08-07).** Two explicitly approved authenticated `baseline` runs were
+  executed — on 2026-08-06 and 2026-08-07 — and both failed strict completeness
+  (exited non-zero); their evidence is observed-once and sanitized (not verified,
+  and corroboration across the two runs is not verification), and no live capture
+  was promoted. The 2026-08-07 run's remediated cleanup diagnostics observed
+  `DELETE` returning HTTP `403`, leaving two recovery-journal-owned threads
+  unresolved (their identifiers are never exposed). The staged
   live-discovery session/CLI
   runs one bounded `baseline` session against a **fixed** destination origin
   (no origin/path/thread-id/run-id injection). Its **default is preflight only**:
@@ -153,7 +173,13 @@ exist today are:
   atomically (private temp file, mode `0600`, `O_NOFOLLOW`, then rename) and
   rejects symlinks, non-regular files, wrong origin, malformed JSON, unsupported
   version, duplicate ids, more than two ids, empty ids, oversized ids, and
-  oversized files. Authenticated execution requires `--recovery-journal-approved`
+  oversized files. A single shared safe-directory helper
+  (`ensureSafeDiscoveryDir`), used by both the sanitized report writer and the
+  journal, creates-or-tightens the shared directory to a real, private `0700`,
+  non-symlink directory before journal initialization — tightening an existing
+  real `0755` directory to `0700` and refusing a symlink or non-directory — so an
+  approved run recovers cleanly from a directory left loose by a prior report
+  while read/delete paths still require `0700`. Authenticated execution requires `--recovery-journal-approved`
   (re-checked in the runner) and verifies writability before the first request;
   each created thread id is recorded immediately and dropped only after a
   confirmed deletion; the journal is removed when empty and retains ids if cleanup

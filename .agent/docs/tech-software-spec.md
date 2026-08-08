@@ -53,7 +53,9 @@ The gateway must not attempt to execute OpenCode tools itself. It only translate
 
 The supplied API sample demonstrates the following workflow:
 
-1. Authenticate with a bearer token.
+1. Authenticate with a bearer token — either a static `COLLECTIVIQ_API_KEY`
+   (`bearer` mode) or a short-lived token obtained from `POST /login` with a
+   username/password (`password` mode); see section 21.1.
 2. Create a thread.
 3. Submit one prompt to one or more selected models.
 4. Optionally request a combined response.
@@ -549,7 +551,10 @@ interface GetMessagesResult {
 
 The adapter must:
 
-* send `Authorization: Bearer <COLLECTIVIQ_API_KEY>`;
+* send `Authorization: Bearer <token>`, where the token comes from the shared
+  credential provider (`src/collectiviq/auth.ts`): the static `COLLECTIVIQ_API_KEY`
+  in `bearer` mode, or a short-lived token minted at `POST /login` in `password`
+  mode. A `401` invalidates the lease (no replay); a `403` does not;
 * use `multipart/form-data` where required;
 * validate all response bodies;
 * impose connection and response timeouts;
@@ -1717,22 +1722,37 @@ Raw CollectivIQ response bodies must not be returned to clients in production.
 
 ### 21.1 Credential separation
 
-Required secrets:
+Upstream authentication is dual-mode, selected by `COLLECTIVIQ_AUTH_MODE`
+(`bearer` | `password`, default `bearer`). Required secrets by mode:
 
 ```text
-COLLECTIVIQ_API_KEY
-COLLECTIVIQ_GATEWAY_KEYS
+COLLECTIVIQ_GATEWAY_KEYS                       # always (client auth)
+COLLECTIVIQ_API_KEY                            # bearer mode
+COLLECTIVIQ_USERNAME + COLLECTIVIQ_PASSWORD    # password mode
 ```
+
+In `bearer` mode the static `COLLECTIVIQ_API_KEY` is the upstream bearer token.
+In `password` mode `COLLECTIVIQ_USERNAME`/`COLLECTIVIQ_PASSWORD` are exchanged at
+`POST /login` for a short-lived bearer token held in memory only (implemented
+offline, unverified). The inactive mode's credentials may be present but are
+ignored. Byte bounds: username trimmed ≤ 320 bytes; password preserved exactly
+≤ 4096 bytes; bearer/`access_token` preserved exactly ≤ 16 KiB.
 
 OpenCode receives only a gateway key.
 
-The CollectivIQ key must:
+The CollectivIQ upstream credentials (`COLLECTIVIQ_API_KEY`,
+`COLLECTIVIQ_USERNAME`, `COLLECTIVIQ_PASSWORD`, and any minted `access_token`)
+must:
 
 * be loaded from a secret manager or environment variable;
 * never appear in configuration committed to source control;
 * never be sent to OpenCode;
 * never be logged;
 * never appear in exception messages.
+
+Residual risk: the username/password remain resident in process/config memory so
+a later login can run, and a JavaScript string's bytes cannot be deterministically
+erased.
 
 ### 21.2 Network binding
 
@@ -1984,12 +2004,15 @@ Trace propagation to CollectivIQ should occur only if custom correlation headers
 
 ## 24. Configuration
 
-Required environment variables:
+Required environment variables (upstream credentials depend on the auth mode):
 
 ```text
-COLLECTIVIQ_API_KEY
 COLLECTIVIQ_BASE_URL=https://api.prod.collectiviq.ai
 COLLECTIVIQ_GATEWAY_KEYS=<comma-separated keys or secret reference>
+COLLECTIVIQ_AUTH_MODE=bearer                 # bearer | password (default bearer)
+COLLECTIVIQ_API_KEY=<token>                  # required in bearer mode
+COLLECTIVIQ_USERNAME=<username>              # required in password mode
+COLLECTIVIQ_PASSWORD=<password>              # required in password mode
 ```
 
 Recommended configuration:
@@ -2473,10 +2496,13 @@ Exit criterion:
 
 * upstream adapter contract tests reflect real responses.
 
-Current status (offline portion complete; one authorized live baseline ran and
-failed): the OpenAPI-grounded adapter boundary (`src/collectiviq/`), the shared
+Current status (offline portion complete; two authorized live baselines ran and
+both failed): the OpenAPI-grounded adapter boundary (`src/collectiviq/`), the
+shared dual-mode credential provider (`auth.ts`: static `bearer` plus the
+offline, unverified OAuth2 `password`/`POST /login` mode), the shared
 request builders (`requests.ts`) reused by production and discovery, the filtered
-contract snapshot (`contract/collectiviq/openapi-filtered.json`), the hermetic
+contract snapshot of **ten** allowlisted operations
+(`contract/collectiviq/openapi-filtered.json`), the hermetic
 mock-server contract tests (`test/contract/`), and the opt-in discovery
 session/CLI exist and pass `validate`. The staged discovery session captures
 evidence from the **raw** upstream body (any status) via a discovery-only
@@ -2505,7 +2531,18 @@ status, so no `403` claim and no claim that deletion works). A remediation has
 since landed: value-free per-attempt cleanup diagnostics, a content-free recovery
 journal, a recovery-only `contract:discovery:cleanup` command, and an
 `available_llms` completeness policy that accepts a `403` as an observed
-inventory-access restriction. **No live capture was promoted**; the contract tests
+inventory-access restriction.
+
+A **second** explicitly approved authenticated `baseline` run reached production
+on 2026-08-07 and again **exited non-zero** (failed strict completeness),
+distinct from the 2026-08-06 run. The core statuses/shapes and SSE thread+run
+correlation repeated (corroboration, not verification). This time the remediated
+cleanup diagnostics **observed `DELETE` returning HTTP `403`**, leaving two
+recovery-journal-owned threads unresolved (identifiers never exposed; no causal
+claim, and API thread deletion is still not confirmed to work). Dual-mode
+password authentication was implemented offline but remained unverified for this
+run (no live `POST /login` was performed). **No live capture was promoted** from
+either run; the contract tests
 still use synthetic fixtures, all runtime response shapes remain provisional or
 observed-once, and capability flags remain `false`. Phase 0 is **not complete**:
 it exits only after approved, repeatable live discovery captures sanitized
@@ -2692,8 +2729,9 @@ Mitigation:
 ## 35. Open Questions Requiring CollectivIQ Confirmation
 
 Before declaring production readiness, obtain answers to the following. The
-2026-08-06 authorized baseline supplied value-free **observed-once (not verified)**
-partial evidence for some items, noted inline; observed-once does not resolve a
+2026-08-06 and 2026-08-07 authorized baselines supplied value-free
+**observed-once (not verified)** partial evidence for some items, noted inline;
+observed-once — even when corroborated across both runs — does not resolve a
 question. None of these is verified.
 
 1. Is there official API documentation?
@@ -2711,9 +2749,12 @@ question. None of these is verified.
    once:** a `status` field was present, but its meaning is **unknown**.)
 7. Does `get_messages` return messages in chronological order? (**Unresolved.**)
 8. Can it paginate? (**Unresolved.**)
-9. Can a thread be deleted? (**Unresolved:** cleanup DELETEs failed and two
-   threads leaked, then were manually deleted; the old report did not capture
-   delete status, so no `403` claim and no claim that deletion works.)
+9. Can a thread be deleted? (**Unresolved.** On 2026-08-06 cleanup DELETEs failed
+   and two threads leaked, then were manually deleted; the old report did not
+   capture delete status, so no `403` claim. On 2026-08-07 the remediated
+   diagnostics **observed `DELETE` returning `403`**, leaving two
+   recovery-journal-owned threads unresolved — no causal claim, and deletion is
+   still not confirmed to work.)
 10. What is the maximum prompt size?
 11. What are account and model rate limits?
 12. Does `/user/events` include `thread_id`? (**Observed once:** thread
@@ -2732,6 +2773,11 @@ question. None of these is verified.
 23. Are prompts or source code used for model training?
 24. Is enterprise zero-retention available?
 25. Are there regional data-processing controls?
+26. Does the OAuth2 password login (`POST /login`) work, and what is its real
+    `200` response shape and token lifetime? (**Unresolved:** `password` mode is
+    implemented offline with a provisional response validator; no live login has
+    been performed, so the login contract is unverified. `/auth/refresh` has empty
+    schemas and is not implemented.)
 
 ---
 

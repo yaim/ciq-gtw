@@ -19,18 +19,21 @@ Every claim below is tagged with one of:
 - **observed** — seen in a sanitized capture from an authorized live probe.
 - **verified** — observed repeatably and encoded into deterministic fixtures.
 
-One authorized authenticated baseline discovery run was executed on 2026-08-06
-(see "2026-08-06 authorized baseline" below). It **exited non-zero** (it failed
-strict completeness), and its evidence is a **value-free sanitized structural
-capture** (`evidenceFormatVersion` 2). Some response shapes are therefore now
-tagged **observed** — meaning **observed once on 2026-08-06 and not repeatably
-verified**. A single observation is never **verified**: verification requires a
-second independently approved run, and no run has confirmed a prior one. No live
-capture was promoted into a committed fixture. Every runtime response shape that
-was not exercised by that run remains **provisional**, and the response *mapping*
-for observed endpoints stays provisional where the observed field names diverge
-from the gateway's assumptions. Phase 0 is **not complete**: approved, repeatable
-live discovery must still replace provisional shapes with sanitized fixtures.
+Two authorized authenticated baseline discovery runs have been executed — one on
+2026-08-06 (see "2026-08-06 authorized baseline" below) and a second on
+2026-08-07 (see "2026-08-07 authorized baseline" below). **Both exited non-zero**
+(each failed strict completeness), and each run's evidence is a **value-free
+sanitized structural capture** (`evidenceFormatVersion` 2). Some response shapes
+are therefore tagged **observed** — meaning **observed on the 2026-08-06 and/or
+2026-08-07 run and not repeatably verified**. Repetition of a shape across the two
+runs is corroboration, **not verification**: verification requires an
+independently approved run that confirms a prior one under a promoted, sanitized
+fixture, and no capture from either run was promoted. No live capture was promoted
+into a committed fixture. Every runtime response shape that was not exercised by
+these runs remains **provisional**, and the response *mapping* for observed
+endpoints stays provisional where the observed field names diverge from the
+gateway's assumptions. Phase 0 is **not complete**: approved, repeatable live
+discovery must still replace provisional shapes with sanitized fixtures.
 
 ## Source metadata
 
@@ -45,22 +48,76 @@ live discovery must still replace provisional shapes with sanitized fixtures.
 | Full document path count | `422` |
 | Committed filtered snapshot | [`contract/collectiviq/openapi-filtered.json`](../../contract/collectiviq/openapi-filtered.json) |
 
-The full 422-path document is intentionally **not** committed. Only the nine
+The full 422-path document is intentionally **not** committed. Only the ten
 allowlisted operations, their transitively referenced schemas, and source
 metadata are retained. Refresh with `npm run contract:openapi:refresh` (writes a
 review candidate under `.agent/sessions/`) and compare the live document with
 `npm run contract:openapi:check`. Both require network access and are excluded
 from `validate` and CI.
 
-## Authentication (documented)
+## Authentication (documented; dual-mode provisional)
 
-- Security scheme `OAuth2PasswordBearer` (`type: oauth2`, `tokenUrl: /login`);
-  all core and supporting operations except `/user/events` declare it.
-- The gateway sends `Authorization: Bearer <COLLECTIVIQ_API_KEY>` on every
-  request. The credential is never logged and never appears in errors.
+- Security scheme `OAuth2PasswordBearer` (`type: oauth2`); its password flow's
+  `tokenUrl` is `/login`, which is **used by the optional password mode**
+  described below (provisional/unverified). All core and supporting operations
+  except `/user/events` declare the scheme.
+- The gateway attaches a **lease bearer token** — `Authorization: Bearer
+  <token>` — on every request, via a shared credential-provider boundary
+  (`src/collectiviq/auth.ts`) used by the production adapter, discovery, the SSE
+  path, deletion, and recovery tooling. `COLLECTIVIQ_AUTH_MODE` (`bearer` |
+  `password`, default `bearer`) selects the token source; the inactive mode's
+  credentials may be present but are ignored. Either token is never logged and
+  never appears in errors.
+  - **`bearer` (default):** the static `COLLECTIVIQ_API_KEY` is the bearer token.
+  - **`password`:** `COLLECTIVIQ_USERNAME` + `COLLECTIVIQ_PASSWORD` are exchanged
+    at `POST /login` for a short-lived bearer token, held **in memory only** and
+    then attached like any other bearer. This mode is implemented offline and is
+    **provisional/unverified**.
+- **Lease behaviour (both the JSON transport and the SSE path share it).** Each
+  request acquires a lease and attaches its bearer token. An HTTP `401`
+  **invalidates that lease** — the request is **not** replayed — so the next
+  *distinct* request may reauthenticate; an HTTP `403` does **not** invalidate the
+  lease. There is no automatic replay of create/submit/delete or any request, and
+  no auto-retry inside a login.
 - `GET /user/events` declares **no** OAuth2 requirement but documents an optional
   `Authorization` header parameter; it uses header-based bearer auth, not query
   authentication.
+
+### Login contract (provisional)
+
+The password mode's login exchange is the gateway's own working contract; the
+published document's `200` response schema for `/login` is empty, so response
+validation is provisional and unverified.
+
+- **Request** (documented `application/x-www-form-urlencoded`): `grant_type=password`,
+  `username`, `password`, and `scope=` (empty). `client_id`/`client_secret` are
+  omitted, and no `Authorization` header is sent (login is unauthenticated).
+- **Bounds:** a bounded unauthenticated call — 20 s header + 20 s body timeouts,
+  a 64 KiB response cap, strict UTF-8, JSON content type, exactly HTTP `200`
+  required, `redirect: "error"`. The provider keeps an in-memory token cache,
+  coalesces concurrent acquisitions into a single login (single-flight), applies
+  generation-safe invalidation (a late `401` from an older token cannot clear a
+  newer one), and enforces a hard **two-login budget per process** for
+  discovery/recovery (exceeding it fails closed with the normalized authentication
+  error).
+- **Response validator (provisional):** requires a non-array object with an own
+  `access_token` (non-empty string, ≤ 16 KiB) and an own `token_type` equal to
+  `Bearer` (case-insensitive). Unknown fields — including any refresh token — are
+  ignored and never retained.
+- **No refresh or logout.** `/auth/refresh` exists in the published document but
+  both its request and response schemas are empty; it is **not** implemented.
+  There is no refresh, logout, cookie, browser-localStorage, SSO, or
+  browser-session handling.
+- **Credential bounds (config + CLI, value-free errors):** username is trimmed,
+  canonical non-empty, ≤ 320 UTF-8 bytes; password is non-empty, ≤ 4096 UTF-8
+  bytes, preserved exactly including whitespace; a bearer token is non-empty,
+  ≤ 16 KiB, preserved exactly.
+- **Residual risk:** the username/password remain resident in process
+  environment/config memory so a later login can run, and a JavaScript string's
+  bytes cannot be deterministically erased.
+- Normal gateway startup remains **network-free**: no login occurs during module
+  import, configuration loading, server construction, or startup while no
+  completion route consumes the adapter.
 
 ## Core operations
 
@@ -195,11 +252,41 @@ only, no values or value lengths).
   a recovery journal/command so a future run distinguishes a cleanup `403` from a
   timeout/network failure and can recover leaked ids.
 
-## Discovery session (one authorized run; opt-in)
+## 2026-08-07 authorized baseline
+
+On 2026-08-07 a **second** explicitly user-approved authenticated `baseline`
+discovery run reached production against the same fixed origin
+(`https://api.prod.collectiviq.ai`), **in addition to** the 2026-08-06 run. Like
+the first, all facts are **observed once and not repeatably verified**
+(`evidenceFormatVersion` 2). This run is **distinct** from 2026-08-06; the two
+are not conflated.
+
+- **Overall result: non-zero exit** — the run again failed strict completeness,
+  so Phase 0 remains incomplete and **no live capture was promoted**. The contract
+  tests still use synthetic fixtures only.
+- **Corroboration, not verification:** the core statuses/shapes (`create_thread`
+  `200`, `process_message` `202`, `get_messages` `200`) and the SSE **thread and
+  run** correlation repeated consistently with 2026-08-06. Repetition across the
+  two runs is corroboration; it does **not** promote any shape to **verified**
+  (that still requires an independently approved run under a promoted, sanitized
+  fixture).
+- **Cleanup diagnostics (now remediated) observed `DELETE` `403`.** Unlike
+  2026-08-06 — whose old report discarded delete status and made **no** `403`
+  claim, and whose leftover threads were manually deleted — the 2026-08-07 run
+  used the value-free cleanup diagnostics and **observed `DELETE` returning HTTP
+  `403`**. Two recovery-journal-owned threads were left **unresolved** at process
+  exit and are recorded in the recovery journal for the opt-in recovery command;
+  their identifiers are never exposed. No causal claim is made about why the `403`
+  occurred or whether API thread deletion is supported.
+- **Password authentication was implemented offline but remained unverified** for
+  this run; the approval-gated recovery/baseline stages had not yet exercised the
+  `POST /login` exchange live.
+
+## Discovery session (two authorized runs; opt-in)
 
 Live evidence is captured only through the staged discovery session
 (`DiscoverySessionRunner` in `src/collectiviq/discovery.ts`) and its thin CLI
-(`src/collectiviq/discovery-cli.ts`). One authorized baseline has been run (see
+(`src/collectiviq/discovery-cli.ts`). Two authorized baselines have been run (see
 above); it is otherwise opt-in and preflight-only by default. Key properties:
 
 - A single bounded `baseline` session against a **fixed** origin
@@ -467,7 +554,7 @@ repeatable sanitized evidence proves otherwise (`DEFAULT_UPSTREAM_CAPABILITIES`)
 | --- | --- | --- |
 | Native tool definitions | `false` | Unverified. Unrelated tool/MCP endpoints do not establish native tool calling. |
 | Native tool results | `false` | Unverified. |
-| Request-scoped streaming | `false` | `/user/events` SSE thread+run correlation was **observed matched once** on 2026-08-06 but is not repeatably verified, and account-wide-vs-connection scope is unknown; stays `false` pending repeatable evidence. |
+| Request-scoped streaming | `false` | `/user/events` SSE thread+run correlation was **observed matched** on 2026-08-06 and again on 2026-08-07, but is not repeatably verified (corroboration ≠ verification), and account-wide-vs-connection scope is unknown; stays `false` pending repeatable evidence. |
 | Cancellation | `false` (adapter) | `/abort_run` exists but is cooperative and not adopted; a submitted generation may continue after client disconnect. |
 | Token usage | `false` | `/thread_tokens` exists but is not adopted; `percent_usage` meaning is unknown. |
 
@@ -487,9 +574,9 @@ repeatable sanitized evidence proves otherwise (`DEFAULT_UPSTREAM_CAPABILITIES`)
 - Hermetic contract tests (mock HTTP server): `test/contract/`.
 
 No live capture has been promoted into a committed fixture, including from the
-2026-08-06 authorized baseline (which exited non-zero and captured value-free
-structure only). Contract tests still use the synthetic fixtures. When a
-repeatable approved run is available, sanitized captures replace or confirm the
+2026-08-06 or 2026-08-07 authorized baselines (both exited non-zero and captured
+value-free structure only). Contract tests still use the synthetic fixtures. When
+a repeatable approved run is available, sanitized captures replace or confirm the
 synthetic fixtures and the evidence state of the affected rows moves from
 observed-once to verified.
 
@@ -498,12 +585,14 @@ observed-once to verified.
 | Date (UTC) | SHA-256 (short) | Notes |
 | --- | --- | --- |
 | 2026-08-05 | `c66332fd` | Initial capture. 422 paths; all nine allowlisted operations present and consistent with the known facts. Confirmed: `create_thread` is urlencoded (not multipart); `process_message` includes `llms_explicitly_set`; `get_messages` documents `since_id`; all core `200` schemas empty; `thread_tokens.thread_id` is integer while other `thread_id`s are string. |
+| 2026-08-07 | `c66332fd` | Snapshot refresh for the dual-mode auth work. Full document **unchanged** (same SHA, still 422 paths); no unrelated drift. The allowlist grew from **nine to ten** operations — `POST /login` and its transitive `Body_login_login_post` schema were added — to support the optional OAuth2 password mode. Security scheme `OAuth2PasswordBearer`; password-flow `tokenUrl` `/login`; login accepts `application/x-www-form-urlencoded` with required `username`/`password`, `grant_type=password`, `scope` defaulting to empty, and optional `client_id`/`client_secret`; the documented `200` response schema is empty. |
 
 ## Remaining live / provider questions
 
-Tracked in spec section 35. Statuses reflect the 2026-08-06 observed-once run;
-observed-once is not verified and none of these is resolved. The highest-priority
-items blocking Phase 0 exit:
+Tracked in spec section 35. Statuses reflect the 2026-08-06 and 2026-08-07
+observed-once runs; observed-once (even corroborated across both runs) is not
+verified and none of these is resolved. The highest-priority items blocking
+Phase 0 exit:
 
 1. Real success schemas and status codes for the four core endpoints —
    **partially observed once** (`create_thread` `200`, `process_message` `202`,
@@ -521,8 +610,15 @@ items blocking Phase 0 exit:
    repeatability remain **unknown**.
 7. Maximum prompt size, rate limits, and thread retention — **unresolved**.
 8. Whether native tools / structured tool results exist — **unresolved**.
-9. Whether API thread deletion is permitted/works — cleanup DELETEs failed and
-   two threads leaked (then were manually deleted); the old report did not capture
-   delete status, so this is **unresolved** (no `403` claim).
+9. Whether API thread deletion is permitted/works — **unresolved**. On 2026-08-06
+   cleanup DELETEs failed and two threads leaked (then were manually deleted; the
+   old report did not capture delete status, so no `403` claim was made). On
+   2026-08-07 the remediated diagnostics **observed `DELETE` returning `403`**,
+   leaving two recovery-journal-owned threads unresolved; no causal claim is made
+   about why, and API thread deletion is still not confirmed to work.
 10. `/available_llms` access — an authenticated `403` was **observed once**; the
     reason is **unknown** (no causal claim).
+11. Whether the OAuth2 password login (`POST /login`) works and what its real
+    `200` response shape is — **unresolved**. Password mode is implemented offline
+    with a provisional response validator; no live login has been performed, so
+    the login contract is unverified.
