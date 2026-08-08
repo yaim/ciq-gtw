@@ -3,7 +3,7 @@
  *
  * This module is pure (no network, no filesystem, no clock). It takes a full
  * OpenAPI document plus caller-supplied source metadata and produces a small,
- * stable, allowlisted contract snapshot for the nine operations the gateway
+ * stable, allowlisted contract snapshot for the ten operations the gateway
  * cares about. It fails closed on any drift from the shape the gateway relies
  * on (wrong OpenAPI major/minor, wrong API title, or a missing allowlisted
  * operation) so an incompatible upstream document can never be silently
@@ -25,6 +25,7 @@ export interface AllowlistedOperation {
  * is permitted to know about. The extractor fails closed if any is absent.
  */
 export const ALLOWLISTED_OPERATIONS: readonly AllowlistedOperation[] = [
+  { method: "post", path: "/login" },
   { method: "post", path: "/create_thread" },
   { method: "post", path: "/process_message" },
   { method: "get", path: "/get_messages" },

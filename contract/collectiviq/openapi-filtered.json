@@ -3,8 +3,8 @@
     "fullDocumentSha256": "c66332fd7fddd5bc085f984e8a9e34865b1ff7cd2e833942c207c52853fe8e63",
     "fullPathCount": 422,
     "note": "Filtered CollectivIQ contract snapshot. Descriptions and unrelated paths/components are removed. The declared 200 response schemas are empty in the source and therefore establish no runtime response contract; the adapter's success shapes are provisional until verified by live discovery.",
-    "operationCount": 9,
-    "retrievedAtUtc": "2026-08-05",
+    "operationCount": 10,
+    "retrievedAtUtc": "2026-08-07",
     "sourceUrl": "https://api.prod.collectiviq.ai/openapi.json"
   },
   "components": {
@@ -48,6 +48,65 @@
           "thread_title"
         ],
         "title": "Body_create_new_thread_create_thread_post",
+        "type": "object"
+      },
+      "Body_login_login_post": {
+        "properties": {
+          "client_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Client Id"
+          },
+          "client_secret": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "format": "password",
+            "title": "Client Secret"
+          },
+          "grant_type": {
+            "anyOf": [
+              {
+                "pattern": "^password$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Grant Type"
+          },
+          "password": {
+            "format": "password",
+            "title": "Password",
+            "type": "string"
+          },
+          "scope": {
+            "default": "",
+            "title": "Scope",
+            "type": "string"
+          },
+          "username": {
+            "title": "Username",
+            "type": "string"
+          }
+        },
+        "required": [
+          "username",
+          "password"
+        ],
+        "title": "Body_login_login_post",
         "type": "object"
       },
       "Body_process_message_process_message_post": {
@@ -408,6 +467,38 @@
             "OAuth2PasswordBearer": []
           }
         ]
+      }
+    },
+    "/login": {
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_login_login_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/process_message": {

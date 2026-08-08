@@ -54,6 +54,59 @@ function minimalSourceDoc(): Record<string, unknown> {
   };
 }
 
+/**
+ * A source document that also carries a realistic OAuth2 password-form `/login`
+ * operation (referencing `Body_login_login_post`) plus several unrelated auth
+ * endpoints that must never be pulled into the filtered contract.
+ */
+function sourceDocWithLogin(): Record<string, unknown> {
+  const doc = minimalSourceDoc();
+  const paths = doc["paths"] as Record<string, Record<string, unknown>>;
+
+  paths["/login"] = {
+    post: {
+      security: [{ OAuth2PasswordBearer: [] }],
+      requestBody: {
+        required: true,
+        content: {
+          "application/x-www-form-urlencoded": {
+            schema: { $ref: "#/components/schemas/Body_login_login_post" },
+          },
+        },
+      },
+      responses: { "200": { description: "ok", content: { "application/json": { schema: {} } } } },
+    },
+  };
+
+  // Unrelated auth endpoints that are NOT allowlisted and must be dropped.
+  for (const extra of ["/refresh", "/logout", "/session", "/user", "/admin"]) {
+    paths[extra] = {
+      post: {
+        security: [{ OAuth2PasswordBearer: [] }],
+        responses: { "200": { content: { "application/json": { schema: {} } } } },
+      },
+    };
+  }
+
+  const components = doc["components"] as Record<string, unknown>;
+  components["schemas"] = {
+    Body_login_login_post: {
+      type: "object",
+      required: ["username", "password"],
+      properties: {
+        grant_type: { type: "string" },
+        username: { type: "string" },
+        password: { type: "string" },
+        scope: { type: "string" },
+        client_id: { type: "string" },
+        client_secret: { type: "string" },
+      },
+    },
+  };
+
+  return doc;
+}
+
 describe("committed OpenAPI snapshot", () => {
   it("is a valid 3.1.x CollectivIQ contract with all allowlisted operations", () => {
     const snapshot = loadSnapshot();
@@ -122,6 +175,25 @@ describe("committed OpenAPI snapshot", () => {
       ]);
       expect(schema).toEqual({});
     }
+  });
+
+  it("includes POST /login and its transitive body schema, excluding unrelated auth endpoints", () => {
+    const built = buildFilteredContract(sourceDocWithLogin(), META);
+
+    // (a) POST /login is present.
+    expect(built.paths["/login"]?.["post"]).toBeDefined();
+
+    // (b) The transitive request-body schema is pulled in automatically.
+    expect(built.components.schemas["Body_login_login_post"]).toBeDefined();
+
+    // (c) Unrelated auth endpoints are never added by the filter.
+    for (const extra of ["/refresh", "/logout", "/session", "/user", "/admin"]) {
+      expect(built.paths[extra]).toBeUndefined();
+    }
+
+    // The login request encoding is the OAuth2 password form.
+    const loginContent = dig(built, ["paths", "/login", "post", "requestBody", "content"]);
+    expect(Object.keys(loginContent as object)).toEqual(["application/x-www-form-urlencoded"]);
   });
 
   it("stays byte-identical when rebuilt from an equivalent source (deterministic)", () => {
