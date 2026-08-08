@@ -155,6 +155,116 @@ describe("loadConfig — environment", () => {
   });
 });
 
+describe("loadConfig — upstream authentication mode", () => {
+  it("defaults to bearer mode and requires the API key", () => {
+    const config = loadConfig({ env: baseEnv() });
+    expect(config.COLLECTIVIQ_AUTH_MODE).toBe("bearer");
+    expect(config.COLLECTIVIQ_API_KEY).toBe("sk-fake-upstream-000");
+    // Bearer mode does not populate password-mode credentials.
+    expect(config.COLLECTIVIQ_USERNAME).toBeUndefined();
+    expect(config.COLLECTIVIQ_PASSWORD).toBeUndefined();
+  });
+
+  it("preserves the bearer token exactly (no trimming) within the 16 KiB bound", () => {
+    const padded = "  sk-padded-token  ";
+    const config = loadConfig({ env: baseEnv({ COLLECTIVIQ_API_KEY: padded }) });
+    expect(config.COLLECTIVIQ_API_KEY).toBe(padded);
+    expect(() => loadConfig({ env: baseEnv({ COLLECTIVIQ_API_KEY: "x".repeat(16_385) }) })).toThrow(
+      ConfigError,
+    );
+  });
+
+  it("loads password mode with username/password and ignores the (inactive) API key", () => {
+    const config = loadConfig({
+      env: baseEnv({
+        COLLECTIVIQ_AUTH_MODE: "password",
+        COLLECTIVIQ_USERNAME: "  probe-user@example.com  ",
+        COLLECTIVIQ_PASSWORD: "  keep-exactly  ",
+        // Inactive-mode credential present but ignored:
+        COLLECTIVIQ_API_KEY: "sk-should-be-ignored",
+      }),
+    });
+    expect(config.COLLECTIVIQ_AUTH_MODE).toBe("password");
+    // Username is trimmed; password is preserved exactly (incl. whitespace).
+    expect(config.COLLECTIVIQ_USERNAME).toBe("probe-user@example.com");
+    expect(config.COLLECTIVIQ_PASSWORD).toBe("  keep-exactly  ");
+    // The inactive bearer credential is NOT read into the config.
+    expect(config.COLLECTIVIQ_API_KEY).toBeUndefined();
+  });
+
+  it("runs password mode WITHOUT an API key present", () => {
+    const config = loadConfig({
+      env: baseEnv({
+        COLLECTIVIQ_AUTH_MODE: "password",
+        COLLECTIVIQ_USERNAME: "u@example.com",
+        COLLECTIVIQ_PASSWORD: "p",
+        COLLECTIVIQ_API_KEY: undefined,
+      }),
+    });
+    expect(config.COLLECTIVIQ_AUTH_MODE).toBe("password");
+  });
+
+  it("rejects an unsupported auth mode and missing/oversized credentials", () => {
+    expect(() => loadConfig({ env: baseEnv({ COLLECTIVIQ_AUTH_MODE: "token" }) })).toThrow(
+      ConfigError,
+    );
+    // Password mode requires BOTH username and password.
+    expect(() =>
+      loadConfig({
+        env: baseEnv({ COLLECTIVIQ_AUTH_MODE: "password", COLLECTIVIQ_PASSWORD: "p" }),
+      }),
+    ).toThrow(ConfigError);
+    expect(() =>
+      loadConfig({
+        env: baseEnv({ COLLECTIVIQ_AUTH_MODE: "password", COLLECTIVIQ_USERNAME: "u" }),
+      }),
+    ).toThrow(ConfigError);
+    // Byte bounds.
+    expect(() =>
+      loadConfig({
+        env: baseEnv({
+          COLLECTIVIQ_AUTH_MODE: "password",
+          COLLECTIVIQ_USERNAME: "u".repeat(321),
+          COLLECTIVIQ_PASSWORD: "p",
+        }),
+      }),
+    ).toThrow(ConfigError);
+    expect(() =>
+      loadConfig({
+        env: baseEnv({
+          COLLECTIVIQ_AUTH_MODE: "password",
+          COLLECTIVIQ_USERNAME: "u@example.com",
+          COLLECTIVIQ_PASSWORD: "p".repeat(4_097),
+        }),
+      }),
+    ).toThrow(ConfigError);
+  });
+
+  it("never echoes password-mode secret values in errors", () => {
+    const userLeak = "user-DO-NOT-LEAK@example.com";
+    const passLeak = "pw-DO-NOT-LEAK-9999";
+    try {
+      loadConfig({
+        env: baseEnv({
+          COLLECTIVIQ_AUTH_MODE: "password",
+          COLLECTIVIQ_USERNAME: userLeak,
+          COLLECTIVIQ_PASSWORD: passLeak,
+          PORT: "x", // force a failure so the error path runs
+        }),
+      });
+      throw new Error("expected ConfigError");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfigError);
+      const serialized = `${(error as ConfigError).format()} ${JSON.stringify(
+        (error as ConfigError).issues,
+      )}`;
+      expect(serialized).not.toContain(userLeak);
+      expect(serialized).not.toContain(passLeak);
+      expect(serialized).toContain("PORT");
+    }
+  });
+});
+
 describe("loadConfig — model file validation", () => {
   it("rejects duplicate YAML keys", () => {
     expectReject(

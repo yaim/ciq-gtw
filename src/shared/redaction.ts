@@ -50,15 +50,27 @@ export const REDACT_PATHS: readonly string[] = [
   "*.gatewayKeys",
   "COLLECTIVIQ_GATEWAY_KEYS",
   "*.COLLECTIVIQ_GATEWAY_KEYS",
+  "COLLECTIVIQ_USERNAME",
+  "*.COLLECTIVIQ_USERNAME",
+  "COLLECTIVIQ_PASSWORD",
+  "*.COLLECTIVIQ_PASSWORD",
   "token",
   "*.token",
+  "access_token",
+  "*.access_token",
+  "refresh_token",
+  "*.refresh_token",
   "secret",
   "*.secret",
   "password",
   "*.password",
+  "username",
+  "*.username",
+  "email",
+  "*.email",
 ];
 
-/** Substrings that unambiguously mark a credential-bearing key. */
+/** Substrings that unambiguously mark a credential-bearing or identity key. */
 const SECRET_KEY_MARKERS = [
   "authorization",
   "apikey",
@@ -66,6 +78,10 @@ const SECRET_KEY_MARKERS = [
   "password",
   "secret",
   "credential",
+  // Identity/auth values used by the OAuth password-exchange mode. The gateway
+  // logs no user content, so redacting these in logs is pure defense in depth.
+  "username",
+  "email",
 ];
 
 /** Exact normalized key names that are always credentials. */

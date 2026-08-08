@@ -18,7 +18,7 @@ import {
   type MockHandler,
   type MockServer,
 } from "./support/mock-server.js";
-import { TEST_API_KEY, FAST_TIMEOUTS } from "./support/adapter.js";
+import { FAST_TIMEOUTS, testTransportConfig } from "./support/adapter.js";
 import type { CollectivIQTransportConfig } from "../../src/collectiviq/types.js";
 
 let server: MockServer | undefined;
@@ -84,7 +84,7 @@ describe("runRecoveryCleanup", () => {
     server = await startMockServer(deleteMock(() => 200));
     const dir = tempDir();
     seedJournal(dir, server.baseUrl, [ID_A, ID_B]);
-    const config: CollectivIQTransportConfig = { baseUrl: server.baseUrl, apiKey: TEST_API_KEY };
+    const config: CollectivIQTransportConfig = testTransportConfig(server.baseUrl);
 
     const report = await runRecoveryCleanup(config, dir, FAST_TIMEOUTS);
     expect(report).toEqual({
@@ -122,7 +122,7 @@ describe("runRecoveryCleanup", () => {
     server = await startMockServer(deleteMock(() => 404));
     const dir = tempDir();
     seedJournal(dir, server.baseUrl, [ID_A]);
-    const config: CollectivIQTransportConfig = { baseUrl: server.baseUrl, apiKey: TEST_API_KEY };
+    const config: CollectivIQTransportConfig = testTransportConfig(server.baseUrl);
 
     const report = await runRecoveryCleanup(config, dir, FAST_TIMEOUTS);
     expect(report.resolved).toBe(1);
@@ -144,7 +144,7 @@ describe("runRecoveryCleanup", () => {
     server = await startMockServer(deleteMock((i) => (i === 1 ? 200 : 500)));
     const dir = tempDir();
     seedJournal(dir, server.baseUrl, [ID_A, ID_B]);
-    const config: CollectivIQTransportConfig = { baseUrl: server.baseUrl, apiKey: TEST_API_KEY };
+    const config: CollectivIQTransportConfig = testTransportConfig(server.baseUrl);
 
     const report = await runRecoveryCleanup(config, dir, FAST_TIMEOUTS);
     expect(report.resolved).toBe(1);
@@ -158,7 +158,7 @@ describe("runRecoveryCleanup", () => {
     server = await startMockServer(deleteMock((i) => (i === 1 ? 403 : 410)));
     const dir = tempDir();
     seedJournal(dir, server.baseUrl, [ID_A, ID_B]);
-    const config: CollectivIQTransportConfig = { baseUrl: server.baseUrl, apiKey: TEST_API_KEY };
+    const config: CollectivIQTransportConfig = testTransportConfig(server.baseUrl);
 
     const report = await runRecoveryCleanup(config, dir, FAST_TIMEOUTS);
     expect(report.resolved).toBe(0);
@@ -174,7 +174,7 @@ describe("runRecoveryCleanup", () => {
     server = await startMockServer(deleteMock((i) => (i === 1 ? 200 : 403)));
     const dir = tempDir();
     seedJournal(dir, server.baseUrl, [ID_A, ID_B]);
-    const config: CollectivIQTransportConfig = { baseUrl: server.baseUrl, apiKey: TEST_API_KEY };
+    const config: CollectivIQTransportConfig = testTransportConfig(server.baseUrl);
 
     const report = await runRecoveryCleanup(config, dir, FAST_TIMEOUTS);
     expect(report.resolved).toBe(1);
@@ -186,7 +186,7 @@ describe("runRecoveryCleanup", () => {
     server = await startMockServer(deleteMock(() => 500));
     const dir = tempDir();
     seedJournal(dir, server.baseUrl, [ID_A, ID_B]);
-    const config: CollectivIQTransportConfig = { baseUrl: server.baseUrl, apiKey: TEST_API_KEY };
+    const config: CollectivIQTransportConfig = testTransportConfig(server.baseUrl);
 
     const report = await runRecoveryCleanup(config, dir, FAST_TIMEOUTS);
     expect(report.unresolved).toBe(2);
@@ -196,12 +196,13 @@ describe("runRecoveryCleanup", () => {
   });
 
   it("refuses a missing, empty, or origin-mismatched journal", async () => {
-    const config: CollectivIQTransportConfig = {
-      baseUrl: "https://api.prod.collectiviq.ai",
-      apiKey: TEST_API_KEY,
-      // A fetch that must never be called on the refusal paths.
-      fetch: vi.fn(() => Promise.reject(new Error("should not fetch"))),
-    };
+    const config: CollectivIQTransportConfig = testTransportConfig(
+      "https://api.prod.collectiviq.ai",
+      {
+        // A fetch that must never be called on the refusal paths.
+        fetch: vi.fn(() => Promise.reject(new Error("should not fetch"))),
+      },
+    );
     const missing = tempDir();
     await expect(runRecoveryCleanup(config, missing)).rejects.toThrow();
 
@@ -220,10 +221,9 @@ describe("runRecoveryCleanup", () => {
     const dir = tempDir();
     // Write a malformed journal directly (private mode so only the content is at issue).
     writeFileSync(join(dir, "recovery-journal.json"), "{ not json", { mode: 0o600 });
-    const config: CollectivIQTransportConfig = {
-      baseUrl: "https://api.prod.collectiviq.ai",
-      apiKey: TEST_API_KEY,
-    };
+    const config: CollectivIQTransportConfig = testTransportConfig(
+      "https://api.prod.collectiviq.ai",
+    );
     await expect(runRecoveryCleanup(config, dir)).rejects.toThrow();
   });
 });
@@ -238,7 +238,7 @@ describe("runRecoveryCleanup crash-window convergence", () => {
     server = await startMockServer(deleteMock((i) => (i === 1 ? 200 : 404)));
     const dir = tempDir();
     seedJournal(dir, server.baseUrl, [ID_A]);
-    const config: CollectivIQTransportConfig = { baseUrl: server.baseUrl, apiKey: TEST_API_KEY };
+    const config: CollectivIQTransportConfig = testTransportConfig(server.baseUrl);
 
     // Inject a failing journal removal (unlink) for the first run only.
     const restore = __setRecoveryJournalFsForTests({
@@ -276,7 +276,7 @@ describe("runRecoveryCleanup crash-window convergence", () => {
     server = await startMockServer(deleteMock(() => 404));
     const dir = tempDir();
     seedJournal(dir, server.baseUrl, [ID_A]);
-    const config: CollectivIQTransportConfig = { baseUrl: server.baseUrl, apiKey: TEST_API_KEY };
+    const config: CollectivIQTransportConfig = testTransportConfig(server.baseUrl);
 
     const restore = __setRecoveryJournalFsForTests({
       unlinkSync: () => {
@@ -314,7 +314,14 @@ describe("recovery module import safety", () => {
       {},
       {
         get(_target, key) {
-          if (key === "COLLECTIVIQ_API_KEY") throw new Error("credential read at import");
+          // Any upstream credential variable read at import is a failure.
+          if (
+            key === "COLLECTIVIQ_API_KEY" ||
+            key === "COLLECTIVIQ_USERNAME" ||
+            key === "COLLECTIVIQ_PASSWORD"
+          ) {
+            throw new Error("credential read at import");
+          }
           return undefined;
         },
       },

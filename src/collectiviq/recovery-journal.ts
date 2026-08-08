@@ -298,11 +298,18 @@ export function readRecoveryJournal(dir: string): RecoveryJournalData | null {
 }
 
 /**
- * Ensure the journal directory exists, is a real (non-symlink) directory, and is
- * private (`0700`). Creates it with `0700` when absent and enforces the mode on
- * an existing directory. Refuses a symlinked or non-directory path.
+ * The single write-capable helper that makes the shared discovery/report
+ * directory a real, private (`0700`), non-symlink directory. It creates the
+ * directory with `0700` when absent and TIGHTENS an existing real directory
+ * (e.g. a `0755` directory left by the sanitized report writer) to `0700`
+ * before journal initialization. It refuses a symlinked or non-directory path.
+ *
+ * Both the sanitized report writer (`discovery-cli`) and the recovery journal
+ * use this same helper so the directory can never be left world/group readable.
+ * It is deliberately separate from the NON-creating {@link assertAccessibleDir}
+ * used on read-only paths.
  */
-function ensurePrivateDir(dir: string): void {
+export function ensureSafeDiscoveryDir(dir: string): void {
   mkdirSync(dir, { recursive: true, mode: JOURNAL_DIR_MODE });
   const stat = lstatSync(dir);
   if (stat.isSymbolicLink()) throw new Error("recovery journal directory must not be a symlink");
@@ -359,7 +366,7 @@ export function writeRecoveryJournal(dir: string, data: RecoveryJournalData): vo
     throw new Error("recovery journal is too large");
   }
 
-  ensurePrivateDir(dir);
+  ensureSafeDiscoveryDir(dir);
   const target = journalPath(dir);
   try {
     const stat = lstatSync(target);
@@ -480,6 +487,12 @@ export class FileRecoveryJournal implements RecoveryJournalSink {
 
   init(): Promise<void> {
     return settle(() => {
+      // Create-or-tighten the shared directory to a real, private 0700 directory
+      // BEFORE the read. This lets an approved run recover cleanly when the
+      // directory already exists at 0755 (e.g. left by the sanitized report
+      // writer) — the read path itself requires 0700 and would otherwise refuse
+      // it. A symlink/non-directory is still rejected here.
+      ensureSafeDiscoveryDir(this.#dir);
       const existing = readRecoveryJournal(this.#dir);
       if (existing !== null) {
         if (existing.destinationOrigin !== this.#origin) {

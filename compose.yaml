@@ -3,7 +3,17 @@
 # The container binds HOST=0.0.0.0 internally, but the port is published ONLY to
 # host loopback (127.0.0.1). Credentials are supplied through environment
 # interpolation (from your shell or a local .env); no functional secret is
-# stored in this file. The `:?` guards fail fast when a required secret is unset.
+# stored in this file.
+#
+# Upstream authentication is selected by COLLECTIVIQ_AUTH_MODE (default `bearer`).
+# The gateway validates the mode-appropriate credential at startup with
+# value-free errors, so the upstream credentials are forwarded softly (`:-`)
+# rather than hard-required here — this lets `password` mode run WITHOUT
+# COLLECTIVIQ_API_KEY set. Only COLLECTIVIQ_GATEWAY_KEYS (client auth) keeps the
+# `:?` fail-fast guard.
+#
+#   bearer   mode requires COLLECTIVIQ_API_KEY.
+#   password mode requires COLLECTIVIQ_USERNAME and COLLECTIVIQ_PASSWORD.
 
 services:
   gateway:
@@ -17,7 +27,10 @@ services:
       HOST: "0.0.0.0"
       PORT: "8787"
       COLLECTIVIQ_BASE_URL: "https://api.prod.collectiviq.ai"
-      COLLECTIVIQ_API_KEY: "${COLLECTIVIQ_API_KEY:?set COLLECTIVIQ_API_KEY in your shell or .env}"
+      COLLECTIVIQ_AUTH_MODE: "${COLLECTIVIQ_AUTH_MODE:-bearer}"
+      COLLECTIVIQ_API_KEY: "${COLLECTIVIQ_API_KEY:-}"
+      COLLECTIVIQ_USERNAME: "${COLLECTIVIQ_USERNAME:-}"
+      COLLECTIVIQ_PASSWORD: "${COLLECTIVIQ_PASSWORD:-}"
       COLLECTIVIQ_GATEWAY_KEYS: "${COLLECTIVIQ_GATEWAY_KEYS:?set COLLECTIVIQ_GATEWAY_KEYS in your shell or .env}"
       MODEL_CONFIG_PATH: "/app/config/models.yaml"
       LOG_LEVEL: "info"

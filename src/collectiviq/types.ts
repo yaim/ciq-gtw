@@ -15,6 +15,49 @@
 /** A minimal fetch surface, injected so the transport is fully testable. */
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
+/**
+ * An opaque credential lease handed to the transport for a single request.
+ *
+ * `generation` identifies the token instance a provider minted; it lets a
+ * provider apply generation-safe invalidation (a late `401` from a request that
+ * used an old token must never clear a newer token). `token` is the bearer value
+ * the transport/SSE internals attach; it is never serialized, logged, or exposed
+ * outside the transport boundary.
+ */
+export interface CredentialLease {
+  readonly generation: number;
+  readonly token: string;
+}
+
+/**
+ * The shared upstream-credential boundary used by the production adapter,
+ * discovery, SSE, deletion, and recovery tooling. Implementations live in
+ * `auth.ts` (a static bearer provider and an OAuth password-exchange provider);
+ * this interface is the only shape the transport depends on.
+ *
+ * `acquire` returns a lease (optionally honouring caller cancellation, e.g. by
+ * detaching from an in-flight login). `invalidate` marks a specific lease's
+ * token unusable so the next distinct request obtains a fresh one; it must be
+ * generation-safe. Neither method exposes the credential through serialization
+ * or logging.
+ */
+export interface CollectivIQCredentialProvider {
+  acquire(signal?: AbortSignal): Promise<CredentialLease>;
+  invalidate(lease: CredentialLease): void;
+}
+
+/**
+ * The origin/transport-only fields shared by authenticated and unauthenticated
+ * request paths. The login path uses this WITHOUT a credential provider so it
+ * can never recursively ask for credentials.
+ */
+export interface TransportBase {
+  /** Validated absolute base URL (e.g. `https://api.prod.collectiviq.ai`). */
+  readonly baseUrl: string;
+  /** Injected fetch implementation (defaults to global `fetch`). */
+  readonly fetch?: FetchLike;
+}
+
 /** Per-operation transport bounds. */
 export interface OperationTimeouts {
   /** Deadline to receive response headers (includes connect), in ms. */
@@ -26,13 +69,13 @@ export interface OperationTimeouts {
 }
 
 /** Transport configuration for the adapter/discovery client. */
-export interface CollectivIQTransportConfig {
-  /** Validated absolute base URL (e.g. `https://api.prod.collectiviq.ai`). */
-  readonly baseUrl: string;
-  /** Upstream bearer credential. Never logged. */
-  readonly apiKey: string;
-  /** Injected fetch implementation (defaults to global `fetch`). */
-  readonly fetch?: FetchLike;
+export interface CollectivIQTransportConfig extends TransportBase {
+  /**
+   * The shared credential provider. The transport acquires a lease per request
+   * and attaches its bearer token; the raw credential is never stored on the
+   * config, logged, or serialized.
+   */
+  readonly credentials: CollectivIQCredentialProvider;
   /** Per-operation timeouts; sensible defaults are applied when omitted. */
   readonly timeouts?: Partial<Record<CoreOperation, OperationTimeouts>>;
 }

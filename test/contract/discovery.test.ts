@@ -22,8 +22,12 @@ import {
   type MockHandler,
   type MockServer,
 } from "./support/mock-server.js";
-import { TEST_API_KEY } from "./support/adapter.js";
-import type { FetchLike } from "../../src/collectiviq/types.js";
+import { testTransportConfig } from "./support/adapter.js";
+import type {
+  CollectivIQCredentialProvider,
+  CredentialLease,
+  FetchLike,
+} from "../../src/collectiviq/types.js";
 
 /**
  * Run a baseline with recovery-journal approval and a synthetic in-memory
@@ -176,7 +180,15 @@ describe("discovery preflight", () => {
       {},
       {
         get(_target, key) {
-          if (key === "COLLECTIVIQ_API_KEY") throw new Error("credential read during preflight");
+          // Guard EVERY upstream credential variable, not just the bearer key, so
+          // preflight is proven credential-free in both auth modes.
+          if (
+            key === "COLLECTIVIQ_API_KEY" ||
+            key === "COLLECTIVIQ_USERNAME" ||
+            key === "COLLECTIVIQ_PASSWORD"
+          ) {
+            throw new Error("credential read during preflight");
+          }
           if (key === "CIQ_DISCOVERY_SINGLE_LLM") return "m1";
           if (key === "CIQ_DISCOVERY_COMBINED_LLMS") return "a,b";
           return undefined;
@@ -234,7 +246,7 @@ describe("discovery model modes", () => {
 describe("discovery baseline execution", () => {
   it("submits the deterministic single and combined stages without leaking ids", async () => {
     server = await startMockServer(baselineHandler());
-    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
 
     const report = await baseline(runner, {
       selection: { single: "solo", combined: ["a", "b", "c"] },
@@ -263,7 +275,7 @@ describe("discovery baseline execution", () => {
 
   it("captures raw process_message run_id structurally (name kept, value gone)", async () => {
     server = await startMockServer(baselineHandler());
-    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
     const report = await baseline(runner, {
       selection: { single: "solo", combined: ["a"] },
       cleanupApproved: false,
@@ -278,7 +290,7 @@ describe("discovery baseline execution", () => {
 
   it("captures raw auth and validation error bodies structurally", async () => {
     server = await startMockServer(baselineHandler());
-    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
     const report = await baseline(runner, {
       selection: { single: "solo", combined: ["a"] },
       cleanupApproved: false,
@@ -297,7 +309,7 @@ describe("discovery baseline execution", () => {
 
   it("cleans up only session-owned threads when approved, reporting remaining", async () => {
     server = await startMockServer(baselineHandler());
-    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
     const report = await baseline(runner, {
       selection: { single: "solo", combined: ["a"] },
       cleanupApproved: true,
@@ -319,7 +331,7 @@ describe("discovery baseline execution", () => {
 
   it("reports failure and retains ownership when an approved cleanup delete fails", async () => {
     server = await startMockServer(baselineHandler({ deleteStatus: 500 }));
-    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
     const report = await baseline(runner, {
       selection: { single: "solo", combined: ["a"] },
       cleanupApproved: true,
@@ -351,7 +363,7 @@ describe("discovery baseline execution", () => {
 
   it("does not clean up when cleanup is not approved", async () => {
     server = await startMockServer(baselineHandler());
-    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
     const report = await baseline(runner, {
       selection: { single: "solo", combined: ["a"] },
       cleanupApproved: false,
@@ -367,11 +379,9 @@ describe("discovery baseline execution", () => {
 describe("discovery recovery-journal integration", () => {
   it("rejects a run without recovery-journal approval before any request", async () => {
     const fetch = vi.fn<FetchLike>();
-    const runner = new DiscoverySessionRunner({
-      baseUrl: "https://api.prod.collectiviq.ai",
-      apiKey: TEST_API_KEY,
-      fetch,
-    });
+    const runner = new DiscoverySessionRunner(
+      testTransportConfig("https://api.prod.collectiviq.ai", { fetch }),
+    );
     await expect(
       runner.executeBaseline({
         selection: { single: "solo", combined: ["a"] },
@@ -385,11 +395,9 @@ describe("discovery recovery-journal integration", () => {
 
   it("rejects an approved run that supplies no journal sink before any request", async () => {
     const fetch = vi.fn<FetchLike>();
-    const runner = new DiscoverySessionRunner({
-      baseUrl: "https://api.prod.collectiviq.ai",
-      apiKey: TEST_API_KEY,
-      fetch,
-    });
+    const runner = new DiscoverySessionRunner(
+      testTransportConfig("https://api.prod.collectiviq.ai", { fetch }),
+    );
     await expect(
       runner.executeBaseline({
         selection: { single: "solo", combined: ["a"] },
@@ -404,11 +412,9 @@ describe("discovery recovery-journal integration", () => {
 
   it("initializes the journal before the first request and fails closed if init throws", async () => {
     const fetch = vi.fn<FetchLike>();
-    const runner = new DiscoverySessionRunner({
-      baseUrl: "https://api.prod.collectiviq.ai",
-      apiKey: TEST_API_KEY,
-      fetch,
-    });
+    const runner = new DiscoverySessionRunner(
+      testTransportConfig("https://api.prod.collectiviq.ai", { fetch }),
+    );
     const journal = new InMemoryRecoveryJournal();
     journal.init = (): Promise<void> => Promise.reject(new Error("journal not writable"));
     await expect(
@@ -425,7 +431,7 @@ describe("discovery recovery-journal integration", () => {
 
   it("records created ids and drops them after a successful cleanup", async () => {
     server = await startMockServer(baselineHandler());
-    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
     const journal = new InMemoryRecoveryJournal();
     const report = await runner.executeBaseline({
       selection: { single: "solo", combined: ["a"] },
@@ -442,7 +448,7 @@ describe("discovery recovery-journal integration", () => {
 
   it("retains ids in the journal when cleanup fails, so they stay recoverable", async () => {
     server = await startMockServer(baselineHandler({ deleteStatus: 500 }));
-    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
     const journal = new InMemoryRecoveryJournal();
     const report = await runner.executeBaseline({
       selection: { single: "solo", combined: ["a"] },
@@ -484,7 +490,7 @@ describe("discovery recovery-journal integration", () => {
       return replyJson(res, {}, 404);
     };
     server = await startMockServer(handler);
-    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
     const journal = new InMemoryRecoveryJournal();
     const report = await runner.executeBaseline({
       selection: { single: "solo", combined: ["a"] },
@@ -504,7 +510,7 @@ describe("discovery recovery-journal integration", () => {
 describe("discovery available_llms structural gate", () => {
   it("accepts a well-formed llms inventory as a successful observation", async () => {
     server = await startMockServer(baselineHandler());
-    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
     const report = await baseline(runner, {
       selection: { single: "solo", combined: ["a"] },
       cleanupApproved: false,
@@ -528,7 +534,7 @@ describe("discovery available_llms structural gate", () => {
     for (const body of malformed) {
       const s = await startMockServer(regressionHandler({ available: () => ({ body }) }));
       try {
-        const runner = new DiscoverySessionRunner({ baseUrl: s.baseUrl, apiKey: TEST_API_KEY });
+        const runner = new DiscoverySessionRunner(testTransportConfig(s.baseUrl));
         const report = await baseline(runner, {
           selection: { single: "solo", combined: ["a"] },
           cleanupApproved: false,
@@ -559,7 +565,7 @@ describe("discovery available_llms structural gate", () => {
     });
     server = await startMockServer(regressionHandler({ available: () => ({ body: {} }) }));
     try {
-      const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+      const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
       const report = await baseline(runner, {
         selection: { single: "solo", combined: ["a"] },
         cleanupApproved: false,
@@ -580,7 +586,7 @@ describe("discovery available_llms structural gate", () => {
 describe("discovery fatal journal-persistence abort", () => {
   it("aborts after a failed recordCreated: one create, no submit, cleanup attempted, content-free", async () => {
     server = await startMockServer(baselineHandler());
-    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
     const journal = new InMemoryRecoveryJournal();
     // Persisting the first created id fails durably; the injected message must
     // never appear in the sanitized report.
@@ -619,7 +625,7 @@ describe("discovery fatal journal-persistence abort", () => {
 
   it("still returns a structured abort report when the cleanup DELETE's journal removal also fails", async () => {
     server = await startMockServer(baselineHandler());
-    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
     const journal = new InMemoryRecoveryJournal();
     // BOTH the create-time record and the cleanup-time removal fail durably.
     journal.recordCreated = (): Promise<void> =>
@@ -668,7 +674,7 @@ describe("discovery fatal journal-persistence abort", () => {
     // DELETE's journal removal fails. The run must still return a structured,
     // non-zero report rather than reject.
     server = await startMockServer(baselineHandler());
-    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
     const journal = new InMemoryRecoveryJournal();
     journal.recordDeleted = (): Promise<void> =>
       Promise.reject(new Error("SECRET-DELETE /Users/x/.agent"));
@@ -694,11 +700,9 @@ describe("discovery fatal journal-persistence abort", () => {
 
   it("makes zero network calls when journal init fails before any create", async () => {
     const fetch = vi.fn<FetchLike>();
-    const runner = new DiscoverySessionRunner({
-      baseUrl: "https://api.prod.collectiviq.ai",
-      apiKey: TEST_API_KEY,
-      fetch,
-    });
+    const runner = new DiscoverySessionRunner(
+      testTransportConfig("https://api.prod.collectiviq.ai", { fetch }),
+    );
     const journal = new InMemoryRecoveryJournal();
     journal.init = (): Promise<void> => Promise.reject(new Error("not writable"));
     await expect(
@@ -719,11 +723,9 @@ describe("discovery fatal journal-persistence abort", () => {
 describe("discovery runner approval invariants", () => {
   it("rejects not-found approval without cleanup approval before any fetch", async () => {
     const fetch = vi.fn<FetchLike>();
-    const runner = new DiscoverySessionRunner({
-      baseUrl: "https://api.prod.collectiviq.ai",
-      apiKey: TEST_API_KEY,
-      fetch,
-    });
+    const runner = new DiscoverySessionRunner(
+      testTransportConfig("https://api.prod.collectiviq.ai", { fetch }),
+    );
     await expect(
       baseline(runner, {
         selection: { single: "solo", combined: ["a"] },
@@ -736,11 +738,9 @@ describe("discovery runner approval invariants", () => {
 
   it("rejects a duplicate combined selection before any fetch", async () => {
     const fetch = vi.fn<FetchLike>();
-    const runner = new DiscoverySessionRunner({
-      baseUrl: "https://api.prod.collectiviq.ai",
-      apiKey: TEST_API_KEY,
-      fetch,
-    });
+    const runner = new DiscoverySessionRunner(
+      testTransportConfig("https://api.prod.collectiviq.ai", { fetch }),
+    );
     await expect(
       baseline(runner, {
         selection: { single: "solo", combined: ["a", "a"] },
@@ -757,7 +757,7 @@ describe("discovery runner approval invariants", () => {
 describe("discovery not-found observation", () => {
   it("re-deletes the same session-owned id and never a guessed id", async () => {
     server = await startMockServer(baselineHandler());
-    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
     const report = await baseline(runner, {
       selection: { single: "solo", combined: ["a"] },
       cleanupApproved: true,
@@ -798,7 +798,7 @@ describe("discovery not-found observation", () => {
   it("skips the second delete and retains ownership when the first delete fails", async () => {
     // Every delete returns 500, so the not-found first deletion fails.
     server = await startMockServer(baselineHandler({ deleteStatus: 500 }));
-    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
     const report = await baseline(runner, {
       selection: { single: "solo", combined: ["a"] },
       cleanupApproved: true,
@@ -833,7 +833,7 @@ describe("discovery not-found observation", () => {
 describe("discovery token/abort unreachability", () => {
   it("never touches token or abort endpoints and exposes no such method", async () => {
     server = await startMockServer(baselineHandler());
-    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
     await baseline(runner, {
       selection: { single: "solo", combined: ["a", "b"] },
       cleanupApproved: true,
@@ -1060,7 +1060,7 @@ describe("discovery SSE non-2xx handling", () => {
       return replyJson(res, {}, 404);
     };
     server = await startMockServer(handler);
-    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
     const report = await baseline(runner, {
       selection: { single: "solo", combined: ["a"] },
       cleanupApproved: false,
@@ -1070,6 +1070,151 @@ describe("discovery SSE non-2xx handling", () => {
     expect(sse?.ok).toBe(false);
     expect(sse?.status).toBe(401);
     expect(sse?.structure).toBeNull();
+  });
+});
+
+// --- SSE bespoke lease behavior (401 invalidation, 403 no-invalidation) ------
+
+/**
+ * A spy credential provider that records an ORDERED, value-free ledger of its
+ * lifecycle events and always returns one fixed lease. Unlike the static bearer
+ * provider it lets a test prove the transport's exact acquire -> invalidate ->
+ * reacquire causality across the SSE stage, not merely aggregate counts.
+ *
+ * The ledger pushes `"acquire"` on every {@link acquire} and
+ * `"invalidate:<generation>"` on every {@link invalidate} (using the exact
+ * lease's `generation`, so a late invalidation of a stale generation would be
+ * distinguishable). The lease/generation/token never change: genuine token
+ * re-minting is proven separately in `auth.test.ts`; here we only prove the
+ * transport's invalidate-then-reacquire ordering.
+ */
+class SseSpyProvider implements CollectivIQCredentialProvider {
+  acquires = 0;
+  readonly invalidations: CredentialLease[] = [];
+  /** Ordered, value-free event ledger: "acquire" | "invalidate:<generation>". */
+  readonly ledger: string[] = [];
+  readonly lease: CredentialLease = { generation: 1, token: "spy-token" };
+  acquire(): Promise<CredentialLease> {
+    this.acquires += 1;
+    this.ledger.push("acquire");
+    return Promise.resolve(this.lease);
+  }
+  invalidate(lease: CredentialLease): void {
+    this.invalidations.push(lease);
+    this.ledger.push(`invalidate:${lease.generation}`);
+  }
+}
+
+/**
+ * A full baseline-capable mock whose `/user/events` returns a fixed non-2xx
+ * status. Every JSON stage returns a normalizer-valid body (mirroring
+ * `baselineHandler`) so the run reaches the SSE stage; the auth-error probe's
+ * empty-bearer request still receives its 401.
+ */
+function sseLeaseHandler(userEventsStatus: number): MockHandler {
+  let nextThread = 1000;
+  return (req, res) => {
+    if (req.path === "/available_llms") {
+      const authz = req.headers["authorization"];
+      if (typeof authz === "string" && authz.trim() === "Bearer") {
+        return replyJson(res, { error: "denied" }, 401);
+      }
+      return replyJson(res, { llms: { "m-1": {} } });
+    }
+    if (req.path === "/get_messages") {
+      return req.query.get("thread_id") === null
+        ? replyJson(res, { detail: "invalid request" }, 422)
+        : replyJson(res, { messages: [] });
+    }
+    if (req.path === "/create_thread" && req.method === "POST") {
+      nextThread += 1;
+      return replyJson(res, { thread_id: nextThread });
+    }
+    if (req.path === "/process_message" && req.method === "POST") {
+      return replyJson(res, { run_id: 5000 });
+    }
+    if (req.path.startsWith("/delete_thread/") && req.method === "DELETE") {
+      return replyJson(res, {});
+    }
+    if (req.path === "/user/events") {
+      return replyJson(res, { detail: "denied" }, userEventsStatus);
+    }
+    return replyJson(res, {}, 404);
+  };
+}
+
+describe("discovery SSE lease lifecycle", () => {
+  it("invalidates the exact SSE lease on 401, issues /user/events once, and keeps acquiring after", async () => {
+    server = await startMockServer(sseLeaseHandler(401));
+    const spy = new SseSpyProvider();
+    const runner = new DiscoverySessionRunner(
+      testTransportConfig(server.baseUrl, { credentials: spy }),
+    );
+
+    const report = await baseline(runner, {
+      selection: { single: "solo", combined: ["a"] },
+      cleanupApproved: false,
+      observeNotFoundApproved: false,
+    });
+
+    const sse = report.observations.find((o) => o.stage === "sse_structure");
+    expect(sse?.ok).toBe(false);
+    expect(sse?.status).toBe(401);
+    expect(sse?.structure).toBeNull();
+
+    // The SSE request was issued exactly once and never replayed.
+    expect(server.requests.filter((r) => r.path === "/user/events")).toHaveLength(1);
+
+    // The 401 invalidated exactly the lease used for that SSE request, once.
+    expect(spy.invalidations).toHaveLength(1);
+    expect(spy.invalidations[0]).toBe(spy.lease);
+    // The ledger records exactly one invalidation, of the SSE lease's generation.
+    const invalidateEvents = spy.ledger.filter((e) => e.startsWith("invalidate:"));
+    expect(invalidateEvents).toEqual(["invalidate:1"]);
+
+    // Causal ordering, not just counts: the single invalidation happens AFTER an
+    // acquire (the SSE lease acquisition) and BEFORE at least one further acquire
+    // (the subsequent messages_state request re-authenticating).
+    const invalidateIdx = spy.ledger.indexOf("invalidate:1");
+    expect(invalidateIdx).toBeGreaterThan(0);
+    // At least one acquire precedes the invalidation (the SSE lease acquire).
+    expect(spy.ledger.slice(0, invalidateIdx)).toContain("acquire");
+    // ...and at least one distinct acquire follows it (the messages_state probe).
+    expect(spy.ledger.slice(invalidateIdx + 1)).toContain("acquire");
+
+    // That subsequent distinct request (messages_state) still succeeds.
+    const messages = report.observations.find((o) => o.stage === "messages_state");
+    expect(messages?.ok).toBe(true);
+
+    // No bearer token value ever leaks into the sanitized report.
+    expect(JSON.stringify(report)).not.toContain("spy-token");
+  });
+
+  it("does NOT invalidate the lease on an SSE 403 and issues /user/events once", async () => {
+    server = await startMockServer(sseLeaseHandler(403));
+    const spy = new SseSpyProvider();
+    const runner = new DiscoverySessionRunner(
+      testTransportConfig(server.baseUrl, { credentials: spy }),
+    );
+
+    const report = await baseline(runner, {
+      selection: { single: "solo", combined: ["a"] },
+      cleanupApproved: false,
+      observeNotFoundApproved: false,
+    });
+
+    const sse = report.observations.find((o) => o.stage === "sse_structure");
+    expect(sse?.ok).toBe(false);
+    expect(sse?.status).toBe(403);
+    expect(sse?.structure).toBeNull();
+
+    expect(server.requests.filter((r) => r.path === "/user/events")).toHaveLength(1);
+    // A 403 is an authorization signal, not a stale-credential one: no invalidation.
+    expect(spy.invalidations).toHaveLength(0);
+    // The ordered ledger corroborates it: no invalidation event was ever recorded.
+    expect(spy.ledger.some((e) => e.startsWith("invalidate:"))).toBe(false);
+
+    expect(JSON.stringify(report)).not.toContain("spy-token");
   });
 });
 
@@ -1138,7 +1283,7 @@ describe("discovery production-normalization gate", () => {
     server = await startMockServer(
       regressionHandler({ create: () => ({ body: { meta: { thread_id: 123 } } }) }),
     );
-    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
     const report = await baseline(runner, {
       selection: OK_SELECTION,
       cleanupApproved: false,
@@ -1167,7 +1312,7 @@ describe("discovery production-normalization gate", () => {
         sse: 'data: {"run_id":8888}\n\n',
       }),
     );
-    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
     const report = await baseline(runner, {
       selection: OK_SELECTION,
       cleanupApproved: false,
@@ -1187,7 +1332,7 @@ describe("discovery production-normalization gate", () => {
 
   it("fails messages on a 2xx body without a valid messages array, keeping raw structure", async () => {
     server = await startMockServer(regressionHandler({ messages: () => ({ body: {} }) }));
-    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
     const report = await baseline(runner, {
       selection: OK_SELECTION,
       cleanupApproved: false,
@@ -1205,7 +1350,7 @@ describe("discovery production-normalization gate", () => {
     server = await startMockServer(
       regressionHandler({ messages: () => ({ body: { messages: [{ nope: 1 }] } }) }),
     );
-    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
     const report = await baseline(runner, {
       selection: OK_SELECTION,
       cleanupApproved: false,
@@ -1228,7 +1373,7 @@ describe("discovery combined-stage SSE correlation", () => {
         sse: 'data: {"thread_id":1002,"combined_run_id":7002}\n\n',
       }),
     );
-    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
     const report = await baseline(runner, {
       selection: OK_SELECTION,
       cleanupApproved: false,
@@ -1248,7 +1393,7 @@ describe("discovery combined-stage SSE correlation", () => {
         sse: 'data: {"thread_id":1001,"run_id":7001}\n\n',
       }),
     );
-    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
     const report = await baseline(runner, {
       selection: OK_SELECTION,
       cleanupApproved: false,
@@ -1267,7 +1412,7 @@ describe("discovery combined-stage SSE correlation", () => {
         sse: 'data: {"thread_id":1002,"run_id":7001}\n\n',
       }),
     );
-    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
     const report = await baseline(runner, {
       selection: OK_SELECTION,
       cleanupApproved: false,
@@ -1285,7 +1430,7 @@ describe("discovery combined-stage SSE correlation", () => {
         sse: 'data: {"thread_id":1001}\n\n',
       }),
     );
-    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
     const report = await baseline(runner, {
       selection: OK_SELECTION,
       cleanupApproved: false,
@@ -1304,7 +1449,7 @@ describe("discovery combined-stage SSE correlation", () => {
         sse: 'data: {"thread_id":1002,"run_id":7101}\n\n',
       }),
     );
-    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
     const report = await baseline(runner, {
       selection: OK_SELECTION,
       cleanupApproved: false,
@@ -1326,7 +1471,7 @@ describe("discovery combined-stage SSE correlation", () => {
         sse: 'data: {"thread_id":1002,"combined_run_id":7102}\n\n',
       }),
     );
-    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
     const report = await baseline(runner, {
       selection: OK_SELECTION,
       cleanupApproved: false,
@@ -1345,7 +1490,7 @@ describe("discovery combined-stage SSE correlation", () => {
 describe("discovery canonical runner selection", () => {
   it("canonicalizes padded combined ids before transmission without mutating the caller array", async () => {
     server = await startMockServer(regressionHandler());
-    const runner = new DiscoverySessionRunner({ baseUrl: server.baseUrl, apiKey: TEST_API_KEY });
+    const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
     const combined = [" a ", "b "];
     await baseline(runner, {
       selection: { single: " solo ", combined },
@@ -1374,11 +1519,9 @@ describe("discovery canonical runner selection", () => {
     ];
     for (const selection of cases) {
       const fetch = vi.fn<FetchLike>();
-      const runner = new DiscoverySessionRunner({
-        baseUrl: "https://api.prod.collectiviq.ai",
-        apiKey: TEST_API_KEY,
-        fetch,
-      });
+      const runner = new DiscoverySessionRunner(
+        testTransportConfig("https://api.prod.collectiviq.ai", { fetch }),
+      );
       await expect(
         baseline(runner, {
           selection,
@@ -1452,7 +1595,14 @@ describe("discovery module import safety", () => {
       {},
       {
         get(_target, key) {
-          if (key === "COLLECTIVIQ_API_KEY") throw new Error("credential read at import");
+          // Any upstream credential variable read at import is a failure.
+          if (
+            key === "COLLECTIVIQ_API_KEY" ||
+            key === "COLLECTIVIQ_USERNAME" ||
+            key === "COLLECTIVIQ_PASSWORD"
+          ) {
+            throw new Error("credential read at import");
+          }
           return undefined;
         },
       },

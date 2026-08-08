@@ -17,6 +17,7 @@ const config = {
   HOST: "127.0.0.1",
   PORT: 8787,
   COLLECTIVIQ_BASE_URL: "https://api.prod.collectiviq.ai",
+  COLLECTIVIQ_AUTH_MODE: "bearer",
   COLLECTIVIQ_API_KEY: "sk-fake",
   COLLECTIVIQ_GATEWAY_KEYS: ["gw-fake"],
   MODEL_CONFIG_PATH: "./config/models.yaml",

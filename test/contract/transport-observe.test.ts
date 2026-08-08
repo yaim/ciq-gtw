@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { startMockServer, replyJson, replyRaw, type MockServer } from "./support/mock-server.js";
-import { FAST_TIMEOUTS, TEST_API_KEY } from "./support/adapter.js";
+import { FAST_TIMEOUTS, testTransportConfig } from "./support/adapter.js";
 import {
   observeUpstreamJson,
   requestUpstreamJson,
@@ -20,7 +20,7 @@ function delay(ms: number): Promise<void> {
 }
 
 function config(baseUrl: string): CollectivIQTransportConfig {
-  return { baseUrl, apiKey: TEST_API_KEY };
+  return testTransportConfig(baseUrl);
 }
 
 function getRequest(overrides: Partial<UpstreamJsonRequest> = {}): UpstreamJsonRequest {

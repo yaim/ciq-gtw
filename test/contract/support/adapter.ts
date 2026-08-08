@@ -3,6 +3,7 @@
  * overridable per-operation timeouts.
  */
 import { CollectivIQHttpAdapter } from "../../../src/collectiviq/adapter.js";
+import { staticBearerCredentialProvider } from "../../../src/collectiviq/auth.js";
 import type {
   CollectivIQTransportConfig,
   OperationTimeouts,
@@ -16,15 +17,31 @@ export const FAST_TIMEOUTS: OperationTimeouts = {
   maxResponseBytes: 1_048_576,
 };
 
+/** A static bearer credential provider carrying the fixed synthetic test token. */
+export function testCredentials() {
+  return staticBearerCredentialProvider(TEST_API_KEY);
+}
+
+/**
+ * Build a transport config using a static bearer provider (the fixed test
+ * token). Extra fields (e.g. `fetch`, `timeouts`) can be merged via `overrides`.
+ */
+export function testTransportConfig(
+  baseUrl: string,
+  overrides: Partial<CollectivIQTransportConfig> = {},
+): CollectivIQTransportConfig {
+  return { baseUrl, credentials: staticBearerCredentialProvider(TEST_API_KEY), ...overrides };
+}
+
 export function makeAdapter(
   baseUrl: string,
   timeouts: OperationTimeouts = FAST_TIMEOUTS,
   overrides: Partial<CollectivIQTransportConfig> = {},
 ): CollectivIQHttpAdapter {
-  return new CollectivIQHttpAdapter({
-    baseUrl,
-    apiKey: TEST_API_KEY,
-    timeouts: { createThread: timeouts, processMessage: timeouts, getMessages: timeouts },
-    ...overrides,
-  });
+  return new CollectivIQHttpAdapter(
+    testTransportConfig(baseUrl, {
+      timeouts: { createThread: timeouts, processMessage: timeouts, getMessages: timeouts },
+      ...overrides,
+    }),
+  );
 }

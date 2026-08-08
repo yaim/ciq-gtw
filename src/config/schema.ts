@@ -9,6 +9,8 @@ import { Type, type Static } from "typebox";
  */
 
 export const ENVIRONMENTS = ["development", "staging", "production"] as const;
+/** Upstream authentication modes; re-exported from the adapter's auth boundary. */
+export { AUTH_MODES } from "../collectiviq/auth.js";
 export const LOG_LEVELS = ["trace", "debug", "info", "warn", "error", "fatal", "silent"] as const;
 export const TOOL_MODES = ["disabled", "emulated", "native"] as const;
 
@@ -50,6 +52,7 @@ export const ENV_DEFAULTS = {
   HOST: "127.0.0.1",
   PORT: 8787,
   COLLECTIVIQ_BASE_URL: "https://api.prod.collectiviq.ai",
+  COLLECTIVIQ_AUTH_MODE: "bearer",
   MODEL_CONFIG_PATH: "./config/models.yaml",
   LOG_LEVEL: "info",
   LOG_CONTENT: false,
@@ -70,7 +73,13 @@ export const EnvConfigSchema = Type.Object(
     HOST: Type.String({ minLength: 1 }),
     PORT: Type.Integer({ minimum: 1, maximum: 65_535 }),
     COLLECTIVIQ_BASE_URL: Type.String({ minLength: 1 }),
-    COLLECTIVIQ_API_KEY: Type.String({ minLength: 1 }),
+    COLLECTIVIQ_AUTH_MODE: Type.Union([Type.Literal("bearer"), Type.Literal("password")]),
+    // Credentials are conditionally present by mode; the loader enforces presence
+    // and byte bounds per the active mode and preserves values exactly. Only the
+    // active-mode fields are populated on the validated candidate.
+    COLLECTIVIQ_API_KEY: Type.Optional(Type.String({ minLength: 1 })),
+    COLLECTIVIQ_USERNAME: Type.Optional(Type.String({ minLength: 1 })),
+    COLLECTIVIQ_PASSWORD: Type.Optional(Type.String({ minLength: 1 })),
     COLLECTIVIQ_GATEWAY_KEYS: Type.Array(Type.String({ minLength: 1 }), {
       minItems: 1,
       uniqueItems: true,

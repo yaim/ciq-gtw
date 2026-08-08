@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { observeThreadDeletion, resolveThreadDeletion } from "../../src/collectiviq/cleanup.js";
 import { startMockServer, replyJson, type MockServer } from "./support/mock-server.js";
-import { TEST_API_KEY, FAST_TIMEOUTS } from "./support/adapter.js";
+import { FAST_TIMEOUTS, testTransportConfig } from "./support/adapter.js";
 import type { CollectivIQTransportConfig, FetchLike } from "../../src/collectiviq/types.js";
 
 let server: MockServer | undefined;
@@ -19,7 +19,7 @@ describe("cleanup delete diagnostics", () => {
       if (req.method === "DELETE") return replyJson(res, {});
       return replyJson(res, {}, 404);
     });
-    const config: CollectivIQTransportConfig = { baseUrl: server.baseUrl, apiKey: TEST_API_KEY };
+    const config: CollectivIQTransportConfig = testTransportConfig(server.baseUrl);
     const diag = await observeThreadDeletion(config, SYNTHETIC_ID, FAST_TIMEOUTS);
     expect(diag).toEqual({ ok: true, status: 200, errorCode: null });
     expect(JSON.stringify(diag)).not.toContain(SYNTHETIC_ID);
@@ -31,7 +31,7 @@ describe("cleanup delete diagnostics", () => {
       if (req.method === "DELETE") return replyJson(res, { detail: "forbidden" }, 403);
       return replyJson(res, {}, 404);
     });
-    const config: CollectivIQTransportConfig = { baseUrl: server.baseUrl, apiKey: TEST_API_KEY };
+    const config: CollectivIQTransportConfig = testTransportConfig(server.baseUrl);
     const forbidden = await observeThreadDeletion(config, SYNTHETIC_ID, FAST_TIMEOUTS);
     expect(forbidden).toEqual({
       ok: false,
@@ -43,7 +43,7 @@ describe("cleanup delete diagnostics", () => {
     // A network failure has no status and the network code.
     const throwingFetch: FetchLike = () => Promise.reject(new Error("boom"));
     const network = await observeThreadDeletion(
-      { baseUrl: "https://api.prod.collectiviq.ai", apiKey: TEST_API_KEY, fetch: throwingFetch },
+      testTransportConfig("https://api.prod.collectiviq.ai", { fetch: throwingFetch }),
       SYNTHETIC_ID,
       FAST_TIMEOUTS,
     );
@@ -57,7 +57,7 @@ describe("cleanup delete diagnostics", () => {
         });
       });
     const timeout = await observeThreadDeletion(
-      { baseUrl: "https://api.prod.collectiviq.ai", apiKey: TEST_API_KEY, fetch: hangingFetch },
+      testTransportConfig("https://api.prod.collectiviq.ai", { fetch: hangingFetch }),
       SYNTHETIC_ID,
       { headerTimeoutMs: 20, bodyTimeoutMs: 20, maxResponseBytes: 1_048_576 },
     );
@@ -71,7 +71,7 @@ describe("recovery delete resolution", () => {
       if (req.method === "DELETE") return replyJson(res, {});
       return replyJson(res, {}, 404);
     });
-    const config: CollectivIQTransportConfig = { baseUrl: server.baseUrl, apiKey: TEST_API_KEY };
+    const config: CollectivIQTransportConfig = testTransportConfig(server.baseUrl);
     const outcome = await resolveThreadDeletion(config, SYNTHETIC_ID, FAST_TIMEOUTS);
     expect(outcome).toEqual({
       diagnostics: { ok: true, status: 200, errorCode: null },
@@ -82,7 +82,7 @@ describe("recovery delete resolution", () => {
 
   it("resolves an exact 404 as already_absent without relabeling HTTP truth", async () => {
     server = await startMockServer((_req, res) => replyJson(res, { detail: "gone" }, 404));
-    const config: CollectivIQTransportConfig = { baseUrl: server.baseUrl, apiKey: TEST_API_KEY };
+    const config: CollectivIQTransportConfig = testTransportConfig(server.baseUrl);
     const outcome = await resolveThreadDeletion(config, SYNTHETIC_ID, FAST_TIMEOUTS);
     // A 404 is not an HTTP success: ok stays false, status stays 404.
     expect(outcome.diagnostics.ok).toBe(false);
@@ -94,7 +94,7 @@ describe("recovery delete resolution", () => {
 
   it("does not resolve a 403, a 410, or a network failure", async () => {
     server = await startMockServer((_req, res) => replyJson(res, {}, 403));
-    const config: CollectivIQTransportConfig = { baseUrl: server.baseUrl, apiKey: TEST_API_KEY };
+    const config: CollectivIQTransportConfig = testTransportConfig(server.baseUrl);
     const forbidden = await resolveThreadDeletion(config, SYNTHETIC_ID, FAST_TIMEOUTS);
     expect(forbidden.resolved).toBe(false);
     expect(forbidden.resolution).toBeNull();
@@ -102,13 +102,13 @@ describe("recovery delete resolution", () => {
 
     await server.close();
     server = await startMockServer((_req, res) => replyJson(res, {}, 410));
-    const config2: CollectivIQTransportConfig = { baseUrl: server.baseUrl, apiKey: TEST_API_KEY };
+    const config2: CollectivIQTransportConfig = testTransportConfig(server.baseUrl);
     const gone = await resolveThreadDeletion(config2, SYNTHETIC_ID, FAST_TIMEOUTS);
     expect(gone.resolved).toBe(false);
 
     const throwingFetch: FetchLike = () => Promise.reject(new Error("boom"));
     const network = await resolveThreadDeletion(
-      { baseUrl: "https://api.prod.collectiviq.ai", apiKey: TEST_API_KEY, fetch: throwingFetch },
+      testTransportConfig("https://api.prod.collectiviq.ai", { fetch: throwingFetch }),
       SYNTHETIC_ID,
       FAST_TIMEOUTS,
     );

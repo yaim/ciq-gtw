@@ -13,6 +13,7 @@ const config: AppConfig = {
   HOST: "127.0.0.1",
   PORT: 8787,
   COLLECTIVIQ_BASE_URL: "https://api.prod.collectiviq.ai",
+  COLLECTIVIQ_AUTH_MODE: "bearer",
   COLLECTIVIQ_API_KEY: UPSTREAM_KEY,
   COLLECTIVIQ_GATEWAY_KEYS: [GATEWAY_KEY],
   MODEL_CONFIG_PATH: "./config/models.yaml",

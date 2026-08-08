@@ -147,6 +147,47 @@ describe("createLogger sanitization (actual output)", () => {
     expect(rec["totalTokens"]).toBe(10);
   });
 
+  it("redacts OAuth password-mode login request/response fields through Pino", () => {
+    const cap = capturingLogger();
+    cap.logger.info(
+      {
+        loginRequest: {
+          grant_type: "password",
+          username: "S_USERNAME",
+          password: "S_PASSWORD",
+          scope: "",
+        },
+        loginResponse: {
+          access_token: "S_ACCESS",
+          token_type: "Bearer",
+          refresh_token: "S_REFRESH",
+        },
+        env: { COLLECTIVIQ_USERNAME: "S_ENV_USER", COLLECTIVIQ_PASSWORD: "S_ENV_PASS" },
+        contact: { email: "S_EMAIL" },
+      },
+      "m",
+    );
+    const text = cap.text();
+    for (const sentinel of [
+      "S_USERNAME",
+      "S_PASSWORD",
+      "S_ACCESS",
+      "S_REFRESH",
+      "S_ENV_USER",
+      "S_ENV_PASS",
+      "S_EMAIL",
+    ]) {
+      expect(text).not.toContain(sentinel);
+    }
+    const rec = cap.records()[0] as {
+      loginRequest: Record<string, unknown>;
+      loginResponse: Record<string, unknown>;
+    };
+    // Non-secret login fields remain usable (token_type is the constant "Bearer").
+    expect(rec.loginRequest["grant_type"]).toBe("password");
+    expect(rec.loginResponse["token_type"]).toBe("Bearer");
+  });
+
   it("never invokes array-index or Error constructor accessors through Pino", () => {
     const cap = capturingLogger();
     let arrayInvoked = false;

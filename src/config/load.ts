@@ -4,6 +4,12 @@ import { parse as parseYaml } from "yaml";
 import { Value } from "typebox/value";
 import type { TSchema } from "typebox";
 import {
+  validateBearerToken,
+  validatePassword,
+  validateUsername,
+  type AuthMode,
+} from "../collectiviq/auth.js";
+import {
   ENV_DEFAULTS,
   EnvConfigSchema,
   MODEL_CONFIG_LIMITS,
@@ -49,7 +55,10 @@ const KNOWN_ENV_KEYS = [
   "HOST",
   "PORT",
   "COLLECTIVIQ_BASE_URL",
+  "COLLECTIVIQ_AUTH_MODE",
   "COLLECTIVIQ_API_KEY",
+  "COLLECTIVIQ_USERNAME",
+  "COLLECTIVIQ_PASSWORD",
   "COLLECTIVIQ_GATEWAY_KEYS",
   "MODEL_CONFIG_PATH",
   "LOG_LEVEL",
@@ -222,8 +231,36 @@ function loadEnvConfig(source: NodeJS.ProcessEnv): EnvConfig {
     }
   }
 
-  if (!present(raw.COLLECTIVIQ_API_KEY)) {
-    issues.push({ field: "COLLECTIVIQ_API_KEY", reason: "is required" });
+  // Auth mode selects which upstream credential is required and validated. The
+  // inactive mode's credentials may be present but are ignored (not read into
+  // the validated config). All credential errors are value-free.
+  let mode: AuthMode | null;
+  const rawMode = present(raw.COLLECTIVIQ_AUTH_MODE)
+    ? raw.COLLECTIVIQ_AUTH_MODE.trim().toLowerCase()
+    : ENV_DEFAULTS.COLLECTIVIQ_AUTH_MODE;
+  if (rawMode === "bearer" || rawMode === "password") {
+    mode = rawMode;
+  } else {
+    mode = null;
+    issues.push({ field: "COLLECTIVIQ_AUTH_MODE", reason: "has unsupported value" });
+  }
+
+  let apiKey: string | undefined;
+  let username: string | undefined;
+  let password: string | undefined;
+  if (mode === "bearer") {
+    // Bearer token is preserved EXACTLY (no trimming), bounded to 16 KiB.
+    const token = validateBearerToken(raw.COLLECTIVIQ_API_KEY);
+    if (!token.ok) issues.push({ field: "COLLECTIVIQ_API_KEY", reason: token.reason });
+    else apiKey = token.value;
+  } else if (mode === "password") {
+    const user = validateUsername(raw.COLLECTIVIQ_USERNAME);
+    if (!user.ok) issues.push({ field: "COLLECTIVIQ_USERNAME", reason: user.reason });
+    else username = user.value;
+    // Password is preserved EXACTLY, including leading/trailing whitespace.
+    const pass = validatePassword(raw.COLLECTIVIQ_PASSWORD);
+    if (!pass.ok) issues.push({ field: "COLLECTIVIQ_PASSWORD", reason: pass.reason });
+    else password = pass.value;
   }
 
   let gatewayKeys: string[] = [];
@@ -251,10 +288,16 @@ function loadEnvConfig(source: NodeJS.ProcessEnv): EnvConfig {
     HOST: host,
     PORT: port,
     COLLECTIVIQ_BASE_URL: baseUrl,
-    // A required-but-missing secret is reported above; use a fixed non-empty
-    // internal placeholder (never emitted) so structural validation does not
-    // double-report the same field, and no real value is involved.
-    COLLECTIVIQ_API_KEY: present(raw.COLLECTIVIQ_API_KEY) ? raw.COLLECTIVIQ_API_KEY : "unset",
+    // When the mode itself was invalid an issue is already recorded; a placeholder
+    // keeps structural validation from double-reporting and is never emitted.
+    COLLECTIVIQ_AUTH_MODE: mode ?? ENV_DEFAULTS.COLLECTIVIQ_AUTH_MODE,
+    // Only the active mode's validated credentials are populated (preserved
+    // exactly). A required-but-missing/invalid credential is reported above; its
+    // field is then simply absent here (the schema field is optional), so
+    // structural validation never double-reports it.
+    ...(apiKey !== undefined ? { COLLECTIVIQ_API_KEY: apiKey } : {}),
+    ...(username !== undefined ? { COLLECTIVIQ_USERNAME: username } : {}),
+    ...(password !== undefined ? { COLLECTIVIQ_PASSWORD: password } : {}),
     COLLECTIVIQ_GATEWAY_KEYS: gatewayKeys.length > 0 ? gatewayKeys : ["unset"],
     MODEL_CONFIG_PATH: modelConfigPath,
     LOG_LEVEL: logLevel,

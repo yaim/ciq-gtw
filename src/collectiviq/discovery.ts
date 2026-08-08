@@ -64,8 +64,15 @@ import {
   type CaptureLimits,
 } from "./structural-capture.js";
 import {
+  resolveAuthMode,
+  staticBearerCredentialProvider,
+  type AuthMode,
+  type AuthObservation,
+} from "./auth.js";
+import {
   DEFAULT_OPERATION_TIMEOUTS,
   type CollectivIQTransportConfig,
+  type CredentialLease,
   type FetchLike,
   type OperationTimeouts,
 } from "./types.js";
@@ -134,6 +141,12 @@ export interface DiscoveryProjectedCounts {
 export interface DiscoveryPreflightReport {
   readonly session: DiscoverySession;
   readonly destinationOrigin: string;
+  /**
+   * The selected auth mode (read from `COLLECTIVIQ_AUTH_MODE` only). Preflight
+   * never reads a credential value and never reports whether any individual
+   * secret variable is populated.
+   */
+  readonly authMode: AuthMode;
   readonly projectedCounts: DiscoveryProjectedCounts;
   readonly cleanupApproved: boolean;
   readonly notFoundObservationApproved: boolean;
@@ -388,6 +401,7 @@ export function buildPreflightReport(
   return {
     session: DISCOVERY_SESSION,
     destinationOrigin: DISCOVERY_ORIGIN,
+    authMode: resolveAuthMode(env["COLLECTIVIQ_AUTH_MODE"]),
     projectedCounts: projectCounts(selection),
     cleanupApproved: approvals.cleanupApproved,
     notFoundObservationApproved: approvals.notFoundObservationApproved,
@@ -414,6 +428,12 @@ export interface DiscoveryBaselineReport {
    * thread was created upstream; an aborted run is always a non-zero result.
    */
   readonly aborted?: "journal-persistence-failed";
+  /**
+   * Value-free authentication observation, attached by the CLI ONLY in password
+   * mode. It carries the mode, login-attempt count, safe login HTTP status, and
+   * whether the login response normalized — never a token, username, or body.
+   */
+  readonly auth?: AuthObservation;
 }
 
 export interface ExecuteBaselineOptions {
@@ -686,7 +706,13 @@ export class DiscoverySessionRunner {
   /** Observe the auth-failure shape via a deliberately empty bearer. */
   async #authError(signal?: AbortSignal): Promise<DiscoveryObservation> {
     try {
-      const badConfig: CollectivIQTransportConfig = { ...this.#config, apiKey: "" };
+      // Probe the auth-failure shape with a deliberately empty bearer via a
+      // throwaway static provider; its lease invalidation is a no-op, so the
+      // real credential provider (and its login budget) is never touched.
+      const badConfig: CollectivIQTransportConfig = {
+        ...this.#config,
+        credentials: staticBearerCredentialProvider(""),
+      };
       const raw = await this.#observe("GET", ENDPOINTS.availableLlms, {
         config: badConfig,
         ...(signal ? { signal } : {}),
@@ -1019,6 +1045,15 @@ export class DiscoverySessionRunner {
     signal?: AbortSignal,
   ): Promise<{ observation: DiscoveryObservation; correlation: CorrelationReport }> {
     const fetchImpl: FetchLike = this.#config.fetch ?? globalThis.fetch;
+    // Acquire a lease via the SAME credential provider the JSON transport uses
+    // (no bespoke API-key handling here); an acquisition failure is a normalized,
+    // content-free failed observation.
+    let lease: CredentialLease;
+    try {
+      lease = await this.#config.credentials.acquire(signal);
+    } catch (error) {
+      return { observation: errorObservation("sse_structure", error), correlation: NO_CORRELATION };
+    }
     const controller = new AbortController();
     let headerTimedOut = false;
     let externallyCancelled = false;
@@ -1044,7 +1079,7 @@ export class DiscoverySessionRunner {
           method: "GET",
           headers: {
             // Redaction depends on the header name being `authorization`.
-            authorization: `Bearer ${this.#config.apiKey}`,
+            authorization: `Bearer ${lease.token}`,
             accept: "text/event-stream",
           },
           signal: controller.signal,
@@ -1083,6 +1118,8 @@ export class DiscoverySessionRunner {
 
     // Reject and normalize any non-2xx response before event parsing.
     if (!response.ok) {
+      // A 401 invalidates the lease so the next distinct request reauthenticates.
+      if (response.status === 401) this.#config.credentials.invalidate(lease);
       signal?.removeEventListener("abort", onExternalAbort);
       try {
         await response.body?.cancel();

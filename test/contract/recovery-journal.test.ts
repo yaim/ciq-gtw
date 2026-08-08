@@ -17,6 +17,7 @@ import { join } from "node:path";
 import {
   __setRecoveryJournalFsForTests,
   deleteRecoveryJournal,
+  ensureSafeDiscoveryDir,
   FileRecoveryJournal,
   InMemoryRecoveryJournal,
   readRecoveryJournal,
@@ -275,6 +276,57 @@ describe("FileRecoveryJournal lifecycle", () => {
     });
     const journal = new FileRecoveryJournal(dir, ORIGIN);
     await expect(journal.init()).rejects.toThrow();
+  });
+});
+
+describe("safe discovery directory helper (create-or-tighten)", () => {
+  it("creates an absent directory as a private 0700 directory", () => {
+    const target = join(tempDir(), "discovery");
+    ensureSafeDiscoveryDir(target);
+    expect(statSync(target).mode & 0o777).toBe(0o700);
+  });
+
+  it("tightens an existing real 0755 directory to 0700", () => {
+    const dir = tempDir();
+    chmodSync(dir, 0o755);
+    expect(statSync(dir).mode & 0o777).toBe(0o755);
+    ensureSafeDiscoveryDir(dir);
+    expect(statSync(dir).mode & 0o777).toBe(0o700);
+  });
+
+  it("refuses a symlinked or non-directory path", () => {
+    const parent = tempDir();
+    const realDir = join(parent, "real");
+    const linkDir = join(parent, "link");
+    mkdirSync(realDir, { mode: 0o700 });
+    symlinkSync(realDir, linkDir);
+    expect(() => ensureSafeDiscoveryDir(linkDir)).toThrow();
+
+    const filePath = join(parent, "a-file");
+    writeFileSync(filePath, "x", { mode: 0o600 });
+    expect(() => ensureSafeDiscoveryDir(filePath)).toThrow();
+  });
+});
+
+describe("FileRecoveryJournal recovers a pre-existing 0755 report directory", () => {
+  it("initializes cleanly when the directory is 0755 with a sanitized report but no journal", async () => {
+    // Regression: a prior run left the shared directory at 0755 (default mkdir
+    // mode) containing only a sanitized report — no journal. init() must tighten
+    // the directory to 0700 and succeed, rather than refuse the loose directory
+    // on the read path.
+    const dir = tempDir();
+    // A leftover sanitized report file (value-free placeholder) and NO journal.
+    writeFileSync(join(dir, "baseline.json"), JSON.stringify({ session: "baseline" }), {
+      mode: 0o644,
+    });
+    chmodSync(dir, 0o755);
+
+    const journal = new FileRecoveryJournal(dir, ORIGIN);
+    await expect(journal.init()).resolves.toBeUndefined();
+    expect(statSync(dir).mode & 0o777).toBe(0o700);
+    // The report is untouched; the journal is initialized empty.
+    expect(readRecoveryJournal(dir)).toEqual(data([]));
+    expect(readdirSync(dir)).toContain("baseline.json");
   });
 });
 

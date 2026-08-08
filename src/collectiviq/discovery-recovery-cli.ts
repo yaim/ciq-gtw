@@ -19,6 +19,7 @@
  * - Importing this module performs no I/O and reads no credential.
  */
 import { pathToFileURL } from "node:url";
+import { buildCredentialProviderFromEnv, CLI_MAX_LOGINS } from "./auth.js";
 import {
   resolveThreadDeletion,
   type RecoveryAttempt,
@@ -28,6 +29,7 @@ import { DISCOVERY_ORIGIN } from "./discovery.js";
 import {
   deleteRecoveryJournal,
   defaultDiscoveryJournalDir,
+  ensureSafeDiscoveryDir,
   readRecoveryJournal,
   writeRecoveryJournal,
   RECOVERY_JOURNAL_FORMAT,
@@ -74,13 +76,6 @@ export function parseRecoveryArgs(argv: readonly string[]): RecoveryCliArgs {
   if (!recoveryJournalApproved) throw new Error("recovery requires --recovery-journal-approved");
 
   return { executeApproved, cleanupApproved, recoveryJournalApproved };
-}
-
-/** Read a required environment variable or fail closed (no value in the error). */
-function requireEnv(env: NodeJS.ProcessEnv, key: string): string {
-  const value = env[key];
-  if (value === undefined || value.trim() === "") throw new Error(`missing required env ${key}`);
-  return value.trim();
 }
 
 /**
@@ -161,18 +156,91 @@ function emit(value: unknown): void {
   process.stdout.write(JSON.stringify(value, null, 2) + "\n");
 }
 
-async function main(): Promise<void> {
-  // Parsing enforces all three approvals before anything else happens.
-  parseRecoveryArgs(process.argv.slice(2));
+/**
+ * The narrow, injectable dependency surface for {@link runRecoveryCli}. It exists
+ * ONLY so hermetic tests can exercise the SAME precondition ordering production
+ * uses against a temp journal directory, with no live/network/credential access.
+ * The FIXED destination origin ({@link DISCOVERY_ORIGIN}) is intentionally NOT
+ * part of this surface — it stays hardcoded inside the seam so a test can never
+ * broaden the destination. These types are deliberately NOT re-exported through
+ * `src/collectiviq/index.ts`.
+ */
+export interface RecoveryCliDeps {
+  readonly argv: readonly string[];
+  readonly env: NodeJS.ProcessEnv;
+  /** The recovery journal directory (defaults to the fixed sessions directory). */
+  readonly dir: string;
+  /** Build the credential provider (defaults to the real env-backed builder). */
+  readonly buildProvider: typeof buildCredentialProviderFromEnv;
+  /** Execute the bounded recovery cleanup (defaults to {@link runRecoveryCleanup}). */
+  readonly runCleanup: (
+    config: CollectivIQTransportConfig,
+    dir: string,
+  ) => Promise<RecoveryCleanupReport>;
+  /** Emit a sanitized value to the operator (defaults to stdout JSON). */
+  readonly emit: (value: unknown) => void;
+}
 
+/** The production dependency set: fixed directory, real provider, real cleanup. */
+export function defaultRecoveryCliDeps(): RecoveryCliDeps {
+  return {
+    argv: process.argv.slice(2),
+    env: process.env,
+    dir: defaultDiscoveryJournalDir(),
+    buildProvider: buildCredentialProviderFromEnv,
+    runCleanup: (config, dir) => runRecoveryCleanup(config, dir),
+    emit,
+  };
+}
+
+/**
+ * The recovery CLI orchestration seam. Production `main()` is a thin wrapper
+ * around `runRecoveryCli(defaultRecoveryCliDeps())`; tests inject fakes/a temp
+ * directory to assert the exact ordering. The ordering is fixed: parse →
+ * ensureSafeDiscoveryDir → read + validate journal (non-empty, fixed origin) →
+ * build provider → runCleanup → emit → exit code. The destination origin is
+ * hardcoded here (never injected).
+ */
+export async function runRecoveryCli(deps: RecoveryCliDeps): Promise<void> {
+  // Recovery ordering (defense in depth, independent of runRecoveryCleanup):
+  // 1. Parsing enforces all three approvals before anything else happens.
+  parseRecoveryArgs(deps.argv);
+
+  const dir = deps.dir;
+  // 2. Validate the fixed journal directory/file and ensure it contains work,
+  //    tightening the shared directory to 0700 first (write-capable approved).
+  ensureSafeDiscoveryDir(dir);
+  const journal = readRecoveryJournal(dir);
+  if (journal === null || journal.threadIds.length === 0) {
+    throw new Error("no recovery journal to clean up");
+  }
+  // 3. Validate the journal origin against the fixed production origin.
+  if (journal.destinationOrigin !== DISCOVERY_ORIGIN) {
+    throw new Error("recovery journal origin mismatch");
+  }
+
+  // 4. Only now read the credentials and build the provider (login is lazy,
+  //    on the first DELETE), bounded by the hard two-login budget. The base is
+  //    fixed to the hardcoded discovery origin.
+  const resolved = deps.buildProvider(
+    deps.env,
+    { baseUrl: DISCOVERY_ORIGIN },
+    { maxLogins: CLI_MAX_LOGINS },
+  );
   const config: CollectivIQTransportConfig = {
     baseUrl: DISCOVERY_ORIGIN,
-    apiKey: requireEnv(process.env, "COLLECTIVIQ_API_KEY"),
+    credentials: resolved.provider,
   };
-  const report = await runRecoveryCleanup(config, defaultDiscoveryJournalDir());
+  const report = await deps.runCleanup(config, dir);
 
-  emit({ ...report, destinationOrigin: DISCOVERY_ORIGIN });
+  // Attach the value-free authentication observation ONLY in password mode.
+  const auth = resolved.passwordProvider?.authObservation();
+  deps.emit({ ...report, destinationOrigin: DISCOVERY_ORIGIN, ...(auth ? { auth } : {}) });
   if (report.unresolved > 0 || report.remaining > 0) process.exitCode = 1;
+}
+
+async function main(): Promise<void> {
+  await runRecoveryCli(defaultRecoveryCliDeps());
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {

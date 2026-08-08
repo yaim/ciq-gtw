@@ -179,4 +179,87 @@ describe("sanitizeLogValue", () => {
       expect(isSecretKey(key)).toBe(false);
     }
   });
+
+  it("classifies OAuth password-mode identity and login-token keys as secret", () => {
+    for (const key of [
+      "username",
+      "user_name",
+      "COLLECTIVIQ_USERNAME",
+      "email",
+      "userEmail",
+      "COLLECTIVIQ_PASSWORD",
+      "access_token",
+      "refresh_token",
+      "accessToken",
+      "refreshToken",
+    ]) {
+      expect(isSecretKey(key)).toBe(true);
+    }
+    // Innocent metadata that must NOT be caught by the identity markers. The
+    // constant `token_type` ("Bearer") is not a credential and stays usable.
+    for (const key of ["requestId", "status", "userId", "userCount", "durationMs", "token_type"]) {
+      expect(isSecretKey(key)).toBe(false);
+    }
+  });
+
+  it("redacts a nested login request/response object without leaking any value", () => {
+    const result = sanitizeLogValue({
+      loginRequest: {
+        grant_type: "password",
+        username: "SENTINEL-USERNAME",
+        password: "SENTINEL-PASSWORD",
+        scope: "",
+      },
+      loginResponse: {
+        access_token: "SENTINEL-ACCESS-TOKEN",
+        token_type: "Bearer",
+        refresh_token: "SENTINEL-REFRESH-TOKEN",
+      },
+      headers: { authorization: "Bearer SENTINEL-BEARER" },
+    }) as {
+      loginRequest: Record<string, unknown>;
+      loginResponse: Record<string, unknown>;
+      headers: Record<string, unknown>;
+    };
+    expect(result.loginRequest["username"]).toBe(REDACTION_PLACEHOLDER);
+    expect(result.loginRequest["password"]).toBe(REDACTION_PLACEHOLDER);
+    // grant_type/scope carry no secret and stay usable.
+    expect(result.loginRequest["grant_type"]).toBe("password");
+    expect(result.loginRequest["scope"]).toBe("");
+    expect(result.loginResponse["access_token"]).toBe(REDACTION_PLACEHOLDER);
+    expect(result.loginResponse["refresh_token"]).toBe(REDACTION_PLACEHOLDER);
+    // token_type is the non-secret constant "Bearer" and stays usable.
+    expect(result.loginResponse["token_type"]).toBe("Bearer");
+    expect(result.headers["authorization"]).toBe(REDACTION_PLACEHOLDER);
+
+    const serialized = JSON.stringify(result);
+    for (const sentinel of [
+      "SENTINEL-USERNAME",
+      "SENTINEL-PASSWORD",
+      "SENTINEL-ACCESS-TOKEN",
+      "SENTINEL-REFRESH-TOKEN",
+      "SENTINEL-BEARER",
+    ]) {
+      expect(serialized).not.toContain(sentinel);
+    }
+  });
+
+  it("redacts login credentials nested inside hostile arrays and error values", () => {
+    const result = sanitizeLogValue({
+      attempts: [
+        { username: "SENTINEL-U1", note: "ok" },
+        [{ password: "SENTINEL-P1" }, { access_token: "SENTINEL-T1" }],
+      ],
+      failure: Object.assign(new Error("boom"), {
+        code: "E_AUTH",
+        password: "SENTINEL-P2",
+      }),
+    });
+    const serialized = JSON.stringify(result);
+    for (const sentinel of ["SENTINEL-U1", "SENTINEL-P1", "SENTINEL-T1", "SENTINEL-P2", "boom"]) {
+      expect(serialized).not.toContain(sentinel);
+    }
+    // The error still reduces to its fixed, allowlisted shape.
+    expect(serialized).toContain("E_AUTH");
+  });
 });
