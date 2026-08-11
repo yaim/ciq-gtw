@@ -757,6 +757,20 @@ For local single-user development, authentication may be disabled only when the 
 
 Production deployments must require authentication.
 
+**Implementation status (Phase 1A, implemented).** Every route under `/v1/*` is
+authenticated; `/healthz` and `/readyz` remain unauthenticated. The scheme match
+is case-insensitive and the presented token is compared **exactly** (never
+trimmed or normalized). Comparison is fixed-length and timing-safe: each
+configured key is reduced to a SHA-256 digest once at construction, the presented
+token is hashed once, and the digest is compared against every configured digest
+with `node:crypto` `timingSafeEqual` **without** an early return on a match.
+Missing, malformed, empty, oversized, and incorrect credentials all return the
+same fixed `401` (section 9.1.1). Gateway authentication is mandatory (there is
+no disable switch), the gateway key is never forwarded to CollectivIQ, and the
+header/token is never logged or reflected. Configured-key bounds are in
+section 24; a presented token larger than the per-key byte cap is rejected before
+hashing.
+
 ### 9.1.1 Authentication failures
 
 Response:
@@ -807,6 +821,14 @@ Example:
 
 The OpenAI Models API uses `GET /models` for listing available models.
 
+**Implementation status (Phase 1A, implemented).** The catalog is immutable and
+built from the validated `config.models`. Models are listed in configuration
+(YAML) order, and each model object exposes only `id`, `object`, `created`, and
+`owned_by` — never `displayName`, `selectedLlms`, `answerSource`, `toolMode`,
+timeouts, credentials, or configuration paths. A single Unix-seconds `created`
+timestamp is captured when the catalog is constructed and reused for every model
+object served by that server instance; a restart may produce a new timestamp.
+
 ---
 
 ## 9.3 `GET /v1/models/:model`
@@ -823,6 +845,12 @@ Example:
   "owned_by": "collectiviq-gateway"
 }
 ```
+
+Resolution is **exact-case**. An unknown id or a case mismatch returns HTTP
+`404` with the fixed envelope (`type: "invalid_request_error"`,
+`code: "model_not_found"`, `param: "model"`, message
+`The requested model does not exist.`); the submitted identifier is never
+reflected back.
 
 ---
 
@@ -1716,6 +1744,16 @@ Standard envelope:
 
 Raw CollectivIQ response bodies must not be returned to clients in production.
 
+**Implementation status (Phase 1A, implemented).** The shared envelope factory
+and three envelopes are implemented for the `/v1` surface that exists today:
+invalid gateway key (`401`), unknown/case-mismatched model (`404`), and any
+unexpected `/v1` failure (`500`, `type: "server_error"`, `code: "internal_error"`,
+`param: null`, fixed message `The gateway encountered an internal error.`). The
+`500` path never inspects or serializes the thrown value's message, stack, cause,
+body, headers, or serialization. The remaining rows (`400`, `429`, `502`, `504`)
+are defined here but not yet reachable, since `/v1/chat/completions` and the
+upstream request path are unimplemented.
+
 ---
 
 ## 21. Security Requirements
@@ -2043,6 +2081,14 @@ Configuration validation must occur before the HTTP server starts.
 Invalid configuration must terminate the process with a non-zero exit code.
 
 Secrets must be redacted from startup output.
+
+Gateway client keys (`COLLECTIVIQ_GATEWAY_KEYS`) are bounded by conservative,
+non-overridable initial limits: at most **64** configured keys, and at most
+**8192 UTF-8 bytes** per key (byte length, not JavaScript string length). The
+existing comma-separated parsing — outer trimming, empty-entry removal, and
+de-duplication — is preserved, and the same 8192-byte cap is applied to a
+presented token before it is hashed for comparison (section 9.1). Configuration
+failures remain value-free (they never echo a key).
 
 ### 24.1 Model-configuration safety limits (initial implementation)
 
@@ -2569,13 +2615,63 @@ The verified-repeatable shapes were promoted into **synthetic** fixtures
 promoted**; the ignored live reports and recovery journal are not committed, and
 capability flags remain `false`.
 
-Phase 0 has **advanced substantially** but is **not automatically declared
-complete**: idempotency, message ordering/pagination, prompt/rate limits,
-retention, native tools, SSE scope, and token lifetime remain open (see the
-section 35 gap matrix). See
-[`collectiviq-upstream-contract.md`](collectiviq-upstream-contract.md).
+**Phase 0 text-readiness gate — satisfied.** The verified-repeatable
+login/create/submit/messages contract is **sufficient to enter Phase 1
+conservative text development**. This is a scoped entry gate, not a declaration
+that every upstream question is resolved or that the gateway is production-ready.
+The remaining open questions are **non-blocking** under the conservative
+Phase 1 safeguards:
+
+* `create_thread` and `process_message` are never automatically retried, so
+  unresolved POST idempotency cannot silently duplicate upstream work.
+* Each public completion uses a **fresh** upstream thread, so correct operation
+  does not rely on unverified thread reuse, and Phase 1 request execution
+  requires no thread-deletion call. This does **not** reduce provider-side data
+  exposure: prompts and answers still cross into CollectivIQ-managed threads, and
+  provider retention, training, deletion guarantees, and regional controls remain
+  **unknown** — they are production/provider-confirmation gates, not request-path
+  safeguards.
+* The gateway assumes **no** message ordering; duplicate desired-source messages
+  use the documented deterministic timestamp → sortable-id → array-position
+  fallback (section 8.6/8.7).
+* Pagination is not required while each request uses a new thread and retrieves
+  full history.
+* Prompt-size limits remain a conservative **gateway** configuration bound
+  (`maximumPromptBytes`), not a claimed upstream maximum.
+* Password-token `401` invalidation plus next-request re-login allow correct
+  operation without an implemented refresh endpoint.
+
+Still **not** declared fully complete: idempotency and `process_message`
+`status` semantics still prohibit retries and stronger status interpretation;
+message ordering/pagination still gate any thread reuse or pagination
+optimization; rate/quota limits, retention/training/regional controls, and token
+lifetime/refresh remain **production-hardening / provider-confirmation** gates;
+native tools and structured tool results remain **Phase 3/5 capability** gates;
+and SSE scope remains a **future true-streaming** gate. See the section 35 gap
+matrix and [`collectiviq-upstream-contract.md`](collectiviq-upstream-contract.md).
+No new live evidence is asserted by this classification.
 
 ### Phase 1 — Text gateway
+
+Phase 1 is split into an offline **Phase 1A** (implemented) and the remaining
+**Phase 1B** (planned).
+
+**Phase 1A — implemented (offline, no live CollectivIQ call):**
+
+* `GET /v1/models` and `GET /v1/models/:model` (authenticated);
+* gateway client authentication (`Authorization: Bearer <gateway-key>`,
+  SHA-256 + `timingSafeEqual`, fixed `401` envelope);
+* an immutable virtual-model catalog/resolver (exact-case, config-order,
+  one captured `created` timestamp per server instance);
+* shared bounded OpenAI error envelopes (`401`/`404`/`500`);
+* Docker packaging (already present).
+
+**Phase 1B — planned:**
+
+* non-streamed `POST /v1/chat/completions`;
+* one thread per request and wiring the CollectivIQ adapter into the request path;
+* prompt serialization, polling, and generation orchestration;
+* OpenCode text-mode smoke test.
 
 Deliverables:
 
@@ -2758,17 +2854,26 @@ Before declaring production readiness, obtain answers to the following. The two
 **2026-08-11 password baselines** are **verified-repeatable** (identical safe
 facts across two approved runs, encoded into synthetic fixtures) and resolve
 several items below (marked **RESOLVED/VERIFIED**); the 2026-08-06/07 bearer runs
-supplied observed-once corroboration. The still-open items form the **Phase 0 gap
-matrix** — Phase 0 is not declared complete until these are decided:
+supplied observed-once corroboration. The still-open items form the
+**later-release / provider-confirmation gap matrix**. They do **not** block
+conservative Phase 1 text entry — the Phase 0 text-readiness gate is satisfied
+(section 32) — but they gate later phases and production readiness. Each maps to
+a later gate already classified in section 32:
 
-- prompt-size limit (#10) — **open**;
-- rate/quota limits (#11) — **open** (quota `429` never observed);
-- `process_message` idempotency and `status` semantics (#4, #6) — **open**;
-- message ordering/pagination (#7, #8) — **open**;
-- native tools / structured tool results (#14, #15) — **open**;
-- retention/training/zero-retention/regional (#22–#25) — **open**;
-- SSE account-wide-vs-connection scope (#13) — **open**;
-- token lifetime/refresh for password login (#26) — **open**.
+- prompt-size limit (#10) — **open** → production/provider gate;
+- rate/quota limits (#11) — **open** (quota `429` never observed) →
+  production/provider gate;
+- `process_message` idempotency and `status` semantics (#4, #6) — **open** →
+  retry and stronger status-semantics gate;
+- message ordering/pagination (#7, #8) — **open** → thread reuse/pagination gate;
+- native tools / structured tool results (#14, #15) — **open** → Phase 3/5
+  capability gate;
+- retention/training/zero-retention/regional (#22–#25) — **open** →
+  production/provider gate;
+- SSE account-wide-vs-connection scope (#13) — **open** → future true-streaming
+  gate;
+- token lifetime/refresh for password login (#26) — **open** →
+  production/provider gate.
 
 1. Is there official API documentation?
 2. What are the precise schemas for all four demonstrated endpoints?

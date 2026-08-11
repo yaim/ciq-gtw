@@ -3,14 +3,18 @@
 A local or privately hosted HTTP service that will sit between OpenCode and
 CollectivIQ, exposing a bounded OpenAI Chat Completions-compatible profile.
 
-> **Status: runnable foundation plus an offline upstream adapter boundary.**
-> This repository provides a secure, validated service skeleton and an
-> OpenAPI-grounded CollectivIQ adapter with hermetic contract tests. It does
-> **not** yet implement chat completions, model listing, live CollectivIQ calls,
-> prompt serialization, tool calling, streaming, or Redis, and the adapter is
-> **not wired into any request path**. Those remain planned per
-> [`.agent/docs/tech-software-spec.md`](.agent/docs/tech-software-spec.md). The
-> grounded upstream contract is documented in
+> **Status: runnable foundation, offline upstream adapter boundary, and the
+> Phase 1A public model surface.**
+> This repository provides a secure, validated service skeleton, an
+> OpenAPI-grounded CollectivIQ adapter with hermetic contract tests, and the
+> authenticated public model endpoints (`GET /v1/models`,
+> `GET /v1/models/:model`) with OpenAI-style error envelopes. It does **not** yet
+> implement chat completions, live CollectivIQ calls, prompt serialization, tool
+> calling, streaming, or Redis, and the adapter is **not wired into any request
+> path**. Those remain planned per
+> [`.agent/docs/tech-software-spec.md`](.agent/docs/tech-software-spec.md). This
+> is not full OpenAI API compatibility or production readiness. The grounded
+> upstream contract is documented in
 > [`.agent/docs/collectiviq-upstream-contract.md`](.agent/docs/collectiviq-upstream-contract.md).
 
 ## What works today
@@ -19,6 +23,15 @@ CollectivIQ, exposing a bounded OpenAI Chat Completions-compatible profile.
 - A Fastify server that can be constructed in-process without binding a socket.
 - Liveness (`GET /healthz`) and readiness (`GET /readyz`) endpoints. Neither
   calls CollectivIQ or any dependency.
+- Authenticated public model endpoints: `GET /v1/models` and
+  `GET /v1/models/:model`. Every `/v1/*` route requires
+  `Authorization: Bearer <gateway-key>` (case-insensitive scheme, exact-match
+  token, fixed-length SHA-256 + `timingSafeEqual` comparison); `/healthz` and
+  `/readyz` stay unauthenticated. Model objects expose only `id`, `object`,
+  `created`, and `owned_by`, are listed in configuration order, and resolve
+  case-sensitively. Missing/invalid credentials return a fixed OpenAI `401`;
+  unknown/case-mismatched ids return a fixed OpenAI `404`; unexpected `/v1`
+  failures return a fixed OpenAI `500`. No public route calls CollectivIQ.
 - Credential-redacting Pino logging with content logging off by default.
 - Graceful `SIGINT`/`SIGTERM` shutdown.
 - Docker packaging and GitHub Actions CI.
@@ -32,11 +45,12 @@ CollectivIQ, exposing a bounded OpenAI Chat Completions-compatible profile.
 
 ## What is not implemented yet
 
-`GET /v1/models`, `GET /v1/models/:model`, `POST /v1/chat/completions`,
-`GET /metrics`, gateway authentication, prompt construction, emulated/native
-tool calling, synthetic SSE streaming, polling, generation orchestration, and
-any live CollectivIQ call. The adapter exists but is not connected to a public
-endpoint. Four authorized authenticated discovery baselines ran: two bearer-mode
+`POST /v1/chat/completions`, `GET /metrics`, prompt construction,
+emulated/native tool calling, synthetic SSE streaming, polling, generation
+orchestration, and any live CollectivIQ call. The adapter exists but is not
+connected to a public endpoint. (Gateway authentication and the `GET /v1/models`
+/ `GET /v1/models/:model` endpoints are now implemented — see "What works
+today".) Four authorized authenticated discovery baselines ran: two bearer-mode
 runs (2026-08-06/07) **failed strict completeness (exited non-zero)**, and two
 `password`-mode runs (2026-08-11) **both passed (exited zero)** with identical
 sanitized safe facts. The core create/submit/messages contract and password
@@ -85,6 +99,22 @@ The service binds to `127.0.0.1:8787` by default (loopback only).
 ```bash
 curl http://127.0.0.1:8787/healthz   # {"status":"ok"}
 curl http://127.0.0.1:8787/readyz    # {"status":"ready"} once listening
+```
+
+The `/v1/*` endpoints require a gateway key from `COLLECTIVIQ_GATEWAY_KEYS`
+(replace the fake placeholder below with one of your configured keys):
+
+```bash
+# List configured virtual models
+curl http://127.0.0.1:8787/v1/models \
+  -H "Authorization: Bearer gw-fake-key-change-me"
+
+# Retrieve one model by id
+curl http://127.0.0.1:8787/v1/models/collectiviq-consensus \
+  -H "Authorization: Bearer gw-fake-key-change-me"
+
+# Missing/invalid credentials return a fixed OpenAI 401 envelope
+curl -i http://127.0.0.1:8787/v1/models
 ```
 
 ## Validation
@@ -234,21 +264,21 @@ gateway validates the mode-appropriate credential at startup. Only
 
 ## Configuration reference
 
-| Variable                   | Required | Default                           | Notes                                                                                                   |
-| -------------------------- | -------- | --------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `ENVIRONMENT`              | no       | `production`                      | `development` \| `staging` \| `production`                                                              |
-| `HOST`                     | no       | `127.0.0.1`                       | Loopback by default                                                                                     |
-| `PORT`                     | no       | `8787`                            | 1–65535                                                                                                 |
-| `COLLECTIVIQ_BASE_URL`     | no       | `https://api.prod.collectiviq.ai` | Must be an absolute http(s) URL                                                                         |
-| `COLLECTIVIQ_AUTH_MODE`    | no       | `bearer`                          | `bearer` \| `password`; selects the upstream credential                                                 |
-| `COLLECTIVIQ_API_KEY`      | bearer   | —                                 | Bearer-mode upstream token (≤16 KiB, preserved exactly); required when `COLLECTIVIQ_AUTH_MODE=bearer`   |
-| `COLLECTIVIQ_USERNAME`     | password | —                                 | Password-mode username (trimmed, ≤320 bytes); required when `COLLECTIVIQ_AUTH_MODE=password`            |
-| `COLLECTIVIQ_PASSWORD`     | password | —                                 | Password-mode password (preserved exactly, ≤4096 bytes); required when `COLLECTIVIQ_AUTH_MODE=password` |
-| `COLLECTIVIQ_GATEWAY_KEYS` | **yes**  | —                                 | Comma-separated client keys; trimmed and de-duplicated                                                  |
-| `MODEL_CONFIG_PATH`        | no       | `./config/models.yaml`            | Path to the YAML model file                                                                             |
-| `LOG_LEVEL`                | no       | `info`                            | Pino level                                                                                              |
-| `LOG_CONTENT`              | no       | `false`                           | May be `true` only when `ENVIRONMENT=development`                                                       |
-| `MAX_REQUEST_BODY_BYTES`   | no       | `8388608`                         | 1024 – 67108864                                                                                         |
+| Variable                   | Required | Default                           | Notes                                                                                                     |
+| -------------------------- | -------- | --------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `ENVIRONMENT`              | no       | `production`                      | `development` \| `staging` \| `production`                                                                |
+| `HOST`                     | no       | `127.0.0.1`                       | Loopback by default                                                                                       |
+| `PORT`                     | no       | `8787`                            | 1–65535                                                                                                   |
+| `COLLECTIVIQ_BASE_URL`     | no       | `https://api.prod.collectiviq.ai` | Must be an absolute http(s) URL                                                                           |
+| `COLLECTIVIQ_AUTH_MODE`    | no       | `bearer`                          | `bearer` \| `password`; selects the upstream credential                                                   |
+| `COLLECTIVIQ_API_KEY`      | bearer   | —                                 | Bearer-mode upstream token (≤16 KiB, preserved exactly); required when `COLLECTIVIQ_AUTH_MODE=bearer`     |
+| `COLLECTIVIQ_USERNAME`     | password | —                                 | Password-mode username (trimmed, ≤320 bytes); required when `COLLECTIVIQ_AUTH_MODE=password`              |
+| `COLLECTIVIQ_PASSWORD`     | password | —                                 | Password-mode password (preserved exactly, ≤4096 bytes); required when `COLLECTIVIQ_AUTH_MODE=password`   |
+| `COLLECTIVIQ_GATEWAY_KEYS` | **yes**  | —                                 | Comma-separated client keys; trimmed, de-duplicated, ≤64 keys, ≤8192 UTF-8 bytes/key; enforced on `/v1/*` |
+| `MODEL_CONFIG_PATH`        | no       | `./config/models.yaml`            | Path to the YAML model file                                                                               |
+| `LOG_LEVEL`                | no       | `info`                            | Pino level                                                                                                |
+| `LOG_CONTENT`              | no       | `false`                           | May be `true` only when `ENVIRONMENT=development`                                                         |
+| `MAX_REQUEST_BODY_BYTES`   | no       | `8388608`                         | 1024 – 67108864                                                                                           |
 
 The upstream credential authenticates the gateway to CollectivIQ: in `bearer`
 mode `COLLECTIVIQ_API_KEY` is sent as a static bearer token; in `password` mode
@@ -256,10 +286,13 @@ mode `COLLECTIVIQ_API_KEY` is sent as a static bearer token; in `password` mode
 short-lived bearer token held in memory (login **verified-live** on 2026-08-11;
 token lifetime/refresh still unverified). The inactive mode's credentials may be
 set but are ignored.
-`COLLECTIVIQ_GATEWAY_KEYS` are **intended to authenticate clients (OpenCode) to
-the gateway once gateway authentication is implemented**. Gateway authentication
-is not implemented in this foundation: the keys are validated and held, but no
-endpoint enforces them yet. The upstream and gateway credentials are never
+`COLLECTIVIQ_GATEWAY_KEYS` authenticate clients (OpenCode) to the gateway.
+Gateway authentication is **implemented and mandatory** on every `/v1/*` route
+(`/healthz` and `/readyz` stay open): a client presents
+`Authorization: Bearer <gateway-key>`, the scheme is matched case-insensitively,
+and the token is compared **exactly** against the configured keys with a
+fixed-length SHA-256 + `timingSafeEqual` comparison. There is no
+authentication-disable switch. The upstream and gateway credentials are never
 conflated or forwarded, and both are redacted from logs. Even in development,
 this scaffold does not log request or model content; enabling `LOG_CONTENT=true`
 (development only) emits a single fixed warning line and nothing else.

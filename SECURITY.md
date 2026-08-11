@@ -21,16 +21,33 @@ a fix and disclosure timeline privately.
 
 ## Security posture of this scaffold
 
-This repository is a **runnable foundation** plus an offline CollectivIQ adapter
-boundary. The completion, gateway-authentication, tool, streaming, and Redis
-features are not implemented, and the upstream adapter is not wired into any
-request path, so those runtime controls are not yet active. The controls that
-exist today are:
+This repository is a **runnable foundation**, an offline CollectivIQ adapter
+boundary, and the Phase 1A authenticated public model surface. The completion,
+tool, streaming, and Redis features are not implemented, and the upstream adapter
+is not wired into any request path, so those runtime controls are not yet active.
+The controls that exist today are:
 
+- **Gateway client authentication (implemented).** Every route under `/v1/*` —
+  today `GET /v1/models` and `GET /v1/models/:model` — requires
+  `Authorization: Bearer <gateway-key>` matched against `COLLECTIVIQ_GATEWAY_KEYS`;
+  `/healthz` and `/readyz` stay unauthenticated. The scheme is case-insensitive
+  and the token is compared **exactly** (never trimmed/normalized) using a
+  fixed-length comparison: configured keys are reduced to SHA-256 digests once,
+  the presented token is hashed once, and the digest is compared against every
+  configured digest with `node:crypto` `timingSafeEqual` **without** an early
+  return on a match. Missing, malformed, empty, oversized, and incorrect
+  credentials all return the same fixed OpenAI `401` envelope. Configured keys
+  are bounded (≤64 keys, ≤8192 UTF-8 bytes/key; the same byte cap bounds a
+  presented token before hashing). Authentication is mandatory (no disable
+  switch), the gateway key is never forwarded upstream, and the header/token is
+  never logged or reflected. Unexpected `/v1` failures return a fixed OpenAI
+  `500` whose thrown value is never inspected or serialized.
 - **Credential separation.** The upstream credentials — `COLLECTIVIQ_API_KEY`
-  (bearer mode) or `COLLECTIVIQ_USERNAME`/`COLLECTIVIQ_PASSWORD` (the offline,
-  unverified OAuth2 password mode, selected by `COLLECTIVIQ_AUTH_MODE`) — and the
-  client `COLLECTIVIQ_GATEWAY_KEYS` are distinct and never conflated or forwarded.
+  (bearer mode) or `COLLECTIVIQ_USERNAME`/`COLLECTIVIQ_PASSWORD` (the OAuth2
+  password mode — login **verified-live** by the two 2026-08-11 baselines, with
+  token lifetime/refresh still unverified — selected by `COLLECTIVIQ_AUTH_MODE`) —
+  and the client `COLLECTIVIQ_GATEWAY_KEYS` are distinct and never conflated or
+  forwarded.
   All of them are redacted from logs (including any minted `access_token`). The
   inactive mode's credentials are ignored.
 - **Content-free logging by default.** Prompts, answers, request bodies, tool
@@ -224,9 +241,10 @@ errorCode, resolved, resolution, persisted }] }` (no longer `succeeded`/
 
 ## Current limitations
 
-- No gateway authentication is enforced yet, because no authenticated endpoints
-  exist. Do not expose this scaffold beyond loopback until authentication is
-  implemented.
+- `POST /v1/chat/completions` and any live CollectivIQ call are not implemented,
+  and the upstream adapter is not wired into any public route. The authenticated
+  endpoints that exist today (`GET /v1/models`, `GET /v1/models/:model`) serve
+  only configured virtual-model metadata.
 - No metrics endpoint is exposed.
 - Readiness reports a simple ready/not-ready state; it does not yet probe
   dependencies.

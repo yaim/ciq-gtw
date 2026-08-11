@@ -38,10 +38,24 @@ masked by structural capture (e.g. message `content`, whose real field name neve
 appeared in the sanitized evidence). Phase 0 has **advanced substantially** — the
 core create/submit/messages contract and password login are now
 verified-repeatable, and thread-deletion and inventory-access outcomes were
-observed to be credential/principal-dependent (cause not established) — but is
-**not automatically declared complete**: several provider questions (idempotency,
-message ordering/pagination, prompt/rate limits, retention, native tools, SSE
-scope, token lifetime) remain open (see the gap matrix in spec section 35).
+observed to be credential/principal-dependent (cause not established).
+
+**Phase 0 text-readiness gate — satisfied.** The verified-repeatable
+login/create/submit/messages contract is sufficient to **enter Phase 1
+conservative text development** (spec section 32). This is a scoped entry gate,
+not a claim that every upstream question is resolved or that the gateway is
+production-ready, and it asserts **no new live evidence**. The remaining open
+questions are non-blocking under the Phase 1 safeguards: `create_thread` and
+`process_message` are never auto-retried; each completion uses a fresh thread; no
+message ordering is assumed (duplicate desired-source messages fall back to
+timestamp → sortable-id → array-position); pagination is unneeded with a fresh
+thread and full-history read; prompt limits are a conservative gateway bound, not
+a verified upstream maximum; and password-token `401` invalidation plus
+next-request re-login cover the absence of a refresh endpoint. Phase 0 is
+therefore **not** auto-declared fully complete: idempotency and `status`
+semantics, message ordering/pagination, prompt/rate limits, retention, native
+tools, SSE scope, and token lifetime/refresh remain open later-phase gates (see
+the gap matrix in spec section 35).
 
 ## Source metadata
 
@@ -668,7 +682,8 @@ reports and recovery journal under `.agent/sessions/` are never committed.
 Tracked in spec section 35. Statuses now reflect the two **verified-repeatable**
 2026-08-11 password baselines plus the earlier bearer runs. Several items below
 are now resolved/verified; the rest remain open and are consolidated into the
-Phase 0 gap matrix in spec section 35. The highest-priority items:
+later-release / provider-confirmation gap matrix in spec section 35 (they do not
+block Phase 1 text entry). The highest-priority items:
 
 1. Real success schemas and status codes for the four core endpoints —
    **verified-repeatable** (`create_thread` `200`, `process_message` `202`,
