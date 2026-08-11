@@ -1,11 +1,20 @@
 /**
- * PROVISIONAL upstream response validators.
+ * Upstream response validators (mixed-evidence contract).
  *
  * The source OpenAPI document declares empty (`{}`) success schemas for every
- * core operation, so none of these shapes are upstream-guaranteed. Each
- * validator enforces the minimal contract the gateway needs and ignores
- * unknown fields. They must stay visibly labeled provisional until live
- * discovery produces sanitized fixtures that confirm them.
+ * core operation, so no shape here is upstream-*guaranteed*; each validator is
+ * the gateway's own minimal contract and ignores unknown fields. The evidence
+ * behind each rule now varies, so the shapes are no longer uniformly
+ * provisional:
+ *   - Safe field names and statuses that repeated identically across the two
+ *     2026-08-11 authorized password baselines are verified-repeatable and are
+ *     encoded as synthetic fixtures (e.g. the `create_time` metadata key and the
+ *     `process_message` `202` shape).
+ *   - Mappings whose observed field NAME stayed masked by structural capture
+ *     (notably message `content`), and any field meaning/semantics, remain
+ *     provisional.
+ * The minimal success *rules* below (e.g. "an object without an own `detail`")
+ * are gateway-owned working rules, not provider guarantees.
  *
  * Validators never surface upstream content: on failure they throw a
  * normalized {@link UpstreamError} with no body, message, or field values.
@@ -76,9 +85,14 @@ function normalizeMessage(raw: unknown): UpstreamMessage | null {
   else if (typeof rawPercent === "number" && Number.isFinite(rawPercent)) percentUsage = rawPercent;
   else return null;
 
-  // Provisional metadata for the future selection policy; upstream key names
-  // are unverified. Absent values normalize to null.
-  const rawCreatedAt = raw["created_at"];
+  // Creation-time metadata for the future selection policy. The 2026-08-11
+  // authorized password baselines (two verified-repeatable runs) observed the
+  // field name `create_time`, not the earlier provisional `created_at`; the
+  // provisional `created_at` is retained as a fallback so the mapping stays
+  // forward/backward compatible and no synthetic fixture regresses. A separate
+  // `updated_at` was also observed but is intentionally not mapped here (its
+  // selection semantics are unverified). Absent values normalize to null.
+  const rawCreatedAt = Object.hasOwn(raw, "create_time") ? raw["create_time"] : raw["created_at"];
   let createdAt: string | number | null;
   if (rawCreatedAt === undefined || rawCreatedAt === null) createdAt = null;
   else if (typeof rawCreatedAt === "string") createdAt = rawCreatedAt;

@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { startMockServer, replyJson, type MockServer } from "./support/mock-server.js";
 import { makeAdapter } from "./support/adapter.js";
-import { processAccepted, processDetailError } from "./fixtures/collectiviq/responses.js";
+import {
+  processAccepted,
+  processAccepted202,
+  processDetailError,
+} from "./fixtures/collectiviq/responses.js";
 import { normalizeProcessMessage } from "../../src/collectiviq/validation.js";
 
 let server: MockServer | undefined;
@@ -59,6 +63,21 @@ describe("processMessage", () => {
       generateCombined: false,
     });
     expect(server.requests[0]?.text()).toMatch(/name="generate_combined"\r?\n\r?\nfalse/);
+  });
+
+  it("accepts the observed 202 shape (combined_run_id/status/has_rag_files, no detail)", async () => {
+    // 2026-08-11 password baselines (two verified-repeatable runs): the success
+    // response is HTTP 202 with a run identifier and no top-level `detail`.
+    server = await startMockServer((_req, res) => replyJson(res, processAccepted202, 202));
+    const adapter = makeAdapter(server.baseUrl);
+    const result = await adapter.processMessage({
+      threadId: "synthetic-thread",
+      prompt: "p",
+      selectedLlms: ["gpt"],
+      generateCombined: true,
+    });
+    expect(result.accepted).toBe(true);
+    expect(result.rawStatus).toBe(202);
   });
 
   it("treats a 2xx response carrying `detail` as a failure, not success", async () => {

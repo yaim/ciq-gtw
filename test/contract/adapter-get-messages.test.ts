@@ -3,6 +3,7 @@ import { startMockServer, replyJson, type MockServer } from "./support/mock-serv
 import { makeAdapter } from "./support/adapter.js";
 import {
   messagesCombined,
+  messagesCreateTime,
   messagesDuplicateSource,
   messagesEmpty,
   messagesNotArray,
@@ -72,6 +73,30 @@ describe("getMessages", () => {
         id: 2,
       },
     ]);
+  });
+
+  it("maps the observed `create_time` field to createdAt (2026-08-11 baselines)", async () => {
+    server = await startMockServer((_req, res) => replyJson(res, messagesCreateTime));
+    const adapter = makeAdapter(server.baseUrl);
+    const result = await adapter.getMessages("t");
+    // The observed creation-time field name is `create_time`, not `created_at`.
+    expect(result.messages[0]).toMatchObject({
+      source: "gpt",
+      percentUsage: null,
+      createdAt: "2026-01-02T00:00:00Z",
+      id: 21,
+    });
+  });
+
+  it("still accepts the provisional `created_at` field as a fallback", async () => {
+    // Backward compatibility: an entry using only `created_at` keeps mapping.
+    const legacy = {
+      messages: [{ source: "combined", content: "x", created_at: "2026-01-03T00:00:00Z", id: 5 }],
+    };
+    server = await startMockServer((_req, res) => replyJson(res, legacy));
+    const adapter = makeAdapter(server.baseUrl);
+    const result = await adapter.getMessages("t");
+    expect(result.messages[0]).toMatchObject({ createdAt: "2026-01-03T00:00:00Z", id: 5 });
   });
 
   it("preserves duplicate-source messages with their timestamp/id metadata", async () => {

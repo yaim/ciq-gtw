@@ -6,10 +6,14 @@
  * inside this package (`adapter.ts`, `http.ts`). Every result here is already
  * validated and normalized; every failure is a normalized `UpstreamError`.
  *
- * Response shapes are PROVISIONAL: the source OpenAPI document declares empty
- * (`{}`) success schemas, so the success validation below is the gateway's own
- * minimal contract, not an upstream-guaranteed one. It is intentionally lax
- * (ignore unknown fields) and clearly labeled until live discovery verifies it.
+ * Response shapes are a MIXED-EVIDENCE contract: the source OpenAPI document
+ * declares empty (`{}`) success schemas, so the success validation below is the
+ * gateway's own minimal contract, not an upstream-guaranteed one, and stays lax
+ * (ignore unknown fields). Some safe field names/statuses are now
+ * verified-repeatable (repeated identically across the two 2026-08-11 authorized
+ * password baselines and encoded as synthetic fixtures); others — masked field
+ * names and any field semantics — remain provisional. See per-field notes and
+ * `.agent/docs/collectiviq-upstream-contract.md`.
  */
 
 /** A minimal fetch surface, injected so the transport is fully testable. */
@@ -106,7 +110,12 @@ export interface ProcessMessageInput {
 }
 
 export interface ProcessMessageResult {
-  /** True only after minimal provisional success validation passed. */
+  /**
+   * True only after the gateway's minimal success rule passed (a top-level
+   * object with no own `detail`). This is a gateway-owned rule; it does not
+   * assert the meaning of the observed upstream `status` field or whether the
+   * `202` implies accepted-versus-failed work.
+   */
   readonly accepted: boolean;
   readonly rawStatus: number;
 }
@@ -116,9 +125,14 @@ export interface UpstreamMessage {
   readonly source: string;
   readonly content: string | null;
   readonly percentUsage: number | null;
-  /** Provisional field (upstream key/name unverified). */
+  /**
+   * Creation timestamp. Mapped from the verified-repeatable upstream key
+   * `create_time` (observed in both 2026-08-11 password baselines), with the
+   * earlier `created_at` retained as a gateway-owned compatibility fallback.
+   * The value's selection semantics are not yet verified.
+   */
   readonly createdAt: string | number | null;
-  /** Provisional field (upstream key/name unverified). */
+  /** Safe field name `id` observed repeatably; its selection semantics are unverified. */
   readonly id: string | number | null;
 }
 
