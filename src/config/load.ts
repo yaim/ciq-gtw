@@ -12,6 +12,7 @@ import {
 import {
   ENV_DEFAULTS,
   EnvConfigSchema,
+  GATEWAY_KEY_LIMITS,
   MODEL_CONFIG_LIMITS,
   MODEL_PROPERTY_NAMES,
   ModelsFileShapeSchema,
@@ -272,6 +273,21 @@ function loadEnvConfig(source: NodeJS.ProcessEnv): EnvConfig {
       issues.push({
         field: "COLLECTIVIQ_GATEWAY_KEYS",
         reason: "must contain at least one non-empty key",
+      });
+    } else if (gatewayKeys.length > GATEWAY_KEY_LIMITS.maxKeys) {
+      issues.push({
+        field: "COLLECTIVIQ_GATEWAY_KEYS",
+        reason: "item count is outside allowed bounds",
+      });
+    }
+    // Bound each key by UTF-8 byte length (not string length). A value-free
+    // reason is recorded once even if several keys exceed the cap.
+    if (
+      gatewayKeys.some((key) => Buffer.byteLength(key, "utf8") > GATEWAY_KEY_LIMITS.maxKeyBytes)
+    ) {
+      issues.push({
+        field: "COLLECTIVIQ_GATEWAY_KEYS",
+        reason: "length is outside allowed bounds",
       });
     }
   }

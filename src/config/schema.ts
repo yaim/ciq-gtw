@@ -19,6 +19,20 @@ export const MAX_REQUEST_BODY_BYTES_MIN = 1024;
 export const MAX_REQUEST_BODY_BYTES_MAX = 67_108_864; // 64 MiB
 
 /**
+ * Conservative, non-overridable bounds for the configured client gateway keys.
+ * These are initial implementation limits chosen for safety; relaxing them is a
+ * configuration-contract/security change, not a runtime override. Byte length is
+ * measured in UTF-8 bytes, not JavaScript string length. The same per-key byte
+ * cap is applied to a presented token before it is hashed for comparison.
+ */
+export const GATEWAY_KEY_LIMITS = {
+  /** Maximum number of configured gateway keys. */
+  maxKeys: 64,
+  /** Maximum size of a single gateway key, in UTF-8 bytes (8 KiB). */
+  maxKeyBytes: 8192,
+} as const;
+
+/**
  * Conservative, non-overridable foundation limits for the model configuration
  * file. Relaxing any of these is a configuration-contract/security change, not
  * a runtime override. See `.agent/docs/tech-software-spec.md` section 24.
@@ -82,6 +96,7 @@ export const EnvConfigSchema = Type.Object(
     COLLECTIVIQ_PASSWORD: Type.Optional(Type.String({ minLength: 1 })),
     COLLECTIVIQ_GATEWAY_KEYS: Type.Array(Type.String({ minLength: 1 }), {
       minItems: 1,
+      maxItems: GATEWAY_KEY_LIMITS.maxKeys,
       uniqueItems: true,
     }),
     MODEL_CONFIG_PATH: Type.String({ minLength: 1 }),

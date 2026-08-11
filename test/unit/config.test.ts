@@ -155,6 +155,84 @@ describe("loadConfig — environment", () => {
   });
 });
 
+describe("loadConfig — gateway keys", () => {
+  /** Load with a raw gateway-key string, returning either config or issues. */
+  function loadWithKeys(rawKeys: string): ReturnType<typeof loadConfig> {
+    return loadConfig({ env: baseEnv({ COLLECTIVIQ_GATEWAY_KEYS: rawKeys }) });
+  }
+
+  /** The value-free issues raised by loading a given raw gateway-key string. */
+  function keyIssues(rawKeys: string): ConfigError["issues"] {
+    try {
+      loadWithKeys(rawKeys);
+      throw new Error("expected ConfigError");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfigError);
+      return (error as ConfigError).issues;
+    }
+  }
+
+  it("accepts a single configured key", () => {
+    const config = loadWithKeys("gw-only");
+    expect(config.COLLECTIVIQ_GATEWAY_KEYS).toEqual(["gw-only"]);
+  });
+
+  it("accepts exactly 64 configured keys", () => {
+    const keys = Array.from({ length: 64 }, (_v, i) => `gw-fake-${i}`);
+    const config = loadWithKeys(keys.join(","));
+    expect(config.COLLECTIVIQ_GATEWAY_KEYS).toHaveLength(64);
+  });
+
+  it("rejects 65 configured keys value-free", () => {
+    const keys = Array.from({ length: 65 }, (_v, i) => `gw-fake-${i}`);
+    const issues = keyIssues(keys.join(","));
+    const relevant = issues.filter((i) => i.field === "COLLECTIVIQ_GATEWAY_KEYS");
+    expect(relevant.length).toBeGreaterThan(0);
+    const serialized = JSON.stringify(issues);
+    for (const key of keys) expect(serialized).not.toContain(key);
+  });
+
+  it("accepts an 8192-byte UTF-8 key", () => {
+    const key = "a".repeat(8192);
+    const config = loadWithKeys(key);
+    expect(config.COLLECTIVIQ_GATEWAY_KEYS).toEqual([key]);
+  });
+
+  it("rejects an 8193-byte key value-free", () => {
+    const key = "a".repeat(8193);
+    const issues = keyIssues(key);
+    const relevant = issues.filter((i) => i.field === "COLLECTIVIQ_GATEWAY_KEYS");
+    expect(relevant.some((i) => i.reason === "length is outside allowed bounds")).toBe(true);
+    expect(JSON.stringify(issues)).not.toContain(key);
+  });
+
+  it("measures the key byte cap in UTF-8 bytes, not string length", () => {
+    // 4096 × "é" (2 bytes each) = 8192 bytes with a string length of 4096.
+    const ok = "é".repeat(4096);
+    expect(ok.length).toBe(4096);
+    expect(Buffer.byteLength(ok, "utf8")).toBe(8192);
+    expect(loadWithKeys(ok).COLLECTIVIQ_GATEWAY_KEYS).toEqual([ok]);
+
+    // 4097 × "é" = 8194 bytes: string length (4097) is well under the cap, but
+    // the UTF-8 byte length exceeds it, so it must be rejected.
+    const tooBig = "é".repeat(4097);
+    expect(tooBig.length).toBeLessThan(8192);
+    expect(Buffer.byteLength(tooBig, "utf8")).toBe(8194);
+    const issues = keyIssues(tooBig);
+    expect(
+      issues.some(
+        (i) =>
+          i.field === "COLLECTIVIQ_GATEWAY_KEYS" && i.reason === "length is outside allowed bounds",
+      ),
+    ).toBe(true);
+  });
+
+  it("trims, drops empty entries, and de-duplicates", () => {
+    const config = loadWithKeys(" gw-a , , gw-a ,gw-b, gw-b ");
+    expect(config.COLLECTIVIQ_GATEWAY_KEYS).toEqual(["gw-a", "gw-b"]);
+  });
+});
+
 describe("loadConfig — upstream authentication mode", () => {
   it("defaults to bearer mode and requires the API key", () => {
     const config = loadConfig({ env: baseEnv() });
