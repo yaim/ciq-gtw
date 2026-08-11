@@ -1733,9 +1733,12 @@ COLLECTIVIQ_USERNAME + COLLECTIVIQ_PASSWORD    # password mode
 
 In `bearer` mode the static `COLLECTIVIQ_API_KEY` is the upstream bearer token.
 In `password` mode `COLLECTIVIQ_USERNAME`/`COLLECTIVIQ_PASSWORD` are exchanged at
-`POST /login` for a short-lived bearer token held in memory only (implemented
-offline, unverified). The inactive mode's credentials may be present but are
-ignored. Byte bounds: username trimmed ≤ 320 bytes; password preserved exactly
+`POST /login` for a short-lived bearer token held in memory only. The login
+exchange is **verified-live**: each of the two 2026-08-11 authorized password
+baselines performed exactly one `POST /login` → HTTP `200` whose body normalized
+to a `Bearer access_token`; response fields beyond `access_token`/`token_type`
+were masked, and token lifetime/refresh remain unverified. The inactive mode's
+credentials may be present but are ignored. Byte bounds: username trimmed ≤ 320 bytes; password preserved exactly
 ≤ 4096 bytes; bearer/`access_token` preserved exactly ≤ 16 KiB.
 
 OpenCode receives only a gateway key.
@@ -2496,10 +2499,14 @@ Exit criterion:
 
 * upstream adapter contract tests reflect real responses.
 
-Current status (offline portion complete; two authorized live baselines ran and
-both failed): the OpenAPI-grounded adapter boundary (`src/collectiviq/`), the
-shared dual-mode credential provider (`auth.ts`: static `bearer` plus the
-offline, unverified OAuth2 `password`/`POST /login` mode), the shared
+Current status (four authorized live baselines ran — two 2026-08-06/07 bearer
+runs failed strict completeness and two 2026-08-11 `password` runs both passed;
+the core create/submit/messages contract and password `POST /login` are now
+verified-repeatable, while the deliverables listed above remain partly open, so
+Phase 0 is not declared complete): the OpenAPI-grounded adapter boundary
+(`src/collectiviq/`), the shared dual-mode credential provider (`auth.ts`: static
+`bearer` plus the OAuth2 `password`/`POST /login` mode, whose login is now
+**verified-live**), the shared
 request builders (`requests.ts`) reused by production and discovery, the filtered
 contract snapshot of **ten** allowlisted operations
 (`contract/collectiviq/openapi-filtered.json`), the hermetic
@@ -2520,8 +2527,9 @@ observed-once (not verified) facts: `create_thread` → `200` (numeric
 `status`/`has_rag_files` and no `detail` (a run identifier is present; the
 `status` meaning and accepted-vs-failed semantics are unknown; idempotency
 unresolved); `get_messages` → `200` (`messages` array accepted, but observed
-`create_time`/`updated_at` diverge from the provisional `created_at` mapping, so
-message-metadata mapping stays provisional); empty-bearer auth probe `401` and
+`create_time`/`updated_at` diverged from the then-provisional `created_at`
+mapping — later driving the reconciliation of `createdAt` to `create_time`);
+empty-bearer auth probe `401` and
 no-`thread_id` validation probe `400` (expected failures); authenticated
 `/available_llms` → `403` (reason unknown, no causal claim); SSE `/user/events`
 `200`/`text/event-stream` with thread+run correlation matched once (scope and
@@ -2541,12 +2549,30 @@ cleanup diagnostics **observed `DELETE` returning HTTP `403`**, leaving two
 recovery-journal-owned threads unresolved (identifiers never exposed; no causal
 claim, and API thread deletion is still not confirmed to work). Dual-mode
 password authentication was implemented offline but remained unverified for this
-run (no live `POST /login` was performed). **No live capture was promoted** from
-either run; the contract tests
-still use synthetic fixtures, all runtime response shapes remain provisional or
-observed-once, and capability flags remain `false`. Phase 0 is **not complete**:
-it exits only after approved, repeatable live discovery captures sanitized
-fixtures that reflect real responses. See
+run (no live `POST /login` was performed).
+
+On **2026-08-11** two explicitly approved authenticated `baseline` runs were
+executed in **`password` mode** and **both exited zero** (each passed strict
+completeness), with sanitized captures **identical across every safe contract
+fact**. This makes the core contract **verified-repeatable**: password
+`POST /login` works (`200`, normalizable `Bearer` token); `create_thread` `200`,
+`process_message` `202` (with `combined_run_id`), `get_messages` `200` (metadata
+field `create_time`, not the provisional `created_at`). Deletion and inventory
+access were **credential/principal-dependent** (cause not established): the
+password/member principal read `/available_llms` → `200` (the API-key principal
+had returned `403`), deleted its own newly created thread → `200`, and re-deleting
+that same just-deleted id → `403`. SSE thread+run correlation matched (scope still
+unknown).
+The verified-repeatable shapes were promoted into **synthetic** fixtures
+(`processAccepted202`, `messagesCreateTime`) with contract tests, and the
+`createdAt` mapping was reconciled to `create_time`. **No live value was
+promoted**; the ignored live reports and recovery journal are not committed, and
+capability flags remain `false`.
+
+Phase 0 has **advanced substantially** but is **not automatically declared
+complete**: idempotency, message ordering/pagination, prompt/rate limits,
+retention, native tools, SSE scope, and token lifetime remain open (see the
+section 35 gap matrix). See
 [`collectiviq-upstream-contract.md`](collectiviq-upstream-contract.md).
 
 ### Phase 1 — Text gateway
@@ -2728,44 +2754,68 @@ Mitigation:
 
 ## 35. Open Questions Requiring CollectivIQ Confirmation
 
-Before declaring production readiness, obtain answers to the following. The
-2026-08-06 and 2026-08-07 authorized baselines supplied value-free
-**observed-once (not verified)** partial evidence for some items, noted inline;
-observed-once — even when corroborated across both runs — does not resolve a
-question. None of these is verified.
+Before declaring production readiness, obtain answers to the following. The two
+**2026-08-11 password baselines** are **verified-repeatable** (identical safe
+facts across two approved runs, encoded into synthetic fixtures) and resolve
+several items below (marked **RESOLVED/VERIFIED**); the 2026-08-06/07 bearer runs
+supplied observed-once corroboration. The still-open items form the **Phase 0 gap
+matrix** — Phase 0 is not declared complete until these are decided:
+
+- prompt-size limit (#10) — **open**;
+- rate/quota limits (#11) — **open** (quota `429` never observed);
+- `process_message` idempotency and `status` semantics (#4, #6) — **open**;
+- message ordering/pagination (#7, #8) — **open**;
+- native tools / structured tool results (#14, #15) — **open**;
+- retention/training/zero-retention/regional (#22–#25) — **open**;
+- SSE account-wide-vs-connection scope (#13) — **open**;
+- token lifetime/refresh for password login (#26) — **open**.
 
 1. Is there official API documentation?
-2. What are the precise schemas for all four demonstrated endpoints? (**Partially
-   observed once:** `create_thread` `200`, `process_message` `202`, `get_messages`
-   `200`; structure-only, not verified.)
+2. What are the precise schemas for all four demonstrated endpoints?
+   (**Verified-repeatable safe shapes:** `create_thread` `200`,
+   `process_message` `202`, `get_messages` `200`, and `POST /login` `200`
+   repeated identically across the two 2026-08-11 password baselines and are
+   encoded as synthetic fixtures. Response fields beyond the validated safe names
+   remain masked/provisional, so the precise full schemas are still unconfirmed.)
 3. What HTTP status codes represent authentication, quota, and validation
-   failures? (**Observed once:** `401` empty-bearer auth, `400` missing-parameter
-   validation, and a `403` from authenticated `/available_llms`; quota `429`
-   unobserved.)
+   failures? (**Repeated across the two 2026-08-11 password runs:** `401`
+   empty-bearer auth and `400` missing-parameter validation. A `403` from
+   authenticated `/available_llms` was also observed but is
+   credential/principal-dependent (password/member `200` vs API-key `403`), cause
+   not established. Quota `429` never observed.)
 4. Is `process_message` idempotent? (**Unresolved.**)
-5. Is there a job or message identifier in its response? (**Observed once:** a run
-   identifier `combined_run_id` was present in the `202`.)
-6. How can the gateway distinguish accepted work from failed work? (**Observed
-   once:** a `status` field was present, but its meaning is **unknown**.)
+5. Is there a job or message identifier in its response? (**Presence repeated:** a
+   run identifier `combined_run_id` appears in the `202` across the two password
+   runs; its semantics remain unknown.)
+6. How can the gateway distinguish accepted work from failed work? (**Presence
+   repeated:** a `status` field appears in the `202` across the two password runs,
+   but its meaning and any accepted-versus-failed semantics remain **unknown**.)
 7. Does `get_messages` return messages in chronological order? (**Unresolved.**)
 8. Can it paginate? (**Unresolved.**)
-9. Can a thread be deleted? (**Unresolved.** On 2026-08-06 cleanup DELETEs failed
-   and two threads leaked, then were manually deleted; the old report did not
-   capture delete status, so no `403` claim. On 2026-08-07 the remediated
-   diagnostics **observed `DELETE` returning `403`**, leaving two
-   recovery-journal-owned threads unresolved — no causal claim, and deletion is
-   still not confirmed to work.)
+9. Can a thread be deleted? (**Credential/principal-dependent behavior
+   observed**, cause not established. Value-free outcomes: the password/member
+   principal deleting its own newly created thread → `200` (repeated: both
+   2026-08-11 runs + a standalone probe); re-deleting that same just-deleted id →
+   `403` (repeated); the API-key principal deleting its own newly created thread →
+   `403` (observed in the 2026-08-07 run); a cross-principal recovery attempt
+   (password principal deleting stale threads created by another principal) →
+   `403` (observed during the approved recovery attempt). This is consistent with
+   a permission/scope check, but the provider's evaluation order is unconfirmed
+   and the cause — membership, role, token scope, auth mode, or endpoint policy —
+   is not established. The recovery command's exact-`404` convergence was not
+   exercised by these cases; its handling is retained unchanged.)
 10. What is the maximum prompt size?
 11. What are account and model rate limits?
-12. Does `/user/events` include `thread_id`? (**Observed once:** thread
-    correlation matched once.)
+12. Does `/user/events` include `thread_id`? (**Repeated:** thread correlation
+    matched in both 2026-08-11 password runs, corroborating 2026-08-06. Whether
+    the stream is account-wide vs connection-specific is still unknown — see #13.)
 13. Is `/user/events` account-wide or connection-specific? (**Unknown.**)
 14. Does CollectivIQ support native tools or function calling?
 15. Can tool results be sent back as structured messages?
 16. Can the API receive system and developer messages separately?
 17. Can the API return token usage?
-18. What does `percent_usage` mean? (**Observed once as null;** meaning still
-    **unknown**.)
+18. What does `percent_usage` mean? (**Repeated as null** across the two
+    2026-08-11 password runs; meaning still **unknown**.)
 19. Which values are currently valid for `selected_llms`?
 20. Does `generate_combined=false` guarantee exactly one selected-model response?
 21. What completion signal exists if a selected model fails?
@@ -2774,10 +2824,12 @@ question. None of these is verified.
 24. Is enterprise zero-retention available?
 25. Are there regional data-processing controls?
 26. Does the OAuth2 password login (`POST /login`) work, and what is its real
-    `200` response shape and token lifetime? (**Unresolved:** `password` mode is
-    implemented offline with a provisional response validator; no live login has
-    been performed, so the login contract is unverified. `/auth/refresh` has empty
-    schemas and is not implemented.)
+    `200` response shape and token lifetime? (**Login RESOLVED/VERIFIED:** the two
+    2026-08-11 runs each performed one `POST /login` → `200` with a normalizable
+    `Bearer access_token`. **Still open:** response fields beyond
+    `access_token`/`token_type` (masked in the sanitized evidence) and token
+    **lifetime/refresh**. `/auth/refresh` has empty schemas and is not
+    implemented.)
 
 ---
 

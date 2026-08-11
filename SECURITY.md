@@ -69,8 +69,9 @@ exist today are:
 - **Upstream authentication (offline; dual-mode).** A shared credential provider
   (`src/collectiviq/auth.ts`) supplies a per-request lease bearer token used by
   the transport, SSE, deletion, and recovery paths, and never logs it. `bearer`
-  mode uses the static `COLLECTIVIQ_API_KEY`; the offline, unverified `password`
-  mode performs a bounded **unauthenticated** `POST /login` (20 s deadlines,
+  mode uses the static `COLLECTIVIQ_API_KEY`; the `password` mode (login
+  **verified-live** on 2026-08-11; token lifetime/refresh still unverified)
+  performs a bounded **unauthenticated** `POST /login` (20 s deadlines,
   64 KiB cap, strict UTF-8, JSON, exactly HTTP `200`, `redirect: "error"`,
   no `Authorization` header) that mints a short-lived token held **in memory
   only**, with single-flight coalescing, generation-safe invalidation, and a hard
@@ -99,14 +100,19 @@ exist today are:
   past 16 MiB before buffering the whole body, cancels the reader/response on
   overflow/timeout/decode failure, and decodes strict UTF-8. No credentials are
   sent; the command stays out of `validate`/CI.
-- **Discovery tooling (opt-in; two authorized baseline runs, 2026-08-06 and
-  2026-08-07).** Two explicitly approved authenticated `baseline` runs were
-  executed — on 2026-08-06 and 2026-08-07 — and both failed strict completeness
-  (exited non-zero); their evidence is observed-once and sanitized (not verified,
-  and corroboration across the two runs is not verification), and no live capture
-  was promoted. The 2026-08-07 run's remediated cleanup diagnostics observed
-  `DELETE` returning HTTP `403`, leaving two recovery-journal-owned threads
-  unresolved (their identifiers are never exposed). The staged
+- **Discovery tooling (opt-in; four authorized baseline runs).** Two bearer-mode
+  runs on 2026-08-06 and 2026-08-07 failed strict completeness (exited non-zero);
+  two **`password`-mode** runs on **2026-08-11 both passed strict completeness
+  (exited zero)** with **identical** sanitized results, making password login and
+  the core create/submit/messages contract **verified-repeatable** (encoded into
+  synthetic fixtures — no live value committed). Thread-deletion outcomes were
+  **credential/principal-dependent** (cause not established): the password/member
+  principal deleted its own newly created thread (`200`, repeated) while
+  re-deleting that same just-deleted id returned `403`; the API-key principal's
+  own-thread delete returned `403` (2026-08-07); a cross-principal recovery
+  attempt also returned `403`. This is consistent with a permission/scope check,
+  but the provider's evaluation order is unconfirmed. Thread identifiers are
+  never exposed in reports/logs. The staged
   live-discovery session/CLI
   runs one bounded `baseline` session against a **fixed** destination origin
   (no origin/path/thread-id/run-id injection). Its **default is preflight only**:

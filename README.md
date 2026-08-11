@@ -36,15 +36,16 @@ CollectivIQ, exposing a bounded OpenAI Chat Completions-compatible profile.
 `GET /metrics`, gateway authentication, prompt construction, emulated/native
 tool calling, synthetic SSE streaming, polling, generation orchestration, and
 any live CollectivIQ call. The adapter exists but is not connected to a public
-endpoint. Two authorized authenticated discovery baselines ran — on 2026-08-06
-and 2026-08-07 — and **both failed strict completeness (exited non-zero)**; their
-evidence is observed-once and sanitized, not verified (repetition across the two
-runs is corroboration, not verification), and no live capture was promoted. The
-2026-08-07 run observed `DELETE` returning HTTP `403`, leaving two
-recovery-journal-owned threads unresolved. Dual-mode upstream authentication
-(`bearer` default plus an OAuth2 password-exchange mode via `POST /login`) is
-implemented offline but **unverified**. Upstream response shapes are therefore
-provisional or observed-once, and Phase 0 is not complete.
+endpoint. Four authorized authenticated discovery baselines ran: two bearer-mode
+runs (2026-08-06/07) **failed strict completeness (exited non-zero)**, and two
+`password`-mode runs (2026-08-11) **both passed (exited zero)** with identical
+sanitized safe facts. The core create/submit/messages contract and password
+`POST /login` are therefore **verified-repeatable** (encoded into synthetic
+fixtures; no live value promoted), while masked field names and all field
+semantics stay provisional. Thread-deletion outcomes were observed to be
+credential/principal-dependent (cause not established). Phase 0 has advanced
+substantially but is **not complete** — several provider questions remain open
+(see below).
 
 ## Prerequisites
 
@@ -128,12 +129,22 @@ These commands need network access and are **excluded from `validate` and CI**:
 | `npm run contract:discovery`         | Opt-in live discovery (requires credentials + explicit approval)                                                   |
 | `npm run contract:discovery:cleanup` | Recovery-only: delete leaked session threads listed in the recovery journal (requires credentials + all approvals) |
 
-Two authorized `contract:discovery` baselines were run — on 2026-08-06 and
-2026-08-07 — and **both failed strict completeness (exited non-zero)**; their
-evidence is observed-once and sanitized (not verified), and no live capture was
-promoted, so Phase 0 is not complete. The 2026-08-07 run's remediated diagnostics
-observed `DELETE` returning HTTP `403`, leaving two recovery-journal-owned threads
-unresolved for the recovery command. It runs a single
+Four authorized `contract:discovery` baselines were run: two on 2026-08-06 and
+2026-08-07 in **bearer** mode (both failed strict completeness), and two on
+**2026-08-11 in `password` mode that BOTH passed strict completeness (exited
+zero)** with **identical** sanitized results. The core create/submit/messages
+contract and password `POST /login` are therefore **verified-repeatable** and
+encoded into synthetic fixtures (no live value committed). Thread-deletion
+outcomes were **credential/principal-dependent** (cause not established): the
+password/member principal deleted its own newly created thread (`200`, repeated)
+while re-deleting that same just-deleted id returned `403`; the API-key
+principal's own-thread delete returned `403` (2026-08-07); a cross-principal
+recovery attempt also returned `403` — consistent with a permission/scope check,
+but the provider's evaluation order is unconfirmed, so recovery's exact-`404`
+convergence was not exercised. Phase 0 has advanced substantially but is not
+auto-declared complete — open provider questions remain (idempotency,
+ordering/pagination, prompt/rate limits, retention, native tools, SSE scope,
+token lifetime). It runs a single
 bounded `baseline` session against a **fixed** destination origin
 (`https://api.prod.collectiviq.ai`) — no origin, path, thread-id, or run-id may
 be supplied. The **default invocation is preflight only**: it validates the
@@ -242,8 +253,9 @@ gateway validates the mode-appropriate credential at startup. Only
 The upstream credential authenticates the gateway to CollectivIQ: in `bearer`
 mode `COLLECTIVIQ_API_KEY` is sent as a static bearer token; in `password` mode
 `COLLECTIVIQ_USERNAME`/`COLLECTIVIQ_PASSWORD` are exchanged at `POST /login` for a
-short-lived bearer token held in memory (implemented offline, unverified). The
-inactive mode's credentials may be set but are ignored.
+short-lived bearer token held in memory (login **verified-live** on 2026-08-11;
+token lifetime/refresh still unverified). The inactive mode's credentials may be
+set but are ignored.
 `COLLECTIVIQ_GATEWAY_KEYS` are **intended to authenticate clients (OpenCode) to
 the gateway once gateway authentication is implemented**. Gateway authentication
 is not implemented in this foundation: the keys are validated and held, but no

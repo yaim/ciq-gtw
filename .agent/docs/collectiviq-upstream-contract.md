@@ -19,21 +19,29 @@ Every claim below is tagged with one of:
 - **observed** — seen in a sanitized capture from an authorized live probe.
 - **verified** — observed repeatably and encoded into deterministic fixtures.
 
-Two authorized authenticated baseline discovery runs have been executed — one on
-2026-08-06 (see "2026-08-06 authorized baseline" below) and a second on
-2026-08-07 (see "2026-08-07 authorized baseline" below). **Both exited non-zero**
-(each failed strict completeness), and each run's evidence is a **value-free
-sanitized structural capture** (`evidenceFormatVersion` 2). Some response shapes
-are therefore tagged **observed** — meaning **observed on the 2026-08-06 and/or
-2026-08-07 run and not repeatably verified**. Repetition of a shape across the two
-runs is corroboration, **not verification**: verification requires an
-independently approved run that confirms a prior one under a promoted, sanitized
-fixture, and no capture from either run was promoted. No live capture was promoted
-into a committed fixture. Every runtime response shape that was not exercised by
-these runs remains **provisional**, and the response *mapping* for observed
-endpoints stays provisional where the observed field names diverge from the
-gateway's assumptions. Phase 0 is **not complete**: approved, repeatable live
-discovery must still replace provisional shapes with sanitized fixtures.
+Four authorized authenticated baseline discovery runs have been executed: two on
+2026-08-06 and 2026-08-07 in **bearer** mode (both exited non-zero; see those
+sections below), and two on **2026-08-11 in `password` mode** (see "2026-08-11
+authorized password baseline" below). **Both 2026-08-11 runs exited zero** (each
+passed strict completeness) and their sanitized structural captures
+(`evidenceFormatVersion` 2) are **identical across every safe contract fact**
+(statuses, ok flags, error codes, per-stage structure shapes, correlation,
+cleanup counts, not-found, and the auth observation). Facts that repeated
+identically across those two independently-approved runs **and** are encoded into
+a deterministic synthetic fixture are now tagged **verified**; the affected fixtures
+carry SYNTHETIC values only (no live value was ever copied). The earlier bearer
+runs remain **observed-once** corroboration.
+
+Every runtime response shape that was not exercised by these runs remains
+**provisional**, and a mapping stays provisional where the observed field NAME was
+masked by structural capture (e.g. message `content`, whose real field name never
+appeared in the sanitized evidence). Phase 0 has **advanced substantially** — the
+core create/submit/messages contract and password login are now
+verified-repeatable, and thread-deletion and inventory-access outcomes were
+observed to be credential/principal-dependent (cause not established) — but is
+**not automatically declared complete**: several provider questions (idempotency,
+message ordering/pagination, prompt/rate limits, retention, native tools, SSE
+scope, token lifetime) remain open (see the gap matrix in spec section 35).
 
 ## Source metadata
 
@@ -55,12 +63,13 @@ review candidate under `.agent/sessions/`) and compare the live document with
 `npm run contract:openapi:check`. Both require network access and are excluded
 from `validate` and CI.
 
-## Authentication (documented; dual-mode provisional)
+## Authentication (documented; password login verified-live, extra fields provisional)
 
 - Security scheme `OAuth2PasswordBearer` (`type: oauth2`); its password flow's
   `tokenUrl` is `/login`, which is **used by the optional password mode**
-  described below (provisional/unverified). All core and supporting operations
-  except `/user/events` declare the scheme.
+  described below (login **verified-live**; response fields beyond the validated
+  minimal shape and token lifetime/refresh remain provisional). All core and
+  supporting operations except `/user/events` declare the scheme.
 - The gateway attaches a **lease bearer token** — `Authorization: Bearer
   <token>` — on every request, via a shared credential-provider boundary
   (`src/collectiviq/auth.ts`) used by the production adapter, discovery, the SSE
@@ -71,8 +80,14 @@ from `validate` and CI.
   - **`bearer` (default):** the static `COLLECTIVIQ_API_KEY` is the bearer token.
   - **`password`:** `COLLECTIVIQ_USERNAME` + `COLLECTIVIQ_PASSWORD` are exchanged
     at `POST /login` for a short-lived bearer token, held **in memory only** and
-    then attached like any other bearer. This mode is implemented offline and is
-    **provisional/unverified**.
+    then attached like any other bearer. The login exchange is **verified-live**:
+    the two 2026-08-11 authorized password baselines each performed exactly one
+    `POST /login` returning HTTP `200` whose body normalized to a `Bearer`
+    `access_token` (auth observation `{ mode: password, loginAttempts: 1, status:
+    200, normalized: true }`), and a standalone create+delete probe confirmed the
+    minted bearer authorizes core operations. Response fields **beyond** the
+    validated `access_token`/`token_type` were never captured (masked), and token
+    **lifetime/refresh** behaviour remains unverified.
 - **Lease behaviour (both the JSON transport and the SSE path share it).** Each
   request acquires a lease and attaches its bearer token. An HTTP `401`
   **invalidates that lease** — the request is **not** replayed — so the next
@@ -83,11 +98,13 @@ from `validate` and CI.
   `Authorization` header parameter; it uses header-based bearer auth, not query
   authentication.
 
-### Login contract (provisional)
+### Login contract (verified-live; extra fields provisional)
 
 The password mode's login exchange is the gateway's own working contract; the
-published document's `200` response schema for `/login` is empty, so response
-validation is provisional and unverified.
+published document's `200` response schema for `/login` is empty. The gateway's
+minimal validator (a `Bearer` `access_token`) is now **verified-live** by the two
+2026-08-11 password baselines, but any response field beyond that is masked and
+unverified, as is token lifetime/refresh.
 
 - **Request** (documented `application/x-www-form-urlencoded`): `grant_type=password`,
   `username`, `password`, and `scope=` (empty). `client_id`/`client_secret` are
@@ -100,10 +117,12 @@ validation is provisional and unverified.
   newer one), and enforces a hard **two-login budget per process** for
   discovery/recovery (exceeding it fails closed with the normalized authentication
   error).
-- **Response validator (provisional):** requires a non-array object with an own
-  `access_token` (non-empty string, ≤ 16 KiB) and an own `token_type` equal to
-  `Bearer` (case-insensitive). Unknown fields — including any refresh token — are
-  ignored and never retained.
+- **Response validator (minimal shape verified-live; extra fields provisional):**
+  requires a non-array object with an own `access_token` (non-empty string,
+  ≤ 16 KiB) and an own `token_type` equal to `Bearer` (case-insensitive). This
+  minimal `Bearer access_token`/`token_type` shape is **verified-live** by the two
+  2026-08-11 password baselines; any field beyond it (including any refresh token)
+  is masked/unverified, ignored, and never retained, as is token lifetime/refresh.
 - **No refresh or logout.** `/auth/refresh` exists in the published document but
   both its request and response schemas are empty; it is **not** implemented.
   There is no refresh, logout, cookie, browser-localStorage, SSO, or
@@ -121,7 +140,7 @@ validation is provisional and unverified.
 
 ## Core operations
 
-### `POST /create_thread` (documented request; observed-once success shape, mapping provisional)
+### `POST /create_thread` (documented request; verified-repeatable success shape)
 
 - Content type **`application/x-www-form-urlencoded`** (documented). This
   corrects earlier text that described it as multipart.
@@ -132,11 +151,12 @@ validation is provisional and unverified.
   and never derived from prompts, repositories, filenames, or personal data.
 - Success shape: a top-level object with a `thread_id` that is a positive integer
   or a non-empty string, normalized to a string. Declared `200` schema is empty
-  (`{}`). **Observed once on 2026-08-06 (not verified):** two creates each
-  returned HTTP `200` with a top-level **numeric** `thread_id`, which the
-  production normalizer accepted. Structure-only; no value was captured.
+  (`{}`). **Verified-repeatable:** across the 2026-08-06/07 bearer runs and both
+  2026-08-11 password runs, every create returned HTTP `200` with a top-level
+  **numeric** `thread_id`, which the production normalizer accepted.
+  Structure-only; no value was captured.
 
-### `POST /process_message` (documented request; observed-once success shape, mapping provisional)
+### `POST /process_message` (documented request; verified-repeatable success shape)
 
 - Content type **`multipart/form-data`** (documented).
 - Fields sent by the gateway: `prompt`, `thread_id` (documented type: string),
@@ -150,16 +170,18 @@ validation is provisional and unverified.
   `suppress_user_bubble`, `response_format`, `tier`.
 - **Provisional** success rule: a top-level JSON object; a present `detail`
   field is a failure even on HTTP 2xx. Declared `200` schema is empty.
-- **Observed once on 2026-08-06 (not verified):** two submissions each returned
-  HTTP **`202` (Accepted)** with a top-level object whose safe field names were
-  `thread_id` (string here), `combined_run_id` (string), `status` (string), and
-  `has_rag_files` (boolean); there was **no** top-level `detail`, so the
-  provisional normalizer accepted it. A run identifier (`combined_run_id`) is
-  therefore present in the response. The meaning of the `status` field and whether
-  the `202` implies accepted-versus-failed work are **unknown**, and idempotency
-  remains **unresolved**. Structure-only; no value was captured.
+- **Verified-repeatable:** across the 2026-08-06/07 bearer runs and both
+  2026-08-11 password runs, every submission returned HTTP **`202` (Accepted)**
+  with a top-level object whose safe field names were `thread_id` (string here),
+  `combined_run_id` (string), `status` (string), and `has_rag_files` (boolean),
+  with **no** top-level `detail`, so the normalizer accepted it. A run identifier
+  (`combined_run_id`) is therefore present. Encoded as the synthetic fixture
+  `processAccepted202` (`test/contract/fixtures/collectiviq/responses.ts`) and
+  covered by `adapter-process-message.test.ts`. Still **unknown/unresolved:** the
+  meaning of the `status` field, whether `202` implies accepted-versus-failed
+  work, and idempotency. Structure-only; no value was captured.
 
-### `GET /get_messages` (documented request; observed-once success shape, mapping provisional)
+### `GET /get_messages` (documented request; verified-repeatable shape; content mapping still provisional)
 
 - Query parameters (documented): `thread_id` (string, declared **optional**) and
   `since_id` (`string | null`, optional).
@@ -168,28 +190,36 @@ validation is provisional and unverified.
   this phase so full thread history is returned.
 - Success shape: a top-level object with a `messages` array. Each message is
   normalized to `{ source, content, percentUsage, createdAt, id }`. `source`
-  (string) and `content` (`string | null`) map from documented sample fields;
-  `percentUsage` maps from `percent_usage`; `createdAt`/`id` map from
-  `created_at`/`id`.
-- **Observed once on 2026-08-06 (not verified):** a `200` whose top-level
-  `messages` array was accepted by the production normalizer. Observed
-  message-entry metadata field names included `source`, `id` (number),
-  `combined_run_id`, `create_time` (string), `updated_at` (string), `thread_id`
-  (number), and `percent_usage` (null in this run), plus other booleans/nulls;
-  content-bearing fields are masked by structural capture. **Discrepancy (keeps
-  the mapping provisional):** the provisional validator in
-  `src/collectiviq/validation.ts` maps `created_at`, but the observed field name
-  was `create_time` (and a separate `updated_at` was also present). This is
-  recorded as an **observed discrepancy**, not a correction — the production
-  message-metadata mapping remains **provisional** until reconciled and repeatably
-  verified. Structure-only; no value was captured.
+  (string) and `percentUsage` (from `percent_usage`) and `id` are
+  verified-repeatable safe fields.
+- **`createdAt` mapping reconciled (verified-repeatable):** both 2026-08-11
+  password runs (corroborating 2026-08-06) show the creation-time field is
+  **`create_time`** (with a separate `updated_at`), **not** the earlier
+  provisional `created_at`. `src/collectiviq/validation.ts` now maps `createdAt`
+  from `create_time` first, keeping `created_at` as a backward-compatible
+  fallback (`updated_at` is intentionally not mapped — its selection semantics
+  are unverified). Encoded as the synthetic fixture `messagesCreateTime` and
+  covered by `adapter-get-messages.test.ts`.
+- **`content` mapping stays provisional:** the message content field NAME is
+  content-bearing, so structural capture masks it — it never appeared in the
+  sanitized evidence, so the `content` mapping is unconfirmed. Observed
+  safe-named entry fields included `source`, `id` (number), `combined_run_id`,
+  `create_time`/`updated_at` (strings), `thread_id` (number), `percent_usage`
+  (null in these runs), plus other booleans/nulls. Structure-only; no value was
+  captured.
 
 ## Empty / incomplete success schemas
 
 The declared `200` response schema for **every** allowlisted operation is empty
 (`{}`). The OpenAPI document therefore establishes **no** runtime response
-contract. All success validation in `src/collectiviq/validation.ts` is the
-gateway's own minimal, provisional contract and is labeled as such in code.
+contract, and all success validation in `src/collectiviq/validation.ts` is the
+gateway's own minimal contract. That contract is **mixed-evidence**: safe field
+names and statuses that repeated identically across the two 2026-08-11 password
+baselines are verified-repeatable (and encoded as synthetic fixtures), while
+masked field names (e.g. message `content`) and all field *semantics* remain
+provisional. The minimal success **rules** themselves (e.g. "an object without an
+own `detail`") are gateway-owned working rules, not provider guarantees, and are
+labeled as such in code.
 
 ## Supporting operations (documented endpoints; NOT gateway capabilities)
 
@@ -198,12 +228,12 @@ production `CollectivIQAdapter` and are used by no completion path.
 
 | Operation | Method | Notes |
 | --- | --- | --- |
-| `/available_llms` | GET | Model metadata. Only a `200` is declared (no `422`). **Observed once 2026-08-06:** the authenticated request returned HTTP **`403`** (normalized to the authentication/authorization category); the empty-bearer auth probe returned `401`. No causal claim is made about why `403` occurred. |
-| `/user/events` | GET | SSE; header-based auth; optional `last_event_id`. **Observed once 2026-08-06:** `200` with `text/event-stream`, bounded `event-limit` termination, and thread **and** run correlation both `matched` once. Whether the stream is account-wide vs connection-specific is **unknown**, and correlation is not repeatably verified. |
+| `/available_llms` | GET | Model metadata. Only a `200` is declared (no `422`). **Access is credential/principal-dependent (cause not established):** both 2026-08-11 password (member) runs returned HTTP **`200`** (repeated) with a structurally valid `llms` object of model-family descriptors (family keys `claude`/`gemini`/`gpt`/`grok`/`llama4`/`nemotron`/`specialty`; per-model values masked), whereas the earlier 2026-08-06/07 API-key runs returned **`403`**. The empty-bearer auth probe returns `401`. No account-specific model value is inspected or retained. |
+| `/user/events` | GET | SSE; header-based auth; optional `last_event_id`. **Repeated:** `200` with `text/event-stream`, bounded `event-limit` termination, and thread **and** run correlation both `matched` in both 2026-08-11 password runs (corroborating 2026-08-06). Whether the stream is account-wide vs connection-specific is **unknown**, so the streaming capability stays `false`. |
 | `/abort_run` | POST | urlencoded, required `combined_run_id`. **Cooperative**: already-running provider calls may finish, be saved, and be billed while later combination work is skipped. |
 | `/thread_tokens` | GET | Required `thread_id` (**integer** here — an inconsistency with the string `thread_id` used elsewhere), plus `limit`/`offset`/`rollup`/`include`. |
 | `/thread_tokens/{combined_run_id}` | GET | Path `combined_run_id` (string) + optional `include`. |
-| `/delete_thread/{thread_id}` | DELETE | Path `thread_id` (string). |
+| `/delete_thread/{thread_id}` | DELETE | Path `thread_id` (string). **Credential/principal-dependent behavior observed (cause not established).** Value-free outcomes: the password/member principal deleting its own newly created thread → `200` (repeated: both 2026-08-11 runs' cleanup + a standalone probe); re-deleting that same just-deleted id → `403` (repeated); the API-key principal deleting its own newly created thread → `403` (observed in the 2026-08-07 run); a cross-principal recovery attempt → `403` (observed during the approved recovery attempt). This is consistent with a permission/scope check, but the provider's evaluation order is unconfirmed. The recovery command's exact-`404` convergence was **not exercised** by these cases; its handling (see the discovery section) is retained unchanged. |
 
 Documented existence does not make any of these a gateway feature. Thread
 deletion, account-wide `/user/events`, cooperative abort, and token reporting
@@ -282,12 +312,56 @@ are not conflated.
   this run; the approval-gated recovery/baseline stages had not yet exercised the
   `POST /login` exchange live.
 
-## Discovery session (two authorized runs; opt-in)
+## 2026-08-11 authorized password baseline (two verified-repeatable runs)
+
+On 2026-08-11 two explicitly user-approved authenticated `baseline` runs were
+executed in **`password` mode** against the fixed origin
+`https://api.prod.collectiviq.ai`. **Both exited zero** (each passed strict
+completeness), and their sanitized structural captures
+(`evidenceFormatVersion` 2) are **identical across every safe contract fact** — a
+programmatic comparison of statuses, ok flags, error codes, per-stage structure
+shapes, correlation, cleanup counts, not-found, and the auth observation matched
+exactly. Facts below are therefore **verified-repeatable**; no live value was
+captured or promoted (fixtures are synthetic).
+
+- **Password login (verified-live):** each run performed exactly one `POST /login`
+  → HTTP `200`, body normalized to a `Bearer` `access_token`
+  (`auth = { mode: password, loginAttempts: 1, status: 200, normalized: true }`).
+- **Core stages:** `create_thread` → `200` (numeric `thread_id`);
+  `process_message` → `202` (`thread_id`/`combined_run_id`/`status`/
+  `has_rag_files`, no `detail`); `get_messages` → `200` (`messages` array;
+  `create_time`/`updated_at` metadata).
+- **`available_llms` → `200`** with a valid `llms` object for the password/member
+  principal; the API-key principal had returned `403` in the earlier bearer runs
+  (credential/principal-dependent, cause not established).
+- **Probes:** empty-bearer `available_llms` → `401`; no-`thread_id`
+  `get_messages` → `400` (expected failures).
+- **SSE `/user/events`:** `200`, `text/event-stream`, `event-limit` termination,
+  thread **and** run correlation both **matched** in both runs. The stream carried
+  a value-masked `user_id`, `triage`, and `correlation_id`; whether it is
+  account-wide vs connection-specific is **still unknown**, so the streaming
+  capability stays `false`.
+- **Cleanup (deletions succeeded for this principal):** all cleanup DELETEs
+  returned `200` (`failed: 0`, `remaining: 0`, `journalPersistenceFailed: 0`), and
+  the recovery journal was absent after each run. The observed re-delete of the
+  same just-deleted own thread returned **`403`** (not `404`); this is consistent
+  with a permission/scope check, but the provider's evaluation order is
+  unconfirmed, so the recovery command's exact-`404` convergence was not exercised.
+- **Standalone create+delete probe:** a separate one-shot probe created a thread
+  and deleted it (`200`/`200`), isolating that the password/member principal's
+  login bearer authorizes both create and delete.
+- **Promotion:** the verified-repeatable core shapes are encoded as synthetic
+  fixtures (`processAccepted202`, `messagesCreateTime`) with matching contract
+  tests, and `validation.ts` now maps `createdAt` from `create_time`. The ignored
+  live reports and recovery journal are **not** committed.
+
+## Discovery session (four authorized runs; opt-in)
 
 Live evidence is captured only through the staged discovery session
 (`DiscoverySessionRunner` in `src/collectiviq/discovery.ts`) and its thin CLI
-(`src/collectiviq/discovery-cli.ts`). Two authorized baselines have been run (see
-above); it is otherwise opt-in and preflight-only by default. Key properties:
+(`src/collectiviq/discovery-cli.ts`). Four authorized baselines have been run (see
+above: two 2026-08-06/07 bearer runs and two 2026-08-11 password runs); it is
+otherwise opt-in and preflight-only by default. Key properties:
 
 - A single bounded `baseline` session against a **fixed** origin
   (`https://api.prod.collectiviq.ai`); no origin/path/thread-id/run-id may be
@@ -554,7 +628,7 @@ repeatable sanitized evidence proves otherwise (`DEFAULT_UPSTREAM_CAPABILITIES`)
 | --- | --- | --- |
 | Native tool definitions | `false` | Unverified. Unrelated tool/MCP endpoints do not establish native tool calling. |
 | Native tool results | `false` | Unverified. |
-| Request-scoped streaming | `false` | `/user/events` SSE thread+run correlation was **observed matched** on 2026-08-06 and again on 2026-08-07, but is not repeatably verified (corroboration ≠ verification), and account-wide-vs-connection scope is unknown; stays `false` pending repeatable evidence. |
+| Request-scoped streaming | `false` | `/user/events` SSE thread+run correlation matched across all four runs, including the two **verified-repeatable** 2026-08-11 password runs. It stays `false` because the decisive open question — whether the stream is **account-wide vs connection-specific** — is still unknown; correlation matching alone does not establish request scoping. |
 | Cancellation | `false` (adapter) | `/abort_run` exists but is cooperative and not adopted; a submitted generation may continue after client disconnect. |
 | Token usage | `false` | `/thread_tokens` exists but is not adopted; `percent_usage` meaning is unknown. |
 
@@ -573,12 +647,14 @@ repeatable sanitized evidence proves otherwise (`DEFAULT_UPSTREAM_CAPABILITIES`)
 - Synthetic runtime fixtures (invented, not live): `test/contract/fixtures/collectiviq/`.
 - Hermetic contract tests (mock HTTP server): `test/contract/`.
 
-No live capture has been promoted into a committed fixture, including from the
-2026-08-06 or 2026-08-07 authorized baselines (both exited non-zero and captured
-value-free structure only). Contract tests still use the synthetic fixtures. When
-a repeatable approved run is available, sanitized captures replace or confirm the
-synthetic fixtures and the evidence state of the affected rows moves from
-observed-once to verified.
+No live **value** has ever been promoted into a committed fixture. Following the
+two verified-repeatable 2026-08-11 password baselines, the confirmed core shapes
+are encoded as **synthetic** fixtures — `processAccepted202` (the `202`
+`process_message` shape) and `messagesCreateTime` (the `create_time` metadata
+mapping) — whose values are invented, not captured. Field NAMES and types reflect
+the observation; identifiers, timestamps, account/user fields, prompts, answers,
+tokens, and account-specific model ids are never present. The ignored live
+reports and recovery journal under `.agent/sessions/` are never committed.
 
 ## OpenAPI drift history
 
@@ -589,36 +665,44 @@ observed-once to verified.
 
 ## Remaining live / provider questions
 
-Tracked in spec section 35. Statuses reflect the 2026-08-06 and 2026-08-07
-observed-once runs; observed-once (even corroborated across both runs) is not
-verified and none of these is resolved. The highest-priority items blocking
-Phase 0 exit:
+Tracked in spec section 35. Statuses now reflect the two **verified-repeatable**
+2026-08-11 password baselines plus the earlier bearer runs. Several items below
+are now resolved/verified; the rest remain open and are consolidated into the
+Phase 0 gap matrix in spec section 35. The highest-priority items:
 
 1. Real success schemas and status codes for the four core endpoints —
-   **partially observed once** (`create_thread` `200`, `process_message` `202`,
-   `get_messages` `200`); not verified.
+   **verified-repeatable** (`create_thread` `200`, `process_message` `202`,
+   `get_messages` `200`, plus `POST /login` `200`), encoded as synthetic
+   fixtures. Response *fields* beyond the validated ones remain masked/provisional.
 2. Whether `process_message` is idempotent and returns a job/message identifier —
-   a run identifier (`combined_run_id`) was **observed once** in the `202`;
-   idempotency remains **unresolved**.
+   a run identifier (`combined_run_id`) **repeated** in the `202` across the two
+   2026-08-11 password runs; idempotency remains **unresolved**.
 3. How to distinguish accepted work from failed work beyond `detail` — a `status`
-   field was **observed once** but its meaning is **unknown**.
+   field's presence **repeated** across the two password runs but its meaning is
+   **unknown**.
 4. Whether `get_messages` is chronological and paginates — **unresolved**.
 5. The effect of `llms_explicitly_set` and valid `selected_llms` values —
    **unresolved**.
 6. `/user/events` correlation fields and whether it is account-wide — thread+run
-   correlation **matched once**; account-wide-vs-connection scope and
-   repeatability remain **unknown**.
+   correlation **matched in both 2026-08-11 password runs** (corroborating
+   2026-08-06); account-wide-vs-connection scope remains **unknown**, so the
+   streaming capability stays `false`.
 7. Maximum prompt size, rate limits, and thread retention — **unresolved**.
 8. Whether native tools / structured tool results exist — **unresolved**.
-9. Whether API thread deletion is permitted/works — **unresolved**. On 2026-08-06
-   cleanup DELETEs failed and two threads leaked (then were manually deleted; the
-   old report did not capture delete status, so no `403` claim was made). On
-   2026-08-07 the remediated diagnostics **observed `DELETE` returning `403`**,
-   leaving two recovery-journal-owned threads unresolved; no causal claim is made
-   about why, and API thread deletion is still not confirmed to work.
-10. `/available_llms` access — an authenticated `403` was **observed once**; the
-    reason is **unknown** (no causal claim).
-11. Whether the OAuth2 password login (`POST /login`) works and what its real
-    `200` response shape is — **unresolved**. Password mode is implemented offline
-    with a provisional response validator; no live login has been performed, so
-    the login contract is unverified.
+9. Whether API thread deletion is permitted/works — **credential/principal-dependent
+   behavior observed (cause not established).** The password/member principal
+   deleting its own newly created thread → `200` (repeated: both 2026-08-11 runs +
+   a standalone probe); re-deleting that same just-deleted id → `403` (repeated);
+   the API-key principal deleting its own newly created thread → `403` (observed
+   2026-08-07); a cross-principal recovery attempt → `403` (observed during the
+   approved recovery attempt). Consistent with a permission/scope check, but the
+   provider's evaluation order is unconfirmed; recovery's exact-`404` convergence
+   was not exercised by these cases.
+10. `/available_llms` access — **credential/principal-dependent (cause not
+    established).** The password/member principal got `200` (repeated); the API-key
+    principal got `403` in the earlier bearer runs.
+11. Whether the OAuth2 password login (`POST /login`) works and its real `200`
+    response shape — **login verified-live** (two 2026-08-11 runs: `200`,
+    normalizable `Bearer access_token`). **Still open:** response fields beyond
+    `access_token`/`token_type` (masked), and token **lifetime/refresh**
+    behaviour. `/auth/refresh` has empty schemas and is not implemented.

@@ -81,13 +81,20 @@ contracts, the capability matrix, and open questions.
   unresolved), and reports
   `{ attempted, resolved, unresolved, remaining, attempts }` (no longer
   `succeeded`/`failed`), exiting non-zero when `unresolved > 0 || remaining > 0`.
-  Token-inspection and abort discovery are disabled. Two
-  authorized baselines ran — on 2026-08-06 and 2026-08-07 — and **both failed
-  strict completeness (exited non-zero)**; their evidence is observed-once (not
-  verified; corroboration across the two runs is not verification) and no fixture
-  was promoted. The 2026-08-07 run observed `DELETE` returning HTTP `403`, leaving
-  two recovery-journal-owned threads unresolved. None of it is wired into a public
-  completion path yet.
+  Token-inspection and abort discovery are disabled. Four authorized baselines
+  ran: two on 2026-08-06/07 in **bearer** mode (both failed strict completeness),
+  and two on **2026-08-11 in `password` mode that BOTH exited zero** with
+  **identical safe contract facts** — so the core create/submit/messages contract
+  and password `POST /login` are now **verified-repeatable** and encoded into
+  synthetic fixtures (`processAccepted202`, `messagesCreateTime`). Thread-deletion
+  outcomes were **credential/principal-dependent** (cause not established): the
+  password/member principal deleted its own newly created thread (`200`, repeated)
+  while re-deleting that same just-deleted id returned `403` (repeated); the
+  API-key principal's own-thread delete returned `403` (2026-08-07); and a
+  cross-principal recovery attempt also returned `403`. This is consistent with a
+  permission/scope check, but the provider's evaluation order is unconfirmed, so
+  recovery's exact-`404` convergence was not exercised. None of it is wired into a
+  public completion path yet.
 - Error retryability is **method-aware**: only an idempotent `GET` network or
   selected-transient (502/503/504) failure is retryable; every `POST`/`DELETE`
   failure is non-retryable. The method is carried through the error factory. A
@@ -99,11 +106,12 @@ contracts, the capability matrix, and open questions.
   and includes `llms_explicitly_set=true`; `GET /get_messages` documents an
   optional `since_id` that the gateway omits and an optional `thread_id` that the
   gateway always requires. Every declared `200` success schema is empty, so
-  response shapes are provisional except where the 2026-08-06 and 2026-08-07
-  authorized baselines observed them once (below); observed-once is not verified,
-  and mappings stay
-  provisional where observed field names diverge from the gateway's assumptions
-  (e.g. `create_time`/`updated_at` vs the provisional `created_at`).
+  response shapes were provisional until the two **verified-repeatable** 2026-08-11
+  password baselines confirmed the core create/submit/messages shapes. The
+  `get_messages` metadata mapping was **reconciled**: `validation.ts` now maps
+  `createdAt` from the observed **`create_time`** (keeping `created_at` as a
+  fallback; `updated_at` is not mapped). Mappings whose observed field NAME stays
+  masked by structural capture (notably message `content`) remain provisional.
 
 ## Adapter Boundary
 
