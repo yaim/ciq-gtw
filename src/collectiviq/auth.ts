@@ -28,7 +28,7 @@
  * bytes cannot be deterministically erased. This module never claims otherwise;
  * it only avoids copying, logging, or persisting those values.
  */
-import { UpstreamError } from "./errors.js";
+import { isUpstreamError, UpstreamError } from "./errors.js";
 import { requestUnauthenticatedJson } from "./http.js";
 import type {
   CollectivIQCredentialProvider,
@@ -308,10 +308,10 @@ export class PasswordCredentialProvider implements CollectivIQCredentialProvider
         signal,
       });
     } catch (error) {
-      if (error instanceof UpstreamError && typeof error.rawStatus === "number") {
+      if (isUpstreamError(error) && typeof error.rawStatus === "number") {
         this.#lastLoginStatus = error.rawStatus;
       }
-      throw error instanceof UpstreamError ? error : new UpstreamError("authentication");
+      throw isUpstreamError(error) ? error : new UpstreamError("authentication");
     }
 
     this.#lastLoginStatus = result.status;
@@ -359,7 +359,7 @@ export class PasswordCredentialProvider implements CollectivIQCredentialProvider
           settled = true;
           flight.waiters.delete(waiterKey);
           detach();
-          reject(error instanceof UpstreamError ? error : new UpstreamError("authentication"));
+          reject(isUpstreamError(error) ? error : new UpstreamError("authentication"));
         },
       );
     });
@@ -397,6 +397,53 @@ export interface ResolvedCredentials {
   readonly provider: CollectivIQCredentialProvider;
   /** The concrete password provider (for auth observations) when mode is password. */
   readonly passwordProvider: PasswordCredentialProvider | null;
+}
+
+/**
+ * Runtime per-provider login budget. Unlike discovery/recovery (which cap logins
+ * at {@link CLI_MAX_LOGINS}), the long-running server may re-login across its
+ * whole lifetime — each attempt is still individually bounded (single login
+ * flight, single-flight coalescing, bounded transport, no internal retry,
+ * generation-safe `401` invalidation, no request replay, `403` non-invalidation).
+ */
+export const RUNTIME_MAX_LOGINS = Number.POSITIVE_INFINITY;
+
+/**
+ * Build the credential provider from ALREADY-VALIDATED configuration values
+ * (never re-reading `process.env`). Used by the server runtime after
+ * `loadConfig()` so no arbitrary environment state is consulted again. The
+ * values are re-checked defensively with the same value-free validators; the
+ * inactive mode's credentials are ignored. Constructing the provider performs no
+ * I/O and no login (a password login is lazy).
+ */
+export function buildCredentialProviderFromConfig(input: {
+  readonly mode: AuthMode;
+  readonly apiKey?: string | undefined;
+  readonly username?: string | undefined;
+  readonly password?: string | undefined;
+  readonly base: TransportBase;
+  readonly maxLogins: number;
+}): ResolvedCredentials {
+  if (input.mode === "bearer") {
+    const token = validateBearerToken(input.apiKey);
+    if (!token.ok) throw new AuthConfigError("COLLECTIVIQ_API_KEY", token.reason);
+    return {
+      mode: "bearer",
+      provider: staticBearerCredentialProvider(token.value),
+      passwordProvider: null,
+    };
+  }
+  const username = validateUsername(input.username);
+  if (!username.ok) throw new AuthConfigError("COLLECTIVIQ_USERNAME", username.reason);
+  const password = validatePassword(input.password);
+  if (!password.ok) throw new AuthConfigError("COLLECTIVIQ_PASSWORD", password.reason);
+  const provider = new PasswordCredentialProvider({
+    base: input.base,
+    username: username.value,
+    password: password.value,
+    maxLogins: input.maxLogins,
+  });
+  return { mode: "password", provider, passwordProvider: provider };
 }
 
 /**

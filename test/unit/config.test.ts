@@ -155,6 +155,56 @@ describe("loadConfig — environment", () => {
   });
 });
 
+describe("loadConfig — capacity and shutdown", () => {
+  it("applies conservative defaults", () => {
+    const config = loadConfig({ env: baseEnv() });
+    expect(config.MAX_CONCURRENT_REQUESTS).toBe(4);
+    expect(config.MAX_CONCURRENT_REQUESTS_PER_KEY).toBe(2);
+    expect(config.MAX_QUEUED_REQUESTS).toBe(20);
+    expect(config.MAX_QUEUE_WAIT_MS).toBe(5_000);
+    expect(config.SHUTDOWN_DRAIN_MS).toBe(30_000);
+  });
+
+  it("accepts valid overrides, including a zero-length queue", () => {
+    const config = loadConfig({
+      env: baseEnv({
+        MAX_CONCURRENT_REQUESTS: "8",
+        MAX_CONCURRENT_REQUESTS_PER_KEY: "8",
+        MAX_QUEUED_REQUESTS: "0",
+        MAX_QUEUE_WAIT_MS: "1000",
+        SHUTDOWN_DRAIN_MS: "0",
+      }),
+    });
+    expect(config.MAX_CONCURRENT_REQUESTS).toBe(8);
+    expect(config.MAX_QUEUED_REQUESTS).toBe(0);
+    expect(config.SHUTDOWN_DRAIN_MS).toBe(0);
+  });
+
+  it("rejects non-integer and out-of-range capacity values", () => {
+    expect(() => loadConfig({ env: baseEnv({ MAX_CONCURRENT_REQUESTS: "x" }) })).toThrow(
+      ConfigError,
+    );
+    expect(() => loadConfig({ env: baseEnv({ MAX_CONCURRENT_REQUESTS: "0" }) })).toThrow(
+      ConfigError,
+    );
+    expect(() => loadConfig({ env: baseEnv({ MAX_QUEUE_WAIT_MS: "0" }) })).toThrow(ConfigError);
+    expect(() => loadConfig({ env: baseEnv({ MAX_QUEUED_REQUESTS: "-1" }) })).toThrow(ConfigError);
+  });
+
+  it("rejects a per-key limit greater than the global limit", () => {
+    try {
+      loadConfig({
+        env: baseEnv({ MAX_CONCURRENT_REQUESTS: "2", MAX_CONCURRENT_REQUESTS_PER_KEY: "4" }),
+      });
+      throw new Error("expected ConfigError");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfigError);
+      const fields = (error as ConfigError).issues.map((i) => i.field);
+      expect(fields).toContain("MAX_CONCURRENT_REQUESTS_PER_KEY");
+    }
+  });
+});
+
 describe("loadConfig — gateway keys", () => {
   /** Load with a raw gateway-key string, returning either config or issues. */
   function loadWithKeys(rawKeys: string): ReturnType<typeof loadConfig> {

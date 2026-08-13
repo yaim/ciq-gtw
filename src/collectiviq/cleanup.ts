@@ -9,7 +9,7 @@
  * timeout or a network failure without exposing anything sensitive.
  */
 import { deleteThreadPath } from "./endpoints.js";
-import { UpstreamError, upstreamErrorForStatus, type UpstreamErrorCode } from "./errors.js";
+import { isUpstreamError, upstreamErrorForStatus, type UpstreamErrorCode } from "./errors.js";
 import { observeUpstreamJson } from "./http.js";
 import type { CollectivIQTransportConfig, OperationTimeouts } from "./types.js";
 
@@ -145,7 +145,7 @@ export async function observeThreadDeletion(
   } catch (error) {
     // A size-cap, strict-UTF-8, timeout, cancellation, or network failure throws
     // a normalized UpstreamError; anything else fails closed with no detail.
-    if (error instanceof UpstreamError) {
+    if (isUpstreamError(error)) {
       return { ok: false, status: error.rawStatus ?? null, errorCode: error.code };
     }
     return { ok: false, status: null, errorCode: null };

@@ -13,7 +13,12 @@
  * Endpoint paths are fixed constants supplied by the adapter/discovery client;
  * callers outside this package cannot inject arbitrary paths or hosts.
  */
-import { classifyTransportFailure, UpstreamError, upstreamErrorForStatus } from "./errors.js";
+import {
+  classifyTransportFailure,
+  isUpstreamError,
+  UpstreamError,
+  upstreamErrorForStatus,
+} from "./errors.js";
 import type {
   CollectivIQTransportConfig,
   FetchLike,
@@ -247,7 +252,7 @@ async function completeJsonResponse(
     text = await readBoundedUtf8(response, request.timeouts.maxResponseBytes, controller);
   } catch (error) {
     cleanup();
-    if (error instanceof UpstreamError) throw error;
+    if (isUpstreamError(error)) throw error;
     throw classifyReadFailure();
   }
   cleanup();
@@ -350,7 +355,7 @@ export async function observeUpstreamJson(
     text = await readBoundedUtf8(response, request.timeouts.maxResponseBytes, controller);
   } catch (error) {
     cleanup();
-    if (error instanceof UpstreamError) throw error;
+    if (isUpstreamError(error)) throw error;
     throw classifyReadFailure();
   }
   cleanup();

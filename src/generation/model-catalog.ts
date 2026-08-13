@@ -24,6 +24,14 @@ export interface ModelCatalog {
   list(): readonly ModelObject[];
   /** Resolve one public model object by exact-case id, or `undefined`. */
   resolve(id: string): ModelObject | undefined;
+  /**
+   * Resolve the INTERNAL virtual-model policy by exact-case id, or `undefined`.
+   * This is used only by the generation layer; it exposes the model's execution
+   * policy (selected sources, answer source, timeouts, prompt limits, tool mode)
+   * and must never be encoded into a public response. The public `resolve`
+   * above stays the only source for `GET /v1/models/:model` output.
+   */
+  resolveModel(id: string): VirtualModel | undefined;
 }
 
 /**
@@ -42,13 +50,18 @@ export function createModelCatalog(models: readonly VirtualModel[], created: num
   // Exact-case lookup index. Later duplicates cannot occur: configured ids are
   // unique map keys, but a first-wins insert keeps resolution deterministic.
   const byId = new Map<string, ModelObject>();
+  const policyById = new Map<string, VirtualModel>();
   for (const object of ordered) {
     if (!byId.has(object.id)) byId.set(object.id, object);
+  }
+  for (const model of models) {
+    if (!policyById.has(model.id)) policyById.set(model.id, model);
   }
 
   return {
     created,
     list: () => ordered,
     resolve: (id: string) => byId.get(id),
+    resolveModel: (id: string) => policyById.get(id),
   };
 }

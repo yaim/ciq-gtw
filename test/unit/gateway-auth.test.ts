@@ -9,53 +9,54 @@ const KEY_A = "gw-fake-key-alpha";
 const KEY_B = "gw-fake-key-bravo-longer-than-alpha";
 
 describe("createGatewayAuthenticator", () => {
-  it("accepts every configured key with a case-insensitive scheme", () => {
+  it("accepts every configured key with a case-insensitive scheme and an opaque identity", () => {
     const auth = createGatewayAuthenticator([KEY_A, KEY_B]);
-    expect(auth.authenticate(`Bearer ${KEY_A}`)).toBe(true);
-    expect(auth.authenticate(`Bearer ${KEY_B}`)).toBe(true);
-    expect(auth.authenticate(`bearer ${KEY_A}`)).toBe(true);
-    expect(auth.authenticate(`BEARER ${KEY_A}`)).toBe(true);
-    expect(auth.authenticate(`BeArEr ${KEY_B}`)).toBe(true);
+    // The identity is the matched key's config index, never the key itself.
+    expect(auth.authenticate(`Bearer ${KEY_A}`)).toEqual({ ok: true, keyId: "k0" });
+    expect(auth.authenticate(`Bearer ${KEY_B}`)).toEqual({ ok: true, keyId: "k1" });
+    expect(auth.authenticate(`bearer ${KEY_A}`)).toEqual({ ok: true, keyId: "k0" });
+    expect(auth.authenticate(`BEARER ${KEY_A}`)).toEqual({ ok: true, keyId: "k0" });
+    expect(auth.authenticate(`BeArEr ${KEY_B}`)).toEqual({ ok: true, keyId: "k1" });
   });
 
   it("rejects missing, malformed, empty, wrong-scheme, and wrong tokens alike", () => {
     const auth = createGatewayAuthenticator([KEY_A]);
-    expect(auth.authenticate(undefined)).toBe(false); // missing header
-    expect(auth.authenticate("")).toBe(false); // empty header
-    expect(auth.authenticate(KEY_A)).toBe(false); // no scheme separator
-    expect(auth.authenticate("Bearer")).toBe(false); // scheme only, no token
-    expect(auth.authenticate("Bearer ")).toBe(false); // empty token
-    expect(auth.authenticate("Basic " + KEY_A)).toBe(false); // wrong scheme
-    expect(auth.authenticate("Token " + KEY_A)).toBe(false); // wrong scheme
-    expect(auth.authenticate("Bearer gw-wrong-key")).toBe(false); // wrong token
+    expect(auth.authenticate(undefined)).toEqual({ ok: false }); // missing header
+    expect(auth.authenticate("")).toEqual({ ok: false }); // empty header
+    expect(auth.authenticate(KEY_A)).toEqual({ ok: false }); // no scheme separator
+    expect(auth.authenticate("Bearer")).toEqual({ ok: false }); // scheme only, no token
+    expect(auth.authenticate("Bearer ")).toEqual({ ok: false }); // empty token
+    expect(auth.authenticate("Basic " + KEY_A)).toEqual({ ok: false }); // wrong scheme
+    expect(auth.authenticate("Token " + KEY_A)).toEqual({ ok: false }); // wrong scheme
+    expect(auth.authenticate("Bearer gw-wrong-key")).toEqual({ ok: false }); // wrong token
   });
 
   it("compares the token exactly, rejecting any extra whitespace", () => {
     const auth = createGatewayAuthenticator([KEY_A]);
     // Only the first space delimits the scheme; further whitespace is part of
     // the token and must not match the exact configured key.
-    expect(auth.authenticate(`Bearer  ${KEY_A}`)).toBe(false); // leading space
-    expect(auth.authenticate(`Bearer ${KEY_A} `)).toBe(false); // trailing space
-    expect(auth.authenticate(`Bearer ${KEY_A}\t`)).toBe(false); // trailing tab
-    expect(auth.authenticate(`Bearer ${KEY_A.toUpperCase()}`)).toBe(false); // wrong case token
+    expect(auth.authenticate(`Bearer  ${KEY_A}`)).toEqual({ ok: false }); // leading space
+    expect(auth.authenticate(`Bearer ${KEY_A} `)).toEqual({ ok: false }); // trailing space
+    expect(auth.authenticate(`Bearer ${KEY_A}\t`)).toEqual({ ok: false }); // trailing tab
+    expect(auth.authenticate(`Bearer ${KEY_A.toUpperCase()}`)).toEqual({ ok: false }); // wrong case
   });
 
   it("rejects an oversized presented token before it can match", () => {
     const auth = createGatewayAuthenticator([KEY_A]);
     const oversized = "a".repeat(PRESENTED_TOKEN_MAX_BYTES + 1);
-    expect(auth.authenticate(`Bearer ${oversized}`)).toBe(false);
+    expect(auth.authenticate(`Bearer ${oversized}`)).toEqual({ ok: false });
     // A token exactly at the cap is allowed to be compared (still wrong here).
     const atCap = "a".repeat(PRESENTED_TOKEN_MAX_BYTES);
-    expect(auth.authenticate(`Bearer ${atCap}`)).toBe(false);
+    expect(auth.authenticate(`Bearer ${atCap}`)).toEqual({ ok: false });
   });
 
   it("authenticates keys regardless of differing lengths", () => {
     const short = "g";
     const long = "gw-" + "z".repeat(500);
     const auth = createGatewayAuthenticator([short, long]);
-    expect(auth.authenticate(`Bearer ${short}`)).toBe(true);
-    expect(auth.authenticate(`Bearer ${long}`)).toBe(true);
-    expect(auth.authenticate(`Bearer gw-${"z".repeat(499)}`)).toBe(false);
+    expect(auth.authenticate(`Bearer ${short}`)).toEqual({ ok: true, keyId: "k0" });
+    expect(auth.authenticate(`Bearer ${long}`)).toEqual({ ok: true, keyId: "k1" });
+    expect(auth.authenticate(`Bearer gw-${"z".repeat(499)}`)).toEqual({ ok: false });
   });
 
   it("does not short-circuit the comparison loop when a key matches", () => {
@@ -63,7 +64,7 @@ describe("createGatewayAuthenticator", () => {
     // configured key is compared even though the FIRST one matches.
     const compare = vi.fn((a: Buffer, b: Buffer) => timingSafeEqual(a, b));
     const auth = createGatewayAuthenticator([KEY_A, KEY_B], compare);
-    expect(auth.authenticate(`Bearer ${KEY_A}`)).toBe(true);
+    expect(auth.authenticate(`Bearer ${KEY_A}`)).toEqual({ ok: true, keyId: "k0" });
     expect(compare).toHaveBeenCalledTimes(2);
     // The comparator only ever sees 32-byte digests, not key material.
     for (const call of compare.mock.calls) {
@@ -72,11 +73,14 @@ describe("createGatewayAuthenticator", () => {
     }
   });
 
-  it("never returns the presented token or a configured key", () => {
-    // The interface exposes only a boolean; there is no path that surfaces
-    // secret material. This guards against an accidental API widening.
+  it("surfaces only an opaque identity, never the presented token or a configured key", () => {
     const auth = createGatewayAuthenticator([KEY_A]);
     const result = auth.authenticate(`Bearer ${KEY_A}`);
-    expect(typeof result).toBe("boolean");
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.keyId).toMatch(/^k\d+$/);
+      expect(result.keyId).not.toContain(KEY_A);
+      expect(JSON.stringify(result)).not.toContain(KEY_A);
+    }
   });
 });

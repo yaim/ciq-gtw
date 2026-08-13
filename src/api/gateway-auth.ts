@@ -34,15 +34,29 @@ function sha256(value: string): Buffer {
   return createHash("sha256").update(value, "utf8").digest();
 }
 
+/**
+ * The result of authenticating a presented credential. On success it carries an
+ * OPAQUE, stable per-configured-key identity (`keyId`) derived from the matched
+ * key's configuration index — never the raw key or its digest. The identity is
+ * used only for process-local per-key capacity accounting.
+ */
+export type AuthResult = { readonly ok: true; readonly keyId: string } | { readonly ok: false };
+
 /** Authenticates a presented `Authorization` header against configured keys. */
 export interface GatewayAuthenticator {
   /**
-   * Return true only when `header` is a well-formed `Bearer` credential whose
-   * token exactly matches a configured gateway key. A missing, malformed,
-   * empty, oversized, or incorrect credential returns false — the caller maps
-   * every false to the same fixed `401` response.
+   * Return `{ ok: true, keyId }` only when `header` is a well-formed `Bearer`
+   * credential whose token exactly matches a configured gateway key; the `keyId`
+   * is an opaque, stable identity for the matched key. A missing, malformed,
+   * empty, oversized, or incorrect credential returns `{ ok: false }` — the
+   * caller maps every failure to the same fixed `401` response.
    */
-  authenticate(header: string | undefined): boolean;
+  authenticate(header: string | undefined): AuthResult;
+}
+
+/** The fixed, opaque identity for a configured key at index `i`. */
+function keyIdForIndex(index: number): string {
+  return `k${index}`;
 }
 
 /**
@@ -78,24 +92,26 @@ export function createGatewayAuthenticator(
   const digests = keys.map((key) => sha256(key));
 
   return {
-    authenticate(header: string | undefined): boolean {
+    authenticate(header: string | undefined): AuthResult {
       const token = extractBearerToken(header);
-      if (token === null) return false;
+      if (token === null) return { ok: false };
       // Reject an oversized token before hashing; it can never match a
       // bounded configured key, and this bounds the work per request.
-      if (Buffer.byteLength(token, "utf8") > PRESENTED_TOKEN_MAX_BYTES) return false;
+      if (Buffer.byteLength(token, "utf8") > PRESENTED_TOKEN_MAX_BYTES) return { ok: false };
 
       const presented = sha256(token);
       // All digests are exactly DIGEST_BYTES, so timingSafeEqual never throws
       // on a length mismatch. Compare against every configured digest without
       // returning early, so a match's position does not affect the work done.
-      let matched = false;
-      for (const digest of digests) {
-        if (digest.length === DIGEST_BYTES && compare(presented, digest)) {
-          matched = true;
+      // The matched index (if any) yields only an opaque identity.
+      let matchedIndex = -1;
+      for (let i = 0; i < digests.length; i += 1) {
+        const digest = digests[i];
+        if (digest !== undefined && digest.length === DIGEST_BYTES && compare(presented, digest)) {
+          matchedIndex = i;
         }
       }
-      return matched;
+      return matchedIndex >= 0 ? { ok: true, keyId: keyIdForIndex(matchedIndex) } : { ok: false };
     },
   };
 }

@@ -5,13 +5,25 @@
 // started a listener, this process would hang and the test would time out.
 import assert from "node:assert/strict";
 
+// Fail loudly if importing or constructing the app performs ANY network call
+// (including a password-mode login). The gateway must be fully constructable
+// offline; only a real request may contact CollectivIQ.
+let fetchCalls = 0;
+const realFetch = globalThis.fetch;
+globalThis.fetch = (...args) => {
+  fetchCalls += 1;
+  return realFetch ? realFetch(...args) : Promise.reject(new Error("fetch disabled in smoke test"));
+};
+
 const server = await import("../../dist/server.js");
 const index = await import("../../dist/index.js");
 
 assert.equal(typeof server.buildServer, "function", "dist/server.js must export buildServer");
 assert.equal(typeof index.main, "function", "dist/index.js must export main");
 
-// Construct the server from compiled output and prove it is not listening.
+// Construct the server from compiled output and prove it is not listening. The
+// default completion runtime (adapter + capacity + poller) is built from config,
+// which must not make any network/login call at construction time.
 const config = {
   ENVIRONMENT: "development",
   HOST: "127.0.0.1",
@@ -24,12 +36,19 @@ const config = {
   LOG_LEVEL: "silent",
   LOG_CONTENT: false,
   MAX_REQUEST_BODY_BYTES: 8_388_608,
+  MAX_CONCURRENT_REQUESTS: 4,
+  MAX_CONCURRENT_REQUESTS_PER_KEY: 2,
+  MAX_QUEUED_REQUESTS: 20,
+  MAX_QUEUE_WAIT_MS: 5_000,
+  SHUTDOWN_DRAIN_MS: 30_000,
   models: [],
 };
 
 const app = server.buildServer({ config, readiness: { isReady: () => false } });
 await app.ready();
 assert.equal(app.server.listening, false, "buildServer must not open a listening socket");
+assert.equal(fetchCalls, 0, "constructing the server must not make any network/login call");
 await app.close();
 
+globalThis.fetch = realFetch;
 console.log("build smoke OK");

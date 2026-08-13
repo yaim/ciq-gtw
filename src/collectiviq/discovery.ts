@@ -44,7 +44,12 @@ import {
   type CorrelationReport,
 } from "./correlation.js";
 import { deleteThreadPath, ENDPOINTS } from "./endpoints.js";
-import { upstreamErrorForStatus, type UpstreamErrorCode, UpstreamError } from "./errors.js";
+import {
+  isUpstreamError,
+  upstreamErrorForStatus,
+  type UpstreamErrorCode,
+  UpstreamError,
+} from "./errors.js";
 import { observeUpstreamJson } from "./http.js";
 import type { RecoveryJournalSink } from "./recovery-journal.js";
 import {
@@ -366,7 +371,7 @@ function observationFromRaw(
 }
 
 function errorObservation(stage: DiscoveryStage, error: unknown): DiscoveryObservation {
-  if (error instanceof UpstreamError) {
+  if (isUpstreamError(error)) {
     return {
       stage,
       ok: false,
@@ -781,7 +786,7 @@ export class DiscoverySessionRunner {
           stage,
           ok: false,
           status: raw.status,
-          errorCode: error instanceof UpstreamError ? error.code : null,
+          errorCode: isUpstreamError(error) ? error.code : null,
           structure,
         });
         return null;
@@ -861,7 +866,7 @@ export class DiscoverySessionRunner {
             stage,
             ok: false,
             status: raw.status,
-            errorCode: error instanceof UpstreamError ? error.code : null,
+            errorCode: isUpstreamError(error) ? error.code : null,
             structure,
           },
           candidates: null,
@@ -914,7 +919,7 @@ export class DiscoverySessionRunner {
           stage: "messages_state",
           ok: false,
           status: raw.status,
-          errorCode: error instanceof UpstreamError ? error.code : null,
+          errorCode: isUpstreamError(error) ? error.code : null,
           structure,
         };
       }

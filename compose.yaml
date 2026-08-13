@@ -35,6 +35,13 @@ services:
       MODEL_CONFIG_PATH: "/app/config/models.yaml"
       LOG_LEVEL: "info"
       LOG_CONTENT: "false"
+      # Process-local capacity/backpressure and shutdown drain (defaults shown).
+      # Capacity is per-process, not shared across replicas.
+      MAX_CONCURRENT_REQUESTS: "${MAX_CONCURRENT_REQUESTS:-4}"
+      MAX_CONCURRENT_REQUESTS_PER_KEY: "${MAX_CONCURRENT_REQUESTS_PER_KEY:-2}"
+      MAX_QUEUED_REQUESTS: "${MAX_QUEUED_REQUESTS:-20}"
+      MAX_QUEUE_WAIT_MS: "${MAX_QUEUE_WAIT_MS:-5000}"
+      SHUTDOWN_DRAIN_MS: "${SHUTDOWN_DRAIN_MS:-30000}"
     volumes:
       # Provide your own model file (copied from config/models.example.yaml).
       - "./config/models.yaml:/app/config/models.yaml:ro"

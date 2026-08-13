@@ -19,6 +19,8 @@ export {
   AUTH_MODES,
   AuthConfigError,
   PasswordCredentialProvider,
+  RUNTIME_MAX_LOGINS,
+  buildCredentialProviderFromConfig,
   buildCredentialProviderFromEnv,
   resolveAuthMode,
   staticBearerCredentialProvider,

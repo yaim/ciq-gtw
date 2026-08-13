@@ -10,6 +10,7 @@ import {
   type AuthMode,
 } from "../collectiviq/auth.js";
 import {
+  CAPACITY_LIMITS,
   ENV_DEFAULTS,
   EnvConfigSchema,
   GATEWAY_KEY_LIMITS,
@@ -65,6 +66,11 @@ const KNOWN_ENV_KEYS = [
   "LOG_LEVEL",
   "LOG_CONTENT",
   "MAX_REQUEST_BODY_BYTES",
+  "MAX_CONCURRENT_REQUESTS",
+  "MAX_CONCURRENT_REQUESTS_PER_KEY",
+  "MAX_QUEUED_REQUESTS",
+  "MAX_QUEUE_WAIT_MS",
+  "SHUTDOWN_DRAIN_MS",
 ] as const;
 
 export interface LoadConfigOptions {
@@ -222,6 +228,31 @@ function loadEnvConfig(source: NodeJS.ProcessEnv): EnvConfig {
     }
   }
 
+  // Bounded process-local capacity and shutdown-drain integers. Each parses like
+  // PORT: a present-but-non-integer value records a value-free issue; an absent
+  // value uses the conservative default. Range/order checks run in the schema
+  // and cross-field pass below.
+  const coerceEnvInteger = (key: KnownEnvKey, fallback: number): number => {
+    if (!present(raw[key])) return fallback;
+    const parsed = coerceInteger(raw[key]);
+    if (parsed === undefined) {
+      issues.push({ field: key, reason: "must be an integer" });
+      return fallback;
+    }
+    return parsed;
+  };
+  const maxConcurrent = coerceEnvInteger(
+    "MAX_CONCURRENT_REQUESTS",
+    ENV_DEFAULTS.MAX_CONCURRENT_REQUESTS,
+  );
+  const maxConcurrentPerKey = coerceEnvInteger(
+    "MAX_CONCURRENT_REQUESTS_PER_KEY",
+    ENV_DEFAULTS.MAX_CONCURRENT_REQUESTS_PER_KEY,
+  );
+  const maxQueued = coerceEnvInteger("MAX_QUEUED_REQUESTS", ENV_DEFAULTS.MAX_QUEUED_REQUESTS);
+  const maxQueueWaitMs = coerceEnvInteger("MAX_QUEUE_WAIT_MS", ENV_DEFAULTS.MAX_QUEUE_WAIT_MS);
+  const shutdownDrainMs = coerceEnvInteger("SHUTDOWN_DRAIN_MS", ENV_DEFAULTS.SHUTDOWN_DRAIN_MS);
+
   let logContent: boolean = ENV_DEFAULTS.LOG_CONTENT;
   if (present(raw.LOG_CONTENT)) {
     const parsed = coerceBoolean(raw.LOG_CONTENT);
@@ -319,10 +350,31 @@ function loadEnvConfig(source: NodeJS.ProcessEnv): EnvConfig {
     LOG_LEVEL: logLevel,
     LOG_CONTENT: logContent,
     MAX_REQUEST_BODY_BYTES: maxBody,
+    MAX_CONCURRENT_REQUESTS: maxConcurrent,
+    MAX_CONCURRENT_REQUESTS_PER_KEY: maxConcurrentPerKey,
+    MAX_QUEUED_REQUESTS: maxQueued,
+    MAX_QUEUE_WAIT_MS: maxQueueWaitMs,
+    SHUTDOWN_DRAIN_MS: shutdownDrainMs,
   };
 
   // Structural/enum/bounds validation. Reasons are generic; env keys are static.
   issues.push(...envSchemaIssues(EnvConfigSchema, candidate));
+
+  // Cross-field: the per-key active limit can never exceed the global active
+  // limit (otherwise a single key could saturate all capacity). Only checked
+  // when both values are individually in range, so the reason is unambiguous.
+  if (
+    Number.isInteger(maxConcurrent) &&
+    Number.isInteger(maxConcurrentPerKey) &&
+    maxConcurrent >= CAPACITY_LIMITS.maxConcurrent.min &&
+    maxConcurrentPerKey >= CAPACITY_LIMITS.maxConcurrentPerKey.min &&
+    maxConcurrentPerKey > maxConcurrent
+  ) {
+    issues.push({
+      field: "MAX_CONCURRENT_REQUESTS_PER_KEY",
+      reason: "must not exceed MAX_CONCURRENT_REQUESTS",
+    });
+  }
 
   // Cross-field policy: content logging is only acceptable in development, and
   // even then this scaffold never logs content (only the startup warning).

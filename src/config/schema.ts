@@ -19,6 +19,26 @@ export const MAX_REQUEST_BODY_BYTES_MIN = 1024;
 export const MAX_REQUEST_BODY_BYTES_MAX = 67_108_864; // 64 MiB
 
 /**
+ * Conservative, non-overridable bounds for the process-local capacity and
+ * shutdown settings (specification sections 19, 31.3). These are initial
+ * implementation safety limits; relaxing them is a configuration-contract
+ * change, not a runtime override. Capacity is PROCESS-LOCAL — it does not span
+ * replicas.
+ */
+export const CAPACITY_LIMITS = {
+  /** Global active-request limit. */
+  maxConcurrent: { min: 1, max: 1024 },
+  /** Per-gateway-key active-request limit (must not exceed the global limit). */
+  maxConcurrentPerKey: { min: 1, max: 1024 },
+  /** Bounded FIFO queue length (may be zero — no queueing). */
+  maxQueued: { min: 0, max: 100_000 },
+  /** Maximum time a request may wait in the admission queue, in ms. */
+  maxQueueWaitMs: { min: 1, max: 600_000 },
+  /** Graceful-shutdown drain period before in-flight work is cancelled, in ms. */
+  shutdownDrainMs: { min: 0, max: 600_000 },
+} as const;
+
+/**
  * Conservative, non-overridable bounds for the configured client gateway keys.
  * These are initial implementation limits chosen for safety; relaxing them is a
  * configuration-contract/security change, not a runtime override. Byte length is
@@ -71,6 +91,11 @@ export const ENV_DEFAULTS = {
   LOG_LEVEL: "info",
   LOG_CONTENT: false,
   MAX_REQUEST_BODY_BYTES: 8_388_608, // 8 MiB
+  MAX_CONCURRENT_REQUESTS: 4,
+  MAX_CONCURRENT_REQUESTS_PER_KEY: 2,
+  MAX_QUEUED_REQUESTS: 20,
+  MAX_QUEUE_WAIT_MS: 5_000,
+  SHUTDOWN_DRAIN_MS: 30_000,
 } as const;
 
 /**
@@ -113,6 +138,26 @@ export const EnvConfigSchema = Type.Object(
     MAX_REQUEST_BODY_BYTES: Type.Integer({
       minimum: MAX_REQUEST_BODY_BYTES_MIN,
       maximum: MAX_REQUEST_BODY_BYTES_MAX,
+    }),
+    MAX_CONCURRENT_REQUESTS: Type.Integer({
+      minimum: CAPACITY_LIMITS.maxConcurrent.min,
+      maximum: CAPACITY_LIMITS.maxConcurrent.max,
+    }),
+    MAX_CONCURRENT_REQUESTS_PER_KEY: Type.Integer({
+      minimum: CAPACITY_LIMITS.maxConcurrentPerKey.min,
+      maximum: CAPACITY_LIMITS.maxConcurrentPerKey.max,
+    }),
+    MAX_QUEUED_REQUESTS: Type.Integer({
+      minimum: CAPACITY_LIMITS.maxQueued.min,
+      maximum: CAPACITY_LIMITS.maxQueued.max,
+    }),
+    MAX_QUEUE_WAIT_MS: Type.Integer({
+      minimum: CAPACITY_LIMITS.maxQueueWaitMs.min,
+      maximum: CAPACITY_LIMITS.maxQueueWaitMs.max,
+    }),
+    SHUTDOWN_DRAIN_MS: Type.Integer({
+      minimum: CAPACITY_LIMITS.shutdownDrainMs.min,
+      maximum: CAPACITY_LIMITS.shutdownDrainMs.max,
     }),
   },
   { additionalProperties: false },

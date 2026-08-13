@@ -96,6 +96,15 @@ function computeRetryable(
   return category === "network" || category === "transient_http";
 }
 
+/**
+ * Branded registry of the adapter's own {@link UpstreamError} instances.
+ * Membership is tested by object IDENTITY via {@link isUpstreamError}, so a
+ * caught value can be recognized WITHOUT `instanceof` — which would invoke a
+ * hostile Proxy's `getPrototypeOf` trap — and without reading any property of an
+ * untrusted thrown value.
+ */
+const upstreamErrors = new WeakSet<object>();
+
 /** A normalized, content-free upstream failure. */
 export class UpstreamError extends Error {
   readonly category: UpstreamErrorCategory;
@@ -117,7 +126,19 @@ export class UpstreamError extends Error {
       this.rawStatus = rawStatus;
     }
     if (method !== undefined) this.method = method;
+    upstreamErrors.add(this);
   }
+}
+
+/**
+ * True only for an adapter-created {@link UpstreamError}. Trap-safe: it reads no
+ * property of `value` and never invokes `instanceof`, a prototype lookup,
+ * serialization, or coercion, so an arbitrary thrown value (including a hostile
+ * Proxy) is classified purely by identity. Callers must establish identity with
+ * this guard BEFORE reading `category`, `retryable`, `rawStatus`, or `code`.
+ */
+export function isUpstreamError(value: unknown): value is UpstreamError {
+  return typeof value === "object" && value !== null && upstreamErrors.has(value);
 }
 
 /**

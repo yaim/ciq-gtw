@@ -9,9 +9,18 @@ import Fastify, {
 import type { TypeBoxTypeProvider } from "@fastify/type-provider-typebox";
 import { registerHealthRoutes, type ReadinessState } from "./api/health-route.js";
 import { registerV1Routes } from "./api/v1-routes.js";
-import { createGatewayAuthenticator } from "./api/gateway-auth.js";
+import { createGatewayAuthenticator, type GatewayAuthenticator } from "./api/gateway-auth.js";
 import { createModelCatalog, type ModelCatalog } from "./generation/model-catalog.js";
+import { createCompletionRuntime } from "./generation/runtime.js";
+import type { ChatCompletionService } from "./generation/chat-completion.js";
 import type { AppConfig } from "./config/schema.js";
+
+/** The chat-completions wiring the `/v1` scope needs. */
+export interface CompletionWiring {
+  readonly chatService: ChatCompletionService;
+  /** Aborts when the process begins its shutdown drain-cancel step. */
+  readonly shutdownSignal: AbortSignal;
+}
 
 /** The concrete Fastify instance type this application constructs. */
 export type GatewayServer = FastifyInstance<
@@ -40,6 +49,19 @@ export interface BuildServerOptions {
    * internal-error path); production builds the catalog from `config.models`.
    */
   readonly catalog?: ModelCatalog;
+  /**
+   * Pre-built gateway authenticator. Injected only for tests (e.g. to exercise
+   * the error boundary when the auth hook itself throws); production builds it
+   * from `config.COLLECTIVIQ_GATEWAY_KEYS`.
+   */
+  readonly authenticator?: GatewayAuthenticator;
+  /**
+   * Completion wiring (service + shutdown signal). The process root injects a
+   * runtime it also drains on shutdown; when omitted, the server builds a
+   * default runtime from `config` with a never-aborting shutdown signal. Either
+   * way, construction performs no network or login I/O.
+   */
+  readonly completion?: CompletionWiring;
 }
 
 /**
@@ -67,8 +89,24 @@ export function buildServer(options: BuildServerOptions): GatewayServer {
   // timestamp at construction and reuses it for every model object it serves.
   const now = options.now ?? (() => Math.floor(Date.now() / 1000));
   const catalog = options.catalog ?? createModelCatalog(config.models, now());
-  const authenticator = createGatewayAuthenticator(config.COLLECTIVIQ_GATEWAY_KEYS);
-  registerV1Routes(app, { authenticator, catalog });
+  const authenticator =
+    options.authenticator ?? createGatewayAuthenticator(config.COLLECTIVIQ_GATEWAY_KEYS);
+
+  // A default completion runtime is built from config when none is injected
+  // (tests/smoke). Construction opens no socket and makes no CollectivIQ call.
+  const completion: CompletionWiring =
+    options.completion ??
+    (() => {
+      const runtime = createCompletionRuntime(config);
+      return { chatService: runtime.chatService, shutdownSignal: new AbortController().signal };
+    })();
+
+  registerV1Routes(app, {
+    authenticator,
+    catalog,
+    chatService: completion.chatService,
+    shutdownSignal: completion.shutdownSignal,
+  });
 
   return app;
 }

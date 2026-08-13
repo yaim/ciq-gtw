@@ -46,6 +46,11 @@ const config: AppConfig = {
   LOG_LEVEL: "info",
   LOG_CONTENT: false,
   MAX_REQUEST_BODY_BYTES: 8_388_608,
+  MAX_CONCURRENT_REQUESTS: 4,
+  MAX_CONCURRENT_REQUESTS_PER_KEY: 2,
+  MAX_QUEUED_REQUESTS: 20,
+  MAX_QUEUE_WAIT_MS: 5_000,
+  SHUTDOWN_DRAIN_MS: 30_000,
   models: MODELS,
 };
 
@@ -243,6 +248,9 @@ describe("GET /v1 — internal error boundary", () => {
         throw new Error("boom-should-never-surface");
       },
       resolve: () => {
+        throw new Error("boom-should-never-surface");
+      },
+      resolveModel: () => {
         throw new Error("boom-should-never-surface");
       },
     };
