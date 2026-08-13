@@ -3,18 +3,22 @@
 A local or privately hosted HTTP service that will sit between OpenCode and
 CollectivIQ, exposing a bounded OpenAI Chat Completions-compatible profile.
 
-> **Status: runnable foundation, offline upstream adapter boundary, and the
-> Phase 1A public model surface.**
+> **Status: runnable foundation, the Phase 1A public model surface, and the
+> Phase 1B non-streamed chat-completions path — implemented offline.**
 > This repository provides a secure, validated service skeleton, an
-> OpenAPI-grounded CollectivIQ adapter with hermetic contract tests, and the
+> OpenAPI-grounded CollectivIQ adapter with hermetic contract tests, the
 > authenticated public model endpoints (`GET /v1/models`,
-> `GET /v1/models/:model`) with OpenAI-style error envelopes. It does **not** yet
-> implement chat completions, live CollectivIQ calls, prompt serialization, tool
-> calling, streaming, or Redis, and the adapter is **not wired into any request
-> path**. Those remain planned per
+> `GET /v1/models/:model`), and an authenticated, non-streamed, text-only
+> `POST /v1/chat/completions` wired through the adapter (one new CollectivIQ
+> thread per request). The completion path calls CollectivIQ **only when a real
+> request is served** — never during import, construction, or the build smoke
+> test — and the live OpenCode/CollectivIQ smoke test is **not run** (pending
+> separate approval). It does **not** implement streaming (`stream:true`), tool
+> calling, Redis/idempotency, or metrics/tracing; those remain planned per
 > [`.agent/docs/tech-software-spec.md`](.agent/docs/tech-software-spec.md). This
-> is not full OpenAI API compatibility or production readiness. The grounded
-> upstream contract is documented in
+> is the bounded OpenCode Chat Completions profile, not full OpenAI API
+> compatibility or production readiness. The grounded upstream contract is
+> documented in
 > [`.agent/docs/collectiviq-upstream-contract.md`](.agent/docs/collectiviq-upstream-contract.md).
 
 ## What works today
@@ -31,7 +35,8 @@ CollectivIQ, exposing a bounded OpenAI Chat Completions-compatible profile.
   `created`, and `owned_by`, are listed in configuration order, and resolve
   case-sensitively. Missing/invalid credentials return a fixed OpenAI `401`;
   unknown/case-mismatched ids return a fixed OpenAI `404`; unexpected `/v1`
-  failures return a fixed OpenAI `500`. No public route calls CollectivIQ.
+  failures return a fixed OpenAI `500`. These model metadata routes themselves do
+  not call CollectivIQ.
 - Credential-redacting Pino logging with content logging off by default.
 - Graceful `SIGINT`/`SIGTERM` shutdown.
 - Docker packaging and GitHub Actions CI.
@@ -41,16 +46,27 @@ CollectivIQ, exposing a bounded OpenAI Chat Completions-compatible profile.
   provisional response validation, an opt-in staged discovery session/CLI
   (preflight by default), a committed filtered OpenAPI snapshot
   (`contract/collectiviq/`), and hermetic mock-server contract tests
-  (`test/contract/`). **Not wired into any route or completion path.**
+  (`test/contract/`).
+- **Authenticated, non-streamed, text-only `POST /v1/chat/completions`**
+  (Phase 1B), wired through the adapter. It validates/normalizes the OpenAI
+  request (text roles and string/text-part content; `n` must be `1`), rejects
+  `stream:true`, tools, `tool_choice`, `response_format`, `logprobs`, audio, and
+  image/binary content with stable content-free `400`s, serializes a
+  deterministic versioned prompt, enforces process-local global + per-key
+  capacity with a bounded queue (`429` + `Retry-After: 5` when at capacity),
+  creates one new CollectivIQ thread, submits once (no `create_thread`/
+  `process_message` retries), polls `get_messages` under a total deadline with
+  GET-only retry and desired-source selection, and encodes a non-streamed
+  response with zero (unavailable) usage. Client disconnect, the total deadline
+  (`504`), and shutdown share one cancellation path. **The live smoke test is not
+  run** — see the status note above.
 
 ## What is not implemented yet
 
-`POST /v1/chat/completions`, `GET /metrics`, prompt construction,
-emulated/native tool calling, synthetic SSE streaming, polling, generation
-orchestration, and any live CollectivIQ call. The adapter exists but is not
-connected to a public endpoint. (Gateway authentication and the `GET /v1/models`
-/ `GET /v1/models/:model` endpoints are now implemented — see "What works
-today".) Four authorized authenticated discovery baselines ran: two bearer-mode
+`GET /metrics`, emulated/native tool calling, synthetic SSE streaming
+(`stream:true`), Redis/idempotency, and any live OpenCode/CollectivIQ smoke run.
+(Gateway authentication, the model endpoints, and the non-streamed
+`POST /v1/chat/completions` path are implemented — see "What works today".) Four authorized authenticated discovery baselines ran: two bearer-mode
 runs (2026-08-06/07) **failed strict completeness (exited non-zero)**, and two
 `password`-mode runs (2026-08-11) **both passed (exited zero)** with identical
 sanitized safe facts. The core create/submit/messages contract and password
@@ -116,6 +132,42 @@ curl http://127.0.0.1:8787/v1/models/collectiviq-consensus \
 # Missing/invalid credentials return a fixed OpenAI 401 envelope
 curl -i http://127.0.0.1:8787/v1/models
 ```
+
+### Chat completions (non-streamed, text only)
+
+`POST /v1/chat/completions` accepts the bounded OpenCode Chat Completions
+profile: text-only `system`/`developer`/`user`/`assistant` messages with string
+or `{ "type": "text", "text": … }` content, `n` absent or `1`, and `stream`
+absent or exactly `false`. Each request creates one new CollectivIQ thread, so a
+live request needs a real `COLLECTIVIQ_*` upstream credential.
+
+```bash
+curl http://127.0.0.1:8787/v1/chat/completions \
+  -H "Authorization: Bearer gw-fake-key-change-me" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "collectiviq-consensus",
+    "messages": [{ "role": "user", "content": "Explain this function." }]
+  }'
+```
+
+The request surface is strict: `stream` (any value other than `false`), and the
+mere **own-property presence** of `tools`, `tool_choice`, `response_format`,
+`logprobs`, `audio`, message `tool_calls`, or a tool-role message — even when
+empty, `null`, an explicit `undefined`, `"auto"`, `"none"`, or otherwise harmless
+— is rejected with a stable `400`, as is any image/binary content. (Presence is
+decided without reading the field's value, so a value getter is never invoked and
+an inherited property never counts.) Accepted-but-ignored optional fields (`temperature`,
+`top_p`, `max_tokens`, `max_completion_tokens`, `stop`, `seed`, `user`, `store`,
+`parallel_tool_calls`) are surfaced by NAME only in an optional
+`X-CollectivIQ-Ignored-Parameters` response header; their values are never read
+or logged. Responses report `usage` zeros, which denote **unavailable** token
+counts — not estimates and not exact billing usage.
+
+For OpenCode, point `@ai-sdk/openai-compatible` at `http://127.0.0.1:8787/v1`
+with a gateway key as `apiKey` (see specification section 25 for a full example).
+The end-to-end OpenCode smoke test is **not run** in this repository and requires
+separate approval before any live CollectivIQ traffic.
 
 ## Validation
 
@@ -264,21 +316,26 @@ gateway validates the mode-appropriate credential at startup. Only
 
 ## Configuration reference
 
-| Variable                   | Required | Default                           | Notes                                                                                                     |
-| -------------------------- | -------- | --------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `ENVIRONMENT`              | no       | `production`                      | `development` \| `staging` \| `production`                                                                |
-| `HOST`                     | no       | `127.0.0.1`                       | Loopback by default                                                                                       |
-| `PORT`                     | no       | `8787`                            | 1–65535                                                                                                   |
-| `COLLECTIVIQ_BASE_URL`     | no       | `https://api.prod.collectiviq.ai` | Must be an absolute http(s) URL                                                                           |
-| `COLLECTIVIQ_AUTH_MODE`    | no       | `bearer`                          | `bearer` \| `password`; selects the upstream credential                                                   |
-| `COLLECTIVIQ_API_KEY`      | bearer   | —                                 | Bearer-mode upstream token (≤16 KiB, preserved exactly); required when `COLLECTIVIQ_AUTH_MODE=bearer`     |
-| `COLLECTIVIQ_USERNAME`     | password | —                                 | Password-mode username (trimmed, ≤320 bytes); required when `COLLECTIVIQ_AUTH_MODE=password`              |
-| `COLLECTIVIQ_PASSWORD`     | password | —                                 | Password-mode password (preserved exactly, ≤4096 bytes); required when `COLLECTIVIQ_AUTH_MODE=password`   |
-| `COLLECTIVIQ_GATEWAY_KEYS` | **yes**  | —                                 | Comma-separated client keys; trimmed, de-duplicated, ≤64 keys, ≤8192 UTF-8 bytes/key; enforced on `/v1/*` |
-| `MODEL_CONFIG_PATH`        | no       | `./config/models.yaml`            | Path to the YAML model file                                                                               |
-| `LOG_LEVEL`                | no       | `info`                            | Pino level                                                                                                |
-| `LOG_CONTENT`              | no       | `false`                           | May be `true` only when `ENVIRONMENT=development`                                                         |
-| `MAX_REQUEST_BODY_BYTES`   | no       | `8388608`                         | 1024 – 67108864                                                                                           |
+| Variable                          | Required | Default                           | Notes                                                                                                     |
+| --------------------------------- | -------- | --------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `ENVIRONMENT`                     | no       | `production`                      | `development` \| `staging` \| `production`                                                                |
+| `HOST`                            | no       | `127.0.0.1`                       | Loopback by default                                                                                       |
+| `PORT`                            | no       | `8787`                            | 1–65535                                                                                                   |
+| `COLLECTIVIQ_BASE_URL`            | no       | `https://api.prod.collectiviq.ai` | Must be an absolute http(s) URL                                                                           |
+| `COLLECTIVIQ_AUTH_MODE`           | no       | `bearer`                          | `bearer` \| `password`; selects the upstream credential                                                   |
+| `COLLECTIVIQ_API_KEY`             | bearer   | —                                 | Bearer-mode upstream token (≤16 KiB, preserved exactly); required when `COLLECTIVIQ_AUTH_MODE=bearer`     |
+| `COLLECTIVIQ_USERNAME`            | password | —                                 | Password-mode username (trimmed, ≤320 bytes); required when `COLLECTIVIQ_AUTH_MODE=password`              |
+| `COLLECTIVIQ_PASSWORD`            | password | —                                 | Password-mode password (preserved exactly, ≤4096 bytes); required when `COLLECTIVIQ_AUTH_MODE=password`   |
+| `COLLECTIVIQ_GATEWAY_KEYS`        | **yes**  | —                                 | Comma-separated client keys; trimmed, de-duplicated, ≤64 keys, ≤8192 UTF-8 bytes/key; enforced on `/v1/*` |
+| `MODEL_CONFIG_PATH`               | no       | `./config/models.yaml`            | Path to the YAML model file                                                                               |
+| `LOG_LEVEL`                       | no       | `info`                            | Pino level                                                                                                |
+| `LOG_CONTENT`                     | no       | `false`                           | May be `true` only when `ENVIRONMENT=development`                                                         |
+| `MAX_REQUEST_BODY_BYTES`          | no       | `8388608`                         | 1024 – 67108864                                                                                           |
+| `MAX_CONCURRENT_REQUESTS`         | no       | `4`                               | Global active completions (process-local); 1–1024                                                         |
+| `MAX_CONCURRENT_REQUESTS_PER_KEY` | no       | `2`                               | Per-gateway-key active completions; 1–1024 and ≤ `MAX_CONCURRENT_REQUESTS`                                |
+| `MAX_QUEUED_REQUESTS`             | no       | `20`                              | Bounded admission queue length; 0–100000 (0 disables queueing)                                            |
+| `MAX_QUEUE_WAIT_MS`               | no       | `5000`                            | Max time in the admission queue before a `429`; 1–600000                                                  |
+| `SHUTDOWN_DRAIN_MS`               | no       | `30000`                           | Graceful-shutdown drain before in-flight polling is cancelled; 0–600000                                   |
 
 The upstream credential authenticates the gateway to CollectivIQ: in `bearer`
 mode `COLLECTIVIQ_API_KEY` is sent as a static bearer token; in `password` mode

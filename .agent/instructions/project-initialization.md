@@ -18,7 +18,7 @@ The initial scaffold is in place. The concrete choices made are:
 - **Packaging/CI:** multi-stage Dockerfile pinned to a Node 24 bookworm-slim digest running as non-root `node`; Compose publishing to host loopback only; GitHub Actions running `npm run validate` plus a no-push Docker build, with actions pinned to commit SHAs.
 - **Model-config safety limits and diagnostics:** the model file is bounded by `MODEL_CONFIG_LIMITS` in `src/config/schema.ts` (documented in spec section 24.1). Configuration and startup diagnostics are value-free (a single fixed internal message for unexpected startup errors; stable field/reason pairs for configuration issues), and log records are recursively sanitized with bounded depth/width/length. Do not weaken these limits or reintroduce library error text into diagnostics.
 
-Note: TypeScript is pinned within the range supported by `typescript-eslint`. Still planned: the OpenAI, CollectivIQ, generation, prompts, and tools modules, and the contract/compatibility/adversarial/load test suites.
+Note: TypeScript is pinned within the range supported by `typescript-eslint`. The OpenAI, CollectivIQ, generation, and prompts modules now exist and are wired into the implemented, non-streamed `POST /v1/chat/completions` path (Phase 1B); the hermetic contract suite exists. Still planned: the `src/tools/` modules (emulated/native tool calling), SSE streaming, Redis, metrics/tracing, and the compatibility/adversarial/load and live/OpenCode test suites.
 
 ## Initialization Principles
 

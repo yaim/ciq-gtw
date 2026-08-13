@@ -19,6 +19,21 @@ Only the first three are part of the OpenAI-shaped API surface. Do not add Respo
 
 ## Request Validation
 
+**Implementation status (Phase 1B, implemented).** `POST /v1/chat/completions`
+is authenticated, non-streamed, and text-only, with a **strict** request surface.
+`src/openai/chat-request.ts` + `messages.ts` validate/normalize to the **deeply
+frozen** `NormalizedChatRequest` (`chat-types.ts`); `src/prompts/conversation.ts`
+serializes the deterministic versioned prompt; `src/openai/chat-response.ts`
+encodes the non-streamed response with zero (unavailable) usage. Deferred features
+are rejected by **own-property presence alone** (`Object.hasOwn`; even
+empty/`null`/explicit `undefined`/`"auto"`/`"none"`/harmless values, never reading
+the value or counting an inherited property): `stream` (any non-`false` value),
+request `tools`, request `tool_choice`, `response_format`, `logprobs`, audio,
+image/binary content parts, tool-role messages, and message `tool_calls`. `parallel_tool_calls` stays an ignored
+compatibility option only because no other tool surface is accepted. The ignored
+optional-parameter NAMES are echoed in `X-CollectivIQ-Ignored-Parameters`. SSE
+and tools remain planned.
+
 - Require a configured `model` and an ordered non-empty `messages` collection according to the public schema.
 - Accept supported roles and text content forms exactly as specified.
 - Reject image, audio, file, binary, response-format, logprobs, and other unsupported combinations with a stable OpenAI error envelope.

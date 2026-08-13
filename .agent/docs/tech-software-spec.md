@@ -734,6 +734,15 @@ If reliable token counts are unavailable, the gateway shall return zeros or omit
 
 The gateway must not present estimated tokens as exact upstream billing usage.
 
+**Implementation status (Phase 1B, implemented).** The non-streamed text encoder
+(`src/openai/chat-response.ts`) emits exactly `id` (`chatcmpl_ciq_*`),
+`object: "chat.completion"`, Unix-seconds `created`, the requested virtual-model
+`id`, one choice at index `0` with an assistant text `message` and
+`finish_reason: "stop"`, and `usage` with `prompt_tokens`/`completion_tokens`/
+`total_tokens` all `0`. The zeros denote **unavailable** counts — not estimates
+and not exact billing usage. The completion id and clock are injectable seams for
+deterministic tests. The tool response shape stays a Phase 3 concern.
+
 ---
 
 ## 9. Public API Specification
@@ -981,6 +990,32 @@ HTTP/1.1 400 Bad Request
   }
 }
 ```
+
+**Implementation status (Phase 1B, implemented).** `POST /v1/chat/completions`
+is authenticated, non-streamed, and text-only, with a **strict** request surface.
+Accepted: a non-empty exact-case `model`, a non-empty ordered `messages` array
+with `system`/`developer`/`user`/`assistant` roles, string content or arrays of
+`{ "type": "text", "text" }` parts (text parts are joined with `\n`), `n` absent
+or `1`, and `stream` **absent or exactly `false`**. Documented optional
+sampling/storage fields (`temperature`, `top_p`, `max_tokens`,
+`max_completion_tokens`, `stop`, `seed`, `user`, `store`, `parallel_tool_calls`)
+are accepted but ignored — only their **names** are recorded and echoed in the
+optional `X-CollectivIQ-Ignored-Parameters` header (values are never read or
+logged). `parallel_tool_calls` remains an ignored compatibility option only
+because no other tool surface is accepted. Rejected with stable content-free
+`400`s — by **own-property presence alone**, including an empty array, `null`,
+an explicit `undefined` supplied directly to the normalization boundary,
+`"auto"`, `"none"`, or any otherwise-harmless value: `stream` (any non-`false`
+value), request `tools`, request `tool_choice`, `response_format`, `logprobs`,
+audio parameters, message `tool_calls`, tool-role messages, and
+image/audio/file/binary content parts. Presence is decided with `Object.hasOwn`
+(the field value is never read for a presence decision, so a value getter is
+never invoked and an inherited/prototype property never counts as supplied);
+the accepted-but-ignored names are recorded the same way. Conservative initial collection bounds apply (`MAX_MESSAGES = 512`,
+`MAX_TEXT_PARTS_PER_MESSAGE = 256`); the body-byte and final-prompt-byte limits
+remain authoritative. The raw request is normalized to a **deeply immutable**
+internal value (each message, the message array, the ignored-name collection, and
+the outer request are frozen) and never flows into generation logic.
 
 ---
 
@@ -1750,9 +1785,47 @@ invalid gateway key (`401`), unknown/case-mismatched model (`404`), and any
 unexpected `/v1` failure (`500`, `type: "server_error"`, `code: "internal_error"`,
 `param: null`, fixed message `The gateway encountered an internal error.`). The
 `500` path never inspects or serializes the thrown value's message, stack, cause,
-body, headers, or serialization. The remaining rows (`400`, `429`, `502`, `504`)
-are defined here but not yet reachable, since `/v1/chat/completions` and the
-upstream request path are unimplemented.
+body, headers, or serialization.
+
+**Implementation status (Phase 1B, implemented).** The remaining rows are now
+reachable through `POST /v1/chat/completions` (`src/openai/errors.ts` is the
+single public-error owner). Added envelopes: invalid request (`400`,
+`invalid_request` / `unsupported_parameter` with a static `param` such as
+`messages`/`model`/`n`/`stream`/`tools`), unsupported content (`400`,
+`unsupported_content_type`, `param: "messages"`), prompt too large (`400`,
+`context_length_exceeded`, `param: "messages"`), an oversized-body guard (`413`,
+`request_too_large`), gateway capacity (`429`, `gateway_capacity_exceeded`, with
+`Retry-After: 5`), and a shutdown guard (`503`, `service_unavailable`). Normalized
+`UpstreamError`s map by closed category only (never by reading a body/status/
+message): `quota → 429 upstream_quota_exceeded` (with `Retry-After: 5`);
+`authentication → 502 upstream_authentication_failed`; `timeout → 504
+completion_timeout`; `upstream_protocol`/`response_too_large → 502
+invalid_upstream_response`; and `validation`/`transient_http`/`network`/
+`unexpected_upstream → 502 upstream_request_failed` (a minimal, stable
+transport-category mapping added by this phase). A total-deadline expiry maps to
+`504 completion_timeout`; a client disconnect produces no body (there is no
+public `499`); a shutdown cancellation with the client still connected maps to
+`503`. The route error boundary **fails closed** on trusted request **provenance**, not
+on the structure of the thrown value. A thrown value is classified to `400`/`413`
+only when it originated in Fastify's parser/body-limit phase — proven by two
+trusted per-request markers (gateway authentication completed **and** the handler
+body has not begun), the exact window in which nothing but Fastify's own parser
+runs. In every other case — an auth/hook failure, or any thrown value once the
+handler has begun, **including one forging a Fastify-like `code`/`statusCode` or a
+hostile Proxy** — the value becomes the fixed `500` **without being inspected,
+serialized, logged, re-thrown, or `instanceof`-tested** (so no getter or
+prototype trap runs). Gateway completion errors are recognized by object identity
+via a `WeakSet`; normalized upstream errors are likewise recognized by an
+identity guard (`isUpstreamError`) rather than `instanceof`, so an arbitrary
+thrown value can never impersonate one. The total request deadline **and
+cancellation** are **authoritative** in the poller: both are checked before every
+`get_messages` and **rechecked the instant the poll settles** — before any answer
+is selected or any thrown error is classified. Cancellation observed while a poll
+is in flight always wins, so a late fulfilment never returns an answer and a late
+rejection is never reinterpreted as a timeout or transport error; a poll or answer
+arriving at/after the deadline (with no cancellation) becomes `504
+completion_timeout`. No raw upstream body, exception detail, credential, prompt,
+answer, or identifier appears in any envelope.
 
 ---
 
@@ -2081,6 +2154,26 @@ Configuration validation must occur before the HTTP server starts.
 Invalid configuration must terminate the process with a non-zero exit code.
 
 Secrets must be redacted from startup output.
+
+**Implementation status (Phase 1B, implemented).** The process-local capacity,
+queue, and shutdown-drain settings are validated environment integers with
+conservative, non-overridable bounds (`CAPACITY_LIMITS` in
+`src/config/schema.ts`):
+
+| Variable | Default | Bounds |
+| --- | ---: | :--- |
+| `MAX_CONCURRENT_REQUESTS` | 4 | 1–1024 |
+| `MAX_CONCURRENT_REQUESTS_PER_KEY` | 2 | 1–1024, and ≤ `MAX_CONCURRENT_REQUESTS` |
+| `MAX_QUEUED_REQUESTS` | 20 | 0–100000 (0 disables queueing) |
+| `MAX_QUEUE_WAIT_MS` | 5000 | 1–600000 |
+| `SHUTDOWN_DRAIN_MS` | 30000 | 0–600000 |
+
+A non-integer or out-of-range value, or a per-key limit greater than the global
+limit, is a value-free `ConfigError` (the field name and a fixed reason; never a
+submitted value). Capacity is **process-local** — it does not span replicas.
+`REQUEST_TIMEOUT_MS`/`DEFAULT_UPSTREAM_TIMEOUT_MS`/`POLL_INTERVAL_MS`/
+`POLL_MAX_INTERVAL_MS` remain per-model settings (`requestTimeoutMs`,
+`pollIntervalMs`, `maxPollIntervalMs`) rather than global env vars in this phase.
 
 Gateway client keys (`COLLECTIVIQ_GATEWAY_KEYS`) are bounded by conservative,
 non-overridable initial limits: at most **64** configured keys, and at most
@@ -2653,8 +2746,10 @@ No new live evidence is asserted by this classification.
 
 ### Phase 1 — Text gateway
 
-Phase 1 is split into an offline **Phase 1A** (implemented) and the remaining
-**Phase 1B** (planned).
+Phase 1 is split into an offline **Phase 1A** (implemented) and **Phase 1B**,
+whose offline implementation is also complete. The live OpenCode/CollectivIQ
+smoke test and the Phase 1 exit criterion remain pending explicit approval, so
+Phase 1 is not yet complete or production-ready.
 
 **Phase 1A — implemented (offline, no live CollectivIQ call):**
 
@@ -2666,12 +2761,33 @@ Phase 1 is split into an offline **Phase 1A** (implemented) and the remaining
 * shared bounded OpenAI error envelopes (`401`/`404`/`500`);
 * Docker packaging (already present).
 
-**Phase 1B — planned:**
+**Phase 1B — implemented (offline; the completion path calls CollectivIQ only
+when a real request is served, never during import/construction):**
 
-* non-streamed `POST /v1/chat/completions`;
-* one thread per request and wiring the CollectivIQ adapter into the request path;
-* prompt serialization, polling, and generation orchestration;
-* OpenCode text-mode smoke test.
+* non-streamed, text-only `POST /v1/chat/completions` (authenticated), with
+  `stream` absent/`false` only; deferred features (`stream:true`, tools,
+  `tool_choice`, `response_format`, `logprobs`, audio, images) rejected with
+  stable content-free `400` envelopes;
+* the CollectivIQ adapter wired into the request path — one **new** thread per
+  completion, one `process_message`, then bounded polling of `get_messages`;
+* deterministic versioned prompt serialization (`src/prompts/conversation.ts`),
+  internal virtual-model policy resolution (`ModelCatalog.resolveModel`),
+  process-local global + per-key capacity with a bounded queue/queue-wait
+  (`src/generation/capacity.ts`), a total request deadline, client-disconnect +
+  shutdown cancellation, safe GET-only poll retry with capped 1.25 backoff +
+  jitter, desired-source message selection, the non-streamed OpenAI response
+  encoder (zero/unavailable usage), and the graceful-shutdown drain
+  (`SHUTDOWN_DRAIN_MS`);
+* runtime upstream-credential composition from validated config (no env re-read;
+  password logins are lazy and bounded per attempt, unbounded across the process
+  lifetime);
+* hermetic unit/integration/adapter-backed contract tests.
+
+**Phase 1B — deferred / not run:** the live OpenCode text-mode smoke test (and
+any live CollectivIQ request from this repo) is **not run** and requires separate
+explicit approval. `stream:true` and SSE stay in Phase 2; tools stay in Phase 3;
+Redis/idempotency and metrics/tracing remain unimplemented; thread reuse and
+upstream deletion are not performed.
 
 Deliverables:
 
@@ -2688,6 +2804,8 @@ Deliverables:
 Exit criterion:
 
 * OpenCode can ask a question and receive a CollectivIQ combined answer.
+  (Offline implementation and hermetic tests are complete; the live OpenCode
+  smoke test that closes this criterion is pending separate approval.)
 
 ### Phase 2 — Streaming compatibility
 

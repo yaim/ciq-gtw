@@ -100,6 +100,14 @@ contracts, the capability matrix, and open questions.
   failure is non-retryable. The method is carried through the error factory. A
   `process_message` 2xx body with an own `detail` property (any value) is a
   failure.
+- A caught value is recognized as a normalized failure by the identity guard
+  `isUpstreamError` (a private `WeakSet` populated in the `UpstreamError`
+  constructor), **never** `instanceof` — so a hostile thrown value (e.g. a Proxy)
+  triggers no `getPrototypeOf`/property trap, and `category`/`retryable`/
+  `rawStatus`/`code` are read only after identity is established. Every production
+  `src/` site (transport rethrow, login classification, polling retry decision,
+  completion mapping, discovery/cleanup observation) uses this guard; there are no
+  remaining `instanceof UpstreamError` checks in `src/`.
 - Confirmed encoding facts: `POST /create_thread` is
   `application/x-www-form-urlencoded` (fields `thread_title`,
   `is_title_from_user=false`); `POST /process_message` is `multipart/form-data`
@@ -114,6 +122,17 @@ contracts, the capability matrix, and open questions.
   masked by structural capture (notably message `content`) remain provisional.
 
 ## Adapter Boundary
+
+**Implementation status (Phase 1B, implemented).** The adapter is now wired into
+the completion path (`src/generation/chat-completion.ts` via
+`src/generation/runtime.ts`): each `POST /v1/chat/completions` creates one **new**
+thread, submits once (never retrying `create_thread`/`process_message`), and polls
+`get_messages` (`src/generation/polling.ts`) under the model's total deadline with
+GET-only retry, capped 1.25 backoff + jitter, and the documented duplicate-source
+selection. The runtime credential provider is built from validated config
+(`buildCredentialProviderFromConfig`, no env re-read; runtime logins are lazy and
+bounded per attempt). Normalized `UpstreamError`s map to public envelopes by
+closed category only (spec section 20). No live smoke run has been performed.
 
 Only the CollectivIQ adapter may know:
 

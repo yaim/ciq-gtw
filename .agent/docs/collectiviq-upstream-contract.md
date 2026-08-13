@@ -40,6 +40,20 @@ core create/submit/messages contract and password login are now
 verified-repeatable, and thread-deletion and inventory-access outcomes were
 observed to be credential/principal-dependent (cause not established).
 
+**Phase 1B now consumes this contract (implemented, offline).** The production
+adapter is wired into `POST /v1/chat/completions` via
+`src/generation/runtime.ts`/`chat-completion.ts`: each completion creates one
+**new** thread, submits once (never retrying `create_thread`/`process_message`),
+and polls `get_messages` under the model's total deadline with GET-only retry and
+the timestamp → sortable-id → array-position selection above. Normalized
+`UpstreamError`s map to public OpenAI envelopes by closed category only (spec
+section 20). **No new live evidence is asserted** — no live CollectivIQ request is
+made from this repository except when a real completion is served, and the live
+OpenCode smoke test is not run. Because each completion sends the prompt into a
+new CollectivIQ-managed thread, provider-side retention/training/deletion/regional
+behavior remains a **production/provider-confirmation gate**, unchanged by this
+phase; the gateway itself retains no prompt/answer content after the request.
+
 **Phase 0 text-readiness gate — satisfied.** The verified-repeatable
 login/create/submit/messages contract is sufficient to **enter Phase 1
 conservative text development** (spec section 32). This is a scoped entry gate,

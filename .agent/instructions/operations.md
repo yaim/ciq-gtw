@@ -24,6 +24,20 @@ When adding or renaming configuration, update schema, loader, example environmen
 
 ## Concurrency and Idempotency
 
+**Implementation status (Phase 1B, implemented).** Process-local admission
+control lives in `src/generation/capacity.ts` (`createCapacityController`):
+global + per-key active limits, a bounded FIFO queue, a bounded queue wait, a
+grant pass that scans past per-key-blocked heads, idempotent permit release, and
+`closeAdmission()` for shutdown. It is driven by validated config
+(`MAX_CONCURRENT_REQUESTS`, `MAX_CONCURRENT_REQUESTS_PER_KEY`,
+`MAX_QUEUED_REQUESTS`, `MAX_QUEUE_WAIT_MS`; see spec section 24). Capacity is
+acquired **before** `createThread` and released on every exit path; overflow/
+closed-admission returns `429` + `Retry-After: 5`. Graceful shutdown
+(`src/index.ts`) marks readiness false, calls `closeAdmission()`, allows
+`SHUTDOWN_DRAIN_MS`, then aborts the shared shutdown signal to cancel in-flight
+polling and release permits. Capacity is process-local (not cross-replica);
+Redis-backed idempotency remains unimplemented.
+
 - Acquire a global/per-key permit before creating an upstream thread.
 - Bound the queue and queue duration; reject overflow with documented OpenAI-shaped `429` and `Retry-After`.
 - Always release permits during success, error, timeout, client abort, and shutdown.

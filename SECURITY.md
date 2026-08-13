@@ -21,11 +21,13 @@ a fix and disclosure timeline privately.
 
 ## Security posture of this scaffold
 
-This repository is a **runnable foundation**, an offline CollectivIQ adapter
-boundary, and the Phase 1A authenticated public model surface. The completion,
-tool, streaming, and Redis features are not implemented, and the upstream adapter
-is not wired into any request path, so those runtime controls are not yet active.
-The controls that exist today are:
+This repository is a **runnable foundation**, the Phase 1A authenticated public
+model surface, and the Phase 1B non-streamed chat-completions path wired through
+the CollectivIQ adapter. Tool calling, streaming (`stream:true`), Redis, and
+metrics/tracing are not implemented. The completion path calls CollectivIQ only
+when a real request is served (never during import/construction/build smoke), and
+the live OpenCode/CollectivIQ smoke test is **not run** (pending separate
+approval). The controls that exist today are:
 
 - **Gateway client authentication (implemented).** Every route under `/v1/*` —
   today `GET /v1/models` and `GET /v1/models/:model` — requires
@@ -108,8 +110,57 @@ The controls that exist today are:
   reduces each to `{ name, code }`. Retryability is **method-aware**: only an
   idempotent `GET` network/transient failure is marked retryable, and every
   `POST`/`DELETE` failure is non-retryable. A `process_message` 2xx body with an
-  own `detail` property of any value is treated as a failure. The adapter is not
-  connected to any route.
+  own `detail` property of any value is treated as a failure. In Phase 1B the
+  adapter is used by the completion route, but only when a real request is served
+  — never during import, construction, or the build smoke test.
+- **Chat-completions request path (implemented; Phase 1B).** `POST
+/v1/chat/completions` sits inside the authenticated `/v1` scope, so the gateway
+  key is checked **before** any body parsing or use-case work. The raw request is
+  validated/normalized to a **deeply frozen** internal value and never flows into
+  generation; the strict surface rejects, by **own-property presence**
+  (`Object.hasOwn` — even empty/`null`/explicit `undefined`/`"auto"`/`"none"`/
+  harmless values, never reading the value or an inherited property), `stream≠false`,
+  `tools`, `tool_choice`, `response_format`, `logprobs`, `audio`, message
+  `tool_calls`, tool-role messages, and image/binary content — all with stable,
+  content-free `400`s. Public errors come only from the shared owner
+  (`src/openai/errors.ts`) and never contain a submitted value, prompt, answer, raw
+  upstream body, exception detail, credential, or thread/request identifier. The
+  route error boundary **fails closed** on trusted request **provenance**, not on
+  the shape of the thrown value: a value is mapped to `400`/`413` only when it arose
+  in Fastify's parser/body-limit phase, proven by trusted per-request markers
+  (authentication completed **and** the handler not yet begun). An auth/hook failure,
+  or any thrown value once the handler has begun — including one forging a
+  Fastify-like `code`/`statusCode` or a hostile `Proxy` — becomes the fixed `500`
+  with **no** property read and no `instanceof`/prototype trap (gateway completion
+  errors are matched by identity via a `WeakSet`, normalized upstream errors by an
+  `isUpstreamError` identity guard, and untrusted values are never inspected or
+  re-thrown to the framework). The matched gateway key is exposed internally as an
+  **opaque** index-based identity (`k<index>`), never the raw key, and is used only
+  for per-key capacity accounting. **Process-local** capacity (global + per-key
+  active limits, a bounded FIFO queue, and a bounded queue wait) is acquired
+  **before** the upstream thread is created and released on every exit path
+  (success, upstream failure, timeout, client disconnect, shutdown); overflow
+  returns `429` + `Retry-After: 5`. Capacity does **not** span replicas. The total
+  request deadline **and cancellation** are **authoritative** in the poller (both
+  checked before every poll and **rechecked the instant the poll settles**, so
+  cancellation seen in-flight always wins — no late poll, no late answer, and no
+  rejection reinterpreted as a timeout or transport error); the deadline,
+  client-disconnect detection (via the response socket `close`), and a shutdown
+  signal share one abort path: the deadline maps to `504`, a client disconnect
+  aborts polling/upstream work and sends no body, and a shutdown cancellation
+  (client still connected) maps to `503`. The completion serializes
+  the prompt with a
+  content-free generic thread title (never derived from prompt/model/repo/file
+  data), measures the final prompt in UTF-8 bytes against the model's
+  `maximumPromptBytes` (`context_length_exceeded` when exceeded), and never logs or
+  persists the prompt or answer. `usage` is reported as zeros meaning
+  **unavailable** (not estimates, not billing). The runtime upstream-credential
+  provider is built from already-validated config (`buildCredentialProviderFromConfig`)
+  and never re-reads `process.env`; construction opens no socket and performs no
+  login. **Retention:** each completion creates a **new** CollectivIQ thread, so
+  prompts and answers cross into CollectivIQ-managed storage; the gateway retains
+  no prompt/answer content after the request completes, but provider-side
+  retention/training/deletion/regional behavior remains **unknown** (see below).
 - **Bounded OpenAPI retrieval.** `scripts/openapi/fetch-openapi.ts` contacts only
   the fixed public source URL (no caller-supplied URL/env), enforces an overall
   deadline with cancellation, requires a JSON content type, rejects an
@@ -241,10 +292,15 @@ errorCode, resolved, resolution, persisted }] }` (no longer `succeeded`/
 
 ## Current limitations
 
-- `POST /v1/chat/completions` and any live CollectivIQ call are not implemented,
-  and the upstream adapter is not wired into any public route. The authenticated
-  endpoints that exist today (`GET /v1/models`, `GET /v1/models/:model`) serve
-  only configured virtual-model metadata.
+- `POST /v1/chat/completions` is implemented but the end-to-end live
+  OpenCode/CollectivIQ smoke test is **not run** (pending separate approval). No
+  live CollectivIQ request is made from this repository except when a real
+  completion request is served against a configured upstream credential.
+- Streaming (`stream:true`/SSE), tool calling, and Redis/idempotency are not
+  implemented; those requests are rejected or unavailable rather than silently
+  degraded.
+- Capacity/backpressure is **process-local** — it does not coordinate across
+  replicas. Cross-replica limits require shared state that does not yet exist.
 - No metrics endpoint is exposed.
 - Readiness reports a simple ready/not-ready state; it does not yet probe
   dependencies.
