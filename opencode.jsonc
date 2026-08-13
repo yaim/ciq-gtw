@@ -1,0 +1,33 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  // This key authenticates OpenCode to the local gateway. It must match one
+  // entry in COLLECTIVIQ_GATEWAY_KEYS; it is not a CollectivIQ upstream key.
+  "provider": {
+    "collectiviq": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "CollectivIQ Gateway",
+      "options": {
+        "baseURL": "http://127.0.0.1:8787/v1",
+        "apiKey": "{env:COLLECTIVIQ_GATEWAY_KEY}",
+        "timeout": 110000,
+        "chunkTimeout": 30000,
+      },
+      "models": {
+        "collectiviq-consensus": {
+          "name": "CollectivIQ Consensus",
+        },
+        "collectiviq-coder": {
+          "name": "CollectivIQ Coder",
+        },
+        "collectiviq-fast": {
+          "name": "CollectivIQ Fast",
+        },
+      },
+    },
+  },
+
+  "model": "collectiviq/collectiviq-consensus",
+  "small_model": "collectiviq/collectiviq-fast",
+  "share": "disabled",
+}
