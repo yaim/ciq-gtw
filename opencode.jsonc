@@ -13,6 +13,11 @@
         "timeout": 110000,
         "chunkTimeout": 30000,
       },
+      // The consensus/coder/fast virtual models remain declared for accounts
+      // whose CollectivIQ routing supports non-Claude sources. For THIS account,
+      // upstream routing currently classifies generic gateway prompts as
+      // Atlassian queries and skips non-Claude sources, so only collectiviq-claude
+      // is observed to answer — hence the Claude-only defaults below.
       "models": {
         "collectiviq-claude": {
           "name": "CollectivIQ Claude",
@@ -30,15 +35,22 @@
     },
   },
 
-  // Phase 2 is text-only: the gateway accepts non-streamed JSON and synthetic
-  // SSE (`stream:true`) but rejects tools/tool_choice/tool messages. This primary
-  // agent denies every tool permission so OpenCode sends no tool definitions to
-  // the gateway, keeping requests within the supported text-only surface.
+  // The gateway is text-only: it accepts non-streamed JSON and synthetic SSE
+  // (`stream:true`). OpenCode automatically attaches tool DEFINITIONS to every
+  // request even when every tool permission is denied. A text-only
+  // (`toolMode: disabled`) virtual model TOLERATES that metadata as a
+  // compatibility bridge — it is bounded (≤128 tools and ≤2 MiB aggregate JSON),
+  // examined only through data-property descriptors for shape/byte accounting
+  // (never executing getters/toJSON), never serialized into the CollectivIQ
+  // prompt, never forwarded upstream, and never turned into a tool call — so
+  // denying all permissions plus discarding the definitions keeps every request
+  // within the supported text-only surface. Actual tool calling stays disabled
+  // (Phase 3).
   "agent": {
     "collectiviq-text": {
-      "description": "Text-only CollectivIQ consensus agent (no tools; Phase 2 SSE).",
+      "description": "Text-only CollectivIQ agent (Claude source; no tools; Phase 2 SSE).",
       "mode": "primary",
-      "model": "collectiviq/collectiviq-consensus",
+      "model": "collectiviq/collectiviq-claude",
       "permission": {
         "*": "deny",
       },
@@ -46,7 +58,9 @@
   },
   "default_agent": "collectiviq-text",
 
-  "model": "collectiviq/collectiviq-consensus",
-  "small_model": "collectiviq/collectiviq-fast",
+  // Claude is the committed default for foreground and hidden (small_model) work
+  // because it is the only source currently observed to answer for this account.
+  "model": "collectiviq/collectiviq-claude",
+  "small_model": "collectiviq/collectiviq-claude",
   "share": "disabled",
 }
