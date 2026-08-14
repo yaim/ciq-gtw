@@ -36,7 +36,6 @@ import { streamChatCompletion } from "./chat-stream-response.js";
 import {
   INTERNAL_ERROR,
   INVALID_REQUEST_ERROR,
-  MODEL_NOT_FOUND_ERROR,
   OpenAIErrorSchema,
   REQUEST_BODY_TOO_LARGE_ERROR,
   SERVICE_UNAVAILABLE_ERROR,
@@ -147,14 +146,14 @@ export function registerChatCompletionsRoute(
           return apiError.body;
         };
 
-        // Validate + normalize; the raw body never flows past this point.
-        const validated = validateChatRequest(request.body);
+        // Validate + normalize against the resolved model policy; the raw body
+        // never flows past this point. The validator resolves the INTERNAL model
+        // policy (never exposed to the client) so the model-aware tool-metadata
+        // bridge runs inside the boundary that already owns raw-body access.
+        const validated = validateChatRequest(request.body, (id) => deps.catalog.resolveModel(id));
         if (!validated.ok) return sendError(validated.error);
         const normalized = validated.request;
-
-        // Resolve the INTERNAL model policy (never exposed to the client).
-        const model = deps.catalog.resolveModel(normalized.model);
-        if (model === undefined) return sendError(MODEL_NOT_FOUND_ERROR);
+        const model = validated.model;
 
         // The auth hook guarantees an identity before the handler runs.
         const keyId = request.gatewayKeyId;

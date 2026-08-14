@@ -185,6 +185,62 @@ describe("POST /v1/chat/completions — synthetic SSE success", () => {
   });
 });
 
+describe("POST /v1/chat/completions — tool metadata on the stream path", () => {
+  const toolDef = [
+    {
+      type: "function",
+      function: {
+        name: "read",
+        description: "Read a file.",
+        parameters: { type: "object", properties: {}, additionalProperties: false },
+      },
+    },
+  ];
+
+  it("tolerates tool metadata and streams ordinary text with the ignored header", async () => {
+    app = build(() => Promise.resolve({ content: "Hello, world" }));
+    const res = await app.inject({
+      method: "POST",
+      url,
+      headers: auth,
+      payload: { ...streamBody, tools: toolDef, tool_choice: "auto" },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["content-type"]).toContain("text/event-stream");
+    expect(res.headers["x-collectiviq-ignored-parameters"]).toBe("tool_choice,tools");
+
+    const events = jsonEvents(res.body) as {
+      choices: { delta: { role?: string; content?: string }; finish_reason: string | null }[];
+    }[];
+    expect(events[0]?.choices[0]?.delta).toEqual({ role: "assistant" });
+    const content = events.map((e) => e.choices[0]?.delta.content ?? "").join("");
+    expect(content).toBe("Hello, world");
+    expect(events.at(-1)?.choices[0]?.finish_reason).toBe("stop");
+    expect(dataPayloads(res.body).at(-1)).toBe("[DONE]");
+  });
+
+  it("rejects a required tool_choice as a pre-header JSON 400, never opening an SSE stream", async () => {
+    let called = false;
+    app = build(() => {
+      called = true;
+      return Promise.resolve({ content: "unreachable" });
+    });
+    const res = await app.inject({
+      method: "POST",
+      url,
+      headers: auth,
+      payload: { ...streamBody, tools: toolDef, tool_choice: "required" },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.headers["content-type"]).toContain("application/json");
+    expect(res.json()).toMatchObject({
+      error: { param: "tool_choice", code: "unsupported_parameter" },
+    });
+    expect(res.body).not.toContain("event-stream");
+    expect(called).toBe(false);
+  });
+});
+
 describe("POST /v1/chat/completions — post-header failures become SSE error records", () => {
   const cases = [
     {

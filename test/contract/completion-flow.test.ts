@@ -169,6 +169,62 @@ describe("completion flow — success", () => {
   });
 });
 
+describe("completion flow — tool metadata is discarded before upstream", () => {
+  it("tolerates tool metadata, keeps one thread + one submit, and never leaks the tool schema", async () => {
+    // A unique marker embedded in the tool definition must not appear in the
+    // serialized prompt, the multipart submit, any upstream request, or the
+    // public response — the definition is discarded at the OpenAI boundary.
+    const SENTINEL = "SENTINEL_TOOL_SCHEMA_MARKER_ZZQ9";
+    const server = await startWith({
+      "/create_thread": (_req, res) => createOk(res),
+      "/process_message": (_req, res) => processOk(res),
+      "/get_messages": (_req, res) =>
+        replyJson(res, { messages: [{ source: "combined", content: "ordinary text answer" }] }),
+    });
+    const payload = {
+      ...okBody,
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "read",
+            description: SENTINEL,
+            parameters: {
+              type: "object",
+              properties: { [SENTINEL]: { type: "string" } },
+              additionalProperties: false,
+            },
+          },
+        },
+      ],
+      tool_choice: "auto",
+    };
+    const response = await server.inject({ method: "POST", url, headers: auth, payload });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      choices: [{ message: { content: "ordinary text answer" }, finish_reason: "stop" }],
+    });
+    expect(response.headers["x-collectiviq-ignored-parameters"]).toBe("tool_choice,tools");
+    expect(response.body).not.toContain(SENTINEL);
+
+    // Exactly one create and one submit — the flow is unchanged by tool metadata.
+    const creates = mock?.requests.filter((r) => r.path === "/create_thread") ?? [];
+    const submits = mock?.requests.filter((r) => r.path === "/process_message") ?? [];
+    expect(creates).toHaveLength(1);
+    expect(submits).toHaveLength(1);
+
+    // The multipart submit carries the serialized conversation but NOT the schema.
+    const submitBody = submits[0]?.text() ?? "";
+    expect(submitBody).toContain("BEGIN_CONVERSATION_JSON");
+    expect(submitBody).not.toContain(SENTINEL);
+
+    // No captured upstream request anywhere carries the sentinel.
+    for (const captured of mock?.requests ?? []) {
+      expect(captured.text()).not.toContain(SENTINEL);
+    }
+  });
+});
+
 describe("completion flow — error mapping", () => {
   it("maps a malformed get_messages body to 502 invalid_upstream_response", async () => {
     const server = await startWith({

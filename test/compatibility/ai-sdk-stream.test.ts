@@ -11,7 +11,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { AddressInfo } from "node:net";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
-import { generateText, streamText } from "ai";
+import { generateText, jsonSchema, streamText, tool } from "ai";
 import { buildServer, type GatewayServer } from "../../src/server.js";
 import { createReadinessState } from "../../src/api/health-route.js";
 import type {
@@ -136,6 +136,66 @@ describe("@ai-sdk/openai-compatible against the gateway", () => {
 
     expect(result.text).toBe(ANSWER);
     expect(result.finishReason).toBe("stop");
+  });
+
+  it("reconstructs text via streamText when a function tool + toolChoice auto are sent", async () => {
+    // OpenCode attaches tool definitions automatically; a text-only model must
+    // tolerate them and still stream ordinary text with no tool call.
+    const baseURL = await startGateway();
+    const provider = providerFor(baseURL);
+
+    const result = streamText({
+      model: provider("collectiviq-consensus"),
+      messages: [{ role: "user", content: "What's the weather in Paris?" }],
+      tools: {
+        get_weather: tool({
+          description: "Get the current weather for a city.",
+          inputSchema: jsonSchema<{ city: string }>({
+            type: "object",
+            properties: { city: { type: "string", description: "City name" } },
+            required: ["city"],
+            additionalProperties: false,
+          }),
+        }),
+      },
+      toolChoice: "auto",
+      maxRetries: 0,
+    });
+
+    let streamed = "";
+    for await (const delta of result.textStream) streamed += delta;
+
+    expect(streamed).toBe(ANSWER);
+    expect(await result.text).toBe(ANSWER);
+    expect(await result.finishReason).toBe("stop");
+    expect(await result.toolCalls).toEqual([]);
+  });
+
+  it("returns text via generateText with a function tool (no 'tools is not supported yet')", async () => {
+    const baseURL = await startGateway();
+    const provider = providerFor(baseURL);
+
+    const result = await generateText({
+      model: provider("collectiviq-consensus"),
+      messages: [{ role: "user", content: "What's the weather in Paris?" }],
+      tools: {
+        get_weather: tool({
+          description: "Get the current weather for a city.",
+          inputSchema: jsonSchema<{ city: string }>({
+            type: "object",
+            properties: { city: { type: "string", description: "City name" } },
+            required: ["city"],
+            additionalProperties: false,
+          }),
+        }),
+      },
+      toolChoice: "auto",
+      maxRetries: 0,
+    });
+
+    expect(result.text).toBe(ANSWER);
+    expect(result.finishReason).toBe("stop");
+    expect(result.toolCalls).toEqual([]);
   });
 
   it("surfaces a model-not-found as an SDK error (unknown virtual model)", async () => {

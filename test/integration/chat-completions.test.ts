@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
+import type { DestinationStream } from "pino";
 import { buildServer, type GatewayServer } from "../../src/server.js";
 import { createReadinessState } from "../../src/api/health-route.js";
+import { createLogger } from "../../src/observability/logger.js";
 import type { AuthResult, GatewayAuthenticator } from "../../src/api/gateway-auth.js";
 import {
   ChatCompletionError,
@@ -273,6 +275,128 @@ describe("POST /v1/chat/completions — request rejections", () => {
     });
     expect(response.statusCode).toBe(413);
     expect(response.json()).toMatchObject({ error: { code: "request_too_large" } });
+  });
+});
+
+describe("POST /v1/chat/completions — tool-metadata compatibility (disabled model)", () => {
+  const toolDef = [
+    {
+      type: "function",
+      function: {
+        name: "read",
+        description: "Read a file.",
+        parameters: { type: "object", properties: {}, additionalProperties: false },
+      },
+    },
+  ];
+
+  it("tolerates realistic tool metadata, returns ordinary text, and reports the ignored names", async () => {
+    app = build();
+    const response = await app.inject({
+      method: "POST",
+      url,
+      headers: auth,
+      payload: { ...okBody, tools: toolDef, tool_choice: "auto", parallel_tool_calls: true },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      choices: [{ message: { role: "assistant", content: "hello answer" }, finish_reason: "stop" }],
+    });
+    // The definitions are never reflected; only the parameter names are recorded.
+    expect(response.headers["x-collectiviq-ignored-parameters"]).toBe(
+      "parallel_tool_calls,tool_choice,tools",
+    );
+  });
+
+  it("rejects a required tool_choice with a stable 400 (never a silent text fallback)", async () => {
+    let called = false;
+    app = build(() => {
+      called = true;
+      return Promise.resolve({ content: "unreachable" });
+    });
+    const response = await app.inject({
+      method: "POST",
+      url,
+      headers: auth,
+      payload: { ...okBody, tools: toolDef, tool_choice: "required" },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({
+      error: { code: "unsupported_parameter", param: "tool_choice" },
+    });
+    expect(called).toBe(false);
+  });
+
+  it("rejects a named-function tool_choice with a stable 400", async () => {
+    app = build();
+    const response = await app.inject({
+      method: "POST",
+      url,
+      headers: auth,
+      payload: {
+        ...okBody,
+        tools: toolDef,
+        tool_choice: { type: "function", function: { name: "read" } },
+      },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({ error: { param: "tool_choice" } });
+  });
+});
+
+describe("POST /v1/chat/completions — tool metadata does not leak into logs", () => {
+  it("keeps a tool-schema sentinel out of all captured logs (disabled model, ordinary text)", () => {
+    // A capturing logger at the most verbose level; automatic request logging is
+    // already disabled by buildServer, so no new logging seam is introduced.
+    const lines: string[] = [];
+    const stream: DestinationStream = {
+      write: (chunk: string) => void lines.push(chunk),
+    };
+    const logger = createLogger({ LOG_LEVEL: "trace" }, stream);
+
+    app = buildServer({
+      config: makeConfig(),
+      readiness: createReadinessState(true),
+      logger,
+      completion: {
+        chatService: fakeService(okAnswer),
+        shutdownSignal: new AbortController().signal,
+      },
+    });
+
+    const SENTINEL = "SENTINEL_TOOL_LOG_LEAK_MARKER_QZ7";
+    return app
+      .inject({
+        method: "POST",
+        url,
+        headers: auth,
+        payload: {
+          ...okBody,
+          tools: [
+            {
+              type: "function",
+              function: {
+                name: `tool_${SENTINEL}`,
+                description: `describes ${SENTINEL}`,
+                parameters: {
+                  type: "object",
+                  properties: { [SENTINEL]: { type: "string", description: SENTINEL } },
+                  additionalProperties: false,
+                },
+              },
+            },
+          ],
+          tool_choice: "auto",
+        },
+      })
+      .then((response) => {
+        expect(response.statusCode).toBe(200);
+        expect(response.json()).toMatchObject({
+          choices: [{ message: { role: "assistant", content: "hello answer" } }],
+        });
+        // The sentinel appears nowhere in any captured log line.
+        expect(lines.join("")).not.toContain(SENTINEL);
+      });
   });
 });
 
