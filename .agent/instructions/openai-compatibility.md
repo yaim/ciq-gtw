@@ -31,13 +31,27 @@ encodes the SSE frames (see Streaming below). `stream` is normalized to a
 boolean: absent/`false` → JSON, exactly `true` → SSE, every other value (`null`,
 explicit `undefined`, `"true"`, `0`, `1`, objects) → stable `400`. Deferred
 features are rejected by **own-property presence alone** (`Object.hasOwn`; even
-empty/`null`/explicit `undefined`/`"auto"`/`"none"`/harmless values, never reading
-the value or counting an inherited property): request `tools`, request
-`tool_choice`, `response_format`, `logprobs`, audio, image/binary content parts,
-tool-role messages, and message `tool_calls`. `parallel_tool_calls` stays an
-ignored compatibility option only because no other tool surface is accepted. The
-ignored optional-parameter NAMES are echoed in `X-CollectivIQ-Ignored-Parameters`.
-Tool calling (and tool-call streaming) remain planned (Phase 3).
+empty/`null`/explicit `undefined`/harmless values, never reading
+the value or counting an inherited property): `response_format`, `logprobs`,
+audio, image/binary content parts, tool-role messages, and message `tool_calls`.
+`parallel_tool_calls` stays an ignored compatibility option. Request `tools` and
+`tool_choice` are handled by a **model-policy-aware compatibility bridge (Phase
+2.1)** that runs AFTER exact model resolution (validate `tools` first, then
+`tool_choice`): for a `toolMode: "disabled"` model it TOLERATES the tool metadata
+OpenCode attaches automatically — accepting an own `tools` array of ≤128 entries
+whose entire JSON encoding is ≤2 MiB (`MAX_TOOL_SCHEMA_BYTES`, spec §21.6) and a
+`tool_choice` of exactly `"auto"`/`"none"`, recording only the NAME. A definition
+is never semantically interpreted, retained, serialized, forwarded, logged,
+reflected, persisted, or executed; it is traversed ONLY through data-property
+descriptors (`getOwnPropertyDescriptor`/`Reflect.ownKeys`, no `[[Get]]`) for
+bounded shape/byte accounting, so accessors and executable hooks (getters,
+`toJSON`, iterators) are never invoked. It rejects `required`/named choices; a
+non-array, over-count, or over-budget `tools`; accessors, cycles,
+sparse/exotic/over-deep structures, unsupported values, or descriptor/proxy
+failures; and ANY tool metadata against an `emulated`/`native` model with the
+stable `unsupported_parameter` `400`. The ignored optional-parameter NAMES are
+echoed in `X-CollectivIQ-Ignored-Parameters`. Actual tool CALLING (and tool-call
+streaming) remain planned (Phase 3).
 
 - Require a configured `model` and an ordered non-empty `messages` collection according to the public schema.
 - Accept supported roles and text content forms exactly as specified.

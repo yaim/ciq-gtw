@@ -898,8 +898,8 @@ reflected back.
 | `model`                 | Required and enforced                                |
 | `messages`              | Required and enforced                                |
 | `stream`                | Supported                                            |
-| `tools`                 | Supported through native or emulated tool mode       |
-| `tool_choice`           | Supported subset                                     |
+| `tools`                 | Tolerated + discarded for disabled models (Phase 2.1); executed only through native/emulated mode (Phase 3, unimplemented) |
+| `tool_choice`           | `auto`/`none` tolerated + discarded for disabled models (Phase 2.1); `required`/named rejected until tool mode ships |
 | `parallel_tool_calls`   | Accepted; best-effort                                |
 | `temperature`           | Accepted but ignored unless CollectivIQ adds support |
 | `top_p`                 | Accepted but ignored                                 |
@@ -961,6 +961,15 @@ Behavior:
 
 If a required tool call cannot be parsed, the gateway must not silently return ordinary text. It must return a structured gateway failure.
 
+**Implementation status (Phase 2.1).** The behaviors above describe the eventual
+tool-calling target (Phase 3). Today, tool calling is unimplemented and every
+virtual model is `toolMode: "disabled"`, so the request boundary only TOLERATES
+the tool metadata OpenCode sends automatically: it accepts a `tool_choice` of
+exactly `"auto"` or `"none"` (discarded, name recorded) and rejects `"required"`
+and named-function choices with a stable `unsupported_parameter` `400` — a
+request that requires or names a tool is never silently answered with text. See
+the Phase 2.1 note in section 9.4.4.
+
 ### 9.4.4 Text-only constraints
 
 String content is accepted:
@@ -1018,17 +1027,49 @@ sampling/storage fields (`temperature`, `top_p`, `max_tokens`,
 `max_completion_tokens`, `stop`, `seed`, `user`, `store`, `parallel_tool_calls`)
 are accepted but ignored — only their **names** are recorded and echoed in the
 optional `X-CollectivIQ-Ignored-Parameters` header (values are never read or
-logged). `parallel_tool_calls` remains an ignored compatibility option only
-because no other tool surface is accepted. Rejected with stable content-free
-`400`s — by **own-property presence alone**, including an empty array, `null`,
-an explicit `undefined` supplied directly to the normalization boundary,
-`"auto"`, `"none"`, or any otherwise-harmless value: a non-boolean `stream`,
-request `tools`, request `tool_choice`, `response_format`, `logprobs`,
+logged). `parallel_tool_calls` remains an ignored compatibility option regardless of tool
+mode. Rejected with stable content-free
+`400`s — by **own-property presence alone**, including an empty value, `null`,
+an explicit `undefined` supplied directly to the normalization boundary, or any
+otherwise-harmless value: a non-boolean `stream`,
+`response_format`, `logprobs`,
 audio parameters, message `tool_calls`, tool-role messages, and
 image/audio/file/binary content parts. Presence is decided with `Object.hasOwn`
 (the field value is never read for a presence decision, so a value getter is
 never invoked and an inherited/prototype property never counts as supplied);
-the accepted-but-ignored names are recorded the same way. Conservative initial collection bounds apply (`MAX_MESSAGES = 512`,
+the accepted-but-ignored names are recorded the same way.
+
+**Tool-metadata compatibility bridge (Phase 2.1).** Request `tools` and
+`tool_choice` are validated by a **model-policy-aware** bridge that runs AFTER
+exact model resolution (`tools` first, then `tool_choice`), because OpenCode
+attaches tool definitions to every request even when all tool permissions are
+denied. For a `toolMode: "disabled"` (text-only) model the bridge TOLERATES that
+metadata: a tool definition is never semantically interpreted, retained,
+serialized into the prompt, forwarded upstream, logged, reflected, persisted, or
+included in an error; it is traversed ONLY through data-property descriptors for
+a bounded, iterative (cycle- and depth-guarded) JSON-shape and byte accounting,
+and submitted accessors and executable hooks are never invoked. It records only
+the parameter NAME for the ignored-parameter header.
+It accepts an own `tools` value that is a JSON array of at most `MAX_TOOLS`
+(`128`) entries whose entire JSON encoding is at most `MAX_TOOL_SCHEMA_BYTES`
+(`2 MiB`, section 21.6 — array/object framing, keys, and every nested value all
+count) and a `tool_choice` of exactly `"auto"` or `"none"`. Descriptor-safe
+inspection (`Object.getOwnPropertyDescriptor`/`Reflect.ownKeys`, no `[[Get]]` —
+the array length is read from its own DATA descriptor) means an accessor,
+`toJSON`, or iterator hook is never invoked and a hostile descriptor/proxy read
+fails closed. Actual tool calling
+stays disabled: a `tool_choice` of `"required"` or a named function (which
+requires or names a tool); a non-array, over-count (`> 128`), or over-budget
+(`> 2 MiB`) `tools` value; an accessor, cycle, sparse/anomalous array, exotic
+(non-plain) object, over-deep nesting, or unsupported value
+(function/symbol/bigint/`undefined`/non-finite number) anywhere in the
+collection; a descriptor/proxy failure; or ANY presence of `tools`/`tool_choice`
+against an `emulated`/`native` model (neither implemented) is rejected with the
+stable content-free `unsupported_parameter` `400` (`param` = `tools` or
+`tool_choice`). No tool definition ever reaches the prompt, upstream, logs,
+storage, or the response, and no tool call can be emitted or executed.
+Conservative initial collection bounds apply (`MAX_MESSAGES = 512`,
+`MAX_TOOLS = 128`, `MAX_TOOL_SCHEMA_BYTES = 2 MiB`,
 `MAX_TEXT_PARTS_PER_MESSAGE = 256`); the body-byte and final-prompt-byte limits
 remain authoritative. The raw request is normalized to a **deeply immutable**
 internal value (each message, the message array, the ignored-name collection, and
@@ -2365,8 +2406,8 @@ Recommended OpenCode configuration:
       }
     }
   },
-  "model": "collectiviq/collectiviq-consensus",
-  "small_model": "collectiviq/collectiviq-fast",
+  "model": "collectiviq/collectiviq-claude",
+  "small_model": "collectiviq/collectiviq-claude",
   "share": "disabled"
 }
 ```
@@ -2374,26 +2415,37 @@ Recommended OpenCode configuration:
 OpenCode documents provider-level timeout and streamed-chunk timeout settings, as well as custom models and separate `small_model` selection.
 
 Because tool calling is not implemented (Phase 3), the committed `opencode.jsonc`
-ships a default primary agent that sends **no** tools to the gateway — a
-`collectiviq-text` agent bound to `collectiviq/collectiviq-consensus` with a
-wildcard permission `deny`, selected as the `default_agent`:
+ships a text-only default primary agent — a `collectiviq-text` agent with a
+wildcard permission `deny`, selected as the `default_agent`. Denying permissions
+stops OpenCode from EXECUTING tools but does not stop it from SENDING tool
+definitions to the model, so the agent depends on the disabled-mode
+tool-metadata compatibility bridge (section 9.4.4, Phase 2.1) to discard that
+metadata rather than on OpenCode withholding it. The agent `model`, the top-level
+`model`, and `small_model` are all `collectiviq/collectiviq-claude` because that
+is the only source currently observed to answer for the discovery account
+(non-Claude routing is blocked account-side; see section 34.7):
 
 ```jsonc
 {
   "agent": {
     "collectiviq-text": {
-      "description": "Text-only CollectivIQ consensus agent (no tools; Phase 2 SSE).",
+      "description": "Text-only CollectivIQ agent (Claude source; no tools; Phase 2 SSE).",
       "mode": "primary",
-      "model": "collectiviq/collectiviq-consensus",
+      "model": "collectiviq/collectiviq-claude",
       "permission": { "*": "deny" }
     }
   },
-  "default_agent": "collectiviq-text"
+  "default_agent": "collectiviq-text",
+  "model": "collectiviq/collectiviq-claude",
+  "small_model": "collectiviq/collectiviq-claude"
 }
 ```
 
+The `collectiviq-consensus`/`collectiviq-coder`/`collectiviq-fast` provider models
+stay declared for accounts whose CollectivIQ routing supports non-Claude sources.
 This keeps the streamed and non-streamed text paths within the implemented,
-tool-free contract until Phase 3 lands.
+tool-free contract (tool DEFINITIONS tolerated and discarded, tool CALLS never
+emitted) until Phase 3 lands.
 
 No context-window values should be declared until CollectivIQ’s effective limits are measured or documented.
 
@@ -2990,6 +3042,44 @@ Exit criterion:
   (Offline implementation and hermetic tests are complete; the live OpenCode
   streaming smoke test that closes this criterion is pending separate approval.)
 
+### Phase 2.1 — OpenCode text-compatibility bridge
+
+**Implemented (offline).** A text-only compatibility bridge (NOT Phase 3 tool
+calling) so text-only virtual models tolerate the tool metadata OpenCode attaches
+automatically even when all tool permissions are denied:
+
+* `tools`/`tool_choice` are validated by a model-policy-aware bridge after exact
+  model resolution (`tools` first, then `tool_choice`); see section 9.4.4.
+* For a `toolMode: "disabled"` model the bridge accepts a bounded `tools` array
+  (≤ `MAX_TOOLS` = 128 entries AND ≤ `MAX_TOOL_SCHEMA_BYTES` = 2 MiB aggregate
+  JSON, section 21.6) and a `tool_choice` of exactly `"auto"`/`"none"`, discards
+  them (recording only the NAME in `X-CollectivIQ-Ignored-Parameters`), and never
+  serializes, forwards, logs, reflects, persists, or executes them.
+* A definition is traversed ONLY through data-property descriptors for a bounded,
+  iterative (cycle- and depth-guarded) JSON-shape and byte accounting; accessors
+  and executable hooks (getters, `toJSON`, iterators) are never invoked and
+  descriptor/proxy failures fail closed.
+* Tool CALLING stays disabled: `required`/named `tool_choice`; a non-array,
+  over-count, or over-budget `tools`; an accessor, cycle, sparse/exotic/over-deep
+  structure, or unsupported value anywhere; and any tool metadata against an
+  `emulated`/`native` model are rejected with the stable `unsupported_parameter`
+  `400`.
+* `collectiviq-claude` is the committed OpenCode default (foreground and
+  `small_model`) because non-Claude routing is blocked account-side (section
+  34.7).
+* Hermetic unit/integration/contract coverage plus the pinned-SDK compatibility
+  suite (a real function tool + `toolChoice: "auto"` through streamed and
+  non-streamed paths, asserting ordinary text, `finish_reason: "stop"`, and no
+  tool call).
+
+Exit criterion:
+
+* OpenCode drives the gateway with its default tool-sending agent without a
+  request being rejected for tool-field presence and without any tool call being
+  emitted. (Offline implementation and hermetic tests are complete; the live
+  OpenCode smoke test is pending separate approval, and non-Claude execution
+  remains blocked upstream, not by the gateway.)
+
 ### Phase 3 — Emulated tool calling
 
 Deliverables:
@@ -3038,7 +3128,7 @@ Possible work:
 The initial gateway release is accepted when:
 
 1. OpenCode lists all configured CollectivIQ virtual models.
-2. OpenCode can select `collectiviq/collectiviq-consensus`.
+2. OpenCode can select the committed default `collectiviq/collectiviq-claude` (the only source currently observed to answer for the discovery account; see section 34.7).
 3. A plain user prompt produces the configured CollectivIQ answer.
 4. The gateway creates exactly one upstream thread per request.
 5. The gateway sends the correct `selected_llms` value.
@@ -3132,6 +3222,29 @@ Mitigation:
 * contract discovery phase;
 * no invented context-window claims.
 
+### 34.7 Account-specific source routing
+
+For the CollectivIQ account used during discovery, generic gateway prompts were
+classified account-side as Atlassian queries, and non-Claude sources were skipped
+as unsupported for that query category. The submit fields `selected_llms`,
+`generate_combined`, and `llms_explicitly_set=true` did not provide a verified
+routing override, and the filtered OpenAPI snapshot exposes no documented
+generic/non-Atlassian routing field. Consequently only `collectiviq-claude` is
+currently observed to answer for this account, and the gateway cannot claim
+verified GPT/Gemini/Grok execution for it. This is a value-free, account-specific
+observation (no live response text, prompt, Jira identifier, thread id, or model
+answer is recorded) and does **not** generalize to every account.
+
+Mitigation:
+
+* `collectiviq-claude` is the committed OpenCode default (agent `model`,
+  top-level `model`, and `small_model`);
+* the consensus/coder/fast virtual models remain available for accounts whose
+  routing supports non-Claude sources;
+* confirm a supported generic-routing mechanism with CollectivIQ before
+  advertising multi-source execution (see the upstream-contract document and
+  section 35, item 27 — the dedicated generic/non-Atlassian routing question).
+
 ---
 
 ## 35. Open Questions Requiring CollectivIQ Confirmation
@@ -3159,7 +3272,10 @@ a later gate already classified in section 32:
 - SSE account-wide-vs-connection scope (#13) — **open** → future true-streaming
   gate;
 - token lifetime/refresh for password login (#26) — **open** →
-  production/provider gate.
+  production/provider gate;
+- generic/non-Atlassian source routing with explicit `selected_llms` (#27) —
+  **open** → account/provider routing gate (blocks any multi-source/non-Claude
+  execution claim; see section 34.7).
 
 1. Is there official API documentation?
 2. What are the precise schemas for all four demonstrated endpoints?
@@ -3221,6 +3337,14 @@ a later gate already classified in section 32:
     `access_token`/`token_type` (masked in the sanitized evidence) and token
     **lifetime/refresh**. `/auth/refresh` has empty schemas and is not
     implemented.)
+27. Is there a supported request field or account setting that forces
+    generic/non-Atlassian routing while preserving explicit `selected_llms`
+    selection? (**Open.** For the discovery account, generic prompts were
+    classified account-side as Atlassian queries and non-Claude sources were
+    skipped; `selected_llms`, `generate_combined`, and `llms_explicitly_set=true`
+    gave no verified override, and the filtered OpenAPI snapshot exposes no such
+    field — see section 34.7. This gates any claim of multi-source/non-Claude
+    execution.)
 
 ---
 
@@ -3240,17 +3364,13 @@ OpenCode
   → OpenAI-compatible response
 ```
 
-The default virtual model should be:
+For the currently configured discovery account, the committed OpenCode default virtual model is:
 
 ```text
-collectiviq-consensus
+collectiviq-claude
 ```
 
-A lower-latency model should be available as:
-
-```text
-collectiviq-fast
-```
+For accounts whose routing supports non-Claude sources, `collectiviq-consensus` remains available as the multi-source option and `collectiviq-fast` as the lower-latency option. Neither is the committed default for this account.
 
 Tool calling shall be implemented behind:
 

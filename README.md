@@ -54,8 +54,12 @@ CollectivIQ, exposing a bounded OpenAI Chat Completions-compatible profile.
 - **Authenticated, text-only `POST /v1/chat/completions`** (Phase 1B +
   Phase 2), wired through the adapter. It validates/normalizes the OpenAI
   request (text roles and string/text-part content; `n` must be `1`; `stream`
-  absent/`false`/`true`), rejects tools, `tool_choice`, `response_format`,
-  `logprobs`, audio, and image/binary content with stable content-free `400`s,
+  absent/`false`/`true`), rejects `response_format`, `logprobs`, audio,
+  image/binary content, tool-role messages, and assistant `tool_calls` with
+  stable content-free `400`s, tolerates the tool metadata OpenCode attaches
+  automatically for text-only models (a bounded `tools` array plus an
+  `auto`/`none` `tool_choice`) by discarding it while rejecting any tool use that
+  requires or names a tool (Phase 2.1; see below),
   serializes a deterministic versioned prompt, enforces process-local global +
   per-key capacity with a bounded queue (`429` + `Retry-After: 5` when at
   capacity), creates one new CollectivIQ thread, submits once (no `create_thread`/
@@ -198,12 +202,31 @@ curl -N http://127.0.0.1:8787/v1/chat/completions \
 ```
 
 The request surface is strict: a non-boolean `stream`, and the
-mere **own-property presence** of `tools`, `tool_choice`, `response_format`,
-`logprobs`, `audio`, message `tool_calls`, or a tool-role message — even when
-empty, `null`, an explicit `undefined`, `"auto"`, `"none"`, or otherwise harmless
-— is rejected with a stable `400`, as is any image/binary content. (Presence is
-decided without reading the field's value, so a value getter is never invoked and
-an inherited property never counts.) Accepted-but-ignored optional fields (`temperature`,
+mere **own-property presence** of `response_format`, `logprobs`, `audio`,
+message `tool_calls`, or a tool-role message — even when empty, `null`, an
+explicit `undefined`, or otherwise harmless — is rejected with a stable `400`, as
+is any image/binary content. (Presence is decided without reading the field's
+value, so a value getter is never invoked and an inherited property never
+counts.)
+
+`tools` and `tool_choice` are handled by a **model-policy-aware
+compatibility bridge (Phase 2.1)**, because OpenCode attaches tool definitions to
+every request even when all tool permissions are denied. A tool definition is
+never semantically interpreted, retained, serialized into the prompt, forwarded
+upstream, logged, reflected, persisted, or executed; it is traversed only through
+data-property descriptors for bounded JSON-shape and byte accounting, and
+submitted accessors and executable hooks (getters, `toJSON`, iterators) are never
+invoked. For a text-only (`toolMode: disabled`) model the gateway TOLERATES the
+metadata: it accepts an own `tools` array of at most **128** entries whose
+**entire JSON encoding is at most 2 MiB** (`MAX_TOOL_SCHEMA_BYTES`, spec §21.6),
+and a `tool_choice` of exactly `"auto"` or `"none"`, records only the parameter
+NAMES in the ignored-parameter header, and never emits a tool call. Actual tool
+calling stays disabled: a `tool_choice` of `"required"` or a named function; a
+non-array, over-count, or over-budget `tools` value; an accessor, cycle,
+sparse/exotic/over-deep structure, or unsupported value anywhere in the
+collection; or any tool metadata sent to an `emulated`/`native` model (neither
+implemented) is rejected with a stable content-free `400`
+(`unsupported_parameter`). `tools` is validated before `tool_choice`. Accepted-but-ignored optional fields (`temperature`,
 `top_p`, `max_tokens`, `max_completion_tokens`, `stop`, `seed`, `user`, `store`,
 `parallel_tool_calls`) are surfaced by NAME only in an optional
 `X-CollectivIQ-Ignored-Parameters` response header (on the streamed path this
@@ -214,12 +237,28 @@ token counts — not estimates and not exact billing usage; streamed responses o
 
 For OpenCode, point `@ai-sdk/openai-compatible` at `http://127.0.0.1:8787/v1`
 with a gateway key as `apiKey` (see specification section 25 for a full example).
-Because tool calling is not implemented yet, use a text-only primary agent that
-sends no tools — the committed `opencode.jsonc` ships a default `collectiviq-text`
-agent bound to `collectiviq/collectiviq-consensus` with a wildcard permission
-`deny` (see specification section 25).
+The committed `opencode.jsonc` ships a text-only default `collectiviq-text`
+primary agent with a wildcard permission `deny`. Denying permissions stops
+OpenCode from executing tools but does **not** stop it from sending tool
+definitions to the model, so the agent relies on the disabled-mode compatibility
+bridge above to discard that metadata. Its `model`, the top-level `model`, and
+`small_model` are all set to `collectiviq/collectiviq-claude` because that is the
+only source currently observed to answer for this account — non-Claude routing is
+blocked upstream (see the note below), not by any missing gateway model mapping;
+the `collectiviq-consensus`/`collectiviq-coder`/`collectiviq-fast` models remain
+declared for accounts whose routing supports non-Claude sources.
 The end-to-end OpenCode smoke test is **not run** in this repository and requires
 separate approval before any live CollectivIQ traffic.
+
+**Account-specific upstream routing limitation.** For the CollectivIQ account
+used during discovery, generic gateway prompts were classified by the account as
+Atlassian queries, and non-Claude sources were skipped as unsupported for that
+query category. The `selected_llms`, `generate_combined`, and
+`llms_explicitly_set=true` submit fields did not provide a verified override, and
+the filtered OpenAPI snapshot exposes no documented generic/non-Atlassian routing
+field. The gateway therefore cannot currently claim verified GPT/Gemini/Grok
+execution for this account; this is an account-side routing observation and does
+not generalize to every CollectivIQ account.
 
 ## Validation
 

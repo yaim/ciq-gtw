@@ -31,7 +31,8 @@ the live OpenCode/CollectivIQ smoke test is **not run** (pending separate
 approval). The controls that exist today are:
 
 - **Gateway client authentication (implemented).** Every route under `/v1/*` —
-  today `GET /v1/models` and `GET /v1/models/:model` — requires
+  today `GET /v1/models`, `GET /v1/models/:model`, and the implemented
+  `POST /v1/chat/completions` (non-streamed JSON and synthetic SSE) — requires
   `Authorization: Bearer <gateway-key>` matched against `COLLECTIVIQ_GATEWAY_KEYS`;
   `/healthz` and `/readyz` stay unauthenticated. The scheme is case-insensitive
   and the token is compared **exactly** (never trimmed/normalized) using a
@@ -119,11 +120,26 @@ approval). The controls that exist today are:
   key is checked **before** any body parsing or use-case work. The raw request is
   validated/normalized to a **deeply frozen** internal value and never flows into
   generation; the strict surface rejects, by **own-property presence**
-  (`Object.hasOwn` — even empty/`null`/explicit `undefined`/`"auto"`/`"none"`/
-  harmless values, never reading the value or an inherited property), `tools`,
-  `tool_choice`, `response_format`, `logprobs`, `audio`, message `tool_calls`,
+  (`Object.hasOwn` — even empty/`null`/explicit `undefined`/harmless values,
+  never reading the value or an inherited property), `response_format`,
+  `logprobs`, `audio`, message `tool_calls`,
   tool-role messages, and image/binary content — all with stable, content-free
-  `400`s. `stream` is normalized to a boolean: absent or exactly `false` selects
+  `400`s. Request `tools`/`tool_choice` are handled by a **model-policy-aware
+  compatibility bridge (Phase 2.1)** that accepts bounded metadata ONLY for a
+  `toolMode: "disabled"` model: an own `tools` JSON array of at most **128**
+  entries whose entire JSON encoding is at most the **2 MiB**
+  `MAX_TOOL_SCHEMA_BYTES` aggregate (spec §21.6), and a `tool_choice` of exactly
+  `"auto"` or `"none"` — recording only the parameter NAME. Structural and byte
+  accounting is done through data-property descriptors only
+  (`getOwnPropertyDescriptor`/`Reflect.ownKeys`, never `[[Get]]`), so submitted
+  accessors, `toJSON`, iterators, and other executable hooks are never invoked;
+  accessors, cycles, sparse/exotic/over-deep structures, unsupported values, an
+  over-count/over-budget collection, `required`/named `tool_choice`, and any tool
+  metadata against an `emulated`/`native` model all fail closed with the stable
+  content-free `unsupported_parameter` `400`. A tool definition never reaches the
+  prompt, upstream, logs, persistence, errors, or a tool-call response, and no
+  tool call can be emitted or executed (actual tool calling stays Phase 3).
+  `stream` is normalized to a boolean: absent or exactly `false` selects
   the non-streamed JSON path, exactly `true` selects the synthetic-SSE path
   (below), and every other value is rejected with the same content-free `400`. Public errors come only from the shared owner
   (`src/openai/errors.ts`) and never contain a submitted value, prompt, answer, raw

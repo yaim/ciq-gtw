@@ -193,6 +193,21 @@ unverified, as is token lifetime/refresh.
 - `llms_explicitly_set` is `string | null`, default `"false"`; the gateway sets
   it to `"true"` because its configuration explicitly selects the models. **Its
   runtime effect is provisional** until live discovery confirms it.
+- **Account-specific source-routing limitation (value-free observation).** For
+  the CollectivIQ account used during discovery, generic gateway prompts were
+  classified account-side as Atlassian queries, and non-Claude sources were
+  skipped as unsupported for that query category. `selected_llms`,
+  `generate_combined`, and `llms_explicitly_set="true"` did **not** provide a
+  verified routing override for that classification, and the filtered OpenAPI
+  snapshot exposes **no** documented generic/non-Atlassian routing field. So for
+  this account only `claude` is currently observed to answer, and the gateway
+  cannot claim verified GPT/Gemini/Grok execution for it — hence
+  `collectiviq-claude` is the committed OpenCode default (see specification
+  section 34.7 and `opencode.jsonc`). This is a value-free, account-specific
+  note (no live response text, prompt, Jira identifier, thread id, or model
+  answer is recorded) and does **not** generalize to every account; a supported
+  generic-routing mechanism remains an open provider question (specification
+  section 35, item 27).
 - Documented but out-of-scope fields the gateway never sends: `files`,
   `client_timezone`, `client_location`, `clarification_origin_run_id`,
   `suppress_user_bubble`, `response_format`, `tier`.

@@ -8,6 +8,27 @@ Read specification sections 5.2–5.3, 8.7, 11.2, 12–13, 14.4, 21.4–21.5, 29
 
 The gateway never executes, authorizes, simulates, or claims execution of a tool. OpenCode owns permissions, execution, results, and loop limits.
 
+**Phase 2.1 text-compatibility bridge (current behavior).** Tool calling is not
+yet implemented and every virtual model is `toolMode: "disabled"`. Because
+OpenCode attaches `tools`/`tool_choice` to every request even when all tool
+permissions are denied, the request boundary runs a model-policy-aware bridge
+(`src/openai/chat-request.ts`, after model resolution) that TOLERATES that
+metadata for a disabled model: it accepts a bounded `tools` array (≤128 entries
+AND ≤2 MiB aggregate JSON — `MAX_TOOL_SCHEMA_BYTES`, spec §21.6) and a
+`tool_choice` of exactly `"auto"`/`"none"`, records only the NAME for the
+diagnostic header. A tool definition is never semantically interpreted, retained,
+serialized into the prompt, forwarded upstream, logged, reflected, persisted, or
+executed; it is traversed ONLY through data-property descriptors for bounded
+JSON-shape and byte accounting (`getOwnPropertyDescriptor`/`Reflect.ownKeys`, no
+`[[Get]]`), so submitted accessors and executable hooks (getters, `toJSON`,
+iterators) are never invoked. This is NOT tool calling: `required`/named
+`tool_choice`; a non-array, over-count, or over-budget `tools`; an accessor,
+cycle, sparse/exotic/over-deep structure, unsupported value, or descriptor/proxy
+failure anywhere; and any tool metadata against an `emulated`/`native` model fail
+closed with a stable `unsupported_parameter` `400`. Do not use this bridge to
+activate emulated/native mode or emit tool calls; those stay Phase 3 and gated by
+section 30.
+
 ## Prompt Protocol
 
 - Use the versioned `tool-or-final` control prompt and one versioned conversation envelope.
