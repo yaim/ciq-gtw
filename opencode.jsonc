@@ -27,6 +27,22 @@
     },
   },
 
+  // Phase 2 is text-only: the gateway accepts non-streamed JSON and synthetic
+  // SSE (`stream:true`) but rejects tools/tool_choice/tool messages. This primary
+  // agent denies every tool permission so OpenCode sends no tool definitions to
+  // the gateway, keeping requests within the supported text-only surface.
+  "agent": {
+    "collectiviq-text": {
+      "description": "Text-only CollectivIQ consensus agent (no tools; Phase 2 SSE).",
+      "mode": "primary",
+      "model": "collectiviq/collectiviq-consensus",
+      "permission": {
+        "*": "deny",
+      },
+    },
+  },
+  "default_agent": "collectiviq-text",
+
   "model": "collectiviq/collectiviq-consensus",
   "small_model": "collectiviq/collectiviq-fast",
   "share": "disabled",
