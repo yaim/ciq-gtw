@@ -139,21 +139,31 @@ describe("validateChatRequest — reject", () => {
     expectReject("x", 400, "invalid_request", null);
   });
 
-  it("accepts stream absent or exactly false", () => {
-    expect(validateChatRequest({ model: "m", messages: [user("hi")] }).ok).toBe(true);
-    expect(validateChatRequest({ model: "m", messages: [user("hi")], stream: false }).ok).toBe(
-      true,
-    );
+  it("normalizes stream to false when absent or exactly false", () => {
+    const absent = validateChatRequest({ model: "m", messages: [user("hi")] });
+    expect(absent.ok).toBe(true);
+    if (absent.ok) expect(absent.request.stream).toBe(false);
+
+    const explicit = validateChatRequest({ model: "m", messages: [user("hi")], stream: false });
+    expect(explicit.ok).toBe(true);
+    if (explicit.ok) expect(explicit.request.stream).toBe(false);
   });
 
-  it("rejects stream:true, stream:null, explicit undefined, and every non-false stream value", () => {
-    // An explicit `undefined` own property is supplied (presence), so it is
-    // rejected exactly like any other non-false value.
-    for (const stream of [true, null, undefined, "false", 0, {}]) {
+  it("normalizes stream to true for exactly stream:true (Phase 2 synthetic SSE)", () => {
+    const result = validateChatRequest({ model: "m", messages: [user("hi")], stream: true });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.request.stream).toBe(true);
+  });
+
+  it("rejects stream:null, explicit undefined, and every non-boolean stream value", () => {
+    // Presence with a non-boolean value fails closed — including an explicit
+    // `undefined` supplied directly to the normalization boundary — and the
+    // value is never coerced.
+    for (const stream of [null, undefined, "false", "true", 0, 1, {}]) {
       expectReject(
         { model: "m", messages: [user("hi")], stream },
         400,
-        "unsupported_parameter",
+        "invalid_request",
         "stream",
       );
     }

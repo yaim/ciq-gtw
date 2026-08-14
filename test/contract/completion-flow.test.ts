@@ -238,13 +238,15 @@ describe("completion flow — cancellation", () => {
       model: "collectiviq-consensus",
       messages: [{ role: "user", content: "hi" }],
       ignoredParameters: [],
+      stream: false,
     };
-    const promise = runtime.chatService.complete({
+    const prepared = runtime.chatService.prepare({
       request,
       model: MODEL,
       keyId: "k0",
       signal: controller.signal,
     });
+    const promise = runtime.chatService.run(prepared, controller.signal);
     setTimeout(() => controller.abort(), 50);
     await expect(promise).rejects.toBeInstanceOf(RequestCancelledError);
   });

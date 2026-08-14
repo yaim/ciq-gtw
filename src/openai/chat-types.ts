@@ -50,4 +50,11 @@ export interface NormalizedChatRequest {
   readonly model: string;
   readonly messages: readonly NormalizedMessage[];
   readonly ignoredParameters: readonly string[];
+  /**
+   * The normalized streaming choice: `true` when the client requested exactly
+   * `stream: true` (synthetic SSE), `false` when `stream` was absent or exactly
+   * `false` (the non-streamed JSON path). Every other `stream` value is rejected
+   * at the validation boundary and never reaches this type.
+   */
+  readonly stream: boolean;
 }

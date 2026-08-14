@@ -7,8 +7,9 @@ import {
   RequestCancelledError,
   type ChatCompletionRequestContext,
   type ChatCompletionService,
+  type CompletionResult,
+  type PreparedCompletion,
 } from "../../src/generation/chat-completion.js";
-import { encodeChatCompletion } from "../../src/openai/chat-response.js";
 import {
   COMPLETION_TIMEOUT_ERROR,
   GATEWAY_CAPACITY_EXCEEDED_ERROR,
@@ -16,7 +17,6 @@ import {
   UPSTREAM_QUOTA_EXCEEDED_ERROR,
 } from "../../src/openai/errors.js";
 import type { AppConfig, VirtualModel } from "../../src/config/schema.js";
-import type { ChatCompletionResponse } from "../../src/openai/chat-response.js";
 
 const GATEWAY_KEY = "gw-fake-key";
 
@@ -59,21 +59,24 @@ function makeConfig(over: Partial<AppConfig> = {}): AppConfig {
   };
 }
 
-type Handler = (ctx: ChatCompletionRequestContext) => Promise<ChatCompletionResponse>;
+/** The run behaviour under test; prepare is fixed so identity is deterministic. */
+type RunFn = (prepared: PreparedCompletion, signal: AbortSignal) => Promise<CompletionResult>;
 
-function fakeService(handler: Handler): ChatCompletionService {
-  return { complete: handler };
-}
-
-const okAnswer: Handler = (ctx) =>
-  Promise.resolve(
-    encodeChatCompletion({
+function fakeService(run: RunFn): ChatCompletionService {
+  return {
+    prepare: (ctx: ChatCompletionRequestContext): PreparedCompletion => ({
       id: "chatcmpl_ciq_fixed",
       created: 1_785_933_840,
       model: ctx.request.model,
-      content: "hello answer",
+      prompt: "PROMPT",
+      policy: ctx.model,
+      keyId: ctx.keyId,
     }),
-  );
+    run,
+  };
+}
+
+const okAnswer: RunFn = () => Promise.resolve({ content: "hello answer" });
 
 let app: GatewayServer | undefined;
 afterEach(async () => {
@@ -83,7 +86,7 @@ afterEach(async () => {
   }
 });
 
-function build(handler: Handler = okAnswer, configOver: Partial<AppConfig> = {}): GatewayServer {
+function build(handler: RunFn = okAnswer, configOver: Partial<AppConfig> = {}): GatewayServer {
   const readiness = createReadinessState(true);
   return buildServer({
     config: makeConfig(configOver),
@@ -179,7 +182,7 @@ describe("POST /v1/chat/completions — request rejections", () => {
     let called = false;
     app = build(() => {
       called = true;
-      return okAnswer({} as ChatCompletionRequestContext);
+      return Promise.resolve({ content: "unreachable" });
     });
     const unknown = await app.inject({
       method: "POST",
@@ -238,13 +241,13 @@ describe("POST /v1/chat/completions — request rejections", () => {
     expect(response.json()).toMatchObject({ error: { code: "unsupported_content_type" } });
   });
 
-  it("returns 400 for stream:true and n!=1", async () => {
+  it("returns 400 for an invalid (non-boolean) stream value and n!=1", async () => {
     app = build();
     const stream = await app.inject({
       method: "POST",
       url,
       headers: auth,
-      payload: { ...okBody, stream: true },
+      payload: { ...okBody, stream: "yes" },
     });
     expect(stream.statusCode).toBe(400);
     expect(stream.json()).toMatchObject({ error: { param: "stream" } });

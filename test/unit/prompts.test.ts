@@ -9,7 +9,7 @@ import {
 import type { NormalizedChatRequest } from "../../src/openai/chat-types.js";
 
 function request(messages: NormalizedChatRequest["messages"]): NormalizedChatRequest {
-  return { model: "m", messages, ignoredParameters: [] };
+  return { model: "m", messages, ignoredParameters: [], stream: false };
 }
 
 describe("conversation prompt", () => {

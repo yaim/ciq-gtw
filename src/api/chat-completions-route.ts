@@ -1,6 +1,8 @@
 /**
- * `POST /v1/chat/completions` — the authenticated, non-streamed, text-only
- * completion route (specification section 9.4).
+ * `POST /v1/chat/completions` — the authenticated, text-only completion route
+ * (specification sections 9.4, 14). It serves both the non-streamed JSON path
+ * (`stream` absent/`false`) and the synthetic-SSE path (`stream: true`) through
+ * one bounded orchestration.
  *
  * Registered inside the already-authenticated `/v1` scope, so the gateway-auth
  * `onRequest` hook runs BEFORE any body parsing or use-case work. This route
@@ -9,9 +11,14 @@
  * (never the generic `500`, and never serializing a framework error message).
  *
  * The handler validates and normalizes the request, resolves the internal model
- * policy, wires client-disconnect + shutdown cancellation, and delegates to the
- * completion service. Success and every failure produce a bounded, content-free
- * response; a disconnected client receives no body.
+ * policy, wires client-disconnect + shutdown cancellation, and PREPARES the
+ * prompt (resolve + serialize + bound; mint the stream-stable identity) — all
+ * before any response header is committed, so a preparation failure stays a
+ * normal JSON error. It then delegates to `service.run` and encodes the result
+ * as JSON, or hands the streamed path to {@link streamChatCompletion} which
+ * commits SSE headers and owns all response output. Success and every failure
+ * produce a bounded, content-free response; a disconnected client receives no
+ * body.
  */
 import { Type } from "@fastify/type-provider-typebox";
 import type { FastifyError } from "fastify";
@@ -24,7 +31,8 @@ import {
   type ChatCompletionService,
 } from "../generation/chat-completion.js";
 import { validateChatRequest } from "../openai/chat-request.js";
-import { ChatCompletionSchema } from "../openai/chat-response.js";
+import { ChatCompletionSchema, encodeChatCompletion } from "../openai/chat-response.js";
+import { streamChatCompletion } from "./chat-stream-response.js";
 import {
   INTERNAL_ERROR,
   INVALID_REQUEST_ERROR,
@@ -164,17 +172,51 @@ export function registerChatCompletionsRoute(
         reply.raw.on("close", onClose);
         const signal = AbortSignal.any([clientAbort.signal, deps.shutdownSignal]);
 
+        // Prepare (resolve + serialize + bound the prompt, mint the stream-stable
+        // identity) BEFORE committing any SSE header. A preparation failure (e.g.
+        // an oversized prompt) always stays a normal JSON error — never SSE.
+        let prepared;
         try {
-          const completion = await deps.service.complete({
-            request: normalized,
-            model,
-            keyId,
-            signal,
-          });
+          prepared = deps.service.prepare({ request: normalized, model, keyId, signal });
+        } catch (error) {
+          reply.raw.removeListener("close", onClose);
+          if (isChatCompletionError(error)) return sendError(error.apiError);
+          return sendError(INTERNAL_ERROR);
+        }
+
+        // Synthetic-SSE path: authenticate/validate/resolve/prepare all happened
+        // above (pre-header), so from here on every failure is an SSE record. The
+        // writer hijacks the reply and owns all response output.
+        if (normalized.stream) {
+          if (normalized.ignoredParameters.length > 0) {
+            reply.raw.setHeader(IGNORED_HEADER, normalized.ignoredParameters.join(","));
+          }
+          try {
+            await streamChatCompletion({
+              reply,
+              meta: { id: prepared.id, created: prepared.created, model: prepared.model, index: 0 },
+              run: (runSignal) => deps.service.run(prepared, runSignal),
+              runSignal: signal,
+              clientAbort,
+            });
+          } finally {
+            reply.raw.removeListener("close", onClose);
+          }
+          return reply;
+        }
+
+        // Non-streamed JSON path.
+        try {
+          const result = await deps.service.run(prepared, signal);
           if (normalized.ignoredParameters.length > 0) {
             reply.header(IGNORED_HEADER, normalized.ignoredParameters.join(","));
           }
-          return completion;
+          return encodeChatCompletion({
+            id: prepared.id,
+            created: prepared.created,
+            model: prepared.model,
+            content: result.content,
+          });
         } catch (error) {
           // Identify gateway errors by identity (trap-safe: no property read, no
           // instanceof/prototype trap). An untrusted thrown value is NEVER

@@ -39,6 +39,7 @@ const REQUEST: NormalizedChatRequest = {
   model: "collectiviq-consensus",
   messages: [{ role: "user", content: "hi" }],
   ignoredParameters: [],
+  stream: false,
 };
 
 interface Trace {
@@ -112,21 +113,40 @@ function makeService(deps: Partial<ChatCompletionDeps> & { trace: Trace }) {
   return createChatCompletionService(full);
 }
 
-function run(service: ReturnType<typeof makeService>, signal = new AbortController().signal) {
-  return service.complete({ request: REQUEST, model: MODEL, keyId: "k0", signal });
+/** Prepare then run, returning only the trusted completion result. */
+function run(
+  service: ReturnType<typeof makeService>,
+  signal = new AbortController().signal,
+  model: VirtualModel = MODEL,
+) {
+  const prepared = service.prepare({ request: REQUEST, model, keyId: "k0", signal });
+  return service.run(prepared, signal);
 }
 
 describe("chat-completion orchestration", () => {
-  it("creates one thread, submits once, polls, and encodes the answer", async () => {
+  it("prepares a stream-stable identity without any upstream work", () => {
+    const trace: Trace = { events: [], processInputs: [], released: 0 };
+    const service = makeService({ trace });
+    const prepared = service.prepare({
+      request: REQUEST,
+      model: MODEL,
+      keyId: "k0",
+      signal: new AbortController().signal,
+    });
+    expect(prepared.id).toBe("chatcmpl_ciq_test");
+    expect(prepared.model).toBe("collectiviq-consensus");
+    expect(prepared.created).toBe(1_000); // floor(1_000_000 / 1000)
+    expect(prepared.prompt).toBe("PROMPT");
+    // Preparation takes no capacity and makes no upstream call.
+    expect(trace.events).toEqual([]);
+  });
+
+  it("creates one thread, submits once, polls, and returns the answer", async () => {
     const trace: Trace = { events: [], processInputs: [], released: 0 };
     const service = makeService({ trace });
     const result = await run(service);
 
-    expect(result.object).toBe("chat.completion");
-    expect(result.model).toBe("collectiviq-consensus");
-    expect(result.choices[0]?.message.content).toBe("answer text");
-    expect(result.choices[0]?.finish_reason).toBe("stop");
-    expect(result.usage).toEqual({ prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 });
+    expect(result.content).toBe("answer text");
 
     // Capacity is acquired BEFORE the thread is created; the permit is released.
     expect(trace.events).toEqual(["acquire", "createThread", "processMessage", "release"]);
@@ -160,22 +180,28 @@ describe("chat-completion orchestration", () => {
     expect(title).not.toContain("hi");
   });
 
-  it("rejects an over-limit prompt before acquiring capacity", async () => {
+  it("rejects an over-limit prompt during prepare, before acquiring capacity", () => {
     const trace: Trace = { events: [], processInputs: [], released: 0 };
     const service = makeService({
       trace,
       serializer: { serialize: () => "x".repeat(200) },
     });
     const smallModel: VirtualModel = { ...MODEL, maximumPromptBytes: 10 };
-    await expect(
-      service.complete({
+    let caught: unknown;
+    try {
+      service.prepare({
         request: REQUEST,
         model: smallModel,
         keyId: "k0",
         signal: new AbortController().signal,
-      }),
-    ).rejects.toMatchObject({
-      apiError: { status: 400, body: { error: { code: "context_length_exceeded" } } },
+      });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(ChatCompletionError);
+    expect((caught as ChatCompletionError).apiError).toMatchObject({
+      status: 400,
+      body: { error: { code: "context_length_exceeded" } },
     });
     // No capacity was taken and no upstream call was made.
     expect(trace.events).toEqual([]);
@@ -268,12 +294,7 @@ describe("chat-completion orchestration", () => {
             }),
         ),
       });
-      const promise = service.complete({
-        request: REQUEST,
-        model: shortModel,
-        keyId: "k0",
-        signal: new AbortController().signal,
-      });
+      const promise = run(service, new AbortController().signal, shortModel);
       const assertion = expect(promise).rejects.toMatchObject({
         apiError: { status: 504, body: { error: { code: "completion_timeout" } } },
       });

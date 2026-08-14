@@ -3,11 +3,13 @@
  * (specification sections 8.2, 9.4). Produces an immutable
  * {@link NormalizedChatRequest} or a value-free OpenAI rejection envelope.
  *
- * The raw request object never leaves this boundary. Deferred features
- * (streaming, tools, response_format, logprobs, audio) are rejected with stable
- * `400` envelopes rather than silently ignored. Documented optional
- * sampling/storage parameters are accepted but their VALUES are never read,
- * logged, or retained — only their names are recorded for a diagnostic header.
+ * The raw request object never leaves this boundary. `stream` is normalized to
+ * a boolean (Phase 2: `true` selects synthetic SSE, absent/`false` the
+ * non-streamed path; any other value is rejected). Deferred features (tools,
+ * response_format, logprobs, audio) are rejected with stable `400` envelopes
+ * rather than silently ignored. Documented optional sampling/storage parameters
+ * are accepted but their VALUES are never read, logged, or retained — only their
+ * names are recorded for a diagnostic header.
  */
 import type { NormalizedChatRequest, NormalizedMessage } from "./chat-types.js";
 import { normalizeMessage, MAX_TEXT_PARTS_PER_MESSAGE } from "./messages.js";
@@ -65,17 +67,19 @@ function fail(error: OpenAIApiError): ChatRequestResult {
 export function validateChatRequest(body: unknown): ChatRequestResult {
   if (!isRecord(body)) return fail(INVALID_REQUEST_ERROR);
 
-  // 1. Streaming is a Phase 2 feature. `stream` may be ABSENT or exactly `false`;
-  //    an explicit `undefined`, `null`, `true`, and every other value are all
-  //    rejected — own-property presence with a non-`false` value fails closed.
-  if (present(body, "stream") && body["stream"] !== false) {
-    return fail(
-      invalidRequest(
-        "Streaming responses are not supported yet.",
-        "stream",
-        "unsupported_parameter",
-      ),
-    );
+  // 1. Streaming (Phase 2). `stream` may be ABSENT or exactly `false` (the
+  //    non-streamed JSON path) or exactly `true` (synthetic SSE). Every other
+  //    value — an explicit `undefined`, `null`, `"true"`, `0`, `1`, etc. — is
+  //    rejected; own-property presence with a non-boolean value fails closed.
+  let stream = false;
+  if (present(body, "stream")) {
+    const value = body["stream"];
+    if (value !== false && value !== true) {
+      return fail(
+        invalidRequest("The stream field must be a boolean.", "stream", "invalid_request"),
+      );
+    }
+    stream = value;
   }
 
   // 2. Deferred feature surfaces are rejected by own-property PRESENCE alone —
@@ -131,6 +135,7 @@ export function validateChatRequest(body: unknown): ChatRequestResult {
       model,
       messages: Object.freeze(messages),
       ignoredParameters: Object.freeze(ignoredParameters),
+      stream,
     }),
   };
 }
