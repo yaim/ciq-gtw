@@ -55,6 +55,34 @@ Redis-backed idempotency remains unimplemented.
 
 ## Cancellation, Streaming, and Shutdown
 
+**Implementation status (Phase 1B / Phase 2, implemented).** Client-disconnect
+(response-socket `close`), the total request deadline, and shutdown share one
+abort path. On the streamed path (`src/api/chat-stream-response.ts`) writes are
+serialized and honour Node backpressure (a later frame waits for `drain`);
+`: collectiviq-gateway keep-alive` comments are emitted every 15 s while polling
+waits and every keep-alive timer is cleared before any terminal/error output and
+on success, error, disconnect, cancellation, and shutdown (the interval is
+`unref`'d so it never keeps the process alive). A write failure or socket close is
+treated as client cancellation — polling is aborted, the capacity permit is
+released, and no body is written to a gone client. After the reply is hijacked
+the writer NEVER rejects: every frame write resolves to an explicit
+written/closed outcome, a synchronous `write` throw or callback error is caught,
+and every temporary `drain`/`close`/`error`/abort listener is cleaned up. The
+combined signal also unblocks an actively **backpressured** write: rather than
+wait for a `drain` a connected non-reading client may never send, the writer
+force-closes the stuck response so the shutdown drain window
+(`SHUTDOWN_DRAIN_MS`) stays authoritative and `app.close()` cannot hang; a forced
+close may end silently (a `503` cannot be guaranteed to flush). Forced
+termination flushes any written terminal frames via `res.end()` then destroys the
+socket, and is hardened so a `res.end()` that throws destroys immediately and a
+`res.end()` whose callback never fires destroys on a bounded next-turn fallback —
+the response always ends destroyed exactly once, so shutdown never hangs. A
+shutdown that cancels `run()` while the transport is still writable keeps the safe
+`503` record. A deadline maps to `504`; a shutdown while the client is still
+connected **and the transport is writable** maps to `503` (otherwise the response
+is force-closed and may end silently); a client disconnect sends no body. Polling
+remains authoritative; `/user/events` is not used.
+
 - Connect client disconnects to a shared abort signal.
 - Abort pending upstream HTTP calls when possible, stop polling/keep-alives, close SSE, and release capacity.
 - Do not retry cancelled work.

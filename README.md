@@ -3,18 +3,22 @@
 A local or privately hosted HTTP service that will sit between OpenCode and
 CollectivIQ, exposing a bounded OpenAI Chat Completions-compatible profile.
 
-> **Status: runnable foundation, the Phase 1A public model surface, and the
-> Phase 1B non-streamed chat-completions path — implemented offline.**
+> **Status: runnable foundation, the Phase 1A public model surface, the
+> Phase 1B non-streamed chat-completions path, and Phase 2 text-only synthetic
+> SSE streaming — implemented offline.**
 > This repository provides a secure, validated service skeleton, an
 > OpenAPI-grounded CollectivIQ adapter with hermetic contract tests, the
 > authenticated public model endpoints (`GET /v1/models`,
-> `GET /v1/models/:model`), and an authenticated, non-streamed, text-only
+> `GET /v1/models/:model`), and an authenticated, text-only
 > `POST /v1/chat/completions` wired through the adapter (one new CollectivIQ
-> thread per request). The completion path calls CollectivIQ **only when a real
-> request is served** — never during import, construction, or the build smoke
-> test — and the live OpenCode/CollectivIQ smoke test is **not run** (pending
-> separate approval). It does **not** implement streaming (`stream:true`), tool
-> calling, Redis/idempotency, or metrics/tracing; those remain planned per
+> thread per request) that serves both the non-streamed JSON path and (Phase 2)
+> buffered synthetic SSE for `stream: true`. The completion path calls
+> CollectivIQ **only when a real request is served** — never during import,
+> construction, or the build smoke test — and the live OpenCode/CollectivIQ
+> smoke test is **not run** (pending separate approval). Streaming is
+> **synthetic** (the answer is obtained by polling, then split into deltas), not
+> true upstream streaming. It does **not** implement tool calling,
+> Redis/idempotency, or metrics/tracing; those remain planned per
 > [`.agent/docs/tech-software-spec.md`](.agent/docs/tech-software-spec.md). This
 > is the bounded OpenCode Chat Completions profile, not full OpenAI API
 > compatibility or production readiness. The grounded upstream contract is
@@ -47,26 +51,43 @@ CollectivIQ, exposing a bounded OpenAI Chat Completions-compatible profile.
   (preflight by default), a committed filtered OpenAPI snapshot
   (`contract/collectiviq/`), and hermetic mock-server contract tests
   (`test/contract/`).
-- **Authenticated, non-streamed, text-only `POST /v1/chat/completions`**
-  (Phase 1B), wired through the adapter. It validates/normalizes the OpenAI
-  request (text roles and string/text-part content; `n` must be `1`), rejects
-  `stream:true`, tools, `tool_choice`, `response_format`, `logprobs`, audio, and
-  image/binary content with stable content-free `400`s, serializes a
-  deterministic versioned prompt, enforces process-local global + per-key
-  capacity with a bounded queue (`429` + `Retry-After: 5` when at capacity),
-  creates one new CollectivIQ thread, submits once (no `create_thread`/
-  `process_message` retries), polls `get_messages` under a total deadline with
-  GET-only retry and desired-source selection, and encodes a non-streamed
-  response with zero (unavailable) usage. Client disconnect, the total deadline
-  (`504`), and shutdown share one cancellation path. **The live smoke test is not
-  run** — see the status note above.
+- **Authenticated, text-only `POST /v1/chat/completions`** (Phase 1B +
+  Phase 2), wired through the adapter. It validates/normalizes the OpenAI
+  request (text roles and string/text-part content; `n` must be `1`; `stream`
+  absent/`false`/`true`), rejects tools, `tool_choice`, `response_format`,
+  `logprobs`, audio, and image/binary content with stable content-free `400`s,
+  serializes a deterministic versioned prompt, enforces process-local global +
+  per-key capacity with a bounded queue (`429` + `Retry-After: 5` when at
+  capacity), creates one new CollectivIQ thread, submits once (no `create_thread`/
+  `process_message` retries), and polls `get_messages` under a total deadline with
+  GET-only retry and desired-source selection. The non-streamed path encodes a
+  JSON response with zero (unavailable) usage. Client disconnect, the total
+  deadline (`504`), and shutdown share one cancellation path. **The live smoke
+  test is not run** — see the status note above.
+- **Text-only synthetic SSE streaming (`stream: true`)** (Phase 2). The same
+  route serves a buffered synthetic `text/event-stream`: it authenticates,
+  validates, resolves the model, and prepares the prompt **before** committing
+  any SSE header (a preparation failure stays a normal JSON error), then emits an
+  assistant-role opener chunk before any upstream work, `: collectiviq-gateway
+keep-alive` comments every 15 s while polling waits, deterministic
+  code-point-safe content deltas whose concatenation reproduces the answer
+  exactly, a terminal `finish_reason: "stop"` chunk, and `data: [DONE]`. No
+  `usage` is emitted on a stream. Post-header failures are encoded as one safe
+  `data: {"error": …}` record then `[DONE]`; a shutdown emits the content-free
+  `503 service_unavailable` record + `[DONE]` **only while the SSE transport
+  remains writable** — if the response is backpressured/undrainable or its
+  terminal close fails, the gateway force-closes it to preserve the shutdown
+  bound and the stream may end silently (delivery of `503` is not guaranteed). A
+  client disconnect stops polling, releases capacity, and sends no body.
+  Streaming is **synthetic** — it keeps the connection alive but cannot improve
+  time-to-first-answer content, and it is **not** true upstream streaming.
 
 ## What is not implemented yet
 
-`GET /metrics`, emulated/native tool calling, synthetic SSE streaming
-(`stream:true`), Redis/idempotency, and any live OpenCode/CollectivIQ smoke run.
-(Gateway authentication, the model endpoints, and the non-streamed
-`POST /v1/chat/completions` path are implemented — see "What works today".) Four authorized authenticated discovery baselines ran: two bearer-mode
+`GET /metrics`, emulated/native tool calling, Redis/idempotency, and any live
+OpenCode/CollectivIQ smoke run. (Gateway authentication, the model endpoints, the
+non-streamed `POST /v1/chat/completions` path, and text-only synthetic SSE
+streaming are implemented — see "What works today".) Four authorized authenticated discovery baselines ran: two bearer-mode
 runs (2026-08-06/07) **failed strict completeness (exited non-zero)**, and two
 `password`-mode runs (2026-08-11) **both passed (exited zero)** with identical
 sanitized safe facts. The core create/submit/messages contract and password
@@ -133,15 +154,17 @@ curl http://127.0.0.1:8787/v1/models/collectiviq-consensus \
 curl -i http://127.0.0.1:8787/v1/models
 ```
 
-### Chat completions (non-streamed, text only)
+### Chat completions (text only; non-streamed JSON or synthetic SSE)
 
 `POST /v1/chat/completions` accepts the bounded OpenCode Chat Completions
 profile: text-only `system`/`developer`/`user`/`assistant` messages with string
 or `{ "type": "text", "text": … }` content, `n` absent or `1`, and `stream`
-absent or exactly `false`. Each request creates one new CollectivIQ thread, so a
-live request needs a real `COLLECTIVIQ_*` upstream credential.
+absent, exactly `false` (non-streamed JSON), or exactly `true` (synthetic SSE).
+Each request creates one new CollectivIQ thread, so a live request needs a real
+`COLLECTIVIQ_*` upstream credential.
 
 ```bash
+# Non-streamed JSON (stream absent or false)
 curl http://127.0.0.1:8787/v1/chat/completions \
   -H "Authorization: Bearer gw-fake-key-change-me" \
   -H "Content-Type: application/json" \
@@ -151,7 +174,27 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   }'
 ```
 
-The request surface is strict: `stream` (any value other than `false`), and the
+Setting `"stream": true` returns a `text/event-stream` instead: an assistant-role
+opener chunk, `: collectiviq-gateway keep-alive` comments while the answer is
+polled, buffered `chat.completion.chunk` content deltas whose concatenation
+reproduces the answer exactly, a terminal `finish_reason: "stop"` chunk, and a
+final `data: [DONE]` line. Streaming carries no `usage` field. It is **synthetic**
+(the complete answer is polled, then split into deltas) — it keeps the connection
+alive but does not deliver upstream tokens as they are produced.
+
+```bash
+# Synthetic SSE stream
+curl -N http://127.0.0.1:8787/v1/chat/completions \
+  -H "Authorization: Bearer gw-fake-key-change-me" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "collectiviq-consensus",
+    "stream": true,
+    "messages": [{ "role": "user", "content": "Explain this function." }]
+  }'
+```
+
+The request surface is strict: a non-boolean `stream`, and the
 mere **own-property presence** of `tools`, `tool_choice`, `response_format`,
 `logprobs`, `audio`, message `tool_calls`, or a tool-role message — even when
 empty, `null`, an explicit `undefined`, `"auto"`, `"none"`, or otherwise harmless
@@ -160,12 +203,18 @@ decided without reading the field's value, so a value getter is never invoked an
 an inherited property never counts.) Accepted-but-ignored optional fields (`temperature`,
 `top_p`, `max_tokens`, `max_completion_tokens`, `stop`, `seed`, `user`, `store`,
 `parallel_tool_calls`) are surfaced by NAME only in an optional
-`X-CollectivIQ-Ignored-Parameters` response header; their values are never read
-or logged. Responses report `usage` zeros, which denote **unavailable** token
-counts — not estimates and not exact billing usage.
+`X-CollectivIQ-Ignored-Parameters` response header (on the streamed path this
+header is set before the SSE body is committed); their values are never read or
+logged. Non-streamed responses report `usage` zeros, which denote **unavailable**
+token counts — not estimates and not exact billing usage; streamed responses omit
+`usage` entirely.
 
 For OpenCode, point `@ai-sdk/openai-compatible` at `http://127.0.0.1:8787/v1`
 with a gateway key as `apiKey` (see specification section 25 for a full example).
+Because tool calling is not implemented yet, use a text-only primary agent that
+sends no tools — the committed `opencode.jsonc` ships a default `collectiviq-text`
+agent bound to `collectiviq/collectiviq-consensus` with a wildcard permission
+`deny` (see specification section 25).
 The end-to-end OpenCode smoke test is **not run** in this repository and requires
 separate approval before any live CollectivIQ traffic.
 
@@ -192,6 +241,15 @@ Individual checks:
 
 `validate` is hermetic: it makes no network, live-upstream, Docker, or load
 checks. The contract suite runs against a local mock HTTP server.
+
+`npm run test:compatibility` is a **separate** hermetic suite
+(`test/compatibility/`, its own `vitest.compatibility.config.ts`) that drives the
+pinned `ai` + `@ai-sdk/openai-compatible` SDK (matching the OpenCode client) via
+`streamText`/`generateText` against an ephemeral loopback gateway with a **fake**
+completion — no CollectivIQ, no real credential, no network. It is intentionally
+excluded from `validate`/CI and is run on its own. `ai` and
+`@ai-sdk/openai-compatible` are pinned **dev** dependencies used only by this
+suite.
 
 ## CollectivIQ contract tooling
 

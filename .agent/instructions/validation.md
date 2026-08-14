@@ -14,6 +14,7 @@
 | `npm run test:unit` | Unit | Vitest `test/unit` only |
 | `npm run test:integration` | Integration | Vitest `test/integration` only (in-process `inject`, no socket) |
 | `npm run test:contract` | Upstream contract | Vitest `test/contract` only (hermetic mock HTTP server, no network) |
+| `npm run test:compatibility` | SDK compatibility | Standalone hermetic suite (`test/compatibility`, own `vitest.compatibility.config.ts`); pinned `ai`/`@ai-sdk/openai-compatible` SDK vs an ephemeral loopback gateway with a **fake** completion — no network/credentials/CollectivIQ. **Excluded from `validate`/CI** |
 | `npm run test:coverage` | Coverage | Vitest with V8 coverage |
 | `npm run build` | Build | `tsc -p tsconfig.json`, emits `dist/` |
 | `npm run test:build` | Build smoke | Imports compiled `dist/*.js`; asserts no listening socket |
@@ -26,11 +27,12 @@ CollectivIQ calls); it runs as part of `npm run test` and therefore inside
 `validate`, and `npm run test:contract` runs it in isolation. The network-only
 `contract:openapi:refresh` and `contract:openapi:check` commands and the opt-in
 `contract:discovery` and `contract:discovery:cleanup` (recovery-only) commands
-must **never** be added to `validate` or CI.
-OpenAI-compatibility, adversarial, load, live-upstream, end-to-end OpenCode, and
-Docker/live checks are **not implemented yet** and must not be added to
-`validate` until their suites and gates exist. Keep fast hermetic validation
-separate from those.
+must **never** be added to `validate` or CI. `test:compatibility` is hermetic but
+is likewise kept **out** of `validate`/CI and run only on its own.
+Adversarial, load, live-upstream, end-to-end OpenCode, and Docker/live checks are
+**not implemented yet** and must not be added to `validate` until their suites and
+gates exist (the hermetic SDK compatibility suite `test:compatibility` exists but
+stays separate). Keep fast hermetic validation separate from those.
 
 ## Validation Order
 
@@ -53,7 +55,50 @@ Cover deterministic policies without sockets: public validation/normalization, s
 
 **Implementation status (Phase 1B).** Chat-completion coverage exists across all three hermetic suites: unit (`chat-request`, `prompts`, `capacity`, `polling`, `chat-completion`, `chat-response`, plus capacity/shutdown config cases and the opaque gateway-key identity), integration (`test/integration/chat-completions.test.ts`: auth-before-parse, success, model-not-found, malformed body / unsupported media type, unsupported content, `413`, capacity `429` + `Retry-After`, upstream/timeout/`500`/`503` mappings), and adapter-backed contract (`test/contract/completion-flow.test.ts`: create→submit→poll→answer, partial/duplicate/retryable-poll paths, malformed/`detail`/auth/quota/timeout mappings, and cancellation) — all against the local mock server. No live upstream or OpenCode compatibility suite is run.
 
-**Phase 1B remediation evidence (added by the review-remediation change).** The following are proven by new hermetic tests, and only these claims are asserted: **deadline authority** (`test/unit/polling.test.ts`) — an already-expired deadline issues zero polls; a poll that advances the clock past the deadline yields a timeout, never a late answer; a retryable error observed at/after the deadline becomes a timeout (not a leaked transport error); a pre-aborted signal throws a cancellation distinct from timeout; and a jittered sleep never exceeds `maxPollIntervalMs`. **Fail-closed route boundary** (`test/integration/chat-completions.test.ts`) — a service rejection with a forged `FST_ERR_CTP_*` code returns the fixed `500`; a hostile `Proxy` error triggers zero getter/`has`/`getPrototypeOf` traps and returns `500`; genuine malformed JSON still returns `400` and an oversized body `413`; auth/validation responses are unchanged. **Strict surface + immutability** (`test/unit/chat-request.test.ts`) — presence-based rejection of `stream≠false`/`tools`/`tool_choice`/`response_format`/`logprobs`/`audio`/message `tool_calls` including empty/`null`/`"auto"`/`"none"`; `parallel_tool_calls` stays ignored; and `Object.isFrozen`/mutation-throws over the whole normalized structure. **Shutdown lifecycle** (`test/unit/shutdown.test.ts`) — the extracted `runGracefulShutdown` used by `main()` flips readiness, closes admission, honours the drain window, force-cancels on timeout, cleans up the timer, routes a close() failure to a content-free sink, and never calls `process.exit`. **Runtime authentication** (`test/unit/runtime-auth.test.ts`) — `buildCredentialProviderFromConfig` builds the correct provider per mode using only the active mode's credentials with no construction-time network/login, re-logs in beyond the two-login CLI budget after generation-safe `401` invalidations while the CLI budget stays two, reuses a non-invalidated lease (as on a `403`), and leaks no synthetic credential sentinel. **Real client disconnect** (`test/integration/client-disconnect.test.ts`) — a bounded loopback regression on an ephemeral port destroys the client socket mid-completion and asserts the request signal aborts, polling stops, and the capacity permit is released (deterministic; cannot hang). No live upstream, OpenCode, or network call occurs in any of these.
+**Implementation status (Phase 2 — synthetic SSE streaming).** Streaming coverage
+is hermetic and layered: unit (`test/unit/chat-stream.test.ts` — the frame
+encoders and the deterministic code-point split; `test/unit/chat-stream-response.test.ts`
+— the backpressure-aware writer, keep-alives, error records, and cancellation),
+integration (`test/integration/chat-completions-stream.test.ts` — injected frame
+sequences and SSE error records; `test/integration/chat-stream-loopback.test.ts`
+— real-socket delivery, one-thread/one-submit, and streaming-disconnect capacity
+release), plus updates to the existing chat-completion/chat-request/prompts/
+completion-flow tests for the `prepare`/`run` split and `stream` normalization.
+Separately, `npm run test:compatibility` (`test/compatibility/`) drives the pinned
+`ai` + `@ai-sdk/openai-compatible` SDK via `streamText`/`generateText` against an
+ephemeral loopback gateway with a **fake** completion — no CollectivIQ, no real
+credential, no network — and is excluded from `validate`/CI. No live upstream or
+OpenCode smoke run occurs.
+
+**Phase 2 transport-remediation evidence (added by the streaming-review
+remediation).** New hermetic regressions in `test/unit/chat-stream-response.test.ts`
+(a Node-faithful fake `ServerResponse` whose backpressured write callback settles
+only on drain) assert, and only assert: a **synchronous `write()` throw** on the
+role frame makes `streamChatCompletion` FULFIL (never reject), never starts
+`run()`, cancels the client, ends/destroys the response, and writes no `[DONE]`;
+an **async callback error** on a nominally successful role write likewise starts
+no `run()`, produces no unhandled rejection, and cancels + cleans up; a
+**backpressured role write + shutdown before drain** settles promptly, never
+starts `run()`, force-closes the response, and leaves no listener attached; a
+**backpressured write during `run()` + shutdown** unblocks the pending write,
+propagates cancellation to the active work, clears the keep-alive timer, and
+settles without rejection; a **response `error` + `close` race** settles exactly
+once with a single cancellation/end and every `drain`/`close`/`error` listener
+removed; and a **writable shutdown** still emits role + safe `503` + `[DONE]`
+with no `finish_reason:"stop"` terminal. A **second remediation** adds two more
+regressions covering hardened forced termination: a forced-close whose
+`res.end()` **throws** still FULFILS, writes the safe `503` + `[DONE]` first, and
+destroys the response immediately with no listener/timer left; and a forced-close
+whose `res.end()` returns but **never invokes its callback** settles without
+hanging and destroys the response on the writer's **bounded next-turn fallback**
+(with the temporary `close` listener removed). The real-socket lifecycle
+regression in `test/integration/chat-stream-loopback.test.ts` drives the shared
+shutdown signal against the real runtime and proves polling stops, capacity
+returns to zero, the reading client receives the safe `503` + `[DONE]`, and
+`app.close()` completes within a bounded deadline (no hang). The pre-existing
+real-client-disconnect regression is unchanged and green.
+
+**Phase 1B remediation evidence (added by the review-remediation change).** The following are proven by new hermetic tests, and only these claims are asserted: **deadline authority** (`test/unit/polling.test.ts`) — an already-expired deadline issues zero polls; a poll that advances the clock past the deadline yields a timeout, never a late answer; a retryable error observed at/after the deadline becomes a timeout (not a leaked transport error); a pre-aborted signal throws a cancellation distinct from timeout; and a jittered sleep never exceeds `maxPollIntervalMs`. **Fail-closed route boundary** (`test/integration/chat-completions.test.ts`) — a service rejection with a forged `FST_ERR_CTP_*` code returns the fixed `500`; a hostile `Proxy` error triggers zero getter/`has`/`getPrototypeOf` traps and returns `500`; genuine malformed JSON still returns `400` and an oversized body `413`; auth/validation responses are unchanged. **Strict surface + immutability** (`test/unit/chat-request.test.ts`) — presence-based rejection of `tools`/`tool_choice`/`response_format`/`logprobs`/`audio`/message `tool_calls` including empty/`null`/`"auto"`/`"none"`; `stream` is now normalized to a boolean (absent/`false`/`true` accepted, every non-boolean value rejected — a Phase 2 change from the original `stream≠false` rejection); `parallel_tool_calls` stays ignored; and `Object.isFrozen`/mutation-throws over the whole normalized structure. **Shutdown lifecycle** (`test/unit/shutdown.test.ts`) — the extracted `runGracefulShutdown` used by `main()` flips readiness, closes admission, honours the drain window, force-cancels on timeout, cleans up the timer, routes a close() failure to a content-free sink, and never calls `process.exit`. **Runtime authentication** (`test/unit/runtime-auth.test.ts`) — `buildCredentialProviderFromConfig` builds the correct provider per mode using only the active mode's credentials with no construction-time network/login, re-logs in beyond the two-login CLI budget after generation-safe `401` invalidations while the CLI budget stays two, reuses a non-invalidated lease (as on a `403`), and leaks no synthetic credential sentinel. **Real client disconnect** (`test/integration/client-disconnect.test.ts`) — a bounded loopback regression on an ephemeral port destroys the client socket mid-completion and asserts the request signal aborts, polling stops, and the capacity permit is released (deterministic; cannot hang). No live upstream, OpenCode, or network call occurs in any of these.
 
 **Phase 1B second-remediation evidence (added by the follow-up review-remediation change).** Four independently reproduced defects are now covered by hermetic regressions, and only these claims are asserted: **poll-in-flight cancellation** (`test/unit/polling.test.ts`) — when the signal aborts WHILE a `get_messages` is in flight, a subsequent fulfilment returning a usable answer still yields a cancellation (never a late answer) and no extra poll/sleep occurs; and when the same poll rejects as the clock also reaches the deadline, cancellation takes precedence over the timeout so the orchestrator can apply the correct source mapping. **Trap-safe upstream identity** (`test/unit/chat-completion.test.ts`) — a hostile `Proxy` thrown from `createThread`, from `processMessage`, or from the poller read path is re-thrown by identity for the route's fixed `500` with the capacity permit released and **zero** `get`/`has`/`getPrototypeOf` traps invoked; a genuine `UpstreamError` still maps to its public envelope, and a retryable `GET` error still retries (existing tests). **Pre-handler provenance** (`test/integration/chat-completions.test.ts`) — when the gateway auth hook itself throws, an `Error` forged with a real `FST_ERR_CTP_INVALID_JSON` code/`400` status and a hostile `Proxy` both fail closed to the fixed `500` (the Proxy with zero traps), while a normal `{ ok: false }` auth result still returns the fixed `401` and genuine malformed JSON / unsupported media type / oversized body still map to `400`/`400`/`413`; a narrow test-only `authenticator` seam on `buildServer` drives the throwing hook. **Own-property presence** (`test/unit/chat-request.test.ts`) — explicit `undefined` supplied directly to the normalization boundary is rejected for `stream`, `tools`, `tool_choice`, `response_format`, `audio`, `logprobs`, message `tool_calls`, and `n`; an inherited/prototype `tool_calls` or ignored-name is NOT treated as supplied; and an ignored name is recorded from a value getter without invoking it. An `rg 'instanceof UpstreamError' src` audit returns no matches.
 

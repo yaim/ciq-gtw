@@ -741,7 +741,10 @@ The gateway must not present estimated tokens as exact upstream billing usage.
 `finish_reason: "stop"`, and `usage` with `prompt_tokens`/`completion_tokens`/
 `total_tokens` all `0`. The zeros denote **unavailable** counts — not estimates
 and not exact billing usage. The completion id and clock are injectable seams for
-deterministic tests. The tool response shape stays a Phase 3 concern.
+deterministic tests. The tool response shape stays a Phase 3 concern. The
+synthetic-SSE encoder (`src/openai/chat-stream.ts`; Phase 2) reuses the same
+stable `id`/`created`/`model` and single choice index across every frame and
+emits **no** `usage` at all (see section 14).
 
 ---
 
@@ -991,12 +994,17 @@ HTTP/1.1 400 Bad Request
 }
 ```
 
-**Implementation status (Phase 1B, implemented).** `POST /v1/chat/completions`
-is authenticated, non-streamed, and text-only, with a **strict** request surface.
-Accepted: a non-empty exact-case `model`, a non-empty ordered `messages` array
-with `system`/`developer`/`user`/`assistant` roles, string content or arrays of
-`{ "type": "text", "text" }` parts (text parts are joined with `\n`), `n` absent
-or `1`, and `stream` **absent or exactly `false`**. Documented optional
+**Implementation status (Phase 1B / Phase 2, implemented).** `POST
+/v1/chat/completions` is authenticated and text-only, with a **strict** request
+surface, and serves both the non-streamed JSON path and (Phase 2) the synthetic
+SSE path. Accepted: a non-empty exact-case `model`, a non-empty ordered
+`messages` array with `system`/`developer`/`user`/`assistant` roles, string
+content or arrays of `{ "type": "text", "text" }` parts (text parts are joined
+with `\n`), `n` absent or `1`, and `stream` **absent, exactly `false` (JSON), or
+exactly `true` (synthetic SSE)** — every other `stream` value (including `null`,
+an explicit `undefined`, `"true"`, `0`, `1`, or an object) is a stable `400`, and
+the normalized boolean is carried on the frozen `NormalizedChatRequest`.
+Documented optional
 sampling/storage fields (`temperature`, `top_p`, `max_tokens`,
 `max_completion_tokens`, `stop`, `seed`, `user`, `store`, `parallel_tool_calls`)
 are accepted but ignored — only their **names** are recorded and echoed in the
@@ -1005,8 +1013,8 @@ logged). `parallel_tool_calls` remains an ignored compatibility option only
 because no other tool surface is accepted. Rejected with stable content-free
 `400`s — by **own-property presence alone**, including an empty array, `null`,
 an explicit `undefined` supplied directly to the normalization boundary,
-`"auto"`, `"none"`, or any otherwise-harmless value: `stream` (any non-`false`
-value), request `tools`, request `tool_choice`, `response_format`, `logprobs`,
+`"auto"`, `"none"`, or any otherwise-harmless value: a non-boolean `stream`,
+request `tools`, request `tool_choice`, `response_format`, `logprobs`,
 audio parameters, message `tool_calls`, tool-role messages, and
 image/audio/file/binary content parts. Presence is decided with `Object.hasOwn`
 (the field value is never read for a presence decision, so a value getter is
@@ -1415,6 +1423,25 @@ Native tool mode may be enabled only after confirming that CollectivIQ supports:
 
 ## 14. Streaming
 
+**Implementation status (Phase 2, implemented offline).** `POST
+/v1/chat/completions` now serves `stream: true` as **buffered synthetic SSE**,
+text-only, alongside the existing non-streamed JSON path. The frame encoding and
+the deterministic content split are pure (`src/openai/chat-stream.ts`); the SSE
+transport — header commit, keep-alive timers, backpressure, and cancellation —
+is owned by `src/api/chat-stream-response.ts`, driven from
+`src/api/chat-completions-route.ts`. Request normalization (`chat-request.ts`)
+maps `stream` to a boolean on the frozen `NormalizedChatRequest`
+(`chat-types.ts`): absent or exactly `false` selects JSON, exactly `true`
+selects SSE, and every other value (including `null`, an explicit `undefined`,
+`"true"`, `0`, `1`, or an object) is a stable `400`. The synthetic stream does
+NOT stream from CollectivIQ: the complete answer is obtained by authoritative
+polling and only then split into deltas, so it cannot improve time-to-first
+answer content. `usage` is never emitted for a stream, tool-call streaming stays
+a Phase 3 concern, and the live OpenCode/CollectivIQ smoke test that closes the
+Phase 2 exit criterion is **not run** (pending separate approval). The normative
+requirements below are met by this implementation except where a subsection notes
+a Phase 3 (tool-call) deferral.
+
 ## 14.1 Compatibility requirement
 
 OpenAI Chat Completions streaming uses Server-Sent Events containing `chat.completion.chunk` objects.
@@ -1468,6 +1495,61 @@ Synthetic streaming does not reduce time-to-first-answer content. Its purposes a
 * avoidance of client chunk timeouts;
 * incremental delivery after the complete answer is available.
 
+**Implemented wire contract (Phase 2).** Authentication, request validation,
+model resolution, and prompt preparation all run **before** any SSE header is
+committed, so a pre-header failure (e.g. an oversized prompt →
+`context_length_exceeded`) stays a normal JSON error and never a half-open
+stream. The route then hijacks the reply, responds `200` with
+`Content-Type: text/event-stream`, and emits, all sharing one stable `id`, one
+Unix `created`, the requested virtual-model `id`, and choice `index` `0`:
+
+1. an assistant-role opener chunk (`object: "chat.completion.chunk"`,
+   `delta: {"role":"assistant"}`, `finish_reason: null`) **before** capacity
+   acquisition or any upstream request;
+2. a `: collectiviq-gateway keep-alive` comment every 15 s while the
+   authoritative poll waits;
+3. content chunks (`delta: {"content":"…"}`, `finish_reason: null`) from the
+   deterministic split of section 14.3 — concatenating every content delta
+   reproduces the answer EXACTLY;
+4. one terminal chunk (empty `delta`, `finish_reason: "stop"`);
+5. `data: [DONE]`.
+
+An empty answer emits the role chunk, the terminal chunk, and `[DONE]` with no
+content frames. No `usage` field is ever emitted on the stream. A post-header
+gateway/upstream failure is encoded as one safe `data: {"error": …}` record then
+`data: [DONE]` (no terminal chunk); an unexpected post-header failure uses the
+fixed content-free internal `500` error object. A shutdown cancellation emits the
+content-free `503` (`service_unavailable`) error record followed by `[DONE]`
+**only while the client is still connected AND the SSE transport remains
+writable**; an undrainable or failed transport is instead force-closed, possibly
+silently (see below).
+Writes are serialized and honour Node backpressure (later frames wait for the
+prior frame's flush); the combined client-disconnect + shutdown signal can
+force-close a stuck (backpressured, non-draining) response so the shutdown drain
+window stays authoritative and `app.close()` cannot hang, while a shutdown that
+cancels `run()` on a still-writable transport keeps the safe `503` + `[DONE]`
+path. Forced termination flushes any already-written terminal frames via
+`res.end()` and then destroys the socket; it is hardened so a `res.end()` that
+throws destroys immediately and a `res.end()` whose callback never fires destroys
+on a bounded next-turn fallback (all serialized writes have already settled), so
+shutdown can never hang and the response always ends destroyed exactly once. A
+write failure or socket close is treated as client cancellation (polling
+is aborted, capacity released, and no body is written to a gone client), the
+writer never rejects after the reply is hijacked, and every keep-alive timer and
+temporary listener is cleared on success, error, disconnect, cancellation, forced
+close, and shutdown. A forced close of an undrainable or failed-terminal response
+may therefore end **silently** — delivery of the `503` to the client cannot be
+guaranteed.
+
+A **successful** stream intentionally carries the requested answer text (the
+`delta.content` chunks) and the gateway-generated OpenAI completion metadata (the
+`chatcmpl_ciq_*` id, `created`, model, and choice index) to the **authenticated**
+client — that content is the response, not a leak. What must never appear in any
+frame is a submitted prompt outside its intended upstream request, a credential,
+a raw upstream body, an upstream thread/run id, a filesystem path, a stack, or an
+untrusted exception detail; and the answer content is never logged, persisted, or
+placed in an error, keep-alive, or other control record.
+
 ### 14.3 Text chunking
 
 After receiving the full response, text should be emitted in chunks of approximately:
@@ -1485,9 +1567,22 @@ Chunk boundaries should prefer:
 
 Chunking must never split a UTF-8 code point.
 
+**Implemented (Phase 2).** `splitAnswerIntoChunks` operates on a Unicode
+code-point array (surrogate-pair safe) with a target of 128 code points, a hard
+maximum of 256, and a preferred minimum of 32 (only a shorter FINAL remainder,
+or a whole answer below the minimum, is allowed). Within the `[MIN, MAX]` window
+it prefers the strongest boundary — paragraph (a blank-line / double-newline
+break), then sentence (terminal punctuation, optionally after a closing
+quote/bracket, then whitespace), then any whitespace — closest to the target,
+and falls back to a hard cut at the target when no natural boundary exists. The
+split is deterministic, never splits a code point, and concatenates back to the
+exact answer with no trimming or loss.
+
 ### 14.4 Tool-call streaming
 
-Tool calls may be emitted in one complete delta rather than character-by-character.
+Tool-call streaming remains a **Phase 3** concern and is not implemented; the
+Phase 2 stream is text-only. Tool calls may be emitted in one complete delta
+rather than character-by-character.
 
 Example:
 
@@ -1629,6 +1724,19 @@ When the client disconnects:
 The supplied API does not demonstrate an upstream cancellation endpoint. Therefore, a submitted CollectivIQ generation may continue after the OpenCode client disconnects.
 
 This must be documented as an upstream limitation.
+
+**Implemented (Phase 1B / Phase 2).** Client-disconnect, the total deadline, and
+shutdown share one abort path. On the streamed path a write failure or socket
+close aborts the client controller, which stops polling, releases capacity,
+clears the keep-alive timer, and writes no body to a gone client; the deadline
+maps to `504`. On the non-streamed JSON path a shutdown cancellation with the
+client still connected maps to `503`. On the streamed SSE path that `503`
+(`service_unavailable`) record + `[DONE]` is emitted **only while the transport
+remains writable**; a backpressured/undrainable response (or one whose terminal
+`res.end()` throws or never completes) is force-closed instead — on a bounded
+fallback if necessary — to keep the shutdown drain authoritative, so the stream
+may end silently. A submitted CollectivIQ generation may still continue upstream
+because no verified cancellation endpoint exists.
 
 ---
 
@@ -2253,6 +2361,28 @@ Recommended OpenCode configuration:
 
 OpenCode documents provider-level timeout and streamed-chunk timeout settings, as well as custom models and separate `small_model` selection.
 
+Because tool calling is not implemented (Phase 3), the committed `opencode.jsonc`
+ships a default primary agent that sends **no** tools to the gateway — a
+`collectiviq-text` agent bound to `collectiviq/collectiviq-consensus` with a
+wildcard permission `deny`, selected as the `default_agent`:
+
+```jsonc
+{
+  "agent": {
+    "collectiviq-text": {
+      "description": "Text-only CollectivIQ consensus agent (no tools; Phase 2 SSE).",
+      "mode": "primary",
+      "model": "collectiviq/collectiviq-consensus",
+      "permission": { "*": "deny" }
+    }
+  },
+  "default_agent": "collectiviq-text"
+}
+```
+
+This keeps the streamed and non-streamed text paths within the implemented,
+tool-free contract until Phase 3 lands.
+
 No context-window values should be declared until CollectivIQ’s effective limits are measured or documented.
 
 ---
@@ -2454,6 +2584,17 @@ Required areas:
 * SSE chunk encoding;
 * redaction;
 * timeout behavior.
+
+**Implementation status (Phase 2).** SSE coverage is hermetic and split across
+unit tests (`test/unit/chat-stream.test.ts` — the frame encoders and the
+deterministic code-point split; `test/unit/chat-stream-response.test.ts` — the
+backpressure-aware writer, keep-alives, error records, and cancellation),
+integration tests (`test/integration/chat-completions-stream.test.ts` — injected
+frame sequences and SSE error records; `test/integration/chat-stream-loopback.test.ts`
+— real-socket delivery, one-thread/one-submit, and streaming-disconnect capacity
+release), and the separate `npm run test:compatibility` suite
+(`test/compatibility/`) driving the pinned SDK. See
+`.agent/instructions/validation.md`.
 
 ### 29.2 Upstream contract tests
 
@@ -2764,10 +2905,11 @@ Phase 1 is not yet complete or production-ready.
 **Phase 1B — implemented (offline; the completion path calls CollectivIQ only
 when a real request is served, never during import/construction):**
 
-* non-streamed, text-only `POST /v1/chat/completions` (authenticated), with
-  `stream` absent/`false` only; deferred features (`stream:true`, tools,
-  `tool_choice`, `response_format`, `logprobs`, audio, images) rejected with
-  stable content-free `400` envelopes;
+* the non-streamed JSON `POST /v1/chat/completions` path (authenticated),
+  text-only, for `stream` absent/`false` (the `stream: true` synthetic-SSE path
+  was added in Phase 2, below); deferred features (tools, `tool_choice`,
+  `response_format`, `logprobs`, audio, images) rejected with stable content-free
+  `400` envelopes;
 * the CollectivIQ adapter wired into the request path — one **new** thread per
   completion, one `process_message`, then bounded polling of `get_messages`;
 * deterministic versioned prompt serialization (`src/prompts/conversation.ts`),
@@ -2785,9 +2927,9 @@ when a real request is served, never during import/construction):**
 
 **Phase 1B — deferred / not run:** the live OpenCode text-mode smoke test (and
 any live CollectivIQ request from this repo) is **not run** and requires separate
-explicit approval. `stream:true` and SSE stay in Phase 2; tools stay in Phase 3;
-Redis/idempotency and metrics/tracing remain unimplemented; thread reuse and
-upstream deletion are not performed.
+explicit approval. `stream:true` synthetic SSE is now implemented offline (Phase
+2, below); tools stay in Phase 3; Redis/idempotency and metrics/tracing remain
+unimplemented; thread reuse and upstream deletion are not performed.
 
 Deliverables:
 
@@ -2809,18 +2951,32 @@ Exit criterion:
 
 ### Phase 2 — Streaming compatibility
 
-Deliverables:
+**Implemented (offline).** Text-only buffered synthetic SSE for
+`POST /v1/chat/completions` with `stream: true` (see section 14):
 
-* SSE response;
-* early role chunk;
-* keep-alive comments;
-* buffered text chunks;
-* client-disconnect cancellation;
-* streaming compatibility tests.
+* SSE `200`/`text/event-stream` response committed only after preparation
+  succeeds (`src/api/chat-stream-response.ts`);
+* an early assistant-role chunk emitted before any upstream work;
+* `: collectiviq-gateway keep-alive` comments every 15 s while polling waits;
+* deterministic, code-point-safe buffered text chunks
+  (`src/openai/chat-stream.ts`) that concatenate back to the exact answer;
+* one terminal chunk (`finish_reason: "stop"`) then `data: [DONE]`;
+* backpressure-aware serialized writes, keep-alive timer cleanup, safe SSE error
+  records (`data: {"error": …}` then `[DONE]`), a `503` record on shutdown while
+  the client is connected **and the transport is writable** (an
+  undrainable/failed-terminal transport is force-closed instead and may end
+  silently), and client-disconnect cancellation that stops polling and releases
+  capacity;
+* hermetic streaming unit/integration/loopback tests, plus a separate hermetic
+  `npm run test:compatibility` suite driving the pinned `ai` /
+  `@ai-sdk/openai-compatible` SDK against an ephemeral loopback gateway with a
+  fake completion (never CollectivIQ, no real credential, out of `validate`/CI).
 
 Exit criterion:
 
 * OpenCode completes long-running CollectivIQ requests without stream timeout.
+  (Offline implementation and hermetic tests are complete; the live OpenCode
+  streaming smoke test that closes this criterion is pending separate approval.)
 
 ### Phase 3 — Emulated tool calling
 

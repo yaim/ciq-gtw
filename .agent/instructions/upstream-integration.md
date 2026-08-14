@@ -186,6 +186,8 @@ Every adapter path should be tested for successful and malformed shapes, status/
 
 Represent native tools, request-scoped streaming, cancellation, and token usage through an explicit capability object. A capability defaults to false until supported by official documentation or sanitized, repeatable contract evidence.
 
+The Phase 2 `stream: true` support is **synthetic** SSE encoded from a fully polled answer; it does not consume upstream events, so it does not change any of this. Polling remains authoritative, `/user/events` is still unused, request-scoped upstream streaming stays a false capability, and no upstream cancellation endpoint is verified (a submitted generation may continue after a client disconnect).
+
 Do not use account-wide `/user/events`, persistent thread reuse, thread deletion, native tools, or POST retry/idempotency merely because a field or endpoint appears to exist.
 
 ## Review Checklist

@@ -22,9 +22,10 @@ a fix and disclosure timeline privately.
 ## Security posture of this scaffold
 
 This repository is a **runnable foundation**, the Phase 1A authenticated public
-model surface, and the Phase 1B non-streamed chat-completions path wired through
-the CollectivIQ adapter. Tool calling, streaming (`stream:true`), Redis, and
-metrics/tracing are not implemented. The completion path calls CollectivIQ only
+model surface, the Phase 1B non-streamed chat-completions path wired through the
+CollectivIQ adapter, and Phase 2 text-only synthetic SSE streaming
+(`stream: true`). Tool calling, Redis, and metrics/tracing are not implemented.
+The completion path calls CollectivIQ only
 when a real request is served (never during import/construction/build smoke), and
 the live OpenCode/CollectivIQ smoke test is **not run** (pending separate
 approval). The controls that exist today are:
@@ -119,10 +120,12 @@ approval). The controls that exist today are:
   validated/normalized to a **deeply frozen** internal value and never flows into
   generation; the strict surface rejects, by **own-property presence**
   (`Object.hasOwn` — even empty/`null`/explicit `undefined`/`"auto"`/`"none"`/
-  harmless values, never reading the value or an inherited property), `stream≠false`,
-  `tools`, `tool_choice`, `response_format`, `logprobs`, `audio`, message
-  `tool_calls`, tool-role messages, and image/binary content — all with stable,
-  content-free `400`s. Public errors come only from the shared owner
+  harmless values, never reading the value or an inherited property), `tools`,
+  `tool_choice`, `response_format`, `logprobs`, `audio`, message `tool_calls`,
+  tool-role messages, and image/binary content — all with stable, content-free
+  `400`s. `stream` is normalized to a boolean: absent or exactly `false` selects
+  the non-streamed JSON path, exactly `true` selects the synthetic-SSE path
+  (below), and every other value is rejected with the same content-free `400`. Public errors come only from the shared owner
   (`src/openai/errors.ts`) and never contain a submitted value, prompt, answer, raw
   upstream body, exception detail, credential, or thread/request identifier. The
   route error boundary **fails closed** on trusted request **provenance**, not on
@@ -161,6 +164,35 @@ approval). The controls that exist today are:
   prompts and answers cross into CollectivIQ-managed storage; the gateway retains
   no prompt/answer content after the request completes, but provider-side
   retention/training/deletion/regional behavior remains **unknown** (see below).
+- **Synthetic SSE streaming path (implemented; Phase 2).** `stream: true` reuses
+  the same authenticated, bounded orchestration; authentication, validation,
+  model resolution, and prompt preparation all complete **before** any SSE header
+  is committed, so a pre-header failure stays a normal content-free JSON error and
+  never a half-open stream. A **successful** SSE stream intentionally exposes the
+  requested answer text (as `delta.content` chunks) and the gateway-generated
+  OpenAI completion metadata (the `chatcmpl_ciq_*` id, `created`, model, and
+  choice index) to the **authenticated** client — that is the response. What must
+  never appear in any frame is a submitted prompt outside its intended upstream
+  request, a credential, a raw upstream body, an upstream thread/run id, a
+  filesystem path, a stack, or an untrusted exception detail; and the answer
+  content is never logged, persisted, or placed in an error, keep-alive, or other
+  control record. The default no-content-logging posture is unchanged. A
+  post-header failure is encoded as one **content-free** OpenAI
+  error record (`data: {"error": …}`) then `data: [DONE]` — an unexpected failure
+  uses the fixed internal `500` object (its thrown value is classified by identity
+  only, never inspected). A shutdown emits the content-free `503`
+  `service_unavailable` record + `[DONE]` **only while the SSE transport remains
+  writable**; if the response is backpressured/undrainable or its terminal close
+  fails, the gateway force-closes it (destroying the socket, including on a bounded
+  fallback if `res.end()` never completes) to preserve the shutdown bound, so the
+  stream may end **silently** — delivery of the `503` to the client is not
+  guaranteed. Writes are serialized and honour Node
+  backpressure; a write failure or socket close is treated as client cancellation,
+  which aborts polling, releases the capacity permit, clears every keep-alive
+  timer, and writes no body to a gone client. As with the non-streamed path,
+  capacity is process-local, and a submitted CollectivIQ generation may continue
+  upstream after a disconnect because no verified upstream cancellation endpoint
+  exists.
 - **Bounded OpenAPI retrieval.** `scripts/openapi/fetch-openapi.ts` contacts only
   the fixed public source URL (no caller-supplied URL/env), enforces an overall
   deadline with cancellation, requires a JSON content type, rejects an
@@ -296,9 +328,10 @@ errorCode, resolved, resolution, persisted }] }` (no longer `succeeded`/
   OpenCode/CollectivIQ smoke test is **not run** (pending separate approval). No
   live CollectivIQ request is made from this repository except when a real
   completion request is served against a configured upstream credential.
-- Streaming (`stream:true`/SSE), tool calling, and Redis/idempotency are not
-  implemented; those requests are rejected or unavailable rather than silently
-  degraded.
+- Tool calling and Redis/idempotency are not implemented; those requests are
+  rejected or unavailable rather than silently degraded. Streaming
+  (`stream: true`/SSE) is implemented as text-only buffered synthetic SSE, not
+  true upstream streaming, and the live streaming smoke test is not run.
 - Capacity/backpressure is **process-local** — it does not coordinate across
   replicas. Cross-replica limits require shared state that does not yet exist.
 - No metrics endpoint is exposed.
