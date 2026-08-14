@@ -352,6 +352,15 @@ Example:
 
 ```yaml
 models:
+  collectiviq-claude:
+    displayName: CollectivIQ Claude
+    selectedLlms:
+      - claude
+    generateCombined: false
+    answerSource: claude
+    toolMode: disabled
+    requestTimeoutMs: 90000
+
   collectiviq-consensus:
     displayName: CollectivIQ Consensus
     selectedLlms:
@@ -2341,6 +2350,9 @@ Recommended OpenCode configuration:
         "chunkTimeout": 30000
       },
       "models": {
+        "collectiviq-claude": {
+          "name": "CollectivIQ Claude"
+        },
         "collectiviq-consensus": {
           "name": "CollectivIQ Consensus"
         },
@@ -3249,4 +3261,3 @@ toolMode: emulated
 and remain explicitly experimental until it satisfies the defined release gates.
 
 This architecture meets the central requirement that all model generation passes through CollectivIQ while minimizing changes to OpenCode and preserving a path toward native CollectivIQ capabilities.
-

@@ -118,10 +118,13 @@ npm ci
 Both `.env` and `config/models.yaml` are git-ignored. All example credentials
 are unmistakably fake placeholders — replace them with your own and never commit
 real secrets. The model IDs and source names in the example
-(`collectiviq-consensus`, `collectiviq-coder`, `collectiviq-fast`, and the
-`selectedLlms` entries) are configurable examples only; they are not verified
-against any CollectivIQ account and carry no context-window or token-limit
-claims.
+(`collectiviq-claude`, `collectiviq-consensus`, `collectiviq-coder`,
+`collectiviq-fast`, and the `selectedLlms` entries) are configurable examples
+only; they are not verified against any CollectivIQ account and carry no
+context-window or token-limit claims. `collectiviq-claude` is the single-source
+text policy (`selectedLlms: [claude]`, `generateCombined: false`,
+`answerSource: claude`); select it explicitly when a combined response is not
+desired.
 
 ## Local development
 

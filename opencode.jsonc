@@ -14,6 +14,9 @@
         "chunkTimeout": 30000,
       },
       "models": {
+        "collectiviq-claude": {
+          "name": "CollectivIQ Claude",
+        },
         "collectiviq-consensus": {
           "name": "CollectivIQ Consensus",
         },

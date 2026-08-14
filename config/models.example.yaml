@@ -9,6 +9,18 @@
 # not implemented in this foundation.
 
 models:
+  collectiviq-claude:
+    displayName: CollectivIQ Claude
+    selectedLlms:
+      - claude
+    generateCombined: false
+    answerSource: claude
+    toolMode: disabled
+    requestTimeoutMs: 90000
+    pollIntervalMs: 2000
+    maxPollIntervalMs: 5000
+    maximumPromptBytes: 6291456
+
   collectiviq-consensus:
     displayName: CollectivIQ Consensus
     selectedLlms:

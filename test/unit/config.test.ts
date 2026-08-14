@@ -72,8 +72,14 @@ describe("loadConfig — environment", () => {
     expect(config.LOG_CONTENT).toBe(false);
     expect(config.ENVIRONMENT).toBe("production");
     expect(config.COLLECTIVIQ_GATEWAY_KEYS).toEqual(["gw-fake-a", "gw-fake-b"]);
-    expect(config.models).toHaveLength(3);
+    expect(config.models).toHaveLength(4);
     expect(config.models.map((m) => m.id)).toContain("collectiviq-fast");
+    expect(config.models.find((m) => m.id === "collectiviq-claude")).toMatchObject({
+      selectedLlms: ["claude"],
+      generateCombined: false,
+      answerSource: "claude",
+      toolMode: "disabled",
+    });
   });
 
   it("preserves safe defaults (loopback, content logging off)", () => {
