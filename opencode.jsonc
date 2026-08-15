@@ -55,6 +55,26 @@
         "*": "deny",
       },
     },
+    // OpenCode's built-in hidden `title` agent generates a short session title
+    // with its own separate completion request. OpenCode invokes it conditionally
+    // — for a parentless/top-level session whose title is still the default,
+    // around its first real user message — not unconditionally at session start.
+    // Route it to `collectiviq-fast` (best-effort auxiliary path). The foreground
+    // and `small_model` selections stay Claude — the only source observed to
+    // answer for this account. This is a hidden auxiliary request distinct from
+    // the foreground release gate; the gateway adds no title-specific fallback,
+    // alternate-model probing, or retry, though OpenCode itself configures the
+    // title completion with `retries: 2`. If no usable title results, the session
+    // continues with the unchanged/default title. Because every completion creates
+    // a new upstream thread, the title request (plus any OpenCode retry) creates
+    // additional CollectivIQ thread(s) and cost — the observed smoke made one
+    // title thread and one foreground thread, a common case, not a fixed maximum.
+    // A deployment whose model catalog lacks `collectiviq-fast` gets the ordinary
+    // model-not-found behavior. This session title is unrelated to the fixed,
+    // content-free CollectivIQ upstream thread title.
+    "title": {
+      "model": "collectiviq/collectiviq-fast",
+    },
   },
   "default_agent": "collectiviq-text",
 
