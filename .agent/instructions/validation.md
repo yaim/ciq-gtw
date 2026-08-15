@@ -67,8 +67,10 @@ completion-flow tests for the `prepare`/`run` split and `stream` normalization.
 Separately, `npm run test:compatibility` (`test/compatibility/`) drives the pinned
 `ai` + `@ai-sdk/openai-compatible` SDK via `streamText`/`generateText` against an
 ephemeral loopback gateway with a **fake** completion — no CollectivIQ, no real
-credential, no network — and is excluded from `validate`/CI. No live upstream or
-OpenCode smoke run occurs.
+credential, no network — and is excluded from `validate`/CI. These automated
+suites run no live upstream or OpenCode smoke. (A separate user-observed live
+foreground OpenCode/CollectivIQ smoke was reported on 2026-08-15; live runs are
+never part of `validate`/CI and stay approval-gated.)
 
 **Phase 2 transport-remediation evidence (added by the streaming-review
 remediation).** New hermetic regressions in `test/unit/chat-stream-response.test.ts`

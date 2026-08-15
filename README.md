@@ -14,8 +14,18 @@ CollectivIQ, exposing a bounded OpenAI Chat Completions-compatible profile.
 > thread per request) that serves both the non-streamed JSON path and (Phase 2)
 > buffered synthetic SSE for `stream: true`. The completion path calls
 > CollectivIQ **only when a real request is served** — never during import,
-> construction, or the build smoke test — and the live OpenCode/CollectivIQ
-> smoke test is **not run** (pending separate approval). Streaming is
+> construction, or the build smoke test. A user-observed, sanitized live
+> OpenCode/CollectivIQ smoke result was reported on **2026-08-15**: the foreground
+> `collectiviq-claude` **transport** path worked (a response returned, synthetic
+> streaming completed, and OpenCode's auto-attached tool metadata was accepted and
+> discarded with no tool call emitted). The returned response, however, objected to
+> the gateway's serialized protocol wrapper as embedded identity/instruction
+> manipulation, so end-to-end **semantic** compatibility is **not** established — a
+> clean valid answer, a CollectivIQ _combined_ answer, a long-running keep-alive
+> streaming duration, and `collectiviq-fast` title generation are **not** verified
+> for this account and remain pending prompt-serialization remediation (a planned
+> `collectiviq-claude-direct` profile, not implemented here) and separate approval.
+> Streaming is
 > **synthetic** (the answer is obtained by polling, then split into deltas), not
 > true upstream streaming. It does **not** implement tool calling,
 > Redis/idempotency, or metrics/tracing; those remain planned per
@@ -66,8 +76,12 @@ CollectivIQ, exposing a bounded OpenAI Chat Completions-compatible profile.
   `process_message` retries), and polls `get_messages` under a total deadline with
   GET-only retry and desired-source selection. The non-streamed path encodes a
   JSON response with zero (unavailable) usage. Client disconnect, the total
-  deadline (`504`), and shutdown share one cancellation path. **The live smoke
-  test is not run** — see the status note above.
+  deadline (`504`), and shutdown share one cancellation path. The foreground
+  `collectiviq-claude` **transport** path was observed live on **2026-08-15**
+  (response returned, streaming completed, tool metadata discarded, no tool call);
+  the returned response objected to the gateway's serialized protocol wrapper, so a
+  clean end-to-end answer is **not** yet established — see the status note above;
+  further live runs remain approval-gated.
 - **Text-only synthetic SSE streaming (`stream: true`)** (Phase 2). The same
   route serves a buffered synthetic `text/event-stream`: it authenticates,
   validates, resolves the model, and prepares the prompt **before** committing
@@ -88,10 +102,15 @@ keep-alive` comments every 15 s while polling waits, deterministic
 
 ## What is not implemented yet
 
-`GET /metrics`, emulated/native tool calling, Redis/idempotency, and any live
-OpenCode/CollectivIQ smoke run. (Gateway authentication, the model endpoints, the
-non-streamed `POST /v1/chat/completions` path, and text-only synthetic SSE
-streaming are implemented — see "What works today".) Four authorized authenticated discovery baselines ran: two bearer-mode
+`GET /metrics`, emulated/native tool calling, and Redis/idempotency. (Gateway
+authentication, the model endpoints, the non-streamed `POST /v1/chat/completions`
+path, and text-only synthetic SSE streaming are implemented — see "What works
+today". A basic live OpenCode/CollectivIQ foreground **transport** smoke was
+observed on 2026-08-15, but the returned response objected to the gateway's
+serialized protocol wrapper, so a clean end-to-end valid answer is not yet
+established; a long-running streaming smoke, a combined answer, and
+`collectiviq-fast` title generation are likewise not yet verified for this
+account.) Four authorized authenticated discovery baselines ran: two bearer-mode
 runs (2026-08-06/07) **failed strict completeness (exited non-zero)**, and two
 `password`-mode runs (2026-08-11) **both passed (exited zero)** with identical
 sanitized safe facts. The core create/submit/messages contract and password
@@ -241,14 +260,47 @@ The committed `opencode.jsonc` ships a text-only default `collectiviq-text`
 primary agent with a wildcard permission `deny`. Denying permissions stops
 OpenCode from executing tools but does **not** stop it from sending tool
 definitions to the model, so the agent relies on the disabled-mode compatibility
-bridge above to discard that metadata. Its `model`, the top-level `model`, and
-`small_model` are all set to `collectiviq/collectiviq-claude` because that is the
-only source currently observed to answer for this account — non-Claude routing is
-blocked upstream (see the note below), not by any missing gateway model mapping;
-the `collectiviq-consensus`/`collectiviq-coder`/`collectiviq-fast` models remain
-declared for accounts whose routing supports non-Claude sources.
-The end-to-end OpenCode smoke test is **not run** in this repository and requires
-separate approval before any live CollectivIQ traffic.
+bridge above to discard that metadata. Its foreground `model`, the top-level
+`model`, and `small_model` are all set to `collectiviq/collectiviq-claude` because
+that is the only source currently observed to answer for this account — non-Claude
+routing is blocked upstream (see the note below), not by any missing gateway model
+mapping; the `collectiviq-consensus`/`collectiviq-coder`/`collectiviq-fast` models
+remain declared for accounts whose routing supports non-Claude sources.
+
+OpenCode also runs a built-in **hidden `title` agent** that generates a short
+session title with its own separate completion request. OpenCode invokes it
+**conditionally** — for a parentless/top-level session whose title is still the
+default, around its first real user message — not unconditionally at session
+start; the committed config routes it to `collectiviq/collectiviq-fast` as a
+best-effort auxiliary path. The gateway adds no title-specific fallback,
+alternate-model probing, or retry; OpenCode itself, however, configures the title
+completion with `retries: 2`. If title generation yields no usable title the
+foreground interaction still proceeds with the unchanged/default session title.
+Because **every** completion request creates a new CollectivIQ thread, the title
+request creates its own thread(s): the observed smoke made one title thread plus
+one foreground thread, but OpenCode's title `retries: 2` can create additional
+provider-side threads and cost, so a two-thread session is a common case, not a
+fixed maximum. Deploying operators must have `collectiviq-fast` in their model
+catalog (`config/models.yaml`); a missing model yields the ordinary
+model-not-found behavior. The generated OpenCode session title is **distinct**
+from the CollectivIQ upstream thread title: the gateway still performs exactly one
+`create_thread` per completion using the fixed, content-free
+`CollectivIQ Gateway request` title, and never forwards any prompt-derived or
+OpenCode-generated title upstream.
+
+A basic live foreground OpenCode/CollectivIQ **transport** smoke was observed on
+**2026-08-15** (`collectiviq-claude` response returned, synthetic streaming
+completed, tool metadata accepted and discarded with no tool call); the returned
+response objected to the gateway's serialized protocol wrapper as embedded
+identity/instruction manipulation, so a clean end-to-end valid answer is **not**
+established and remediation (a planned `collectiviq-claude-direct` profile, not
+implemented here) plus live re-verification are still required. `collectiviq-fast`
+title generation is **not yet verified live** and may be blocked account-side (see
+the note below); a long-running streaming smoke and a combined answer are likewise
+unverified. Any further live run requires separate approval before live
+CollectivIQ traffic, and a `collectiviq-fast` title smoke creates one or more
+additional upstream threads (OpenCode may retry it twice) and may incur provider
+cost.
 
 **Account-specific upstream routing limitation.** For the CollectivIQ account
 used during discovery, generic gateway prompts were classified by the account as

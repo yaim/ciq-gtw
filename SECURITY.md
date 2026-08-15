@@ -26,9 +26,14 @@ model surface, the Phase 1B non-streamed chat-completions path wired through the
 CollectivIQ adapter, and Phase 2 text-only synthetic SSE streaming
 (`stream: true`). Tool calling, Redis, and metrics/tracing are not implemented.
 The completion path calls CollectivIQ only
-when a real request is served (never during import/construction/build smoke), and
-the live OpenCode/CollectivIQ smoke test is **not run** (pending separate
-approval). The controls that exist today are:
+when a real request is served (never during import/construction/build smoke). A
+user-observed, sanitized live OpenCode/CollectivIQ foreground **transport** smoke
+was reported on **2026-08-15** (`collectiviq-claude` response returned, synthetic
+streaming completed, tool metadata accepted and discarded with no tool call); the
+returned response objected to the gateway's serialized protocol wrapper, so a
+clean end-to-end valid answer, a combined answer, a long-running streaming
+duration, and `collectiviq-fast` title generation remain unverified and any
+further live run is approval-gated. The controls that exist today are:
 
 - **Gateway client authentication (implemented).** Every route under `/v1/*` —
   today `GET /v1/models`, `GET /v1/models/:model`, and the implemented
@@ -169,8 +174,10 @@ approval). The controls that exist today are:
   aborts polling/upstream work and sends no body, and a shutdown cancellation
   (client still connected) maps to `503`. The completion serializes
   the prompt with a
-  content-free generic thread title (never derived from prompt/model/repo/file
-  data), measures the final prompt in UTF-8 bytes against the model's
+  content-free generic thread title (`CollectivIQ Gateway request`, never derived
+  from prompt/model/repo/file/user/response data — and distinct from any OpenCode
+  session title, which is never forwarded into `create_thread`), measures the
+  final prompt in UTF-8 bytes against the model's
   `maximumPromptBytes` (`context_length_exceeded` when exceeded), and never logs or
   persists the prompt or answer. `usage` is reported as zeros meaning
   **unavailable** (not estimates, not billing). The runtime upstream-credential
@@ -180,6 +187,15 @@ approval). The controls that exist today are:
   prompts and answers cross into CollectivIQ-managed storage; the gateway retains
   no prompt/answer content after the request completes, but provider-side
   retention/training/deletion/regional behavior remains **unknown** (see below).
+  The gateway performs exactly **one** `create_thread` per completion request;
+  OpenCode may issue an **additional** completion request per session — a hidden
+  `collectiviq-fast` title request, invoked conditionally around a new top-level
+  session's first user message and configured by OpenCode with `retries: 2`. The
+  observed smoke created one title thread plus one foreground thread; because each
+  completion (including each OpenCode title retry) creates a new upstream thread, a
+  session may create **two or more** upstream threads — additional auxiliary
+  latency, provider-side retention, and cost, but no change to the gateway's
+  per-request thread-creation or no-content-retention guarantees.
 - **Synthetic SSE streaming path (implemented; Phase 2).** `stream: true` reuses
   the same authenticated, bounded orchestration; authentication, validation,
   model resolution, and prompt preparation all complete **before** any SSE header
@@ -340,14 +356,20 @@ errorCode, resolved, resolution, persisted }] }` (no longer `succeeded`/
 
 ## Current limitations
 
-- `POST /v1/chat/completions` is implemented but the end-to-end live
-  OpenCode/CollectivIQ smoke test is **not run** (pending separate approval). No
+- `POST /v1/chat/completions` is implemented; a basic live foreground
+  **transport** smoke was observed on **2026-08-15** (`collectiviq-claude`
+  response returned, streaming completed, tool metadata discarded, no tool call).
+  The returned response objected to the gateway's serialized protocol wrapper, so
+  a clean end-to-end valid answer is **not** established; that, a combined answer,
+  a long-running streaming duration, and `collectiviq-fast` title generation are
+  **not** verified for this account, and any further live run is approval-gated. No
   live CollectivIQ request is made from this repository except when a real
   completion request is served against a configured upstream credential.
 - Tool calling and Redis/idempotency are not implemented; those requests are
   rejected or unavailable rather than silently degraded. Streaming
   (`stream: true`/SSE) is implemented as text-only buffered synthetic SSE, not
-  true upstream streaming, and the live streaming smoke test is not run.
+  true upstream streaming; a basic live stream completed on 2026-08-15, but the
+  long-running / keep-alive streaming smoke test is not run.
 - Capacity/backpressure is **process-local** — it does not coordinate across
   replicas. Cross-replica limits require shared state that does not yet exist.
 - No metrics endpoint is exposed.

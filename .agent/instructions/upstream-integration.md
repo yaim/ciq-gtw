@@ -132,7 +132,15 @@ GET-only retry, capped 1.25 backoff + jitter, and the documented duplicate-sourc
 selection. The runtime credential provider is built from validated config
 (`buildCredentialProviderFromConfig`, no env re-read; runtime logins are lazy and
 bounded per attempt). Normalized `UpstreamError`s map to public envelopes by
-closed category only (spec section 20). No live smoke run has been performed.
+closed category only (spec section 20). A user-observed, sanitized live foreground
+**transport** smoke was reported on **2026-08-15** (`collectiviq-claude` response
+returned, synthetic streaming completed, tool metadata accepted and discarded with
+no tool call), but the returned response objected to the gateway's serialized
+protocol wrapper, so a clean end-to-end valid answer is **not** established (the
+Phase 1 semantic exit criterion stays open pending a planned
+`collectiviq-claude-direct` prompt-serialization profile and live re-verification);
+a combined answer, a long-running streaming duration, and `collectiviq-fast` title
+generation likewise remain unverified and any further live run is approval-gated.
 
 Only the CollectivIQ adapter may know:
 
