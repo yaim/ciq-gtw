@@ -16,11 +16,23 @@
       // The consensus/coder/fast virtual models remain declared for accounts
       // whose CollectivIQ routing supports non-Claude sources. For THIS account,
       // upstream routing currently classifies generic gateway prompts as
-      // Atlassian queries and skips non-Claude sources, so only collectiviq-claude
-      // is observed to answer — hence the Claude-only defaults below.
+      // Atlassian queries and skips non-Claude sources, so only Claude sources
+      // are observed to answer — hence the Claude-only defaults below.
+      //
+      // collectiviq-claude-direct is a Claude source with promptMode: direct: it
+      // submits only the latest user-message content verbatim, WITHOUT the
+      // gateway protocol wrapper, JSON envelope, role labels, or any
+      // system/developer/assistant/earlier-user content. It is the foreground/
+      // small_model default because the account observed to reject the protocol
+      // wrapper as embedded identity/instruction manipulation; it is intentionally
+      // lossy (no system/developer instructions or conversation history) and is
+      // NOT yet verified live to fix that refusal.
       "models": {
         "collectiviq-claude": {
           "name": "CollectivIQ Claude",
+        },
+        "collectiviq-claude-direct": {
+          "name": "CollectivIQ Claude Direct",
         },
         "collectiviq-consensus": {
           "name": "CollectivIQ Consensus",
@@ -48,9 +60,9 @@
   // (Phase 3).
   "agent": {
     "collectiviq-text": {
-      "description": "Text-only CollectivIQ agent (Claude source; no tools; Phase 2 SSE).",
+      "description": "Text-only CollectivIQ agent (Claude direct source; no tools; Phase 2 SSE).",
       "mode": "primary",
-      "model": "collectiviq/collectiviq-claude",
+      "model": "collectiviq/collectiviq-claude-direct",
       "permission": {
         "*": "deny",
       },
@@ -59,9 +71,10 @@
     // with its own separate completion request. OpenCode invokes it conditionally
     // — for a parentless/top-level session whose title is still the default,
     // around its first real user message — not unconditionally at session start.
-    // Route it to `collectiviq-fast` (best-effort auxiliary path). The foreground
-    // and `small_model` selections stay Claude — the only source observed to
-    // answer for this account. This is a hidden auxiliary request distinct from
+    // Route it to `collectiviq-fast` (best-effort auxiliary path). Title stays on
+    // the protocol-mode fast model; only the foreground and `small_model`
+    // selections move to the Claude direct profile. This is a hidden auxiliary
+    // request distinct from
     // the foreground release gate; the gateway adds no title-specific fallback,
     // alternate-model probing, or retry, though OpenCode itself configures the
     // title completion with `retries: 2`. If no usable title results, the session
@@ -78,9 +91,12 @@
   },
   "default_agent": "collectiviq-text",
 
-  // Claude is the committed default for foreground and hidden (small_model) work
-  // because it is the only source currently observed to answer for this account.
-  "model": "collectiviq/collectiviq-claude",
-  "small_model": "collectiviq/collectiviq-claude",
+  // The Claude direct profile is the committed default for foreground and hidden
+  // (small_model) work: Claude is the only source observed to answer for this
+  // account, and the direct prompt profile drops the gateway protocol wrapper the
+  // account objected to. It is intentionally lossy (no system/developer
+  // instructions or conversation history) and is not yet verified live.
+  "model": "collectiviq/collectiviq-claude-direct",
+  "small_model": "collectiviq/collectiviq-claude-direct",
   "share": "disabled",
 }
