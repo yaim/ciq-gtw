@@ -212,9 +212,14 @@ unverified, as is token lifetime/refresh.
   verified routing override for that classification, and the filtered OpenAPI
   snapshot exposes **no** documented generic/non-Atlassian routing field. So for
   this account only `claude` is currently observed to answer, and the gateway
-  cannot claim verified GPT/Gemini/Grok execution for it — hence
-  `collectiviq-claude` is the committed OpenCode default (see specification
-  section 34.7 and `opencode.jsonc`). This is a value-free, account-specific
+  cannot claim verified GPT/Gemini/Grok execution for it — hence the committed
+  OpenCode foreground/top-level/`small_model` default for this account is
+  `collectiviq-claude-direct`, a Claude-only source selection whose
+  `promptMode: "direct"` drops the protocol wrapper this account objected to;
+  `collectiviq-claude` remains available as the protocol-mode Claude alternative.
+  Direct mode is implemented offline but is **not yet verified live** to resolve
+  that semantic refusal (see specification sections 25, 34.7, and 36, and
+  `opencode.jsonc`). This is a value-free, account-specific
   note (no live response text, prompt, Jira identifier, thread id, or model
   answer is recorded) and does **not** generalize to every account; a supported
   generic-routing mechanism remains an open provider question (specification
