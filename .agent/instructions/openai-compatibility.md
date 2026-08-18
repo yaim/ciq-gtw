@@ -70,6 +70,21 @@ streaming) remain planned (Phase 3).
 - Reject malformed prior tool-call/tool-result relationships when the supported schema requires a link.
 - Use deterministic serialization so fixtures and retries of pure stages reproduce identical prompts except intentionally randomized boundary data.
 
+**Prompt mode.** Serializer selection is model-policy-aware, driven by the resolved
+model's normalized `promptMode` (never a model-id string): `protocol` (default) is
+the full-history `COLLECTIVIQ GATEWAY PROTOCOL` header + versioned JSON envelope
+(`src/prompts/conversation.ts`, byte-for-byte stable); `direct`
+(`src/prompts/direct.ts`) submits ONLY the latest normalized `user`-role message
+content, verbatim, with no header, envelope, markers, role labels, or other
+messages. All the preservation requirements above apply to `protocol` mode; the
+`direct` profile is a narrowly scoped, intentionally lossy exception (spec §8.4.1)
+used only for the account-specific `collectiviq-claude-direct` compatibility model.
+A `direct` request with no user-role message is rejected at the model-aware
+validation boundary with a fixed `400` (`param: "messages"`, `code:
+"invalid_request"`) before prompt construction, capacity, upstream work, or any SSE
+header. Prompt-size enforcement (§11.2.1) measures the final SELECTED prompt, so in
+direct mode only the latest-user content counts toward `maximumPromptBytes`.
+
 ## Response Encoding
 
 - Text responses use assistant content and `finish_reason: "stop"`.

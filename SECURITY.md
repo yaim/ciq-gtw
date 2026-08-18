@@ -33,7 +33,11 @@ streaming completed, tool metadata accepted and discarded with no tool call); th
 returned response objected to the gateway's serialized protocol wrapper, so a
 clean end-to-end valid answer, a combined answer, a long-running streaming
 duration, and `collectiviq-fast` title generation remain unverified and any
-further live run is approval-gated. The controls that exist today are:
+further live run is approval-gated. The `collectiviq-claude-direct` profile
+(`promptMode: direct`, latest-user-only prompt) is now implemented offline as the
+mitigation and is the committed default, but it is not yet verified live and must
+not be claimed to fix the refusal until a separately approved live smoke confirms
+it. The controls that exist today are:
 
 - **Gateway client authentication (implemented).** Every route under `/v1/*` —
   today `GET /v1/models`, `GET /v1/models/:model`, and the implemented
@@ -177,9 +181,19 @@ further live run is approval-gated. The controls that exist today are:
   content-free generic thread title (`CollectivIQ Gateway request`, never derived
   from prompt/model/repo/file/user/response data — and distinct from any OpenCode
   session title, which is never forwarded into `create_thread`), measures the
-  final prompt in UTF-8 bytes against the model's
+  final SELECTED prompt in UTF-8 bytes against the model's
   `maximumPromptBytes` (`context_length_exceeded` when exceeded), and never logs or
-  persists the prompt or answer. `usage` is reported as zeros meaning
+  persists the prompt or answer. Prompt serialization is chosen from the resolved
+  model's normalized `promptMode` (never a model-id string): `protocol` (default)
+  serializes the full ordered conversation in the versioned envelope, while `direct`
+  submits ONLY the latest user message content — dropping the protocol wrapper,
+  system/developer instructions, and conversation history. Direct mode is
+  prompt-content minimization for an account-specific compatibility need, **not**
+  prompt-injection prevention (the collapsed single-`prompt` trust boundary is
+  unchanged), and it enforces the byte limit against only that selected content; a
+  `direct` request with no user message is rejected with a fixed content-free `400`
+  before any upstream call. Both modes keep the same no-content-logging /
+  no-retention posture. `usage` is reported as zeros meaning
   **unavailable** (not estimates, not billing). The runtime upstream-credential
   provider is built from already-validated config (`buildCredentialProviderFromConfig`)
   and never re-reads `process.env`; construction opens no socket and performs no

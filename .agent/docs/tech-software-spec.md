@@ -409,12 +409,34 @@ interface VirtualModel {
   generateCombined: boolean;
   answerSource: string;
   toolMode: "disabled" | "emulated" | "native";
+  promptMode: "protocol" | "direct";
   requestTimeoutMs: number;
   pollIntervalMs: number;
   maxPollIntervalMs: number;
   maximumPromptBytes: number;
 }
 ```
+
+`promptMode` selects prompt serialization (section 8.4) and is OPTIONAL in the
+model-configuration file: an omitted field is normalized to `protocol` when the
+model loads, so existing model files keep the full-history serializer unchanged.
+The loaded internal `VirtualModel` always carries an explicit `promptMode`, and
+prompt behaviour is driven from this validated field — never from a model-id
+string comparison. `promptMode` is internal execution policy: it is never
+exposed in the public `GET /v1/models` objects.
+
+- `protocol` (default): the normative full-history serializer — the fixed
+  `COLLECTIVIQ GATEWAY PROTOCOL` header framing a versioned JSON envelope of the
+  ENTIRE ordered conversation with declared roles (section 8.4 / 11.1).
+- `direct`: an account-specific, intentionally LOSSY compatibility profile that
+  submits ONLY the latest normalized `user`-role message content, verbatim, with
+  no protocol header, JSON envelope, role labels, markers, prefixes, suffixes, or
+  other conversation messages. It deliberately omits system/developer
+  instructions, assistant history, and every earlier user turn. It is NOT a
+  role-preserving Chat Completions translation and MUST NOT be described as
+  prompt-injection prevention (section 8.4). It exists to reduce the observed
+  semantic-refusal trigger (section 32, Phase 1; section 34.7) for an account
+  that rejected the protocol wrapper.
 
 ### 8.4 Conversation Serializer
 
@@ -496,6 +518,39 @@ Example:
 ```
 
 The JSON must be inserted inside a versioned control prompt.
+
+#### 8.4.1 Prompt-mode selection (protocol vs direct)
+
+The serializer is selected per request from the resolved model's normalized
+`promptMode` (section 8.3), never from a model-id string.
+
+- **`protocol` (default) — normative full-history serialization.** All of the
+  preservation requirements above (message order, role, tool-call ID/name/
+  arguments/result, and system/developer instruction precedence) and the
+  versioned JSON envelope apply to `protocol` mode. This is the standard behaviour
+  for every virtual model and is byte-for-byte stable.
+- **`direct` — narrowly scoped, intentionally lossy exception.** A
+  `promptMode: "direct"` model submits ONLY the content of the last normalized
+  `user`-role message, verbatim (the normalized content string), and adds
+  nothing: no `COLLECTIVIQ GATEWAY PROTOCOL` header, no version/mode line, no JSON
+  envelope, no `BEGIN_CONVERSATION_JSON`/`END_CONVERSATION_JSON` markers, no role
+  label, and no surrounding whitespace/prefix/suffix. It OMITS all system,
+  developer, and assistant messages and every earlier user turn. An empty latest
+  user message yields an empty direct prompt. A direct-mode request with **no**
+  user-role message is rejected at the model-aware request-validation boundary
+  (section 9.4) with a fixed, content-free `400 invalid_request_error`
+  (`param: "messages"`, `code: "invalid_request"`) **before** prompt construction,
+  capacity acquisition, thread creation, submission, or any SSE header.
+
+The `direct` profile deliberately discards system/developer instructions, prior
+user turns, and assistant history, so it is NOT a role-preserving Chat Completions
+translation and may produce context-poor or behaviorally different answers. It
+removes the protocol wrapper and all non-latest-user content — which is what the
+observed account objected to (section 32, Phase 1; section 34.7) — but this is
+prompt-content minimization, NOT prompt-injection prevention: the collapsed
+single-`prompt` trust boundary (section 34.2) is unchanged. Prompt-size
+enforcement (section 11.2.1) applies to the final SELECTED prompt, so in direct
+mode only the latest-user content counts toward `maximumPromptBytes`.
 
 ### 8.5 CollectivIQ Adapter
 
@@ -2396,6 +2451,9 @@ Recommended OpenCode configuration:
         "collectiviq-claude": {
           "name": "CollectivIQ Claude"
         },
+        "collectiviq-claude-direct": {
+          "name": "CollectivIQ Claude Direct"
+        },
         "collectiviq-consensus": {
           "name": "CollectivIQ Consensus"
         },
@@ -2408,8 +2466,8 @@ Recommended OpenCode configuration:
       }
     }
   },
-  "model": "collectiviq/collectiviq-claude",
-  "small_model": "collectiviq/collectiviq-claude",
+  "model": "collectiviq/collectiviq-claude-direct",
+  "small_model": "collectiviq/collectiviq-claude-direct",
   "share": "disabled"
 }
 ```
@@ -2423,9 +2481,16 @@ stops OpenCode from EXECUTING tools but does not stop it from SENDING tool
 definitions to the model, so the agent depends on the disabled-mode
 tool-metadata compatibility bridge (section 9.4.4, Phase 2.1) to discard that
 metadata rather than on OpenCode withholding it. The foreground agent `model`, the
-top-level `model`, and `small_model` are all `collectiviq/collectiviq-claude`
-because that is the only source currently observed to answer for the discovery
-account (non-Claude routing is blocked account-side; see section 34.7).
+top-level `model`, and `small_model` are all `collectiviq/collectiviq-claude-direct`
+— a Claude source (the only source currently observed to answer for the discovery
+account; non-Claude routing is blocked account-side, see section 34.7) using
+`promptMode: "direct"` (section 8.3/8.4), which submits only the latest user
+message content without the gateway protocol wrapper the account objected to
+(section 32, Phase 1). This profile is intentionally lossy (no system/developer
+instructions or conversation history) and is **not yet verified live** to fix the
+refusal; the protocol-mode `collectiviq-claude` model stays declared alongside it.
+The hidden `title` agent stays on the protocol-mode `collectiviq-fast` model
+(below).
 
 OpenCode also runs a **built-in hidden `title` agent** that generates a short
 session title with its **own separate completion request**. OpenCode invokes it
@@ -2451,17 +2516,17 @@ title is ever forwarded into `create_thread`.
 {
   "agent": {
     "collectiviq-text": {
-      "description": "Text-only CollectivIQ agent (Claude source; no tools; Phase 2 SSE).",
+      "description": "Text-only CollectivIQ agent (Claude direct source; no tools; Phase 2 SSE).",
       "mode": "primary",
-      "model": "collectiviq/collectiviq-claude",
+      "model": "collectiviq/collectiviq-claude-direct",
       "permission": { "*": "deny" }
     },
-    // Hidden built-in title agent → best-effort auxiliary fast path.
+    // Hidden built-in title agent → best-effort auxiliary fast path (protocol mode).
     "title": { "model": "collectiviq/collectiviq-fast" }
   },
   "default_agent": "collectiviq-text",
-  "model": "collectiviq/collectiviq-claude",
-  "small_model": "collectiviq/collectiviq-claude"
+  "model": "collectiviq/collectiviq-claude-direct",
+  "small_model": "collectiviq/collectiviq-claude-direct"
 }
 ```
 
@@ -2991,11 +3056,15 @@ and no tool call was emitted or executed). However, the returned model response
 **objected to the gateway's serialized protocol wrapper as embedded
 identity/instruction manipulation**, so end-to-end **semantic** compatibility is
 **not** established. The Phase 1 valid-answer / semantic exit criterion therefore
-**remains open**, pending prompt-serialization remediation (a planned
-`collectiviq-claude-direct` profile — named here as follow-up, **not** implemented
-in this change) and live re-verification. Production hardening (idempotency,
-retention/training/deletion confirmation, metrics/tracing, rate/quota limits) also
-remains, so Phase 1 is not complete or production-ready.
+**remains open**. The prompt-serialization remediation — the
+`collectiviq-claude-direct` profile (`promptMode: "direct"`, section 8.3/8.4;
+latest-user-only prompt with no protocol wrapper) — is now **implemented offline**
+and is the committed OpenCode foreground/`small_model` default (section 25), but it
+is **not yet verified live**: only a separately approved successful live smoke can
+close this criterion, and the profile must not be claimed to fix the refusal until
+then. Production hardening (idempotency, retention/training/deletion confirmation,
+metrics/tracing, rate/quota limits) also remains, so Phase 1 is not complete or
+production-ready.
 
 **Phase 1A — implemented (offline, no live CollectivIQ call):**
 
@@ -3073,9 +3142,12 @@ Exit criterion (capability-aware):
   metadata accepted and discarded, no tool call), but the returned response
   objected to the gateway's serialized protocol wrapper as embedded
   identity/instruction manipulation, so a clean end-to-end **valid answer** was
-  **not** established. Closing this criterion requires prompt-serialization
-  remediation (planned `collectiviq-claude-direct` profile, not implemented here)
-  and live re-verification. A CollectivIQ *combined* answer additionally remains
+  **not** established. The prompt-serialization remediation
+  (`collectiviq-claude-direct`, `promptMode: "direct"`) is now **implemented
+  offline** and is the committed default (section 25), but closing this criterion
+  still requires a separately approved successful **live** re-verification; until
+  then the direct profile must not be claimed to fix the refusal. A CollectivIQ
+  *combined* answer additionally remains
   **conditional on account capability** and is **not verified** for this account
   (non-Claude routing is blocked account-side; see section 34.7), so a combined
   answer is not required to close this criterion.
@@ -3135,9 +3207,12 @@ automatically even when all tool permissions are denied:
   structure, or unsupported value anywhere; and any tool metadata against an
   `emulated`/`native` model are rejected with the stable `unsupported_parameter`
   `400`.
-* `collectiviq-claude` is the committed OpenCode default (foreground and
-  `small_model`) because non-Claude routing is blocked account-side (section
-  34.7).
+* `collectiviq-claude-direct` (a Claude source with `promptMode: "direct"`, section
+  8.3/8.4) is the committed OpenCode foreground/`small_model` default because
+  non-Claude routing is blocked account-side (section 34.7) and the account
+  objected to the protocol wrapper (Phase 1, above); the hidden `title` agent
+  stays on the protocol-mode `collectiviq-fast`. The tool-bridge behaviour is
+  unchanged by prompt mode.
 * Hermetic unit/integration/contract coverage plus the pinned-SDK compatibility
   suite (a real function tool + `toolChoice: "auto"` through streamed and
   non-streamed paths, asserting ordinary text, `finish_reason: "stop"`, and no
@@ -3200,7 +3275,7 @@ Possible work:
 The initial gateway release is accepted when:
 
 1. OpenCode lists all configured CollectivIQ virtual models.
-2. OpenCode can select the committed default `collectiviq/collectiviq-claude` (the only source currently observed to answer for the discovery account; see section 34.7).
+2. OpenCode can select the committed default `collectiviq/collectiviq-claude-direct` (a Claude source using `promptMode: "direct"`; Claude is the only source currently observed to answer for the discovery account, and the direct profile drops the protocol wrapper the account objected to — see sections 8.4 and 34.7).
 3. A plain user prompt produces the configured CollectivIQ answer.
 4. The gateway creates exactly one upstream thread per request.
 5. The gateway sends the correct `selected_llms` value.
@@ -3216,7 +3291,7 @@ The initial gateway release is accepted when:
 15. Unsupported multimodal input returns `400`.
 16. Health and readiness endpoints work.
 17. Docker binds only to host loopback in the provided configuration.
-18. The OpenCode configuration in this specification passes an end-to-end smoke test. **Not yet fully passed (as of 2026-08-15):** the foreground `collectiviq-claude` **transport** path was observed live (response returned, streaming completed, tool metadata accepted and discarded with no tool call), but the returned response objected to the gateway's serialized protocol wrapper as embedded identity/instruction manipulation, so end-to-end **semantic** compatibility is not established and this item stays open pending prompt-serialization remediation (planned `collectiviq-claude-direct` profile) and live re-verification. Capability-aware: a combined answer and `collectiviq-fast` title generation are also not verified for the discovery account.
+18. The OpenCode configuration in this specification passes an end-to-end smoke test. **Not yet fully passed (as of 2026-08-15):** the foreground `collectiviq-claude` **transport** path was observed live (response returned, streaming completed, tool metadata accepted and discarded with no tool call), but the returned response objected to the gateway's serialized protocol wrapper as embedded identity/instruction manipulation, so end-to-end **semantic** compatibility is not established and this item stays open pending live re-verification. The prompt-serialization remediation (the `collectiviq-claude-direct` `promptMode: "direct"` profile) is now implemented offline and is the committed default, but it is not yet verified live and must not be claimed to fix the refusal until a separately approved live smoke confirms it. Capability-aware: a combined answer and `collectiviq-fast` title generation are also not verified for the discovery account.
 19. The service recovers from a CollectivIQ outage without restart.
 20. Tool support is labeled experimental until its separate release gates are met.
 
@@ -3248,6 +3323,15 @@ Mitigation:
 * OpenCode permission prompts;
 * adversarial testing;
 * eventual native role support.
+
+These mitigations apply to `promptMode: "protocol"`. The `promptMode: "direct"`
+profile (sections 8.3/8.4) is an even STRONGER collapse: it discards the
+structured serialization and precedence instructions entirely and submits only
+the latest user message, so system/developer instructions, assistant history, and
+prior user turns are lost. That is an accepted, account-specific trade-off to get
+a usable answer where the protocol wrapper is rejected (section 34.7) — it is
+prompt-content minimization, NOT a restored trust boundary and NOT prompt-injection
+prevention.
 
 ### 34.3 High latency
 
@@ -3309,8 +3393,12 @@ answer is recorded) and does **not** generalize to every account.
 
 Mitigation:
 
-* `collectiviq-claude` is the committed OpenCode default for the foreground agent
-  `model`, top-level `model`, and `small_model`;
+* `collectiviq-claude-direct` (a Claude source with `promptMode: "direct"`) is the
+  committed OpenCode default for the foreground agent `model`, top-level `model`,
+  and `small_model` — it keeps the account-supported Claude routing while dropping
+  the protocol wrapper the account objected to (Phase 1); it is intentionally lossy
+  (no system/developer instructions or conversation history) and is not yet
+  verified live. The protocol-mode `collectiviq-claude` model stays declared;
 * OpenCode's hidden `title` agent is routed to `collectiviq-fast` as a best-effort
   auxiliary path (section 25), invoked conditionally by OpenCode around a new
   top-level session's first user message rather than unconditionally. Because
@@ -3439,20 +3527,44 @@ OpenCode
   → @ai-sdk/openai-compatible
   → CollectivIQ Gateway /v1/chat/completions
   → new CollectivIQ thread for each request
-  → full conversation serialized into one prompt
-  → configured multi-model execution
+  → prompt selected from the resolved model's validated promptMode
+      (protocol → full ordered conversation in the versioned gateway envelope;
+       direct → latest normalized user-message content only, no wrapper)
+  → upstream execution per the configured source policy
+      (single-source, or combined/multi-source)
   → polling for desired answer source
   → strict response/tool parsing
   → OpenAI-compatible response
 ```
 
-For the currently configured discovery account, the committed OpenCode default virtual model is:
+Prompt construction is selected from the resolved virtual model's validated
+`promptMode` (section 8.3/8.4), never from its model ID. `protocol` serializes the
+full ordered conversation in the existing versioned gateway envelope; `direct`
+serializes only the latest normalized user-message content, intentionally omitting
+the protocol wrapper and every other conversation message. `direct` is
+intentionally lossy (it drops system/developer instructions and conversation
+history) and is prompt-content minimization, NOT prompt-injection prevention
+(sections 8.4.1, 34.2). Upstream execution follows the configured source policy and
+may be single-source or combined/multi-source.
+
+For the currently configured discovery account, the committed OpenCode
+foreground/top-level/`small_model` default virtual model is:
 
 ```text
-collectiviq-claude
+collectiviq-claude-direct
 ```
 
-For accounts whose routing supports non-Claude sources, `collectiviq-consensus` remains available as the multi-source option and `collectiviq-fast` as the lower-latency option. Neither is the committed default for this account.
+`collectiviq-claude-direct` is a Claude source using `promptMode: "direct"`: Claude
+is the only source currently observed to answer for this account (section 34.7),
+and the direct profile drops the protocol wrapper that account objected to (section
+32, Phase 1). It is implemented offline and is **not yet verified live** to fix that
+refusal, so Phase 1's valid-answer / semantic exit criterion **remains open**.
+`collectiviq-claude` remains available as the protocol-mode Claude profile. For
+accounts whose routing supports non-Claude sources, `collectiviq-consensus` remains
+available as the multi-source option, `collectiviq-coder` as the coding-oriented
+option, and `collectiviq-fast` as the lower-latency option; the hidden OpenCode
+title agent stays on protocol-mode `collectiviq-fast` (section 25). None of these is
+the committed foreground default for this account.
 
 Tool calling shall be implemented behind:
 

@@ -47,7 +47,7 @@ Thread titles and request metadata must be generic. Do not derive them from prom
 
 - Validate raw client, config-file, tool-schema, tool-argument, Redis, and upstream data at their boundaries.
 - Enforce byte limits before retaining or parsing large bodies where possible.
-- Treat prompt boundaries as ambiguity mitigation, not an authorization boundary.
+- Treat prompt boundaries as ambiguity mitigation, not an authorization boundary. The `promptMode: "direct"` profile (spec §8.4.1) removes the protocol wrapper and all non-latest-user content — this is prompt-content minimization for an account-specific compatibility need, NOT prompt-injection prevention; the collapsed single-`prompt` trust boundary is unchanged. It is intentionally lossy (drops system/developer instructions and conversation history). Like protocol mode, the direct serialized prompt is never logged or persisted; keep content confidentiality and default no-retention identical for both modes.
 - Allowlist tool names and validate exact schemas; OpenCode permission checks remain mandatory.
 - Use OpenAI-style sanitized errors externally and structured bounded categories internally.
 - Avoid dangerous dynamic behavior: no evaluation of generated code, no shell execution, no arbitrary module loading, and no gateway-side tools.

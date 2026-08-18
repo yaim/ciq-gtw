@@ -47,12 +47,23 @@ adapter is wired into `POST /v1/chat/completions` via
 and polls `get_messages` under the model's total deadline with GET-only retry and
 the timestamp → sortable-id → array-position selection above. Normalized
 `UpstreamError`s map to public OpenAI envelopes by closed category only (spec
-section 20). **No new live evidence is asserted** — no live CollectivIQ request is
-made from this repository except when a real completion is served, and the live
-OpenCode smoke test is not run. Because each completion sends the prompt into a
-new CollectivIQ-managed thread, provider-side retention/training/deletion/regional
-behavior remains a **production/provider-confirmation gate**, unchanged by this
-phase; the gateway itself retains no prompt/answer content after the request.
+section 20). **No new live evidence is asserted here.** The only live evidence
+that exists is the earlier user-observed, sanitized **2026-08-15** foreground
+transport smoke: the `collectiviq-claude` request returned a response and
+synthetic streaming completed, but the returned model response **objected to the
+gateway's serialized protocol wrapper as embedded identity/instruction
+manipulation**, so a clean end-to-end valid answer was **not** established (spec
+section 32, Phase 1 exit criterion — still open). No live CollectivIQ request is
+made from this repository except when a real completion is served, and no new
+live OpenCode smoke has been run since. The offline `collectiviq-claude-direct`
+prompt-serialization profile (specification section 8.4; latest-user-only prompt,
+no protocol wrapper) is now **implemented** as the mitigation for that refusal but
+is **not yet verified live** — it must not be claimed to fix the refusal until a
+separately approved live smoke confirms it. Because each completion sends the
+prompt into a new CollectivIQ-managed thread, provider-side
+retention/training/deletion/regional behavior remains a
+**production/provider-confirmation gate**, unchanged by this phase; the gateway
+itself retains no prompt/answer content after the request.
 
 **Phase 0 text-readiness gate — satisfied.** The verified-repeatable
 login/create/submit/messages contract is sufficient to **enter Phase 1

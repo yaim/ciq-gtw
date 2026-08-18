@@ -137,10 +137,13 @@ closed category only (spec section 20). A user-observed, sanitized live foregrou
 returned, synthetic streaming completed, tool metadata accepted and discarded with
 no tool call), but the returned response objected to the gateway's serialized
 protocol wrapper, so a clean end-to-end valid answer is **not** established (the
-Phase 1 semantic exit criterion stays open pending a planned
-`collectiviq-claude-direct` prompt-serialization profile and live re-verification);
-a combined answer, a long-running streaming duration, and `collectiviq-fast` title
-generation likewise remain unverified and any further live run is approval-gated.
+Phase 1 semantic exit criterion stays open; the `collectiviq-claude-direct`
+prompt-serialization profile — `promptMode: "direct"`, latest-user-only prompt with
+no protocol wrapper — is now **implemented offline** and is the committed OpenCode
+default, but it is **not yet verified live** and must not be claimed to fix the
+refusal until a separately approved live smoke confirms it); a combined answer, a
+long-running streaming duration, and `collectiviq-fast` title generation likewise
+remain unverified and any further live run is approval-gated.
 
 Only the CollectivIQ adapter may know:
 

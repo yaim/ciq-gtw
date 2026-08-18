@@ -64,7 +64,7 @@ Observability records metadata around each stage without taking ownership of dom
 
 ### Prompt and tool policy
 
-- `src/prompts/` owns deterministic, versioned conversation and control-prompt construction.
+- `src/prompts/` owns deterministic prompt construction: the versioned full-history conversation/control prompt (`conversation.ts`, `promptMode: "protocol"`), the latest-user-only direct prompt (`direct.ts`, `promptMode: "direct"`), and the model-policy-aware selector (`serializer.ts`) that dispatches on the validated `promptMode` — never a model-id string.
 - `src/tools/` owns the emulated protocol envelope, JSON/schema validation, canonicalization, candidate voting, and call-ID generation policy.
 - Neither area executes tools.
 
@@ -90,7 +90,7 @@ Keep raw public and upstream payload types at their boundaries. Do not pass arbi
 ## State and Lifecycle Invariants
 
 - One public completion maps to one new upstream thread.
-- The full conversation is serialized on every completion request.
+- The full conversation is serialized on every completion request for `promptMode: "protocol"` models (the default). The `promptMode: "direct"` compatibility profile is the one exception — it serializes only the latest user message and intentionally drops the rest (spec §8.4.1) — and must not be generalized to protocol models.
 - A concurrency permit covers thread creation through parsing and cleanup.
 - Client abort and total deadline share a cancellation path that stops polling and releases resources.
 - A public response is encoded only from a validated parsed generation.

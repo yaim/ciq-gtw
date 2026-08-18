@@ -23,8 +23,11 @@ CollectivIQ, exposing a bounded OpenAI Chat Completions-compatible profile.
 > manipulation, so end-to-end **semantic** compatibility is **not** established — a
 > clean valid answer, a CollectivIQ _combined_ answer, a long-running keep-alive
 > streaming duration, and `collectiviq-fast` title generation are **not** verified
-> for this account and remain pending prompt-serialization remediation (a planned
-> `collectiviq-claude-direct` profile, not implemented here) and separate approval.
+> for this account. The prompt-serialization remediation — a `collectiviq-claude-direct`
+> virtual model using `promptMode: direct` (latest-user-only prompt, no protocol
+> wrapper) — is now **implemented offline** and is the committed OpenCode default,
+> but it is **not yet verified live** to fix the refusal and closing that criterion
+> still needs separate approval for a live smoke.
 > Streaming is
 > **synthetic** (the answer is obtained by polling, then split into deltas), not
 > true upstream streaming. It does **not** implement tool calling,
@@ -141,13 +144,28 @@ npm ci
 Both `.env` and `config/models.yaml` are git-ignored. All example credentials
 are unmistakably fake placeholders — replace them with your own and never commit
 real secrets. The model IDs and source names in the example
-(`collectiviq-claude`, `collectiviq-consensus`, `collectiviq-coder`,
-`collectiviq-fast`, and the `selectedLlms` entries) are configurable examples
-only; they are not verified against any CollectivIQ account and carry no
-context-window or token-limit claims. `collectiviq-claude` is the single-source
-text policy (`selectedLlms: [claude]`, `generateCombined: false`,
+(`collectiviq-claude`, `collectiviq-claude-direct`, `collectiviq-consensus`,
+`collectiviq-coder`, `collectiviq-fast`, and the `selectedLlms` entries) are
+configurable examples only; they are not verified against any CollectivIQ account
+and carry no context-window or token-limit claims. `collectiviq-claude` is the
+single-source text policy (`selectedLlms: [claude]`, `generateCombined: false`,
 `answerSource: claude`); select it explicitly when a combined response is not
 desired.
+
+Each model may set an optional `promptMode`: `protocol` (default when omitted)
+serializes the full ordered conversation inside the versioned `COLLECTIVIQ GATEWAY
+PROTOCOL` envelope, while `direct` submits **only** the latest user message content
+verbatim — no protocol header, no JSON envelope, no role labels, and none of the
+system/developer/assistant/earlier-user messages. `direct` is intentionally lossy
+(it discards system/developer instructions and conversation history) and exists as
+an account-specific compatibility profile for `collectiviq-claude-direct`; it is
+**not** a role-preserving translation and **not** prompt-injection prevention.
+
+Because the committed `opencode.jsonc` now defaults the foreground and `small_model`
+selections to `collectiviq/collectiviq-claude-direct`, **you must add the
+`collectiviq-claude-direct` model to your local `config/models.yaml` manually**
+(copy the block from `config/models.example.yaml`) before that default resolves —
+the local model file is git-ignored and is not updated by this change.
 
 ## Local development
 
@@ -261,11 +279,17 @@ primary agent with a wildcard permission `deny`. Denying permissions stops
 OpenCode from executing tools but does **not** stop it from sending tool
 definitions to the model, so the agent relies on the disabled-mode compatibility
 bridge above to discard that metadata. Its foreground `model`, the top-level
-`model`, and `small_model` are all set to `collectiviq/collectiviq-claude` because
-that is the only source currently observed to answer for this account — non-Claude
-routing is blocked upstream (see the note below), not by any missing gateway model
-mapping; the `collectiviq-consensus`/`collectiviq-coder`/`collectiviq-fast` models
-remain declared for accounts whose routing supports non-Claude sources.
+`model`, and `small_model` are all set to `collectiviq/collectiviq-claude-direct`
+— a Claude source (the only source currently observed to answer for this account;
+non-Claude routing is blocked upstream, see the note below) using
+`promptMode: direct`, which submits only the latest user message without the
+gateway protocol wrapper the account objected to. This profile is intentionally
+lossy (no system/developer instructions or conversation history) and is **not yet
+verified live** to fix the refusal. The hidden `title` agent stays on the
+protocol-mode `collectiviq-fast`. The protocol-mode `collectiviq-claude` and the
+`collectiviq-consensus`/`collectiviq-coder`/`collectiviq-fast` models remain
+declared. **Add `collectiviq-claude-direct` to your local `config/models.yaml`
+manually** (git-ignored) before this default resolves.
 
 OpenCode also runs a built-in **hidden `title` agent** that generates a short
 session title with its own separate completion request. OpenCode invokes it
@@ -293,8 +317,11 @@ A basic live foreground OpenCode/CollectivIQ **transport** smoke was observed on
 completed, tool metadata accepted and discarded with no tool call); the returned
 response objected to the gateway's serialized protocol wrapper as embedded
 identity/instruction manipulation, so a clean end-to-end valid answer is **not**
-established and remediation (a planned `collectiviq-claude-direct` profile, not
-implemented here) plus live re-verification are still required. `collectiviq-fast`
+established. The remediation — the `collectiviq-claude-direct` profile
+(`promptMode: direct`) — is now **implemented offline** and is the committed
+OpenCode default, but it is **not yet verified live** to fix the refusal; closing
+the criterion still requires a separately approved live re-verification and the
+profile must not be claimed to fix the refusal until then. `collectiviq-fast`
 title generation is **not yet verified live** and may be blocked account-side (see
 the note below); a long-running streaming smoke and a combined answer are likewise
 unverified. Any further live run requires separate approval before live
