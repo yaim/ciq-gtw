@@ -28,6 +28,7 @@ function modelWith(over: Partial<VirtualModel> = {}): VirtualModel {
     generateCombined: false,
     answerSource: "gpt",
     toolMode: "disabled",
+    promptMode: "protocol",
     requestTimeoutMs: 30_000,
     pollIntervalMs: 50,
     maxPollIntervalMs: 50,

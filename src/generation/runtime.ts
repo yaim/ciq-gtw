@@ -12,7 +12,7 @@ import type { AppConfig } from "../config/schema.js";
 import { CollectivIQHttpAdapter } from "../collectiviq/adapter.js";
 import { buildCredentialProviderFromConfig, RUNTIME_MAX_LOGINS } from "../collectiviq/auth.js";
 import type { CollectivIQAdapter, TransportBase } from "../collectiviq/types.js";
-import { createConversationPromptSerializer } from "../prompts/conversation.js";
+import { createPromptSerializer } from "../prompts/serializer.js";
 import { createCapacityController } from "./capacity.js";
 import { createPoller } from "./polling.js";
 import { createChatCompletionService, type ChatCompletionService } from "./chat-completion.js";
@@ -67,7 +67,7 @@ export function createCompletionRuntime(
     });
   const adapter = seams.adapter ?? buildAdapter(config);
   const poller = seams.poller ?? createPoller(adapter);
-  const serializer = seams.serializer ?? createConversationPromptSerializer();
+  const serializer = seams.serializer ?? createPromptSerializer();
   const ids = seams.ids ?? createIdGenerator();
   const clock = seams.clock ?? systemClock;
 

@@ -490,7 +490,11 @@ function validateModel(
   }
 
   if (issues.length > 0) return { issues };
-  return { issues, model: { id: "", ...model } };
+  // Normalize the optional `promptMode` to an explicit value: an omitted field
+  // means `protocol` (the full-history serializer), preserving backward
+  // compatibility with existing model files. The schema already restricted the
+  // present values to `protocol`/`direct`.
+  return { issues, model: { id: "", ...model, promptMode: model.promptMode ?? "protocol" } };
 }
 
 function loadModels(env: EnvConfig, cwd: string): VirtualModel[] {

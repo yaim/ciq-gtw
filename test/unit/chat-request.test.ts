@@ -11,8 +11,12 @@ import type { VirtualModel } from "../../src/config/schema.js";
 
 const user = (content: unknown) => ({ role: "user", content });
 
-/** A minimal virtual model with the requested tool mode. */
-function model(toolMode: VirtualModel["toolMode"], id = "m"): VirtualModel {
+/** A minimal virtual model with the requested tool mode and prompt mode. */
+function model(
+  toolMode: VirtualModel["toolMode"],
+  id = "m",
+  promptMode: VirtualModel["promptMode"] = "protocol",
+): VirtualModel {
   return {
     id,
     displayName: id,
@@ -20,6 +24,7 @@ function model(toolMode: VirtualModel["toolMode"], id = "m"): VirtualModel {
     generateCombined: false,
     answerSource: "gpt",
     toolMode,
+    promptMode,
     requestTimeoutMs: 90_000,
     pollIntervalMs: 2_000,
     maxPollIntervalMs: 5_000,
@@ -32,6 +37,8 @@ const resolveDisabled: ModelResolver = (id) => model("disabled", id);
 const resolveEmulated: ModelResolver = (id) => model("emulated", id);
 const resolveNative: ModelResolver = (id) => model("native", id);
 const resolveNone: ModelResolver = () => undefined;
+/** A `promptMode: "direct"` disabled model (still text-only, no tool calling). */
+const resolveDirect: ModelResolver = (id) => model("disabled", id, "direct");
 
 /** An OpenCode-shaped function-tool definition (the SDK's legacy nested form). */
 const openCodeTool = (name: string) => ({
@@ -890,5 +897,65 @@ describe("validateChatRequest — immutability", () => {
     expect(req.model).toBe("m");
     expect(req.messages[0]?.content).toBe("a");
     expect(req.ignoredParameters).toEqual(["top_p"]);
+  });
+});
+
+describe("validateChatRequest — direct prompt mode", () => {
+  it("accepts a direct-mode request that has a user-role message", () => {
+    const result = validateChatRequest(
+      { model: "m", messages: [{ role: "system", content: "s" }, user("hi")] },
+      resolveDirect,
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      // The normalized request is unchanged by the prompt mode: full history is
+      // preserved here; the direct serializer selects the latest user content
+      // downstream during prepare().
+      expect(result.model.promptMode).toBe("direct");
+      expect(result.request.messages.map((m) => m.role)).toEqual(["system", "user"]);
+    }
+  });
+
+  it("rejects a direct-mode request with no user-role message (fixed 400)", () => {
+    expectReject(
+      {
+        model: "m",
+        messages: [
+          { role: "system", content: "s" },
+          { role: "assistant", content: "a" },
+        ],
+      },
+      400,
+      "invalid_request",
+      "messages",
+      resolveDirect,
+    );
+  });
+
+  it("still accepts the same no-user role sequence for a protocol model", () => {
+    const result = validateChatRequest(
+      {
+        model: "m",
+        messages: [
+          { role: "system", content: "s" },
+          { role: "assistant", content: "a" },
+        ],
+      },
+      resolveDisabled,
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.model.promptMode).toBe("protocol");
+  });
+
+  it("rejects the direct no-user request before reflecting any content", () => {
+    const result = validateChatRequest(
+      { model: "m", messages: [{ role: "developer", content: "SECRET-DEVELOPER" }] },
+      resolveDirect,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(JSON.stringify(result.error.body)).not.toContain("SECRET-DEVELOPER");
+      expect(result.error.body.error.type).toBe("invalid_request_error");
+    }
   });
 });

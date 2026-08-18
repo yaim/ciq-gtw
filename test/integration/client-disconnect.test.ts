@@ -26,6 +26,7 @@ const MODEL: VirtualModel = {
   generateCombined: false,
   answerSource: "gpt",
   toolMode: "disabled",
+  promptMode: "protocol",
   // High deadline so only a disconnect (not a timeout) can release capacity here.
   requestTimeoutMs: 30_000,
   pollIntervalMs: 100,

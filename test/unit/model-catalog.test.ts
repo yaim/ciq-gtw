@@ -12,6 +12,7 @@ function model(id: string, overrides: Partial<VirtualModel> = {}): VirtualModel 
     generateCombined: false,
     answerSource: "gpt",
     toolMode: "disabled",
+    promptMode: "protocol",
     requestTimeoutMs: 90_000,
     pollIntervalMs: 2_000,
     maxPollIntervalMs: 5_000,
@@ -54,17 +55,32 @@ describe("createModelCatalog", () => {
     expect(catalog.resolve("collectiviq-fast")?.created).toBe(CREATED);
   });
 
-  it("exposes only the public OpenAI model fields", () => {
-    const catalog = createModelCatalog(MODELS, CREATED);
-    const object = catalog.resolve("collectiviq-consensus");
+  it("exposes only the public OpenAI model fields (never promptMode)", () => {
+    const catalog = createModelCatalog(
+      [model("collectiviq-direct", { promptMode: "direct" })],
+      CREATED,
+    );
+    const object = catalog.resolve("collectiviq-direct");
     expect(object).toEqual({
-      id: "collectiviq-consensus",
+      id: "collectiviq-direct",
       object: "model",
       created: CREATED,
       owned_by: "collectiviq-gateway",
     });
-    // No internal policy leaks through the public object.
+    // No internal policy leaks through the public object — promptMode included.
     expect(Object.keys(object ?? {})).toEqual(["id", "object", "created", "owned_by"]);
+    expect(Object.keys(object ?? {})).not.toContain("promptMode");
+  });
+
+  it("resolves the internal policy (with promptMode) via resolveModel", () => {
+    const catalog = createModelCatalog(
+      [model("collectiviq-direct", { promptMode: "direct" }), model("collectiviq-claude")],
+      CREATED,
+    );
+    expect(catalog.resolveModel("collectiviq-direct")?.promptMode).toBe("direct");
+    expect(catalog.resolveModel("collectiviq-claude")?.promptMode).toBe("protocol");
+    expect(catalog.resolveModel("Collectiviq-Direct")).toBeUndefined();
+    expect(catalog.resolveModel("unknown")).toBeUndefined();
   });
 
   it("returns an immutable catalog that cannot mutate source configuration", () => {

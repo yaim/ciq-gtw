@@ -34,6 +34,22 @@ const MODEL: VirtualModel = {
   generateCombined: true,
   answerSource: "combined",
   toolMode: "disabled",
+  promptMode: "protocol",
+  requestTimeoutMs: 1_000,
+  pollIntervalMs: 100,
+  maxPollIntervalMs: 100,
+  maximumPromptBytes: 6_291_456,
+};
+
+/** A Claude direct-profile model: latest-user-only prompt, single Claude source. */
+const DIRECT_MODEL: VirtualModel = {
+  id: "collectiviq-claude-direct",
+  displayName: "CollectivIQ Claude Direct",
+  selectedLlms: ["claude"],
+  generateCombined: false,
+  answerSource: "claude",
+  toolMode: "disabled",
+  promptMode: "direct",
   requestTimeoutMs: 1_000,
   pollIntervalMs: 100,
   maxPollIntervalMs: 100,
@@ -58,7 +74,7 @@ function configFor(baseUrl: string): AppConfig {
     MAX_QUEUED_REQUESTS: 20,
     MAX_QUEUE_WAIT_MS: 5_000,
     SHUTDOWN_DRAIN_MS: 30_000,
-    models: [MODEL],
+    models: [MODEL, DIRECT_MODEL],
   };
 }
 
@@ -166,6 +182,118 @@ describe("completion flow — success", () => {
     const response = await server.inject({ method: "POST", url, headers: auth, payload: okBody });
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({ choices: [{ message: { content: "recovered" } }] });
+  });
+});
+
+describe("completion flow — direct prompt mode", () => {
+  const directBody = {
+    model: "collectiviq-claude-direct",
+    messages: [
+      { role: "system", content: "SENTINEL_SYSTEM_ZZ1" },
+      { role: "developer", content: "SENTINEL_DEVELOPER_ZZ2" },
+      { role: "user", content: "SENTINEL_USER_OLD_ZZ3" },
+      { role: "assistant", content: "SENTINEL_ASSISTANT_ZZ4" },
+      { role: "user", content: "the only content that should be submitted" },
+    ],
+  };
+
+  it("submits only the latest user content, without the protocol wrapper", async () => {
+    let polledThreadId: string | null = null;
+    const server = await startWith({
+      "/create_thread": (_req, res) => createOk(res),
+      "/process_message": (_req, res) => processOk(res),
+      "/get_messages": (req, res) => {
+        polledThreadId = req.query.get("thread_id");
+        return void replyJson(res, { messages: [{ source: "claude", content: "direct answer" }] });
+      },
+    });
+    const response = await server.inject({
+      method: "POST",
+      url,
+      headers: auth,
+      payload: directBody,
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      model: "collectiviq-claude-direct",
+      choices: [{ message: { content: "direct answer" }, finish_reason: "stop" }],
+    });
+    // Correlation confirms polling ran against the created thread.
+    expect(polledThreadId).toBe("42");
+
+    // Exactly one thread + one submit; single Claude source, no combined.
+    const creates = mock?.requests.filter((r) => r.path === "/create_thread") ?? [];
+    const submits = mock?.requests.filter((r) => r.path === "/process_message") ?? [];
+    expect(creates).toHaveLength(1);
+    expect(submits).toHaveLength(1);
+    const submitBody = submits[0]?.text() ?? "";
+    expect(submitBody).toContain('name="selected_llms"');
+    expect(submitBody).toContain("claude");
+    expect(submitBody).not.toContain("gpt");
+    expect(submitBody).toContain('name="generate_combined"');
+
+    // The submitted prompt is EXACTLY the latest user content — no protocol
+    // header, no JSON envelope/markers, and none of the other messages.
+    expect(submitBody).toContain("the only content that should be submitted");
+    expect(submitBody).not.toContain("COLLECTIVIQ GATEWAY PROTOCOL");
+    expect(submitBody).not.toContain("BEGIN_CONVERSATION_JSON");
+    expect(submitBody).not.toContain("END_CONVERSATION_JSON");
+    for (const sentinel of [
+      "SENTINEL_SYSTEM_ZZ1",
+      "SENTINEL_DEVELOPER_ZZ2",
+      "SENTINEL_USER_OLD_ZZ3",
+      "SENTINEL_ASSISTANT_ZZ4",
+    ]) {
+      expect(submitBody).not.toContain(sentinel);
+    }
+  });
+
+  it("polls for the model's answer source (claude) and streams the same text", async () => {
+    const server = await startWith({
+      "/create_thread": (_req, res) => createOk(res),
+      "/process_message": (_req, res) => processOk(res),
+      "/get_messages": (_req, res) =>
+        replyJson(res, {
+          messages: [
+            { source: "gpt", content: "wrong source" },
+            { source: "claude", content: "direct streamed answer" },
+          ],
+        }),
+    });
+    const response = await server.inject({
+      method: "POST",
+      url,
+      headers: auth,
+      payload: { ...directBody, stream: true },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["content-type"]).toContain("text/event-stream");
+    expect(response.body).toContain("direct streamed answer");
+    expect(response.body).not.toContain("wrong source");
+    expect(response.body.trimEnd().endsWith("data: [DONE]")).toBe(true);
+  });
+
+  it("rejects a direct-mode request with no user message before any upstream call", async () => {
+    const server = await startWith({
+      "/create_thread": (_req, res) => createOk(res),
+      "/process_message": (_req, res) => processOk(res),
+      "/get_messages": (_req, res) => replyJson(res, { messages: [] }),
+    });
+    const response = await server.inject({
+      method: "POST",
+      url,
+      headers: auth,
+      payload: {
+        model: "collectiviq-claude-direct",
+        messages: [{ role: "system", content: "no user here" }],
+      },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({
+      error: { type: "invalid_request_error", param: "messages", code: "invalid_request" },
+    });
+    // No upstream request was made at all.
+    expect(mock?.requests ?? []).toHaveLength(0);
   });
 });
 

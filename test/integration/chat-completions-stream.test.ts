@@ -27,6 +27,7 @@ function model(id: string, over: Partial<VirtualModel> = {}): VirtualModel {
     generateCombined: false,
     answerSource: "gpt",
     toolMode: "disabled",
+    promptMode: "protocol",
     requestTimeoutMs: 90_000,
     pollIntervalMs: 2_000,
     maxPollIntervalMs: 5_000,
@@ -53,7 +54,10 @@ function makeConfig(): AppConfig {
     MAX_QUEUED_REQUESTS: 20,
     MAX_QUEUE_WAIT_MS: 5_000,
     SHUTDOWN_DRAIN_MS: 30_000,
-    models: [model("collectiviq-consensus")],
+    models: [
+      model("collectiviq-consensus"),
+      model("collectiviq-claude-direct", { promptMode: "direct" }),
+    ],
   };
 }
 
@@ -324,5 +328,31 @@ describe("POST /v1/chat/completions — preparation errors stay pre-header JSON 
     expect(res.headers["content-type"]).toContain("application/json");
     expect(res.json()).toMatchObject({ error: { code: "context_length_exceeded" } });
     expect(res.body).not.toContain("event-stream");
+  });
+
+  it("returns a JSON 400 (not SSE) for a direct model with no user message on stream:true", async () => {
+    let ran = false;
+    app = build(() => {
+      ran = true;
+      return Promise.resolve({ content: "unreachable" });
+    });
+    const res = await app.inject({
+      method: "POST",
+      url,
+      headers: auth,
+      payload: {
+        model: "collectiviq-claude-direct",
+        messages: [{ role: "system", content: "no user" }],
+        stream: true,
+      },
+    });
+    // The direct-mode no-user guard runs at validation, before any SSE header.
+    expect(res.statusCode).toBe(400);
+    expect(res.headers["content-type"]).toContain("application/json");
+    expect(res.json()).toMatchObject({
+      error: { type: "invalid_request_error", param: "messages", code: "invalid_request" },
+    });
+    expect(res.body).not.toContain("event-stream");
+    expect(ran).toBe(false);
   });
 });

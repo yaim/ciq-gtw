@@ -39,6 +39,7 @@ const MODEL: VirtualModel = {
   generateCombined: false,
   answerSource: "gpt",
   toolMode: "disabled",
+  promptMode: "protocol",
   requestTimeoutMs: 30_000,
   pollIntervalMs: 1_000,
   maxPollIntervalMs: 1_000,

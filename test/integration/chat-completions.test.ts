@@ -30,6 +30,7 @@ function model(id: string, over: Partial<VirtualModel> = {}): VirtualModel {
     generateCombined: false,
     answerSource: "gpt",
     toolMode: "disabled",
+    promptMode: "protocol",
     requestTimeoutMs: 90_000,
     pollIntervalMs: 2_000,
     maxPollIntervalMs: 5_000,
@@ -555,5 +556,59 @@ describe("health and model endpoints remain intact", () => {
     const models = await app.inject({ method: "GET", url: "/v1/models", headers: auth });
     expect(models.statusCode).toBe(200);
     expect(models.json()).toMatchObject({ object: "list" });
+  });
+});
+
+describe("POST /v1/chat/completions — direct prompt mode", () => {
+  const directConfig: Partial<AppConfig> = {
+    models: [
+      model("collectiviq-consensus"),
+      model("collectiviq-claude-direct", { promptMode: "direct", answerSource: "gpt" }),
+    ],
+  };
+
+  it("returns 400 (param messages) for a direct model with no user message, without running", async () => {
+    let ran = false;
+    const spy: RunFn = () => {
+      ran = true;
+      return Promise.resolve({ content: "should not happen" });
+    };
+    app = build(spy, directConfig);
+    const response = await app.inject({
+      method: "POST",
+      url,
+      headers: auth,
+      payload: {
+        model: "collectiviq-claude-direct",
+        messages: [{ role: "system", content: "no user" }],
+      },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.headers["content-type"]).toContain("application/json");
+    expect(response.json()).toMatchObject({
+      error: { type: "invalid_request_error", param: "messages", code: "invalid_request" },
+    });
+    expect(ran).toBe(false);
+  });
+
+  it("accepts a direct model with a user message and returns ordinary text", async () => {
+    app = build(okAnswer, directConfig);
+    const response = await app.inject({
+      method: "POST",
+      url,
+      headers: auth,
+      payload: {
+        model: "collectiviq-claude-direct",
+        messages: [
+          { role: "system", content: "ignored" },
+          { role: "user", content: "hi" },
+        ],
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      model: "collectiviq-claude-direct",
+      choices: [{ message: { content: "hello answer" }, finish_reason: "stop" }],
+    });
   });
 });

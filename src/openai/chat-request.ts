@@ -391,9 +391,10 @@ function validateToolCompatibility(
  *
  * Ordering is deterministic: model-independent structural validation (stream →
  * deferred features → model → n → messages) runs first, then the model is
- * resolved (`404` on an unknown/case-mismatched id), then the model-aware tool
- * bridge runs. This keeps a structural `400` ahead of a `404`, and a `404`
- * ahead of a tool `400` (the tool policy is unknown until the model resolves).
+ * resolved (`404` on an unknown/case-mismatched id), then the model-aware checks
+ * run — the direct-mode "at least one user message" guard, then the tool bridge.
+ * This keeps a structural `400` ahead of a `404`, and a `404` ahead of a
+ * model-aware `400` (the model policy is unknown until the model resolves).
  */
 export function validateChatRequest(body: unknown, resolveModel: ModelResolver): ChatRequestResult {
   if (!isRecord(body)) return fail(INVALID_REQUEST_ERROR);
@@ -458,12 +459,23 @@ export function validateChatRequest(body: unknown, resolveModel: ModelResolver):
   const policy = resolveModel(model);
   if (policy === undefined) return fail(MODEL_NOT_FOUND_ERROR);
 
-  // 7. Model-aware `tools`/`tool_choice` bridge (Phase 2.1). Its accepted names
+  // 7. Direct-mode prompt policy (model-aware). A `promptMode: "direct"` model
+  //    submits ONLY the latest normalized user-role message, so a request with
+  //    no user-role message cannot produce a prompt. Reject it here — at the
+  //    model-aware boundary — with a fixed, content-free `400` so the failure
+  //    happens BEFORE prepare(), capacity acquisition, thread creation,
+  //    submission, or any SSE header commitment. Prompt behaviour is driven from
+  //    the validated `promptMode`, never a model-id comparison.
+  if (policy.promptMode === "direct" && !messages.some((message) => message.role === "user")) {
+    return fail(invalidRequest("A user message is required.", "messages", "invalid_request"));
+  }
+
+  // 8. Model-aware `tools`/`tool_choice` bridge (Phase 2.1). Its accepted names
   //    join the ignored-parameter collection; a rejection is a stable `400`.
   const toolBridge = validateToolCompatibility(body, policy.toolMode);
   if (!toolBridge.ok) return fail(toolBridge.error);
 
-  // 8. Record ignored parameter names by own-property presence only — the value
+  // 9. Record ignored parameter names by own-property presence only — the value
   //    is never read (no getter is invoked merely to record a name) — then merge
   //    the accepted tool names and sort deterministically.
   const ignoredParameters = [

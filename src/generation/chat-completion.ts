@@ -163,11 +163,13 @@ export function createChatCompletionService(deps: ChatCompletionDeps): ChatCompl
   return {
     prepare(ctx: ChatCompletionRequestContext): PreparedCompletion {
       const { request, model } = ctx;
-      // Serialize the prompt and enforce the model's byte limit BEFORE any
+      // Serialize the prompt using the resolved model's NORMALIZED `promptMode`
+      // (protocol vs direct — never a model-id comparison) and enforce the
+      // model's UTF-8 byte limit against the FINAL selected prompt, BEFORE any
       // capacity is taken, any upstream call is made, or any SSE header is
       // committed. Mint the stream-stable identity here so both the JSON and SSE
       // encoders reuse one id/timestamp across the whole response.
-      const prompt = deps.serializer.serialize(request);
+      const prompt = deps.serializer.serialize(request, model.promptMode);
       if (Buffer.byteLength(prompt, "utf8") > model.maximumPromptBytes) {
         throw new ChatCompletionError(CONTEXT_LENGTH_EXCEEDED_ERROR);
       }

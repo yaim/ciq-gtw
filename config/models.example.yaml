@@ -7,6 +7,14 @@
 #
 # All examples set toolMode: disabled because emulated/native tool calling is
 # not implemented in this foundation.
+#
+# `promptMode` selects prompt serialization:
+#   - protocol (default when omitted): the normative full-history COLLECTIVIQ
+#     GATEWAY PROTOCOL header + versioned JSON conversation envelope.
+#   - direct: an account-specific, intentionally LOSSY profile that submits only
+#     the latest user-message content verbatim (no protocol wrapper, no envelope,
+#     no role labels, and NO system/developer/assistant/earlier-user content).
+#     Use only where the full-history protocol wrapper is rejected upstream.
 
 models:
   collectiviq-claude:
@@ -16,6 +24,20 @@ models:
     generateCombined: false
     answerSource: claude
     toolMode: disabled
+    promptMode: protocol
+    requestTimeoutMs: 90000
+    pollIntervalMs: 2000
+    maxPollIntervalMs: 5000
+    maximumPromptBytes: 6291456
+
+  collectiviq-claude-direct:
+    displayName: CollectivIQ Claude Direct
+    selectedLlms:
+      - claude
+    generateCombined: false
+    answerSource: claude
+    toolMode: disabled
+    promptMode: direct
     requestTimeoutMs: 90000
     pollIntervalMs: 2000
     maxPollIntervalMs: 5000
@@ -30,6 +52,7 @@ models:
     generateCombined: true
     answerSource: combined
     toolMode: disabled
+    promptMode: protocol
     requestTimeoutMs: 90000
     pollIntervalMs: 2000
     maxPollIntervalMs: 5000
@@ -43,6 +66,7 @@ models:
     generateCombined: true
     answerSource: combined
     toolMode: disabled
+    promptMode: protocol
     requestTimeoutMs: 90000
     pollIntervalMs: 2000
     maxPollIntervalMs: 5000
@@ -55,6 +79,7 @@ models:
     generateCombined: false
     answerSource: gpt
     toolMode: disabled
+    promptMode: protocol
     requestTimeoutMs: 60000
     pollIntervalMs: 2000
     maxPollIntervalMs: 5000

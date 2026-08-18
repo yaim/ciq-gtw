@@ -72,13 +72,24 @@ describe("loadConfig — environment", () => {
     expect(config.LOG_CONTENT).toBe(false);
     expect(config.ENVIRONMENT).toBe("production");
     expect(config.COLLECTIVIQ_GATEWAY_KEYS).toEqual(["gw-fake-a", "gw-fake-b"]);
-    expect(config.models).toHaveLength(4);
+    expect(config.models).toHaveLength(5);
     expect(config.models.map((m) => m.id)).toContain("collectiviq-fast");
     expect(config.models.find((m) => m.id === "collectiviq-claude")).toMatchObject({
       selectedLlms: ["claude"],
       generateCombined: false,
       answerSource: "claude",
       toolMode: "disabled",
+      // An explicit `promptMode: protocol` in the example loads as protocol.
+      promptMode: "protocol",
+    });
+    // The example now includes the direct profile with its exact intended policy.
+    expect(config.models.find((m) => m.id === "collectiviq-claude-direct")).toMatchObject({
+      displayName: "CollectivIQ Claude Direct",
+      selectedLlms: ["claude"],
+      generateCombined: false,
+      answerSource: "claude",
+      toolMode: "disabled",
+      promptMode: "direct",
     });
   });
 
@@ -499,6 +510,49 @@ describe("loadConfig — model file validation", () => {
       )}`;
       expect(serialized).not.toContain("SECRET-MODELID");
       expect(serialized).not.toContain("SECRET_UNKNOWN_FIELD");
+    }
+  });
+
+  it("normalizes an omitted promptMode to protocol", () => {
+    // validModel omits promptMode entirely.
+    const config = expectLoads(writeModelFile("no-prompt-mode.yaml", modelFileFrom({})));
+    expect(config.models[0]?.promptMode).toBe("protocol");
+  });
+
+  it("loads an explicit protocol and an explicit direct promptMode", () => {
+    const protocol = expectLoads(
+      writeModelFile("prompt-protocol.yaml", modelFileFrom({ promptMode: "protocol" })),
+    );
+    expect(protocol.models[0]?.promptMode).toBe("protocol");
+    const direct = expectLoads(
+      writeModelFile(
+        "prompt-direct.yaml",
+        modelFileFrom({
+          promptMode: "direct",
+          generateCombined: false,
+          answerSource: "gpt",
+          selectedLlms: ["gpt"],
+        }),
+      ),
+    );
+    expect(direct.models[0]?.promptMode).toBe("direct");
+  });
+
+  it("rejects an unsupported promptMode value with a value-free ordinal issue", () => {
+    const path = writeModelFile(
+      "prompt-bad.yaml",
+      stringify({ models: { m1: { ...validModel, promptMode: "verbose" } } }),
+    );
+    try {
+      loadConfig({ env: baseEnv({ MODEL_CONFIG_PATH: path }) });
+      throw new Error("expected ConfigError");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfigError);
+      const issues = (error as ConfigError).issues;
+      expect(issues.some((i) => i.field === "models[0].promptMode")).toBe(true);
+      const serialized = `${(error as ConfigError).format()} ${JSON.stringify(issues)}`;
+      // The submitted value is never echoed.
+      expect(serialized).not.toContain("verbose");
     }
   });
 });

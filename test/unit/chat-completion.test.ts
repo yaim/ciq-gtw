@@ -7,6 +7,7 @@ import {
   type ChatCompletionDeps,
 } from "../../src/generation/chat-completion.js";
 import { UpstreamError } from "../../src/collectiviq/errors.js";
+import { createPromptSerializer } from "../../src/prompts/serializer.js";
 import type { VirtualModel } from "../../src/config/schema.js";
 import type { NormalizedChatRequest } from "../../src/openai/chat-types.js";
 import type {
@@ -29,6 +30,7 @@ const MODEL: VirtualModel = {
   generateCombined: true,
   answerSource: "combined",
   toolMode: "disabled",
+  promptMode: "protocol",
   requestTimeoutMs: 90_000,
   pollIntervalMs: 2_000,
   maxPollIntervalMs: 5_000,
@@ -204,6 +206,74 @@ describe("chat-completion orchestration", () => {
       body: { error: { code: "context_length_exceeded" } },
     });
     // No capacity was taken and no upstream call was made.
+    expect(trace.events).toEqual([]);
+  });
+
+  it("selects the serializer from the model's promptMode, not the model id", () => {
+    const trace: Trace = { events: [], processInputs: [], released: 0 };
+    const service = makeService({
+      trace,
+      serializer: { serialize: (_req, promptMode) => `mode:${promptMode}` },
+    });
+    const protocolPrepared = service.prepare({
+      request: REQUEST,
+      model: { ...MODEL, promptMode: "protocol" },
+      keyId: "k0",
+      signal: new AbortController().signal,
+    });
+    const directPrepared = service.prepare({
+      request: REQUEST,
+      model: { ...MODEL, promptMode: "direct" },
+      keyId: "k0",
+      signal: new AbortController().signal,
+    });
+    expect(protocolPrepared.prompt).toBe("mode:protocol");
+    expect(directPrepared.prompt).toBe("mode:direct");
+    expect(trace.events).toEqual([]);
+  });
+
+  it("enforces the byte limit against only the selected direct prompt", () => {
+    // The real router serializer selects the latest user content in direct mode;
+    // only THAT content counts toward maximumPromptBytes — the system message is
+    // ignored. Choose a request whose latest user content is exactly 5 bytes.
+    const trace: Trace = { events: [], processInputs: [], released: 0 };
+    const service = makeService({ trace, serializer: createPromptSerializer() });
+    const directRequest: NormalizedChatRequest = {
+      model: "collectiviq-consensus",
+      messages: [
+        { role: "system", content: "a very long system instruction ignored by direct mode" },
+        { role: "user", content: "hello" }, // 5 UTF-8 bytes
+      ],
+      ignoredParameters: [],
+      stream: false,
+    };
+    const atLimit: VirtualModel = { ...MODEL, promptMode: "direct", maximumPromptBytes: 5 };
+    const prepared = service.prepare({
+      request: directRequest,
+      model: atLimit,
+      keyId: "k0",
+      signal: new AbortController().signal,
+    });
+    expect(prepared.prompt).toBe("hello");
+    expect(trace.events).toEqual([]);
+
+    const overLimit: VirtualModel = { ...atLimit, maximumPromptBytes: 4 };
+    let caught: unknown;
+    try {
+      service.prepare({
+        request: directRequest,
+        model: overLimit,
+        keyId: "k0",
+        signal: new AbortController().signal,
+      });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(ChatCompletionError);
+    expect((caught as ChatCompletionError).apiError).toMatchObject({
+      status: 400,
+      body: { error: { code: "context_length_exceeded" } },
+    });
     expect(trace.events).toEqual([]);
   });
 

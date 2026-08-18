@@ -19,6 +19,7 @@ function model(id: string): VirtualModel {
     generateCombined: false,
     answerSource: "gpt",
     toolMode: "disabled",
+    promptMode: "protocol",
     requestTimeoutMs: 90_000,
     pollIntervalMs: 2_000,
     maxPollIntervalMs: 5_000,

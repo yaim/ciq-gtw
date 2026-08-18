@@ -14,6 +14,25 @@ export { AUTH_MODES } from "../collectiviq/auth.js";
 export const LOG_LEVELS = ["trace", "debug", "info", "warn", "error", "fatal", "silent"] as const;
 export const TOOL_MODES = ["disabled", "emulated", "native"] as const;
 
+/**
+ * Prompt-serialization modes for a virtual model.
+ *
+ * - `protocol` (default): the normative, full-history `COLLECTIVIQ GATEWAY
+ *   PROTOCOL` serializer — the fixed control-prompt header framing a versioned
+ *   JSON envelope of the ENTIRE ordered conversation with declared roles
+ *   (`src/prompts/conversation.ts`). This is the standard behaviour for every
+ *   virtual model.
+ * - `direct`: an account-specific, intentionally lossy compatibility profile
+ *   that submits ONLY the latest normalized `user`-role message content,
+ *   verbatim, with no protocol header, JSON envelope, role labels, markers,
+ *   prefixes, suffixes, or other conversation messages (`src/prompts/direct.ts`).
+ *   It deliberately omits system/developer instructions, assistant history, and
+ *   every earlier user turn. It is NOT a role-preserving Chat Completions
+ *   translation and MUST NOT be treated as prompt-injection prevention.
+ */
+export const PROMPT_MODES = ["protocol", "direct"] as const;
+export type PromptMode = (typeof PROMPT_MODES)[number];
+
 /** Byte bounds for the accepted HTTP request body size. */
 export const MAX_REQUEST_BODY_BYTES_MIN = 1024;
 export const MAX_REQUEST_BODY_BYTES_MAX = 67_108_864; // 64 MiB
@@ -172,6 +191,7 @@ export const MODEL_PROPERTY_NAMES = [
   "generateCombined",
   "answerSource",
   "toolMode",
+  "promptMode",
   "requestTimeoutMs",
   "pollIntervalMs",
   "maxPollIntervalMs",
@@ -211,6 +231,11 @@ export const VirtualModelSchema = Type.Object(
       Type.Literal("emulated"),
       Type.Literal("native"),
     ]),
+    // Optional in the file for backward compatibility: an omitted `promptMode`
+    // is normalized to `protocol` in the loader, so existing ignored/local model
+    // files keep the full-history protocol serializer unchanged. Only the two
+    // supported values are accepted; any other value is a value-free rejection.
+    promptMode: Type.Optional(Type.Union([Type.Literal("protocol"), Type.Literal("direct")])),
     requestTimeoutMs: Type.Integer({
       minimum: MODEL_CONFIG_LIMITS.requestTimeoutMs.min,
       maximum: MODEL_CONFIG_LIMITS.requestTimeoutMs.max,
@@ -245,9 +270,16 @@ export const ModelsFileShapeSchema = Type.Object(
   { additionalProperties: false },
 );
 
-/** A resolved virtual model, with its id promoted from the map key. */
+/**
+ * A resolved virtual model, with its id promoted from the map key and its
+ * `promptMode` NORMALIZED to an explicit value. The loader always populates
+ * `promptMode` (defaulting an omitted file field to `protocol`), so the internal
+ * policy never carries `undefined` and prompt behaviour is driven from this
+ * validated field — never from a model-id string comparison.
+ */
 export interface VirtualModel extends VirtualModelDefinition {
   readonly id: string;
+  readonly promptMode: PromptMode;
 }
 
 /** Immutable application configuration returned by the loader. */

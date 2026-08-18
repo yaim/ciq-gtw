@@ -7,6 +7,7 @@
  * type. Deterministic tests inject fakes for every seam here.
  */
 import type { NormalizedChatRequest } from "../openai/chat-types.js";
+import type { PromptMode } from "../config/schema.js";
 
 // --- Time / randomness / IDs seams -------------------------------------------
 
@@ -104,12 +105,15 @@ export interface Poller {
 // --- Prompt serialization port (specification sections 8.4, 11) --------------
 
 /**
- * Deterministic conversation prompt serializer. Produces the final control
- * prompt (framing + versioned JSON envelope) from a normalized request. Pure:
- * the same request always yields byte-identical output. It never enforces the
- * byte limit itself — the orchestrator measures the result against the model's
- * `maximumPromptBytes`.
+ * Deterministic, model-policy-aware prompt serializer. Produces the final prompt
+ * from a normalized request and the resolved model's NORMALIZED `promptMode`
+ * (`protocol` → framing + versioned JSON envelope; `direct` → latest-user
+ * content only). Pure: the same request and mode always yield byte-identical
+ * output. It never enforces the byte limit itself — the orchestrator measures
+ * the result against the model's `maximumPromptBytes`. The narrow `promptMode`
+ * argument (not the full model policy) is all the serializer needs; behaviour is
+ * driven from that validated mode, never from a model-id string.
  */
 export interface PromptSerializer {
-  serialize(request: NormalizedChatRequest): string;
+  serialize(request: NormalizedChatRequest, promptMode: PromptMode): string;
 }

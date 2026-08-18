@@ -68,7 +68,27 @@ export function serializeConversationPrompt(request: NormalizedChatRequest): str
   return `${HEADER}\n\n${BEGIN_MARKER}\n${envelopeJson}\n${END_MARKER}`;
 }
 
-/** Build the {@link PromptSerializer} port implementation. */
+/**
+ * Build a PROTOCOL-ONLY {@link PromptSerializer} port implementation.
+ *
+ * The port is model-aware (`serialize(request, promptMode)`), but this factory
+ * only knows the `protocol` envelope. It therefore FAILS CLOSED: a non-`protocol`
+ * `promptMode` throws a fixed, content-free internal error rather than silently
+ * emitting a protocol prompt for a `direct` (or any other) request. Production
+ * runtime uses the model-aware router `createPromptSerializer` (`serializer.ts`),
+ * which dispatches every mode; this factory backs protocol-only call sites/tests.
+ * A `protocol` request returns {@link serializeConversationPrompt} byte-for-byte
+ * unchanged.
+ */
 export function createConversationPromptSerializer(): PromptSerializer {
-  return { serialize: serializeConversationPrompt };
+  return {
+    serialize(request, promptMode) {
+      if (promptMode !== "protocol") {
+        // Content-free: no request, prompt, model id, submitted content, or the
+        // dynamic mode value is included.
+        throw new Error("conversation serializer supports protocol mode only");
+      }
+      return serializeConversationPrompt(request);
+    },
+  };
 }
