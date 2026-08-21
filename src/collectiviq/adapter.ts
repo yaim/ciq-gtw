@@ -13,20 +13,24 @@ import { requestUpstreamJson } from "./http.js";
 import {
   buildCreateThreadRequest,
   buildGetMessagesRequest,
+  buildGetThreadsRequest,
   buildProcessMessageRequest,
 } from "./requests.js";
 import {
   normalizeCreateThread,
   normalizeGetMessages,
+  normalizeGetThreadTitle,
   normalizeProcessMessage,
 } from "./validation.js";
 import {
   DEFAULT_OPERATION_TIMEOUTS,
+  GET_THREADS_TIMEOUTS,
   type CollectivIQAdapter,
   type CollectivIQTransportConfig,
   type CreateThreadInput,
   type CreateThreadResult,
   type GetMessagesResult,
+  type GetThreadTitleResult,
   type OperationTimeouts,
   type ProcessMessageInput,
   type ProcessMessageResult,
@@ -88,5 +92,26 @@ export class CollectivIQHttpAdapter implements CollectivIQAdapter {
       ...(signal ? { signal } : {}),
     });
     return normalizeGetMessages(json, status);
+  }
+
+  /**
+   * OBSERVED-ONLY native-title lookup. Reads the target thread's server-generated
+   * title via `get_threads` under bounded (5 s/5 s/4 MiB) transport with no
+   * internal retry, and normalizes to a narrow pending/ready result. This creates
+   * no thread and is never part of the completion flow. Best-effort and
+   * account/principal-dependent; a lookup failure surfaces as a normalized
+   * {@link UpstreamError}.
+   */
+  async getThreadTitle(threadId: string, signal?: AbortSignal): Promise<GetThreadTitleResult> {
+    if (threadId.trim() === "") {
+      throw new UpstreamError("validation");
+    }
+
+    const { status, json } = await requestUpstreamJson(this.#config, {
+      ...buildGetThreadsRequest(),
+      timeouts: this.#config.getThreadsTimeouts ?? GET_THREADS_TIMEOUTS,
+      ...(signal ? { signal } : {}),
+    });
+    return normalizeGetThreadTitle(json, status, threadId);
   }
 }

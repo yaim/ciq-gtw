@@ -20,15 +20,46 @@
  * normalized {@link UpstreamError} with no body, message, or field values.
  */
 import { UpstreamError } from "./errors.js";
-import type {
-  CreateThreadResult,
-  GetMessagesResult,
-  ProcessMessageResult,
-  UpstreamMessage,
+import {
+  MAX_NATIVE_TITLE_BYTES,
+  type CreateThreadResult,
+  type GetMessagesResult,
+  type GetThreadTitleResult,
+  type ProcessMessageResult,
+  type UpstreamMessage,
 } from "./types.js";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** The fixed placeholder the gateway sends on `create_thread`; a still-`New Thread` title means the provider has not renamed the thread yet. */
+const PLACEHOLDER_TITLE = "New Thread";
+
+/**
+ * Read an own DATA property's value without invoking any accessor. Returns
+ * `undefined` when the key is absent OR is an accessor (getter) property, so a
+ * hostile getter is never called during title normalization.
+ */
+function ownDataValue(target: object, key: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(target, key);
+  if (descriptor === undefined || !("value" in descriptor)) return undefined;
+  return descriptor.value;
+}
+
+/**
+ * True when the string contains any C0 (0x00–0x1F) or C1 (0x7F–0x9F) control
+ * code point, or a Unicode line separator (`U+2028`) or paragraph separator
+ * (`U+2029`). All of these break the single-line title contract.
+ */
+function hasControlOrLineSeparator(value: string): boolean {
+  for (const char of value) {
+    const code = char.codePointAt(0);
+    if (code === undefined) continue;
+    if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) return true;
+    if (code === 0x2028 || code === 0x2029) return true;
+  }
+  return false;
 }
 
 /**
@@ -127,4 +158,61 @@ export function normalizeGetMessages(json: unknown, rawStatus: number): GetMessa
     messages.push(normalized);
   }
   return { messages, rawStatus };
+}
+
+/**
+ * `get_threads` (OBSERVED-ONLY native-title lookup): extract ONLY the target
+ * thread's server-generated title. This never enumerates, retains, serializes, or
+ * logs unrelated thread entries — it inspects exactly the one own data-property
+ * keyed by `targetThreadId`.
+ *
+ * Contract (all reads are own DATA descriptors; accessors are never invoked):
+ *   - require a top-level object with no own upstream-error `detail` property;
+ *   - require an own `threads` value that is a non-null, non-array object;
+ *   - the target entry is looked up by exact own key; ABSENT ⇒ `pending`;
+ *   - the target entry must be a non-null, non-array object with an own `title`
+ *     value (otherwise a normalized validation error — never a leaked value);
+ *   - a `title` still equal (trimmed) to the fixed `New Thread` placeholder ⇒
+ *     `pending` (the provider has not renamed the thread yet);
+ *   - a READY title must be a string that trims to non-empty, single-line, free of
+ *     C0/C1 control characters and Unicode line/paragraph separators
+ *     (`U+2028`/`U+2029`), and ≤ {@link MAX_NATIVE_TITLE_BYTES} UTF-8 bytes;
+ *     any violation is a normalized validation error;
+ *   - unknown fields are ignored.
+ *
+ * On any malformed structure it throws {@link UpstreamError}('upstream_protocol')
+ * with no body, message, title, or identifier — the raw upstream value never
+ * escapes. The returned ready title is the trimmed provider value; display-length
+ * truncation is a separate downstream concern.
+ */
+export function normalizeGetThreadTitle(
+  json: unknown,
+  rawStatus: number,
+  targetThreadId: string,
+): GetThreadTitleResult {
+  if (!isRecord(json)) throw new UpstreamError("upstream_protocol", rawStatus);
+  // An own `detail` marks an upstream-reported error even on HTTP 2xx.
+  if (Object.hasOwn(json, "detail")) throw new UpstreamError("unexpected_upstream", rawStatus);
+
+  const threads = ownDataValue(json, "threads");
+  if (!isRecord(threads)) throw new UpstreamError("upstream_protocol", rawStatus);
+
+  // Inspect ONLY the exact own property matching the normalized target id.
+  if (!Object.hasOwn(threads, targetThreadId)) return { kind: "pending" };
+  const entry = ownDataValue(threads, targetThreadId);
+  if (!isRecord(entry)) throw new UpstreamError("upstream_protocol", rawStatus);
+
+  if (!Object.hasOwn(entry, "title")) throw new UpstreamError("upstream_protocol", rawStatus);
+  const rawTitle = ownDataValue(entry, "title");
+  if (typeof rawTitle !== "string") throw new UpstreamError("upstream_protocol", rawStatus);
+
+  const title = rawTitle.trim();
+  // Still the fixed placeholder (in any surrounding whitespace) ⇒ not yet renamed.
+  if (title === PLACEHOLDER_TITLE) return { kind: "pending" };
+  if (title === "") throw new UpstreamError("upstream_protocol", rawStatus);
+  if (hasControlOrLineSeparator(title)) throw new UpstreamError("upstream_protocol", rawStatus);
+  if (Buffer.byteLength(title, "utf8") > MAX_NATIVE_TITLE_BYTES) {
+    throw new UpstreamError("upstream_protocol", rawStatus);
+  }
+  return { kind: "ready", title };
 }

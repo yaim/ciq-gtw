@@ -78,6 +78,20 @@ export function buildProcessMessageRequest(input: {
   };
 }
 
+/**
+ * Encode a `get_threads` request: a bare `GET` with no query and no body. The
+ * upstream returns the caller-visible threads keyed by id; the gateway reads only
+ * the single target entry's title (see `normalizeGetThreadTitle`). OBSERVED-ONLY /
+ * provisional: this is a best-effort, account/principal-dependent lookup, never a
+ * completion operation, and it creates no thread.
+ */
+export function buildGetThreadsRequest(): UpstreamRequestSpec {
+  return {
+    method: "GET",
+    path: ENDPOINTS.getThreads,
+  };
+}
+
 /** Encode a `get_messages` request; `since_id` is intentionally omitted. */
 export function buildGetMessagesRequest(input: { readonly threadId: string }): UpstreamRequestSpec {
   // Standard query construction percent-encodes the thread id on the wire.

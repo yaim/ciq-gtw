@@ -35,6 +35,8 @@ export {
 export {
   DEFAULT_OPERATION_TIMEOUTS,
   DEFAULT_UPSTREAM_CAPABILITIES,
+  GET_THREADS_TIMEOUTS,
+  MAX_NATIVE_TITLE_BYTES,
   type CollectivIQAdapter,
   type CollectivIQCredentialProvider,
   type CollectivIQTransportConfig,
@@ -44,6 +46,7 @@ export {
   type CredentialLease,
   type FetchLike,
   type GetMessagesResult,
+  type GetThreadTitleResult,
   type OperationTimeouts,
   type ProcessMessageInput,
   type ProcessMessageResult,

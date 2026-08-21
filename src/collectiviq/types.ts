@@ -82,6 +82,12 @@ export interface CollectivIQTransportConfig extends TransportBase {
   readonly credentials: CollectivIQCredentialProvider;
   /** Per-operation timeouts; sensible defaults are applied when omitted. */
   readonly timeouts?: Partial<Record<CoreOperation, OperationTimeouts>>;
+  /**
+   * Transport bounds for the OBSERVED-ONLY `get_threads` title lookup. Defaults to
+   * {@link GET_THREADS_TIMEOUTS} (5 s/5 s/4 MiB). Injectable only so tests can
+   * exercise the bounded read cheaply; production always uses the default.
+   */
+  readonly getThreadsTimeouts?: OperationTimeouts;
 }
 
 /** The three core operations the production adapter performs. */
@@ -141,11 +147,33 @@ export interface GetMessagesResult {
   readonly rawStatus: number;
 }
 
+/**
+ * The normalized result of the OBSERVED-ONLY native-title lookup (`get_threads`).
+ *
+ * `pending` means the target thread has no server-generated title yet (it is
+ * absent from the caller's threads, or its title is still the fixed `New Thread`
+ * placeholder). `ready` carries the validated, content-bounded provider title.
+ * A malformed structure is never represented here — the adapter throws a
+ * normalized {@link UpstreamError} instead, so no raw upstream value escapes.
+ *
+ * This is best-effort, account/principal-dependent, provisional evidence — not a
+ * documented, repeatable, or request-scoped upstream guarantee.
+ */
+export type GetThreadTitleResult =
+  { readonly kind: "pending" } | { readonly kind: "ready"; readonly title: string };
+
 /** The narrow production adapter contract (spec section 8.5). */
 export interface CollectivIQAdapter {
   createThread(input: CreateThreadInput): Promise<CreateThreadResult>;
   processMessage(input: ProcessMessageInput): Promise<ProcessMessageResult>;
   getMessages(threadId: string, signal?: AbortSignal): Promise<GetMessagesResult>;
+  /**
+   * OBSERVED-ONLY native-title lookup: read the target thread's server-generated
+   * title via `get_threads`. Best-effort and account/principal-dependent; it
+   * creates no thread and is never part of the completion flow. Returns a narrow
+   * pending/ready result, or throws a normalized {@link UpstreamError}.
+   */
+  getThreadTitle(threadId: string, signal?: AbortSignal): Promise<GetThreadTitleResult>;
 }
 
 /**
@@ -176,3 +204,18 @@ export const DEFAULT_OPERATION_TIMEOUTS: Record<CoreOperation, OperationTimeouts
   processMessage: { headerTimeoutMs: 20_000, bodyTimeoutMs: 20_000, maxResponseBytes: 1_048_576 },
   getMessages: { headerTimeoutMs: 15_000, bodyTimeoutMs: 15_000, maxResponseBytes: 4_194_304 },
 };
+
+/**
+ * Transport bounds for the OBSERVED-ONLY `get_threads` title lookup. Kept
+ * separate from {@link DEFAULT_OPERATION_TIMEOUTS} (the three core operations) so
+ * the provisional bridge stays clearly outside the completion contract. 5 s
+ * header + 5 s body deadlines, 4 MiB max body; no internal retry.
+ */
+export const GET_THREADS_TIMEOUTS: OperationTimeouts = {
+  headerTimeoutMs: 5_000,
+  bodyTimeoutMs: 5_000,
+  maxResponseBytes: 4_194_304,
+};
+
+/** Maximum accepted UTF-8 byte length of a ready native title (before display truncation). */
+export const MAX_NATIVE_TITLE_BYTES = 512;

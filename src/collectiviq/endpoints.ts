@@ -8,6 +8,11 @@ export const ENDPOINTS = {
   createThread: "/create_thread",
   processMessage: "/process_message",
   getMessages: "/get_messages",
+  // `get_threads` backs the OBSERVED-ONLY native-title bridge (a best-effort,
+  // account/principal-dependent, provisional read of a thread's server-generated
+  // title). It performs no thread-creating POST and is not part of the three core
+  // completion operations. See `.agent/docs/collectiviq-upstream-contract.md`.
+  getThreads: "/get_threads",
   userEvents: "/user/events",
   availableLlms: "/available_llms",
   // `abortRun` and `threadTokens` are retained ONLY to document the upstream
