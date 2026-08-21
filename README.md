@@ -16,18 +16,22 @@ CollectivIQ, exposing a bounded OpenAI Chat Completions-compatible profile.
 > CollectivIQ **only when a real request is served** — never during import,
 > construction, or the build smoke test. A user-observed, sanitized live
 > OpenCode/CollectivIQ smoke result was reported on **2026-08-15**: the foreground
-> `collectiviq-claude` **transport** path worked (a response returned, synthetic
-> streaming completed, and OpenCode's auto-attached tool metadata was accepted and
-> discarded with no tool call emitted). The returned response, however, objected to
-> the gateway's serialized protocol wrapper as embedded identity/instruction
-> manipulation, so end-to-end **semantic** compatibility is **not** established — a
-> clean valid answer, a CollectivIQ _combined_ answer, a long-running keep-alive
-> streaming duration, and `collectiviq-fast` title generation are **not** verified
-> for this account. The prompt-serialization remediation — a `collectiviq-claude-direct`
-> virtual model using `promptMode: direct` (latest-user-only prompt, no protocol
-> wrapper) — is now **implemented offline** and is the committed OpenCode default,
-> but it is **not yet verified live** to fix the refusal and closing that criterion
-> still needs separate approval for a live smoke.
+> protocol-mode `collectiviq-claude` **transport** path worked (a response returned,
+> synthetic streaming completed, and OpenCode's auto-attached tool metadata was
+> accepted and discarded with no tool call emitted), but the returned response
+> objected to the gateway's serialized protocol wrapper as embedded
+> identity/instruction manipulation on that path. The prompt-serialization
+> remediation — a `collectiviq-claude-direct` virtual model using `promptMode:
+direct` (latest-user-only prompt, no protocol wrapper) — is the committed OpenCode
+> default, and a sanitized, user-authorized **2026-08-18** smoke **observed it
+> resolve that refusal for the tested account**: a natural coding request returned a
+> relevant, correct answer, synthetic streaming completed with no protocol
+> objection / tool alert / tool call, and the hidden `collectiviq-fast` title
+> request returned a valid title on its first attempt. This meets the Phase 1
+> semantic / OpenCode smoke criterion **for the tested account** — a sanitized
+> single-account observation, **not** production readiness or a repeatable upstream
+> guarantee. A clean CollectivIQ _combined_ answer, a long-running keep-alive
+> streaming duration, and general non-Claude routing remain **not** verified.
 > Streaming is
 > **synthetic** (the answer is obtained by polling, then split into deltas), not
 > true upstream streaming. It does **not** implement tool calling,
@@ -109,11 +113,12 @@ keep-alive` comments every 15 s while polling waits, deterministic
 authentication, the model endpoints, the non-streamed `POST /v1/chat/completions`
 path, and text-only synthetic SSE streaming are implemented — see "What works
 today". A basic live OpenCode/CollectivIQ foreground **transport** smoke was
-observed on 2026-08-15, but the returned response objected to the gateway's
-serialized protocol wrapper, so a clean end-to-end valid answer is not yet
-established; a long-running streaming smoke, a combined answer, and
-`collectiviq-fast` title generation are likewise not yet verified for this
-account.) Four authorized authenticated discovery baselines ran: two bearer-mode
+observed on 2026-08-15 with a protocol-wrapper refusal on the protocol-mode path;
+a sanitized 2026-08-18 smoke then **observed** the committed-default
+`collectiviq-claude-direct` profile return a valid answer for the tested account
+with a valid `collectiviq-fast` title on its first attempt — a single-account
+observation, not production readiness. A long-running keep-alive streaming smoke, a
+combined answer, and general non-Claude routing remain not yet verified.) Four authorized authenticated discovery baselines ran: two bearer-mode
 runs (2026-08-06/07) **failed strict completeness (exited non-zero)**, and two
 `password`-mode runs (2026-08-11) **both passed (exited zero)** with identical
 sanitized safe facts. The core create/submit/messages contract and password
@@ -284,50 +289,67 @@ bridge above to discard that metadata. Its foreground `model`, the top-level
 non-Claude routing is blocked upstream, see the note below) using
 `promptMode: direct`, which submits only the latest user message without the
 gateway protocol wrapper the account objected to. This profile is intentionally
-lossy (no system/developer instructions or conversation history) and is **not yet
-verified live** to fix the refusal. The hidden `title` agent stays on the
-protocol-mode `collectiviq-fast`. The protocol-mode `collectiviq-claude` and the
+lossy (no system/developer instructions or conversation history). A sanitized,
+user-authorized **2026-08-18** smoke **observed it resolve that refusal for the
+tested account** — a sanitized single-account observation, not production
+readiness or a repeatable upstream guarantee. The protocol-mode `collectiviq-claude` and the
 `collectiviq-consensus`/`collectiviq-coder`/`collectiviq-fast` models remain
 declared. **Add `collectiviq-claude-direct` to your local `config/models.yaml`
 manually** (git-ignored) before this default resolves.
 
-OpenCode also runs a built-in **hidden `title` agent** that generates a short
-session title with its own separate completion request. OpenCode invokes it
-**conditionally** — for a parentless/top-level session whose title is still the
-default, around its first real user message — not unconditionally at session
-start; the committed config routes it to `collectiviq/collectiviq-fast` as a
-best-effort auxiliary path. The gateway adds no title-specific fallback,
-alternate-model probing, or retry; OpenCode itself, however, configures the title
-completion with `retries: 2`. If title generation yields no usable title the
-foreground interaction still proceeds with the unchanged/default session title.
-Because **every** completion request creates a new CollectivIQ thread, the title
-request creates its own thread(s): the observed smoke made one title thread plus
-one foreground thread, but OpenCode's title `retries: 2` can create additional
-provider-side threads and cost, so a two-thread session is a common case, not a
-fixed maximum. Deploying operators must have `collectiviq-fast` in their model
-catalog (`config/models.yaml`); a missing model yields the ordinary
-model-not-found behavior. The generated OpenCode session title is **distinct**
-from the CollectivIQ upstream thread title: the gateway still performs exactly one
-`create_thread` per completion using the fixed, content-free
-`CollectivIQ Gateway request` title, and never forwards any prompt-derived or
-OpenCode-generated title upstream.
+OpenCode's built-in **hidden LLM `title` agent is disabled** in the committed
+`opencode.jsonc` (`"title": { "disable": true }`), so it creates **no** separate
+title thread or completion. As a result a first foreground message creates
+**exactly one** CollectivIQ thread — the earlier "two or more upstream threads per
+session" behavior no longer applies. In its place, a dependency-free project-local
+plugin (`.opencode/plugins/collectiviq-native-title.ts`) propagates the
+CollectivIQ-generated **native** thread title to the OpenCode session
+asynchronously: it arms only a parentless top-level session still on OpenCode's
+default title, attaches an `X-CollectivIQ-OpenCode-Session-ID` header once, and
+after `session.idle` polls the authenticated `GET /v1/opencode/session-title`
+extension on a bounded, capped schedule (immediately, then 2/4/8/8/8 s), renaming
+the session only if its title is still the exact captured default. Arming reads
+session metadata from OpenCode lifecycle events (no async lookup in the normal
+case) and only for a not-yet-observed session falls back to a small, bounded,
+fail-open `session.get`, so it adds at most a bounded delay to the foreground
+request — never an indefinite one. It never overwrites a manual or
+already-propagated title and is best-effort — any failure leaves OpenCode's
+default/manual title. Native-title polling adds only bounded `GET` requests and creates no additional
+upstream thread. `collectiviq-fast` is no longer the title agent's model but
+remains declared for manual/other-account use.
+
+The OpenCode session title is **distinct** from the CollectivIQ upstream thread
+title: the gateway still performs exactly one `create_thread` per completion using
+the fixed, content-free placeholder `New Thread`, and never forwards any
+prompt-derived or OpenCode-generated title upstream. A sanitized 2026-08-18
+observation found that CollectivIQ may **asynchronously** replace `New Thread` with
+its own prompt-related, server-generated thread title after `process_message`; that
+native title is prompt-derived provider metadata, produced and persisted
+provider-side (and, after propagation, stored by OpenCode as the session title).
+The gateway reads it only transiently to serve the session-title extension and
+never logs, caches, or retains it. The extension endpoint, its
+`X-CollectivIQ-OpenCode-Session-ID` header, the process-local correlation bounds,
+and the observed-only `get_threads` lookup are documented in
+[`.agent/docs/tech-software-spec.md`](.agent/docs/tech-software-spec.md)
+sections 9.5, 10.4, and 25.
 
 A basic live foreground OpenCode/CollectivIQ **transport** smoke was observed on
-**2026-08-15** (`collectiviq-claude` response returned, synthetic streaming
-completed, tool metadata accepted and discarded with no tool call); the returned
-response objected to the gateway's serialized protocol wrapper as embedded
-identity/instruction manipulation, so a clean end-to-end valid answer is **not**
-established. The remediation — the `collectiviq-claude-direct` profile
-(`promptMode: direct`) — is now **implemented offline** and is the committed
-OpenCode default, but it is **not yet verified live** to fix the refusal; closing
-the criterion still requires a separately approved live re-verification and the
-profile must not be claimed to fix the refusal until then. `collectiviq-fast`
-title generation is **not yet verified live** and may be blocked account-side (see
-the note below); a long-running streaming smoke and a combined answer are likewise
-unverified. Any further live run requires separate approval before live
-CollectivIQ traffic, and a `collectiviq-fast` title smoke creates one or more
-additional upstream threads (OpenCode may retry it twice) and may incur provider
-cost.
+**2026-08-15** (protocol-mode `collectiviq-claude` response returned, synthetic
+streaming completed, tool metadata accepted and discarded with no tool call), on
+which the returned response objected to the gateway's serialized protocol wrapper
+as embedded identity/instruction manipulation. The remediation — the
+`collectiviq-claude-direct` profile (`promptMode: direct`), the committed OpenCode
+default — was **observed to resolve that refusal for the tested account** in a
+sanitized 2026-08-18 smoke: a natural coding request returned a relevant, correct
+answer, synthetic streaming completed with no protocol objection / tool alert /
+tool call, and (at that time, before the hidden LLM title agent was disabled) the
+hidden `collectiviq-fast` title request returned a valid title on its **first**
+attempt. That is a single-account observation of the foreground path (and the
+historical title path), **not** production readiness or a repeatable guarantee, and
+it does **not** prove general non-Claude routing (which stays blocked account-side,
+see the note below); a long-running streaming smoke and a combined answer are
+likewise unverified. Any further live run requires separate approval before live
+CollectivIQ traffic and may incur provider cost.
 
 **Account-specific upstream routing limitation.** For the CollectivIQ account
 used during discovery, generic gateway prompts were classified by the account as

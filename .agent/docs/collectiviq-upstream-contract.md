@@ -47,20 +47,26 @@ adapter is wired into `POST /v1/chat/completions` via
 and polls `get_messages` under the model's total deadline with GET-only retry and
 the timestamp → sortable-id → array-position selection above. Normalized
 `UpstreamError`s map to public OpenAI envelopes by closed category only (spec
-section 20). **No new live evidence is asserted here.** The only live evidence
-that exists is the earlier user-observed, sanitized **2026-08-15** foreground
-transport smoke: the `collectiviq-claude` request returned a response and
-synthetic streaming completed, but the returned model response **objected to the
-gateway's serialized protocol wrapper as embedded identity/instruction
-manipulation**, so a clean end-to-end valid answer was **not** established (spec
-section 32, Phase 1 exit criterion — still open). No live CollectivIQ request is
-made from this repository except when a real completion is served, and no new
-live OpenCode smoke has been run since. The offline `collectiviq-claude-direct`
+section 20). The earlier user-observed, sanitized **2026-08-15** foreground
+transport smoke used the protocol-mode `collectiviq-claude` request: it returned a
+response and synthetic streaming completed, but the returned model response
+**objected to the gateway's serialized protocol wrapper as embedded
+identity/instruction manipulation**, so a clean end-to-end valid answer was **not**
+established for that path. The offline `collectiviq-claude-direct`
 prompt-serialization profile (specification section 8.4; latest-user-only prompt,
-no protocol wrapper) is now **implemented** as the mitigation for that refusal but
-is **not yet verified live** — it must not be claimed to fix the refusal until a
-separately approved live smoke confirms it. Because each completion sends the
-prompt into a new CollectivIQ-managed thread, provider-side
+no protocol wrapper) is the mitigation for that refusal, and a sanitized,
+user-authorized **2026-08-18** smoke **observed it succeed for the tested
+account**: direct mode submitted only the latest user text, a natural TypeScript
+coding request returned a relevant answer, the foreground OpenCode interaction
+produced no protocol objection / tool alert / tool call, and the hidden
+`collectiviq-fast` title request returned a valid title on its first attempt (see
+the "2026-08-18 authorized observation" section below). This meets the Phase 1
+semantic / OpenCode smoke criterion **for the tested account**, but is an observed
+single-account result — **not** production readiness or a repeatable upstream
+guarantee, and it does not establish combined answers, long-duration streaming, or
+generic non-Claude routing. No live CollectivIQ request is made from this
+repository except when a real completion is served. Because each completion sends
+the prompt into a new CollectivIQ-managed thread, provider-side
 retention/training/deletion/regional behavior remains a
 **production/provider-confirmation gate**, unchanged by this phase; the gateway
 itself retains no prompt/answer content after the request.
@@ -185,9 +191,22 @@ unverified, as is token lifetime/refresh.
   corrects earlier text that described it as multipart.
 - Fields: `thread_title` (required, string); `is_title_from_user` (default
   `false`); `project_id` (`integer | null`, optional).
-- The gateway sends `thread_title=<generic title>` and
-  `is_title_from_user=false`, and omits `project_id`. The title is content-free
-  and never derived from prompts, repositories, filenames, or personal data.
+- The gateway sends the fixed placeholder `thread_title=New Thread` and
+  `is_title_from_user=false`, and omits `project_id`. The placeholder is
+  content-free and never derived from prompts, repositories, filenames, or
+  personal data. It is deliberately the exact temporary title `New Thread` (see
+  the 2026-08-18 observation below): in a sanitized 2026-08-18 probe this was the
+  minimal gateway-compatible trigger that caused CollectivIQ to natively generate
+  a server-side, prompt-related thread title after `process_message`. The
+  URL-encoded request is otherwise unchanged (`is_title_from_user=false`, current
+  `process_message` fields including `llms_explicitly_set=true`); still exactly
+  one thread per completion, capacity acquired before create, and no
+  `create_thread`/`process_message` retry. The gateway never derives, logs,
+  caches, or retains the provider-generated title. It reads that title only
+  **transiently** via the observed-only `get_threads` lookup (below) to serve the
+  OpenCode session-title extension (`GET /v1/opencode/session-title`, spec
+  section 9.5); native-title propagation adds only bounded GET requests and no
+  additional thread.
 - Success shape: a top-level object with a `thread_id` that is a positive integer
   or a non-empty string, normalized to a string. Declared `200` schema is empty
   (`{}`). **Verified-repeatable:** across the 2026-08-06/07 bearer runs and both
@@ -217,9 +236,13 @@ unverified, as is token lifetime/refresh.
   `collectiviq-claude-direct`, a Claude-only source selection whose
   `promptMode: "direct"` drops the protocol wrapper this account objected to;
   `collectiviq-claude` remains available as the protocol-mode Claude alternative.
-  Direct mode is implemented offline but is **not yet verified live** to resolve
-  that semantic refusal (see specification sections 25, 34.7, and 36, and
-  `opencode.jsonc`). This is a value-free, account-specific
+  Direct mode was observed live on 2026-08-18 to resolve that semantic refusal
+  for the tested account: a natural coding/OpenCode foreground request returned a
+  relevant answer with no protocol objection, tool alert, or tool call, and
+  synthetic streaming completed. This is a sanitized single-account observation,
+  not a production-readiness claim or repeatable upstream guarantee; the generic
+  non-Claude routing/provider question remains open (see specification sections
+  25, 34.7, and 36, and `opencode.jsonc`). This is a value-free, account-specific
   note (no live response text, prompt, Jira identifier, thread id, or model
   answer is recorded) and does **not** generalize to every account; a supported
   generic-routing mechanism remains an open provider question (specification
@@ -413,6 +436,87 @@ captured or promoted (fixtures are synthetic).
   fixtures (`processAccepted202`, `messagesCreateTime`) with matching contract
   tests, and `validation.ts` now maps `createdAt` from `create_time`. The ignored
   live reports and recovery journal are **not** committed.
+
+## 2026-08-18 authorized observation (direct-mode smoke + native title behavior)
+
+On 2026-08-18 a user-authorized, sanitized session recorded two distinct
+observations. All facts below are **observed** (a value-free structural/behavioral
+capture from a single authorized run), **not** an official or repeatable upstream
+guarantee and **not** production-consumed. No live identifier, title, prompt,
+answer, timestamp, credential, account field, or raw SSE/HAR/inventory body is
+recorded.
+
+### Direct-mode / OpenCode smoke (observed successful)
+
+- The `collectiviq-claude-direct` model (`promptMode: "direct"`) submitted only
+  the latest user text; the CollectivIQ UI showed no protocol wrapper.
+- A natural TypeScript coding request returned a relevant, correct answer.
+- A foreground OpenCode interaction returned a relevant answer, completed
+  synthetic streaming, and produced **no** protocol objection, **no** tool alert,
+  and **no** tool call.
+- OpenCode's hidden `collectiviq-fast` title request returned a valid title on its
+  **first** attempt and updated the OpenCode terminal session title.
+- This establishes the Phase 1 semantic / OpenCode smoke criterion **for the
+  tested account** (resolving the 2026-08-15 protocol-wrapper refusal for this
+  account and path), but does **not** establish production readiness,
+  combined-answer support, long-duration streaming, generic non-Claude foreground
+  routing, or any other open provider gate.
+
+### Native CollectivIQ title behavior (observed)
+
+A bounded probe created three synthetic threads; all three were observed as
+present by the **first** 15-second inventory check:
+
+1. A URL-encoded `create_thread` with `thread_title=New Thread`,
+   `is_title_from_user=false`, and current gateway `process_message` fields.
+2. A Firefox-style multipart create plus the current gateway submission.
+3. A Firefox-style create and submission control.
+
+In this observed run:
+
+- The minimal gateway-compatible trigger for native server-side title generation
+  was the exact temporary title `New Thread`.
+- Firefox-only extras were **not** required: multipart creation, `role=owner`,
+  `llms_explicitly_set=false`, and `client_timezone`.
+- `get_threads` returned an object whose `threads` property was **keyed by
+  normalized thread-ID strings**; each entry contained `title` and did **not**
+  redundantly contain a `thread_id`.
+- Browser/network evidence showed the server-generated title first in a
+  `/user/events` SSE message and **later** in `get_threads`; **no** separate
+  client title-update POST was observed — persistence was server-side.
+- Every gateway completion now starts with the `New Thread` placeholder;
+  CollectivIQ may **asynchronously** replace it with a prompt-related,
+  provider-generated title after `process_message`. That provider title is
+  prompt-derived provider metadata (additional provider-side metadata/retention
+  exposure) and is **distinct** from the OpenCode session title.
+- Observed behavior for one account and run, **not** an official, documented,
+  repeatable, or request-scoped upstream guarantee.
+
+### `GET /get_threads` — OBSERVED-ONLY / provisional native-title lookup
+
+**Consumed by exactly one non-completion path: the OpenCode session-title
+extension** (`GET /v1/opencode/session-title`, spec section 9.5), and only as
+OBSERVED-ONLY, account/principal-dependent, provisional evidence — **not** a
+documented, repeatable, request-scoped, or generally supported provider capability,
+and **not** part of any completion path. `get_threads` is **not** in the committed
+filtered OpenAPI snapshot (the allowlist is unchanged); a bounded snapshot refresh
+to add it is deferred to a separately-approved stage.
+
+- Adapter operation `getThreadTitle(threadId)` issues a bare `GET /get_threads`
+  under the bounded transport (5 s header, 5 s body, 4 MiB max body) with **no**
+  internal retry, reusing the shared credential provider/transport.
+- It reads **only the single target thread entry** from the observed
+  thread-id-keyed `threads` map; it never enumerates, retains, serializes, or logs
+  unrelated entries, and issues **no** thread-creating POST.
+- Narrow pending/ready contract: a target absent from the map, or a title still
+  equal to the fixed `New Thread` placeholder, is **pending**; a **ready** title
+  must be a string that trims to non-empty, is single-line, is free of C0/C1
+  control characters, and is ≤ 512 UTF-8 bytes; any malformed target or title is a
+  normalized, content-free `UpstreamError` (no raw body, title, or identifier
+  leaks).
+- Because access is principal/account-dependent, this lookup (like thread deletion
+  and `/available_llms`) may fail or return `pending` indefinitely on some
+  accounts. No live identifier or title value is recorded here.
 
 ## Discovery session (four authorized runs; opt-in)
 

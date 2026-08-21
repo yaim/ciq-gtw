@@ -28,20 +28,25 @@ CollectivIQ adapter, and Phase 2 text-only synthetic SSE streaming
 The completion path calls CollectivIQ only
 when a real request is served (never during import/construction/build smoke). A
 user-observed, sanitized live OpenCode/CollectivIQ foreground **transport** smoke
-was reported on **2026-08-15** (`collectiviq-claude` response returned, synthetic
-streaming completed, tool metadata accepted and discarded with no tool call); the
-returned response objected to the gateway's serialized protocol wrapper, so a
-clean end-to-end valid answer, a combined answer, a long-running streaming
-duration, and `collectiviq-fast` title generation remain unverified and any
-further live run is approval-gated. The `collectiviq-claude-direct` profile
-(`promptMode: direct`, latest-user-only prompt) is now implemented offline as the
-mitigation and is the committed default, but it is not yet verified live and must
-not be claimed to fix the refusal until a separately approved live smoke confirms
-it. The controls that exist today are:
+was reported on **2026-08-15** (protocol-mode `collectiviq-claude` response
+returned, synthetic streaming completed, tool metadata accepted and discarded with
+no tool call); the returned response objected to the gateway's serialized protocol
+wrapper on that path. The `collectiviq-claude-direct` profile (`promptMode:
+direct`, latest-user-only prompt) is the mitigation and the committed default, and
+a sanitized 2026-08-18 smoke **observed it resolve that refusal for the tested
+account** (a natural coding request returned a relevant answer, streaming
+completed, and the hidden `collectiviq-fast` title request returned a valid title
+on its first attempt). That is a sanitized single-account observation, **not**
+production readiness or a repeatable upstream guarantee: a combined answer, a
+long-running streaming duration, and general non-Claude routing remain unverified,
+and any further live run is approval-gated. The controls that exist today are:
 
 - **Gateway client authentication (implemented).** Every route under `/v1/*` —
-  today `GET /v1/models`, `GET /v1/models/:model`, and the implemented
-  `POST /v1/chat/completions` (non-streamed JSON and synthetic SSE) — requires
+  today `GET /v1/models`, `GET /v1/models/:model`, the implemented
+  `POST /v1/chat/completions` (non-streamed JSON and synthetic SSE), and the
+  `GET /v1/opencode/session-title` extension (an authenticated CollectivIQ/OpenCode
+  extension, **not** part of the OpenAI compatibility profile; spec section 9.5) —
+  requires
   `Authorization: Bearer <gateway-key>` matched against `COLLECTIVIQ_GATEWAY_KEYS`;
   `/healthz` and `/readyz` stay unauthenticated. The scheme is case-insensitive
   and the token is compared **exactly** (never trimmed/normalized) using a
@@ -178,7 +183,7 @@ it. The controls that exist today are:
   aborts polling/upstream work and sends no body, and a shutdown cancellation
   (client still connected) maps to `503`. The completion serializes
   the prompt with a
-  content-free generic thread title (`CollectivIQ Gateway request`, never derived
+  content-free fixed thread-title placeholder (`New Thread`, never derived
   from prompt/model/repo/file/user/response data — and distinct from any OpenCode
   session title, which is never forwarded into `create_thread`), measures the
   final SELECTED prompt in UTF-8 bytes against the model's
@@ -201,15 +206,28 @@ it. The controls that exist today are:
   prompts and answers cross into CollectivIQ-managed storage; the gateway retains
   no prompt/answer content after the request completes, but provider-side
   retention/training/deletion/regional behavior remains **unknown** (see below).
-  The gateway performs exactly **one** `create_thread` per completion request;
-  OpenCode may issue an **additional** completion request per session — a hidden
-  `collectiviq-fast` title request, invoked conditionally around a new top-level
-  session's first user message and configured by OpenCode with `retries: 2`. The
-  observed smoke created one title thread plus one foreground thread; because each
-  completion (including each OpenCode title retry) creates a new upstream thread, a
-  session may create **two or more** upstream threads — additional auxiliary
-  latency, provider-side retention, and cost, but no change to the gateway's
-  per-request thread-creation or no-content-retention guarantees.
+  A sanitized 2026-08-18 observation additionally found that CollectivIQ may
+  **asynchronously derive and persist a prompt-related thread title** server-side
+  after `process_message` (triggered by the fixed `New Thread` placeholder). That
+  provider-generated native title is prompt-derived provider metadata —
+  **additional provider-side metadata/retention exposure** beyond the prompt/answer,
+  outside the gateway's control. The gateway never derives, logs, caches, or retains
+  it; it reads it only **transiently** — via the observed-only `get_threads` lookup
+  — to serve the OpenCode session-title extension (`GET /v1/opencode/session-title`,
+  spec section 9.5), and production consumes **no** account-wide `/user/events`.
+  **Correlation retention:** when a valid `X-CollectivIQ-OpenCode-Session-ID`
+  accompanies a successful completion, a process-local correlation store retains
+  **only** the two opaque ids (gateway-key identity + session id) and the upstream
+  thread id for a bounded TTL (60 s) under per-key (32) and global (128) caps —
+  **never** a title, prompt, or answer — and a restart safely discards it. The
+  session id is never logged, hashed into logs, or reflected in an error.
+  The gateway performs exactly **one** `create_thread` per completion request. The
+  OpenCode hidden LLM `title` agent is **disabled** in the committed
+  configuration, so it creates **no** separate title thread; a first foreground
+  message therefore creates exactly one upstream thread and native-title
+  propagation (via the plugin polling the extension endpoint) adds only bounded
+  `GET` requests, no additional thread. (The earlier "two or more upstream threads
+  per session" behavior no longer applies to the committed configuration.)
 - **Synthetic SSE streaming path (implemented; Phase 2).** `stream: true` reuses
   the same authenticated, bounded orchestration; authentication, validation,
   model resolution, and prompt preparation all complete **before** any SSE header
@@ -371,14 +389,19 @@ errorCode, resolved, resolution, persisted }] }` (no longer `succeeded`/
 ## Current limitations
 
 - `POST /v1/chat/completions` is implemented; a basic live foreground
-  **transport** smoke was observed on **2026-08-15** (`collectiviq-claude`
-  response returned, streaming completed, tool metadata discarded, no tool call).
-  The returned response objected to the gateway's serialized protocol wrapper, so
-  a clean end-to-end valid answer is **not** established; that, a combined answer,
-  a long-running streaming duration, and `collectiviq-fast` title generation are
-  **not** verified for this account, and any further live run is approval-gated. No
-  live CollectivIQ request is made from this repository except when a real
-  completion request is served against a configured upstream credential.
+  **transport** smoke was observed on **2026-08-15** (protocol-mode
+  `collectiviq-claude` response returned, streaming completed, tool metadata
+  discarded, no tool call), on which the returned response objected to the
+  gateway's serialized protocol wrapper. A sanitized 2026-08-18 smoke **observed**
+  the committed-default `collectiviq-claude-direct` profile resolve that refusal for
+  the tested account (a natural coding request returned a relevant, correct answer;
+  streaming completed; the hidden `collectiviq-fast` title request returned a valid
+  title on its first attempt). This is a single-account observation, **not**
+  production readiness or a repeatable guarantee: a combined answer, a long-running
+  streaming duration, and general non-Claude routing remain **not** verified, and
+  any further live run is approval-gated. No live CollectivIQ request is made from
+  this repository except when a real completion request is served against a
+  configured upstream credential.
 - Tool calling and Redis/idempotency are not implemented; those requests are
   rejected or unavailable rather than silently degraded. Streaming
   (`stream: true`/SSE) is implemented as text-only buffered synthetic SSE, not

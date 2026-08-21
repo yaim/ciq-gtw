@@ -109,8 +109,17 @@ contracts, the capability matrix, and open questions.
   completion mapping, discovery/cleanup observation) uses this guard; there are no
   remaining `instanceof UpstreamError` checks in `src/`.
 - Confirmed encoding facts: `POST /create_thread` is
-  `application/x-www-form-urlencoded` (fields `thread_title`,
-  `is_title_from_user=false`); `POST /process_message` is `multipart/form-data`
+  `application/x-www-form-urlencoded` (fields `thread_title` — the gateway sends
+  the fixed content-free placeholder `New Thread`, `is_title_from_user=false`); a
+  sanitized 2026-08-18 observation found `New Thread` to be the minimal
+  gateway-compatible trigger that causes CollectivIQ to natively generate a
+  server-side, prompt-related thread title after `process_message` (request
+  otherwise unchanged; that provider title is derived and persisted entirely
+  provider-side, never logged/cached/retained by the gateway, and read only
+  transiently — via the OBSERVED-ONLY/provisional `getThreadTitle` (`GET
+  /get_threads`) lookup — to serve the OpenCode session-title extension `GET
+  /v1/opencode/session-title` (spec sections 9.5/10.4)). `POST
+  /process_message` is `multipart/form-data`
   and includes `llms_explicitly_set=true`; `GET /get_messages` documents an
   optional `since_id` that the gateway omits and an optional `thread_id` that the
   gateway always requires. Every declared `200` success schema is empty, so
@@ -133,16 +142,21 @@ selection. The runtime credential provider is built from validated config
 (`buildCredentialProviderFromConfig`, no env re-read; runtime logins are lazy and
 bounded per attempt). Normalized `UpstreamError`s map to public envelopes by
 closed category only (spec section 20). A user-observed, sanitized live foreground
-**transport** smoke was reported on **2026-08-15** (`collectiviq-claude` response
-returned, synthetic streaming completed, tool metadata accepted and discarded with
-no tool call), but the returned response objected to the gateway's serialized
-protocol wrapper, so a clean end-to-end valid answer is **not** established (the
-Phase 1 semantic exit criterion stays open; the `collectiviq-claude-direct`
-prompt-serialization profile — `promptMode: "direct"`, latest-user-only prompt with
-no protocol wrapper — is now **implemented offline** and is the committed OpenCode
-default, but it is **not yet verified live** and must not be claimed to fix the
-refusal until a separately approved live smoke confirms it); a combined answer, a
-long-running streaming duration, and `collectiviq-fast` title generation likewise
+**transport** smoke was reported on **2026-08-15** (protocol-mode `collectiviq-claude`
+response returned, synthetic streaming completed, tool metadata accepted and
+discarded with no tool call), on which the returned response objected to the
+gateway's serialized protocol wrapper. The `collectiviq-claude-direct`
+prompt-serialization profile (`promptMode: "direct"`, latest-user-only prompt with
+no protocol wrapper) is the mitigation and the committed OpenCode default, and a
+sanitized, user-authorized **2026-08-18** smoke **observed it resolve that refusal
+for the tested account** (valid answer to a natural coding request; synthetic
+streaming completed with no protocol objection / tool alert / tool call; and — as
+historical evidence recorded before OpenCode's hidden LLM title agent was disabled
+— the hidden `collectiviq-fast` title request returned a valid title on its first
+attempt), so the Phase 1 semantic exit criterion is **met for the tested
+account**. This is a sanitized single-account
+observation, **not** production readiness or a repeatable upstream guarantee; a
+combined answer, a long-running streaming duration, and general non-Claude routing
 remain unverified and any further live run is approval-gated.
 
 Only the CollectivIQ adapter may know:
@@ -162,7 +176,7 @@ Never expose or log the authorization header, the upstream credentials (API key,
 
 ## Per-Completion Workflow
 
-1. Create a thread with a generic request title containing no prompt, filename, repository, or personal data.
+1. Create a thread with the fixed content-free placeholder title `New Thread`, containing no prompt, filename, repository, or personal data. (CollectivIQ may then asynchronously generate its own prompt-related thread title server-side; the gateway never logs, caches, or retains it, reading it only transiently — via the OBSERVED-ONLY/provisional `getThreadTitle`/`GET /get_threads` lookup — to serve the `GET /v1/opencode/session-title` extension, spec sections 9.5/10.4.)
 2. Validate and normalize a positive integer or non-empty string `thread_id` to an internal string.
 3. Submit the complete serialized prompt and configured model/source policy once.
 4. Treat an HTTP success as insufficient: inspect the body for documented/provisional error objects.
