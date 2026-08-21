@@ -25,8 +25,10 @@
       // system/developer/assistant/earlier-user content. It is the foreground/
       // small_model default because the account observed to reject the protocol
       // wrapper as embedded identity/instruction manipulation; it is intentionally
-      // lossy (no system/developer instructions or conversation history) and is
-      // NOT yet verified live to fix that refusal.
+      // lossy (no system/developer instructions or conversation history). A
+      // sanitized 2026-08-18 smoke OBSERVED it resolve that refusal FOR THE TESTED
+      // ACCOUNT (valid answer to a natural coding request); that is a single-account
+      // observation, not production readiness or a repeatable upstream guarantee.
       "models": {
         "collectiviq-claude": {
           "name": "CollectivIQ Claude",
@@ -67,26 +69,33 @@
         "*": "deny",
       },
     },
-    // OpenCode's built-in hidden `title` agent generates a short session title
-    // with its own separate completion request. OpenCode invokes it conditionally
-    // — for a parentless/top-level session whose title is still the default,
-    // around its first real user message — not unconditionally at session start.
-    // Route it to `collectiviq-fast` (best-effort auxiliary path). Title stays on
-    // the protocol-mode fast model; only the foreground and `small_model`
-    // selections move to the Claude direct profile. This is a hidden auxiliary
-    // request distinct from
-    // the foreground release gate; the gateway adds no title-specific fallback,
-    // alternate-model probing, or retry, though OpenCode itself configures the
-    // title completion with `retries: 2`. If no usable title results, the session
-    // continues with the unchanged/default title. Because every completion creates
-    // a new upstream thread, the title request (plus any OpenCode retry) creates
-    // additional CollectivIQ thread(s) and cost — the observed smoke made one
-    // title thread and one foreground thread, a common case, not a fixed maximum.
-    // A deployment whose model catalog lacks `collectiviq-fast` gets the ordinary
-    // model-not-found behavior. This session title is unrelated to the fixed,
-    // content-free CollectivIQ upstream thread title.
+    // OpenCode's built-in hidden `title` agent would generate a short session
+    // title with its OWN separate completion request (and thus a separate upstream
+    // CollectivIQ thread). It is DISABLED here so no separate title thread/
+    // completion is ever created. Note: `disable: true` turns off the hidden LLM
+    // title-generation agent — do NOT rely on `OPENCODE_DISABLE_TERMINAL_TITLE`
+    // for this, which only controls terminal-title RENDERING, not hidden LLM title
+    // generation.
+    //
+    // In place of that hidden agent, the project-local plugin
+    // `.opencode/plugins/collectiviq-native-title.ts` asynchronously fetches the
+    // NATIVE, server-generated CollectivIQ title of the session's first foreground
+    // thread (via the gateway's `/opencode/session-title` endpoint) and applies it
+    // to the OpenCode session — reusing the foreground thread instead of creating
+    // an extra one. This OpenCode session title is unrelated to the CollectivIQ
+    // upstream thread title: the gateway always sends the fixed content-free
+    // placeholder `New Thread`, which CollectivIQ may asynchronously replace with
+    // its own prompt-related, server-generated title. The gateway reads that
+    // correlated native title only TRANSIENTLY, through the extension endpoint, to
+    // answer this plugin; it never logs, caches, or retains it, and the plugin
+    // receives it only through that authenticated gateway endpoint.
+    //
+    // `collectiviq-fast` remains declared in the provider model catalog below for
+    // manual/other-account use. The historical sanitized 2026-08-18 observation
+    // that a `collectiviq-fast` title request succeeded on its first attempt for
+    // one account remains historical evidence, not a current routing guarantee.
     "title": {
-      "model": "collectiviq/collectiviq-fast",
+      "disable": true,
     },
   },
   "default_agent": "collectiviq-text",
@@ -95,7 +104,9 @@
   // (small_model) work: Claude is the only source observed to answer for this
   // account, and the direct prompt profile drops the gateway protocol wrapper the
   // account objected to. It is intentionally lossy (no system/developer
-  // instructions or conversation history) and is not yet verified live.
+  // instructions or conversation history); a sanitized 2026-08-18 smoke observed it
+  // resolve that refusal for the tested account (single-account observation, not
+  // production readiness or a repeatable guarantee).
   "model": "collectiviq/collectiviq-claude-direct",
   "small_model": "collectiviq/collectiviq-claude-direct",
   "share": "disabled",

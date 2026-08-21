@@ -6,7 +6,7 @@ export default tseslint.config(
     ignores: ["dist/**", "coverage/**", "node_modules/**"],
   },
   {
-    files: ["src/**/*.ts", "test/**/*.ts", "scripts/**/*.ts"],
+    files: ["src/**/*.ts", "test/**/*.ts", "scripts/**/*.ts", ".opencode/plugins/**/*.ts"],
     extends: [js.configs.recommended, ...tseslint.configs.recommendedTypeChecked],
     languageOptions: {
       parserOptions: {
