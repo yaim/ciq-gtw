@@ -44,6 +44,7 @@ function makeAdapter(steps: readonly (UpstreamMessage[] | Error)[]): {
   const adapter: CollectivIQAdapter = {
     createThread: notImplemented,
     processMessage: notImplemented,
+    getThreadTitle: notImplemented,
     getMessages,
   };
   return { adapter, getMessages };
@@ -202,6 +203,7 @@ describe("createPoller", () => {
     const adapter: CollectivIQAdapter = {
       createThread: notImplemented,
       processMessage: notImplemented,
+      getThreadTitle: notImplemented,
       getMessages,
     };
     const poller = createPoller(adapter, { clock, sleep, random: () => 0.5 });
@@ -223,6 +225,7 @@ describe("createPoller", () => {
     const adapter: CollectivIQAdapter = {
       createThread: notImplemented,
       processMessage: notImplemented,
+      getThreadTitle: notImplemented,
       getMessages,
     };
     const poller = createPoller(adapter, { clock, sleep, random: () => 0.5 });
@@ -258,6 +261,7 @@ describe("createPoller", () => {
     const adapter: CollectivIQAdapter = {
       createThread: notImplemented,
       processMessage: notImplemented,
+      getThreadTitle: notImplemented,
       getMessages,
     };
     const poller = createPoller(adapter, { clock, sleep, random: () => 0.5 });
@@ -291,6 +295,7 @@ describe("createPoller", () => {
     const adapter: CollectivIQAdapter = {
       createThread: notImplemented,
       processMessage: notImplemented,
+      getThreadTitle: notImplemented,
       getMessages,
     };
     const poller = createPoller(adapter, { clock, sleep, random: () => 0.5 });

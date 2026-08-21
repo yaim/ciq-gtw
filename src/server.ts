@@ -13,11 +13,14 @@ import { createGatewayAuthenticator, type GatewayAuthenticator } from "./api/gat
 import { createModelCatalog, type ModelCatalog } from "./generation/model-catalog.js";
 import { createCompletionRuntime } from "./generation/runtime.js";
 import type { ChatCompletionService } from "./generation/chat-completion.js";
+import type { TitleBridge } from "./opencode/title-bridge.js";
 import type { AppConfig } from "./config/schema.js";
 
 /** The chat-completions wiring the `/v1` scope needs. */
 export interface CompletionWiring {
   readonly chatService: ChatCompletionService;
+  /** Process-local native-title correlation service (best-effort OpenCode bridge). */
+  readonly titleBridge: TitleBridge;
   /** Aborts when the process begins its shutdown drain-cancel step. */
   readonly shutdownSignal: AbortSignal;
 }
@@ -98,13 +101,18 @@ export function buildServer(options: BuildServerOptions): GatewayServer {
     options.completion ??
     (() => {
       const runtime = createCompletionRuntime(config);
-      return { chatService: runtime.chatService, shutdownSignal: new AbortController().signal };
+      return {
+        chatService: runtime.chatService,
+        titleBridge: runtime.titleBridge,
+        shutdownSignal: new AbortController().signal,
+      };
     })();
 
   registerV1Routes(app, {
     authenticator,
     catalog,
     chatService: completion.chatService,
+    titleBridge: completion.titleBridge,
     shutdownSignal: completion.shutdownSignal,
   });
 

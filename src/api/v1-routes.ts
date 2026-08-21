@@ -3,8 +3,10 @@ import type { GatewayServer } from "../server.js";
 import type { GatewayAuthenticator } from "./gateway-auth.js";
 import type { ModelCatalog } from "../generation/model-catalog.js";
 import type { ChatCompletionService } from "../generation/chat-completion.js";
+import type { TitleBridge } from "../opencode/title-bridge.js";
 import { registerModelRoutes } from "./models-route.js";
 import { registerChatCompletionsRoute } from "./chat-completions-route.js";
+import { registerOpenCodeTitleRoute } from "./opencode-title-route.js";
 import { markAuthenticated } from "./request-phase.js";
 import { INTERNAL_ERROR, INVALID_API_KEY_ERROR } from "../openai/errors.js";
 
@@ -25,6 +27,8 @@ export interface V1RouteDeps {
   readonly catalog: ModelCatalog;
   /** The chat-completions use case. */
   readonly chatService: ChatCompletionService;
+  /** Process-local native-title correlation service (best-effort OpenCode bridge). */
+  readonly titleBridge: TitleBridge;
   /** Aborts when the process begins its shutdown drain-cancel step. */
   readonly shutdownSignal: AbortSignal;
 }
@@ -81,6 +85,12 @@ export function registerV1Routes(app: GatewayServer, deps: V1RouteDeps): void {
       registerChatCompletionsRoute(scope, {
         service: deps.chatService,
         catalog: deps.catalog,
+        titleBridge: deps.titleBridge,
+        shutdownSignal: deps.shutdownSignal,
+      });
+      // Authenticated CollectivIQ/OpenCode extension (not OpenAI-compatible).
+      registerOpenCodeTitleRoute(scope, {
+        titleBridge: deps.titleBridge,
         shutdownSignal: deps.shutdownSignal,
       });
       done();

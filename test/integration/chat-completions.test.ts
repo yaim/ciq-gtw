@@ -12,6 +12,7 @@ import {
   type CompletionResult,
   type PreparedCompletion,
 } from "../../src/generation/chat-completion.js";
+import type { TitleBridge } from "../../src/opencode/title-bridge.js";
 import {
   COMPLETION_TIMEOUT_ERROR,
   GATEWAY_CAPACITY_EXCEEDED_ERROR,
@@ -79,7 +80,14 @@ function fakeService(run: RunFn): ChatCompletionService {
   };
 }
 
-const okAnswer: RunFn = () => Promise.resolve({ content: "hello answer" });
+const okAnswer: RunFn = () =>
+  Promise.resolve({ upstreamThreadId: "thread-test", content: "hello answer" });
+
+/** A no-op title bridge: these tests do not exercise native-title correlation. */
+const noopTitleBridge: TitleBridge = {
+  register: () => {},
+  lookup: () => Promise.resolve({ kind: "unavailable" }),
+};
 
 let app: GatewayServer | undefined;
 afterEach(async () => {
@@ -96,6 +104,7 @@ function build(handler: RunFn = okAnswer, configOver: Partial<AppConfig> = {}): 
     readiness,
     completion: {
       chatService: fakeService(handler),
+      titleBridge: noopTitleBridge,
       shutdownSignal: new AbortController().signal,
     },
   });
@@ -109,6 +118,7 @@ function buildWithAuth(authenticator: GatewayAuthenticator): GatewayServer {
     authenticator,
     completion: {
       chatService: fakeService(okAnswer),
+      titleBridge: noopTitleBridge,
       shutdownSignal: new AbortController().signal,
     },
   });
@@ -185,7 +195,7 @@ describe("POST /v1/chat/completions — request rejections", () => {
     let called = false;
     app = build(() => {
       called = true;
-      return Promise.resolve({ content: "unreachable" });
+      return Promise.resolve({ upstreamThreadId: "thread-test", content: "unreachable" });
     });
     const unknown = await app.inject({
       method: "POST",
@@ -313,7 +323,7 @@ describe("POST /v1/chat/completions — tool-metadata compatibility (disabled mo
     let called = false;
     app = build(() => {
       called = true;
-      return Promise.resolve({ content: "unreachable" });
+      return Promise.resolve({ upstreamThreadId: "thread-test", content: "unreachable" });
     });
     const response = await app.inject({
       method: "POST",
@@ -361,6 +371,7 @@ describe("POST /v1/chat/completions — tool metadata does not leak into logs", 
       logger,
       completion: {
         chatService: fakeService(okAnswer),
+        titleBridge: noopTitleBridge,
         shutdownSignal: new AbortController().signal,
       },
     });
@@ -571,7 +582,7 @@ describe("POST /v1/chat/completions — direct prompt mode", () => {
     let ran = false;
     const spy: RunFn = () => {
       ran = true;
-      return Promise.resolve({ content: "should not happen" });
+      return Promise.resolve({ upstreamThreadId: "thread-test", content: "should not happen" });
     };
     app = build(spy, directConfig);
     const response = await app.inject({

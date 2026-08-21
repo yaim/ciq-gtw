@@ -29,7 +29,10 @@ import {
   isChatCompletionError,
   isRequestCancelledError,
   type ChatCompletionService,
+  type CompletionResult,
 } from "../generation/chat-completion.js";
+import type { TitleBridge } from "../opencode/title-bridge.js";
+import { SESSION_ID_HEADER, normalizeSessionId } from "../opencode/session-header.js";
 import { validateChatRequest } from "../openai/chat-request.js";
 import { ChatCompletionSchema, encodeChatCompletion } from "../openai/chat-response.js";
 import { streamChatCompletion } from "./chat-stream-response.js";
@@ -46,6 +49,8 @@ import {
 export interface ChatCompletionsRouteDeps {
   readonly service: ChatCompletionService;
   readonly catalog: ModelCatalog;
+  /** Process-local native-title correlation service (best-effort OpenCode bridge). */
+  readonly titleBridge: TitleBridge;
   /** Aborts when the process begins its shutdown drain-cancel step. */
   readonly shutdownSignal: AbortSignal;
 }
@@ -159,6 +164,21 @@ export function registerChatCompletionsRoute(
         const keyId = request.gatewayKeyId;
         if (keyId === null) return sendError(INTERNAL_ERROR);
 
+        // Native-title correlation (best-effort). A valid OpenCode session header
+        // arms a one-thread title bridge; an absent/malformed header simply skips
+        // it and the completion behaves normally. The header value is never logged
+        // or reflected. Registration happens ONLY after a confirmed success and is
+        // synchronous, bounded, and non-throwing, so it cannot alter the response.
+        const sessionId = normalizeSessionId(request.headers[SESSION_ID_HEADER]);
+        const registerTitleCorrelation = (result: CompletionResult): void => {
+          if (sessionId === null) return;
+          deps.titleBridge.register({
+            keyId,
+            sessionId,
+            upstreamThreadId: result.upstreamThreadId,
+          });
+        };
+
         // Combine client-disconnect and shutdown into one request abort signal.
         // The response socket's `close` event is the canonical client-disconnect
         // signal: it fires when the connection is terminated before the response
@@ -197,6 +217,9 @@ export function registerChatCompletionsRoute(
               run: (runSignal) => deps.service.run(prepared, runSignal),
               runSignal: signal,
               clientAbort,
+              // Register the correlation ONLY after the terminal chunk + [DONE]
+              // were delivered — never on a failed/cancelled/disconnected stream.
+              onCompleted: registerTitleCorrelation,
             });
           } finally {
             reply.raw.removeListener("close", onClose);
@@ -207,6 +230,9 @@ export function registerChatCompletionsRoute(
         // Non-streamed JSON path.
         try {
           const result = await deps.service.run(prepared, signal);
+          // Register the native-title correlation after run() succeeded and before
+          // returning the encoded response (synchronous, bounded, non-throwing).
+          registerTitleCorrelation(result);
           if (normalized.ignoredParameters.length > 0) {
             reply.header(IGNORED_HEADER, normalized.ignoredParameters.join(","));
           }

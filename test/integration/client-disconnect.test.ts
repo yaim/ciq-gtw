@@ -92,6 +92,7 @@ describe("real client disconnect", () => {
       readiness: createReadinessState(true),
       completion: {
         chatService: runtime.chatService,
+        titleBridge: runtime.titleBridge,
         shutdownSignal: new AbortController().signal,
       },
     });

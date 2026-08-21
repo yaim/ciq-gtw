@@ -17,12 +17,15 @@ import { createCapacityController } from "./capacity.js";
 import { createPoller } from "./polling.js";
 import { createChatCompletionService, type ChatCompletionService } from "./chat-completion.js";
 import { createIdGenerator, systemClock } from "./seams.js";
+import { createTitleBridge, type TitleBridge } from "../opencode/title-bridge.js";
 import type { CapacityController, Clock, IdGenerator, Poller, PromptSerializer } from "./types.js";
 
 /** The completion pipeline plus the capacity controller the root drains. */
 export interface CompletionRuntime {
   readonly chatService: ChatCompletionService;
   readonly capacity: CapacityController;
+  /** Process-local native-title correlation service (best-effort OpenCode bridge). */
+  readonly titleBridge: TitleBridge;
 }
 
 /** Optional injected collaborators (tests provide fakes; production omits them). */
@@ -33,6 +36,7 @@ export interface CompletionRuntimeSeams {
   readonly serializer?: PromptSerializer;
   readonly ids?: IdGenerator;
   readonly clock?: Clock;
+  readonly titleBridge?: TitleBridge;
 }
 
 /** Build the upstream adapter from validated config (no I/O; login is lazy). */
@@ -79,5 +83,8 @@ export function createCompletionRuntime(
     ids,
     clock,
   });
-  return { chatService, capacity };
+  // The title bridge shares the same adapter (its OBSERVED-ONLY `getThreadTitle`)
+  // and clock. Construction opens no socket and makes no CollectivIQ call.
+  const titleBridge = seams.titleBridge ?? createTitleBridge({ adapter, clock });
+  return { chatService, capacity, titleBridge };
 }

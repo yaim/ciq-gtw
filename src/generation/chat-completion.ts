@@ -40,10 +40,15 @@ import {
 import type { CapacityController, Clock, IdGenerator, Poller, PromptSerializer } from "./types.js";
 
 /**
- * A generic, content-free upstream thread title. Never derived from prompt
- * content, model ids, repository names, filenames, users, or credentials.
+ * The fixed, content-free upstream thread title sent on every `create_thread`.
+ * `New Thread` is CollectivIQ's observed server-recognized temporary placeholder:
+ * once a completion's message is processed, the provider may ASYNCHRONOUSLY
+ * replace it with its own prompt-related server-side title (which the gateway
+ * never reads, returns, logs, caches, or retains). This value is always fixed and
+ * never derived from prompt content, model ids, repository names, filenames,
+ * users, answers, OpenCode session titles, or credentials.
  */
-export const THREAD_TITLE = "CollectivIQ Gateway request";
+export const THREAD_TITLE = "New Thread";
 
 // Branded registries of the gateway's own completion error instances. Membership
 // is tested by object IDENTITY (WeakSet.has triggers no getter and no Proxy trap),
@@ -137,6 +142,12 @@ export interface PreparedCompletion {
 export interface CompletionResult {
   /** The parsed assistant answer (may be an empty string). */
   readonly content: string;
+  /**
+   * The normalized upstream thread id created for this completion. Used ONLY for
+   * process-local native-title correlation (see `src/opencode/title-bridge.ts`);
+   * it is NEVER exposed in the OpenAI JSON or SSE output.
+   */
+  readonly upstreamThreadId: string;
 }
 
 /** The narrow completion use case consumed by the route (prepare then run). */
@@ -236,7 +247,9 @@ export function createChatCompletionService(deps: ChatCompletionDeps): ChatCompl
           if (outcome.kind === "timeout") {
             throw new ChatCompletionError(COMPLETION_TIMEOUT_ERROR);
           }
-          return { content: outcome.content };
+          // Carry the created thread id out for process-local native-title
+          // correlation only; it never enters the public JSON/SSE response.
+          return { content: outcome.content, upstreamThreadId: thread.threadId };
         } finally {
           acquisition.permit.release();
         }

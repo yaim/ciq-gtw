@@ -122,7 +122,11 @@ async function listen(
   app = buildServer({
     config,
     readiness: createReadinessState(true),
-    completion: { chatService: runtime.chatService, shutdownSignal: shutdown.signal },
+    completion: {
+      chatService: runtime.chatService,
+      titleBridge: runtime.titleBridge,
+      shutdownSignal: shutdown.signal,
+    },
   });
   await app.listen({ host: "127.0.0.1", port: 0 });
   const { port } = app.server.address() as AddressInfo;

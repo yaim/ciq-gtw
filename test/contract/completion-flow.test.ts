@@ -120,10 +120,17 @@ describe("completion flow — success", () => {
     });
 
     // The upstream saw exactly one create and one submit, correctly encoded.
-    const create = mock?.requests.find((r) => r.path === "/create_thread");
+    const creates = mock?.requests.filter((r) => r.path === "/create_thread") ?? [];
+    expect(creates).toHaveLength(1);
+    const create = creates[0];
     expect(create?.method).toBe("POST");
     expect(create?.headers["content-type"]).toContain("application/x-www-form-urlencoded");
-    expect(create?.text()).toContain("is_title_from_user=false");
+    // The URL-encoded create body carries the fixed `New Thread` placeholder and
+    // `is_title_from_user=false` — parse it rather than substring-matching so the
+    // exact wire title is bound (CollectivIQ replaces it server-side afterwards).
+    const createParams = new URLSearchParams(create?.text() ?? "");
+    expect(createParams.get("thread_title")).toBe("New Thread");
+    expect(createParams.get("is_title_from_user")).toBe("false");
     const submits = mock?.requests.filter((r) => r.path === "/process_message") ?? [];
     expect(submits).toHaveLength(1);
     const submitBody = submits[0]?.text() ?? "";

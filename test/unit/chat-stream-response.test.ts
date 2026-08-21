@@ -146,7 +146,7 @@ describe("streamChatCompletion — ordering and success", () => {
     expect(deltasOf(res)).toEqual([{ role: "assistant" }]);
     expect(seenSignal).toBe(clientAbort.signal);
 
-    resolveRun({ content: "Hello world" });
+    resolveRun({ upstreamThreadId: "thread-test", content: "Hello world" });
     await p;
 
     expect(deltasOf(res)).toEqual([{ role: "assistant" }, { content: "Hello world" }, {}]);
@@ -169,7 +169,7 @@ describe("streamChatCompletion — ordering and success", () => {
     await streamChatCompletion({
       reply: fakeReply(res),
       meta: META,
-      run: () => Promise.resolve({ content: "" }),
+      run: () => Promise.resolve({ upstreamThreadId: "thread-test", content: "" }),
       runSignal: clientAbort.signal,
       clientAbort,
       keepAliveMs: 100_000,
@@ -203,7 +203,7 @@ describe("streamChatCompletion — keep-alives", () => {
     await vi.advanceTimersByTimeAsync(30_000);
     expect(keepAlives(res)).toHaveLength(3);
 
-    resolveRun({ content: "done" });
+    resolveRun({ upstreamThreadId: "thread-test", content: "done" });
     await p;
     const keepAliveCount = keepAlives(res).length;
 
@@ -226,7 +226,7 @@ describe("streamChatCompletion — backpressure", () => {
     const p = streamChatCompletion({
       reply: fakeReply(res),
       meta: META,
-      run: () => Promise.resolve({ content: answer }),
+      run: () => Promise.resolve({ upstreamThreadId: "thread-test", content: answer }),
       runSignal: clientAbort.signal,
       clientAbort,
       keepAliveMs: 100_000,
@@ -318,7 +318,7 @@ describe("streamChatCompletion — bounded write failures never reject", () => {
         meta: META,
         run: () => {
           runCalls += 1;
-          return Promise.resolve({ content: "unreachable" });
+          return Promise.resolve({ upstreamThreadId: "thread-test", content: "unreachable" });
         },
         runSignal: clientAbort.signal,
         clientAbort,
@@ -344,7 +344,7 @@ describe("streamChatCompletion — bounded write failures never reject", () => {
       meta: META,
       run: () => {
         runCalls += 1;
-        return Promise.resolve({ content: "unreachable" });
+        return Promise.resolve({ upstreamThreadId: "thread-test", content: "unreachable" });
       },
       runSignal: clientAbort.signal,
       clientAbort,
@@ -371,7 +371,7 @@ describe("streamChatCompletion — bounded write failures never reject", () => {
       meta: META,
       run: () => {
         runCalls += 1;
-        return Promise.resolve({ content: "unreachable" });
+        return Promise.resolve({ upstreamThreadId: "thread-test", content: "unreachable" });
       },
       runSignal,
       clientAbort,
@@ -450,7 +450,7 @@ describe("streamChatCompletion — bounded write failures never reject", () => {
     const p = streamChatCompletion({
       reply: fakeReply(res),
       meta: META,
-      run: () => Promise.resolve({ content: "unreachable" }),
+      run: () => Promise.resolve({ upstreamThreadId: "thread-test", content: "unreachable" }),
       runSignal: clientAbort.signal,
       clientAbort,
       keepAliveMs: 100_000,
@@ -575,5 +575,63 @@ describe("streamChatCompletion — hardened forced termination", () => {
     await nextTurn();
     expect(res.destroyed).toBe(true);
     expect(tempListeners(res)).toBe(0);
+  });
+});
+
+describe("streamChatCompletion — onCompleted (native-title registration hook)", () => {
+  it("invokes onCompleted exactly once, with the result, after a delivered [DONE]", async () => {
+    const res = new FakeRes();
+    const clientAbort = new AbortController();
+    const completed: CompletionResult[] = [];
+    await streamChatCompletion({
+      reply: fakeReply(res),
+      meta: META,
+      run: () => Promise.resolve({ upstreamThreadId: "T-42", content: "hello" }),
+      runSignal: clientAbort.signal,
+      clientAbort,
+      keepAliveMs: 100_000,
+      onCompleted: (r) => void completed.push(r),
+    });
+    expect(hasDone(res)).toBe(true);
+    expect(completed).toEqual([{ upstreamThreadId: "T-42", content: "hello" }]);
+  });
+
+  it("does NOT invoke onCompleted when the transport closes before [DONE]", async () => {
+    const res = new FakeRes();
+    const clientAbort = new AbortController();
+    const answer = "word ".repeat(400); // multiple content chunks
+    res.allowWrite = false; // backpressure every write
+    let called = 0;
+    const p = streamChatCompletion({
+      reply: fakeReply(res),
+      meta: META,
+      run: () => Promise.resolve({ upstreamThreadId: "T-42", content: answer }),
+      runSignal: clientAbort.signal,
+      clientAbort,
+      keepAliveMs: 100_000,
+      onCompleted: () => void (called += 1),
+    });
+    await tick();
+    // Destroy the transport mid-stream (before terminal/[DONE] can be written).
+    res.destroy();
+    await p;
+    expect(hasDone(res)).toBe(false);
+    expect(called).toBe(0);
+  });
+
+  it("does NOT invoke onCompleted on a post-header failure (error record path)", async () => {
+    const res = new FakeRes();
+    const clientAbort = new AbortController();
+    let called = 0;
+    await streamChatCompletion({
+      reply: fakeReply(res),
+      meta: META,
+      run: () => Promise.reject(new ChatCompletionError(GATEWAY_CAPACITY_EXCEEDED_ERROR)),
+      runSignal: clientAbort.signal,
+      clientAbort,
+      keepAliveMs: 100_000,
+      onCompleted: () => void (called += 1),
+    });
+    expect(called).toBe(0);
   });
 });

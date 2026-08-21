@@ -84,6 +84,14 @@ export interface StreamChatCompletionOptions {
    * "shutdown → 503 error record".
    */
   readonly clientAbort: AbortController;
+  /**
+   * Optional, non-throwing success hook. Invoked EXACTLY ONCE and ONLY after the
+   * terminal chunk AND `data: [DONE]` were both successfully written (a fully
+   * delivered stream). A failed, cancelled, disconnected, or incomplete stream
+   * never invokes it. It cannot alter the response; any throw is swallowed. Used
+   * to register the native-title correlation after a confirmed streamed success.
+   */
+  readonly onCompleted?: (result: CompletionResult) => void;
   /** Keep-alive cadence override (tests only). */
   readonly keepAliveMs?: number;
 }
@@ -324,6 +332,15 @@ export async function streamChatCompletion(opts: StreamChatCompletionOptions): P
   const keepAliveMs = opts.keepAliveMs ?? KEEP_ALIVE_INTERVAL_MS;
   const res = reply.raw;
 
+  /** Fire the success hook once, swallowing any throw (it must never affect the stream). */
+  const notifyCompleted = (result: CompletionResult): void => {
+    try {
+      opts.onCompleted?.(result);
+    } catch {
+      // A registration failure must never affect the delivered stream.
+    }
+  };
+
   // Commit SSE headers (200) and flush them so the client sees the stream start.
   try {
     reply.hijack();
@@ -399,7 +416,9 @@ export async function streamChatCompletion(opts: StreamChatCompletionOptions): P
         finish();
         return;
       }
-      await writer.write(DONE_FRAME);
+      const doneOutcome = await writer.write(DONE_FRAME);
+      // Only a fully delivered terminal + [DONE] counts as a streamed success.
+      if (doneOutcome === "written") notifyCompleted(result);
       finish();
       return;
     }

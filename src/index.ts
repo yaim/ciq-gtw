@@ -100,6 +100,7 @@ export async function main(): Promise<void> {
     logger,
     completion: {
       chatService: runtime.chatService,
+      titleBridge: runtime.titleBridge,
       shutdownSignal: shutdownController.signal,
     },
   });

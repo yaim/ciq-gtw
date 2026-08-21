@@ -20,6 +20,7 @@ import type {
   CompletionResult,
   PreparedCompletion,
 } from "../../src/generation/chat-completion.js";
+import type { TitleBridge } from "../../src/opencode/title-bridge.js";
 import type { AppConfig, VirtualModel } from "../../src/config/schema.js";
 
 // A synthetic, multi-sentence answer (well over one content chunk) that lets the
@@ -78,7 +79,14 @@ const fakeService: ChatCompletionService = {
     policy: ctx.model,
     keyId: ctx.keyId,
   }),
-  run: (): Promise<CompletionResult> => Promise.resolve({ content: ANSWER }),
+  run: (): Promise<CompletionResult> =>
+    Promise.resolve({ upstreamThreadId: "thread-test", content: ANSWER }),
+};
+
+/** A no-op title bridge: the compatibility suite does not exercise native titles. */
+const noopTitleBridge: TitleBridge = {
+  register: () => {},
+  lookup: () => Promise.resolve({ kind: "unavailable" }),
 };
 
 let app: GatewayServer | undefined;
@@ -91,7 +99,11 @@ async function startGateway(): Promise<string> {
   app = buildServer({
     config: config(),
     readiness: createReadinessState(true),
-    completion: { chatService: fakeService, shutdownSignal: new AbortController().signal },
+    completion: {
+      chatService: fakeService,
+      titleBridge: noopTitleBridge,
+      shutdownSignal: new AbortController().signal,
+    },
   });
   await app.listen({ host: "127.0.0.1", port: 0 });
   const { port } = app.server.address() as AddressInfo;

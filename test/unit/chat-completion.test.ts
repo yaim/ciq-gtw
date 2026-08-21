@@ -19,6 +19,7 @@ import type {
 import type {
   CreateThreadResult,
   GetMessagesResult,
+  GetThreadTitleResult,
   ProcessMessageInput,
   ProcessMessageResult,
 } from "../../src/collectiviq/types.js";
@@ -94,6 +95,9 @@ function fakeAdapter(trace: Trace, opts: AdapterOptions = {}) {
     },
     getMessages: (): Promise<GetMessagesResult> =>
       Promise.resolve({ messages: [], rawStatus: 200 }),
+    // The completion orchestration never calls the OBSERVED-ONLY title lookup;
+    // this satisfies the adapter contract for the typed dependency.
+    getThreadTitle: (): Promise<GetThreadTitleResult> => Promise.resolve({ kind: "pending" }),
   };
 }
 
@@ -179,6 +183,10 @@ describe("chat-completion orchestration", () => {
     const service = makeService({ trace, adapter: spied });
     await run(service);
     expect(title).toBe(THREAD_TITLE);
+    // Literal regression guard: the on-the-wire title is EXACTLY `New Thread`
+    // (CollectivIQ's server-recognized temporary placeholder). Pinning the
+    // literal — not just the constant — catches an accidental constant change.
+    expect(title).toBe("New Thread");
     expect(title).not.toContain("hi");
   });
 
