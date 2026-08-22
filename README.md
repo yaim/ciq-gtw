@@ -301,8 +301,8 @@ OpenCode's built-in **hidden LLM `title` agent is disabled** in the committed
 `opencode.jsonc` (`"title": { "disable": true }`), so it creates **no** separate
 title thread or completion. As a result a first foreground message creates
 **exactly one** CollectivIQ thread — the earlier "two or more upstream threads per
-session" behavior no longer applies. In its place, a dependency-free project-local
-plugin (`.opencode/plugins/collectiviq-native-title.ts`) propagates the
+session" behavior no longer applies. In its place, a dependency-free plugin
+(`.opencode/plugins/collectiviq-native-title.ts`) propagates the
 CollectivIQ-generated **native** thread title to the OpenCode session
 asynchronously: it arms only a parentless top-level session still on OpenCode's
 default title, attaches an `X-CollectivIQ-OpenCode-Session-ID` header once, and
@@ -317,6 +317,83 @@ already-propagated title and is best-effort — any failure leaves OpenCode's
 default/manual title. Native-title polling adds only bounded `GET` requests and creates no additional
 upstream thread. `collectiviq-fast` is no longer the title agent's model but
 remains declared for manual/other-account use.
+
+To authenticate that lookup, the plugin **reuses the resolved CollectivIQ provider
+credential** — `provider.collectiviq.options.apiKey` from OpenCode's merged config
+(OpenCode substitutes `{env:…}`/`{file:…}` references before the plugin reads it).
+**You do not need a separate terminal `COLLECTIVIQ_GATEWAY_KEY` export** once your
+OpenCode provider is configured with a working `apiKey`; `COLLECTIVIQ_GATEWAY_KEY`
+remains only a compatibility fallback. Base URL and key are resolved together in one
+bounded, descriptor-safe step (a valid provider key wins over the env fallback; the
+key is used exactly, capped at 8192 UTF-8 bytes, and unresolved `{env:…}`/`{file:…}`
+placeholders are rejected). The resolved key is transient — used only for the
+in-flight lookup and never logged, reflected, cached, or stored in session state. (An
+earlier post-loader-fix trace reached provider matching, header attachment, and idle
+handling but stopped before the first lookup because the earlier environment-only key
+source was absent; reusing the provider-config credential fixed that.)
+
+The plugin is committed and discovered **project-locally** by default. Its entry
+module **default-exports the OpenCode V1 `{ id, server }` plugin object** — not a
+bare function — so OpenCode 1.18.21's loader invokes only `default.server` and
+never scans the module's named runtime exports. (A sanitized, user-authorized
+**2026-08-21** smoke ran with hidden title generation disabled and a single
+foreground thread; CollectivIQ generated a provider-native title, but the OpenCode
+session rename did not occur because the plugin **entry module never loaded**: the
+earlier bare-**function** default fell through to OpenCode's legacy export scan,
+which rejects the first non-function runtime export (e.g. `UPDATE_TIMEOUT_MS`) with
+`Plugin export is not a function` — for both the global-symlink and project-local
+paths — so the provider matching, header attachment, polling, and rename logic
+never ran. Changing the default export to the V1 `{ id, server }` object, together
+with reusing the provider-config credential, fixed the propagation path. A sanitized,
+user-authorized **2026-08-22** live smoke then observed the **complete path succeed
+for the tested local configuration** on OpenCode 1.18.21: exactly one new foreground
+CollectivIQ thread, no hidden title thread, a provider-native title generated for
+that thread, and the OpenCode session title changed from its default to that title
+(the foreground response completed and was relevant, with no alert or tool call).
+This is a single-local-configuration observation — **not** production readiness, a
+cross-account/cross-version guarantee, or a claim about which credential source was
+exercised; propagation stays best-effort and a failure leaves the OpenCode default or
+manual title. No live prompts, titles, answers, ids, credentials, or account values
+are recorded, and further live runs remain approval-gated.)
+
+Separately, the plugin matches the provider OpenCode passes to its `chat.headers`
+hook using a descriptor-safe reader that tolerates **both** provider shapes —
+OpenCode's SDK declaration exposes the provider id at `provider.info.id`, while the
+runtime may pass a flat `provider.id`. This dual-shape support is implemented and
+hermetically tested as offline hardening; it was **not** the proven cause of the
+2026-08-21 live failure (the plugin never loaded, so provider matching never ran).
+The plugin also shares one hooks/state instance process-wide across global +
+project-local loads (`Symbol.for(...)` singleton, first-initialization-wins).
+
+#### Optional: global install for cross-project use
+
+To use native-title propagation from **any** project (not only this repository),
+symlink the committed plugin into your global OpenCode plugins directory:
+
+```bash
+mkdir -p "$HOME/.config/opencode/plugins"
+ln -s /absolute/path/to/ciq-gateway/.opencode/plugins/collectiviq-native-title.ts \
+  "$HOME/.config/opencode/plugins/collectiviq-native-title.ts"
+```
+
+Operational notes:
+
+- Do **not** overwrite the target if another file or link already exists there.
+- Moving the `ciq-gateway` repository breaks the symlink; recreate it afterward.
+- Fully **restart** OpenCode after installing the link or updating the plugin
+  source — plugin loading happens at startup.
+- The link points at repository source, so ordinary edits to the plugin are
+  reflected automatically after the restart above.
+- Your **global** OpenCode config must also declare the CollectivIQ provider and
+  the `collectiviq-text` agent and disable the hidden `title` agent (mirroring this
+  repository's `opencode.jsonc`), using environment references for the gateway key
+  rather than embedded credentials.
+- When you open the `ciq-gateway` repository itself, OpenCode discovers **both**
+  the global link and the project-local copy; the plugin de-duplicates itself into
+  one shared instance per process, so duplicate loading is harmless (one header,
+  one poller, one rename per session).
+- The globally loaded plugin still gates on the exact `collectiviq-text` agent and
+  `collectiviq` provider; it does nothing for any other agent or provider request.
 
 The OpenCode session title is **distinct** from the CollectivIQ upstream thread
 title: the gateway still performs exactly one `create_thread` per completion using

@@ -227,7 +227,33 @@ and any further live run is approval-gated. The controls that exist today are:
   message therefore creates exactly one upstream thread and native-title
   propagation (via the plugin polling the extension endpoint) adds only bounded
   `GET` requests, no additional thread. (The earlier "two or more upstream threads
-  per session" behavior no longer applies to the committed configuration.)
+  per session" behavior no longer applies to the committed configuration.) No
+  security posture claim depends on native-title propagation succeeding: a
+  sanitized 2026-08-21 smoke found the plugin propagation path non-functional
+  because the plugin **entry module never loaded** — its bare-function default fell
+  through to OpenCode's legacy export scan, which rejected a non-function runtime
+  export with `Plugin export is not a function`, so no header/correlation/poll/
+  rename behavior ran (the smoke did prove one foreground thread, no hidden title
+  thread, and provider-native title generation). It was remediated by
+  default-exporting the OpenCode V1 `{ id, server }` plugin module; a sanitized,
+  user-authorized 2026-08-22 live smoke then observed the complete propagation path
+  succeed for the tested local configuration (OpenCode 1.18.21) — a single-local-
+  configuration observation, not a production/cross-account/cross-version guarantee
+  and not a claim about which credential source was exercised. The descriptor-safe
+  flat/nested provider matching is offline hardening, not the proven live cause. The
+  bounded-`GET`, one-thread, and correlation-store bounds above hold regardless.
+  **Plugin credential handling:** the plugin authenticates its lookup by reusing the
+  resolved CollectivIQ provider credential (`provider.collectiviq.options.apiKey`
+  from OpenCode's merged config), with `COLLECTIVIQ_GATEWAY_KEY` read only as a lazy
+  injected fallback confined to the production wrapper; the key is resolved
+  descriptor-safely (own data properties only — no getter invoked), accepted only as a
+  non-empty string ≤ 8192 UTF-8 bytes with no unresolved `{env:…}`/`{file:…}`
+  placeholder, used exactly (never trimmed), and kept transient — local to the
+  in-flight lookup and **never** logged, reflected, cached, or stored in
+  singleton/session/correlation state. An earlier post-loader-fix trace showed the
+  poller reaching this step but stopping because the earlier environment-only key
+  source was absent; reusing the provider-config credential fixed that, and the
+  provider-config/environment precedence and lazy fallback are hermetically verified.
 - **Synthetic SSE streaming path (implemented; Phase 2).** `stream: true` reuses
   the same authenticated, bounded orchestration; authentication, validation,
   model resolution, and prompt preparation all complete **before** any SSE header

@@ -77,12 +77,31 @@
     // for this, which only controls terminal-title RENDERING, not hidden LLM title
     // generation.
     //
-    // In place of that hidden agent, the project-local plugin
-    // `.opencode/plugins/collectiviq-native-title.ts` asynchronously fetches the
-    // NATIVE, server-generated CollectivIQ title of the session's first foreground
-    // thread (via the gateway's `/opencode/session-title` endpoint) and applies it
-    // to the OpenCode session — reusing the foreground thread instead of creating
-    // an extra one. This OpenCode session title is unrelated to the CollectivIQ
+    // In place of that hidden agent, the plugin
+    // `.opencode/plugins/collectiviq-native-title.ts` (committed project-local by
+    // default; optionally installed globally via a supported manual symlink for
+    // cross-project use — see README — and process-wide idempotent across both
+    // loads) asynchronously fetches the NATIVE, server-generated CollectivIQ title
+    // of the session's first foreground thread (via the gateway's
+    // `/opencode/session-title` endpoint) and applies it to the OpenCode session —
+    // reusing the foreground thread instead of creating an extra one. The plugin's
+    // entry module default-exports the OpenCode V1 `{ id, server }` object so
+    // OpenCode 1.18.21's loader invokes only `default.server` and never scans the
+    // module's named exports. (Historical 2026-08-21 sequence: the plugin's earlier
+    // bare-function default fell through to OpenCode's legacy export scan, which
+    // rejected a non-function runtime export with `Plugin export is not a function`,
+    // so the plugin never loaded and no rename ran; then, after that loader fix, the
+    // poller resolved its gateway key only from an absent env var. Both are fixed:
+    // the V1 default module, and reuse of the resolved CollectivIQ provider
+    // `options.apiKey` with the env var kept as a lazy fallback. A sanitized,
+    // user-authorized 2026-08-22 live smoke observed the COMPLETE path succeed for
+    // the tested local configuration on OpenCode 1.18.21 — one foreground thread, no
+    // hidden title thread, a provider-native title generated, and the OpenCode
+    // session title changed from its default to that title. This is a single-local-
+    // configuration observation, not a production/cross-account/cross-version
+    // guarantee; further live runs stay approval-gated. The descriptor-safe flat
+    // `provider.id` / nested `provider.info.id` matching is offline hardening, not
+    // the proven live cause.) This OpenCode session title is unrelated to the CollectivIQ
     // upstream thread title: the gateway always sends the fixed content-free
     // placeholder `New Thread`, which CollectivIQ may asynchronously replace with
     // its own prompt-related, server-generated title. The gateway reads that

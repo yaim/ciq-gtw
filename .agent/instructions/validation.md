@@ -71,7 +71,49 @@ credential, no network — and is excluded from `validate`/CI. These automated
 suites run no live upstream or OpenCode smoke. (Separate user-observed live
 foreground smokes were reported on 2026-08-15 for the protocol-mode foreground
 transport and on 2026-08-18 for the direct-mode foreground plus hidden-title
-paths; live runs are never part of `validate`/CI and stay approval-gated.)
+paths; live runs are never part of `validate`/CI and stay approval-gated.) A
+sanitized 2026-08-21 smoke observed the OpenCode **native-title plugin** path: with
+hidden title generation disabled and a single foreground thread, CollectivIQ
+generated a provider-native title, but the OpenCode session rename did **not**
+occur. The **confirmed cause** was that the plugin **entry module never loaded** —
+its earlier bare-function default fell through to OpenCode's legacy export scan,
+which rejected a non-function runtime export with `Plugin export is not a
+function`, so no header/correlation/poll/rename behavior ran. It was remediated
+**offline** by default-exporting the OpenCode V1 `{ id, server }` plugin module
+(covered by new loader-contract regressions in
+`test/unit/opencode-title-plugin.test.ts` that inspect the real module namespace and
+model OpenCode's `readV1Plugin`-before-legacy-scan order). The descriptor-safe
+flat/nested provider matching is separate offline hardening, **not** the proven live
+root cause. A subsequent trace (after the loader fix) then showed the poller
+progress through loader/singleton/lifecycle/provider-match/header/idle/base-URL but
+stop before its first title lookup because it resolved its gateway key ONLY from
+`process.env.COLLECTIVIQ_GATEWAY_KEY` (absent). The plugin now performs one bounded,
+descriptor-safe connection resolution that reuses the resolved CollectivIQ provider
+`options.apiKey` (merged-over-embedded); the `COLLECTIVIQ_GATEWAY_KEY` fallback is
+read **lazily through an injected reader** — invoked at most once, and only when a
+usable base URL exists but no usable provider-config key does (never on the
+provider-config path and never when the base URL is missing) — so the real
+credential environment lookup is confined to the production plugin wrapper alone.
+This is covered by new hermetic connection-resolution tests
+(`test/unit/opencode-title-plugin.test.ts`, all injecting **synthetic** readers that
+record their invocation count so no test touches the real environment):
+provider/env precedence, embedded fallback, zero fallback reads on the
+provider-config and missing-base-URL paths, exactly-one fallback read on the
+no-provider-key path, single `client.config.get()`,
+empty/non-string/over-8192-byte/placeholder rejection, multibyte byte-accounting,
+accessor/inherited/throwing-proxy safety, throwing/unusable-fallback fail-open,
+bounded/cancelled resolution, no-fetch on missing connection, and a source scan
+asserting the credential `process.env` lookup appears in exactly one place (the
+wrapper) and in no test. A sanitized, user-authorized **2026-08-22 live smoke then
+observed the complete propagation path succeed for the tested local configuration**
+(OpenCode 1.18.21): one new foreground CollectivIQ thread, no hidden title thread, a
+provider-native title generated, and the OpenCode session title changed from its
+default to that title (the foreground response completed and was relevant, no
+alert/tool call). This is a single-local-configuration observation — not production
+readiness, a cross-account/cross-version guarantee, or a claim about which credential
+source was exercised. The provider-config/environment precedence and the lazy env
+fallback stay **hermetically verified**; live runs remain approval-gated and are
+never part of `validate`/CI.
 
 **Phase 2 transport-remediation evidence (added by the streaming-review
 remediation).** New hermetic regressions in `test/unit/chat-stream-response.test.ts`
