@@ -12,19 +12,33 @@
  * (agent `collectiviq-text`, provider `collectiviq`, parentless, exact default
  * title) arms; and the bridge remains best-effort.
  */
-import { describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  CollectivIQNativeTitlePlugin,
   createNativeTitleHooks,
+  defaultResolveConnection,
+  getOrCreateSharedHooks,
   normalizeTitle,
+  PLUGIN_ID,
+  resolveConnectionConfig,
   RESOLVE_TIMEOUT_MS,
+  SHARED_HOOKS_KEY,
   UPDATE_TIMEOUT_MS,
   type ChatHeadersInput,
   type ChatHeadersOutput,
   type FetchLike,
   type FetchResponseLike,
+  type HooksRegistry,
+  type NativeTitleConnectionConfig,
   type NativeTitleDeps,
+  type NativeTitleHooks,
+  type PluginInput,
+  type ReadGatewayKey,
   type TitleClient,
 } from "../../.opencode/plugins/collectiviq-native-title.js";
+// Default + namespace imports for the runtime loader-contract tests.
+import pluginDefault, * as pluginModule from "../../.opencode/plugins/collectiviq-native-title.js";
 
 const SESSION_HEADER = "X-CollectivIQ-OpenCode-Session-ID";
 const BASE_URL = "http://127.0.0.1:8787/v1";
@@ -75,7 +89,11 @@ interface HarnessOpts {
   get?: (args: { path: { id: string } }) => Promise<unknown>;
   fetchImpl?: FetchLike;
   sleep?: NativeTitleDeps["sleep"];
-  resolveBaseURL?: NativeTitleDeps["resolveBaseURL"];
+  // Direct connection-resolver injection (takes precedence when provided).
+  resolveConnection?: NativeTitleDeps["resolveConnection"];
+  // Back-compat: legacy base-URL resolver (may be async / hang) used to synthesize
+  // a connection when `resolveConnection` is not injected directly.
+  resolveBaseURL?: () => Promise<string | undefined> | string | undefined;
   baseURL?: string | undefined;
   gatewayKey?: string | undefined;
 }
@@ -99,12 +117,25 @@ function makeHarness(opts: HarnessOpts = {}): Harness {
   const update = vi.fn(() => Promise.resolve(undefined));
   const client: TitleClient = { session: { get, update } };
   const fetchImpl = vi.fn(opts.fetchImpl ?? (() => Promise.resolve(makeResponse(404))));
+  // Synthesize a single connection resolver from the harness opts. Preserves the
+  // legacy `resolveBaseURL`/`baseURL`/`gatewayKey` injection points (including a
+  // hung `resolveBaseURL` for bounded-race tests) behind the new unified seam.
+  const synthConnection = async (): Promise<NativeTitleConnectionConfig | undefined> => {
+    const rawBase = opts.resolveBaseURL
+      ? await opts.resolveBaseURL()
+      : "baseURL" in opts
+        ? opts.baseURL
+        : BASE_URL;
+    const gatewayKey = "gatewayKey" in opts ? opts.gatewayKey : GATEWAY_KEY;
+    if (typeof rawBase !== "string" || rawBase.length === 0) return undefined;
+    if (typeof gatewayKey !== "string" || gatewayKey.length === 0) return undefined;
+    return { baseURL: rawBase, gatewayKey };
+  };
   const deps: NativeTitleDeps = {
     client,
     fetchImpl,
     sleep: opts.sleep ?? autoSleep(sleeps),
-    resolveBaseURL: opts.resolveBaseURL ?? (() => ("baseURL" in opts ? opts.baseURL : BASE_URL)),
-    resolveGatewayKey: () => ("gatewayKey" in opts ? opts.gatewayKey : GATEWAY_KEY),
+    resolveConnection: opts.resolveConnection ?? synthConnection,
     // No real per-request abort timers in tests (fetch gets the lifecycle signal).
     makeTimeoutSignal: () => undefined,
   };
@@ -660,8 +691,7 @@ describe("native-title plugin — bounded terminal update (finding P2)", () => {
         client,
         fetchImpl,
         sleep: opts.sleep ?? autoSleep(sleeps),
-        resolveBaseURL: () => BASE_URL,
-        resolveGatewayKey: () => GATEWAY_KEY,
+        resolveConnection: () => ({ baseURL: BASE_URL, gatewayKey: GATEWAY_KEY }),
         makeTimeoutSignal: () => undefined,
       });
       return { hooks, get, update, fetchImpl, sleeps };
@@ -738,6 +768,779 @@ describe("native-title plugin — privacy", () => {
     } finally {
       for (const spy of Object.values(spies)) spy.mockRestore();
     }
+  });
+});
+
+describe("native-title plugin — provider-shape compatibility (flat runtime vs nested SDK)", () => {
+  // OpenCode 1.18.20's runtime passes a FLAT provider (`provider.id`); the SDK
+  // type declaration describes a NESTED `provider.info.id`. Arming must tolerate
+  // both, read only own DATA descriptors, never invoke a getter, ignore inherited
+  // properties, and fail closed (without consuming the arming opportunity) on
+  // anything else. All cases arm from cached lifecycle metadata (no session.get),
+  // so an ineligible provider is proven to trigger NO lookup.
+  async function seedMeta(h: Harness, sessionId = "s1"): Promise<void> {
+    await emitSession(h, "session.created", { id: sessionId, title: DEFAULT_TITLE });
+  }
+
+  it("arms on the flat runtime provider shape { id: 'collectiviq' }", async () => {
+    const h = makeHarness();
+    await seedMeta(h);
+    const out = freshOutput();
+    await h.hooks["chat.headers"](headersInput("s1", { provider: { id: "collectiviq" } }), out);
+    expect(out.headers[SESSION_HEADER]).toBe("s1");
+    expect(h.get).not.toHaveBeenCalled();
+  });
+
+  it("still arms on the nested SDK provider shape { info: { id: 'collectiviq' } }", async () => {
+    const h = makeHarness();
+    await seedMeta(h);
+    const out = freshOutput();
+    await h.hooks["chat.headers"](
+      headersInput("s1", { provider: { info: { id: "collectiviq" } } }),
+      out,
+    );
+    expect(out.headers[SESSION_HEADER]).toBe("s1");
+    expect(h.get).not.toHaveBeenCalled();
+  });
+
+  it("does not arm a flat non-CollectivIQ provider, and does not consume the opportunity", async () => {
+    const h = makeHarness();
+    await seedMeta(h);
+    const out = freshOutput();
+    await h.hooks["chat.headers"](headersInput("s1", { provider: { id: "anthropic" } }), out);
+    expect(out.headers[SESSION_HEADER]).toBeUndefined();
+    expect(h.hooks.$state.has("s1")).toBe(false);
+    expect(h.get).not.toHaveBeenCalled();
+    // A subsequent well-formed request still arms.
+    const eligible = freshOutput();
+    await h.hooks["chat.headers"](headersInput("s1"), eligible);
+    expect(eligible.headers[SESSION_HEADER]).toBe("s1");
+  });
+
+  it("fails closed when a flat non-CollectivIQ id conflicts with a nested CollectivIQ id (flat is authoritative)", async () => {
+    const h = makeHarness();
+    await seedMeta(h);
+    const out = freshOutput();
+    await h.hooks["chat.headers"](
+      headersInput("s1", { provider: { id: "anthropic", info: { id: "collectiviq" } } }),
+      out,
+    );
+    // Flat `id` present → authoritative → no fallback to the nested id.
+    expect(out.headers[SESSION_HEADER]).toBeUndefined();
+    expect(h.hooks.$state.has("s1")).toBe(false);
+  });
+
+  it("fails closed on a non-string flat id and does not fall back to the nested id", async () => {
+    const h = makeHarness();
+    await seedMeta(h);
+    const out = freshOutput();
+    await h.hooks["chat.headers"](
+      // Flat `id` present but non-string → fails closed, no nested fallback.
+      headersInput("s1", { provider: { id: 123, info: { id: "collectiviq" } } }),
+      out,
+    );
+    expect(out.headers[SESSION_HEADER]).toBeUndefined();
+    expect(h.hooks.$state.has("s1")).toBe(false);
+  });
+
+  it("never invokes a flat accessor `id` and does not arm", async () => {
+    const h = makeHarness();
+    await seedMeta(h);
+    let called = 0;
+    const provider: Record<string, unknown> = {};
+    Object.defineProperty(provider, "id", {
+      enumerable: true,
+      configurable: true,
+      get() {
+        called++;
+        return "collectiviq";
+      },
+    });
+    const out = freshOutput();
+    await h.hooks["chat.headers"](headersInput("s1", { provider }), out);
+    expect(called).toBe(0);
+    expect(out.headers[SESSION_HEADER]).toBeUndefined();
+    expect(h.hooks.$state.has("s1")).toBe(false);
+  });
+
+  it("never invokes a nested `info` accessor and does not arm", async () => {
+    const h = makeHarness();
+    await seedMeta(h);
+    let called = 0;
+    const provider: Record<string, unknown> = {};
+    Object.defineProperty(provider, "info", {
+      enumerable: true,
+      configurable: true,
+      get() {
+        called++;
+        return { id: "collectiviq" };
+      },
+    });
+    const out = freshOutput();
+    await h.hooks["chat.headers"](headersInput("s1", { provider }), out);
+    expect(called).toBe(0);
+    expect(out.headers[SESSION_HEADER]).toBeUndefined();
+  });
+
+  it("never invokes a nested `info.id` accessor and does not arm", async () => {
+    const h = makeHarness();
+    await seedMeta(h);
+    let called = 0;
+    const info: Record<string, unknown> = {};
+    Object.defineProperty(info, "id", {
+      enumerable: true,
+      configurable: true,
+      get() {
+        called++;
+        return "collectiviq";
+      },
+    });
+    const out = freshOutput();
+    await h.hooks["chat.headers"](headersInput("s1", { provider: { info } }), out);
+    expect(called).toBe(0);
+    expect(out.headers[SESSION_HEADER]).toBeUndefined();
+  });
+
+  it("ignores an inherited (non-own) flat `id`", async () => {
+    const h = makeHarness();
+    await seedMeta(h);
+    const provider = Object.create({ id: "collectiviq" }) as unknown; // id on the prototype
+    const out = freshOutput();
+    await h.hooks["chat.headers"](headersInput("s1", { provider }), out);
+    expect(out.headers[SESSION_HEADER]).toBeUndefined();
+  });
+
+  it("ignores an inherited (non-own) `info`", async () => {
+    const h = makeHarness();
+    await seedMeta(h);
+    const provider = Object.create({ info: { id: "collectiviq" } }) as unknown; // info on the prototype
+    const out = freshOutput();
+    await h.hooks["chat.headers"](headersInput("s1", { provider }), out);
+    expect(out.headers[SESSION_HEADER]).toBeUndefined();
+  });
+
+  it("does not throw on a hostile provider whose descriptor lookup throws, and preserves the arming opportunity", async () => {
+    const h = makeHarness();
+    await seedMeta(h);
+    const hostile = new Proxy(
+      {},
+      {
+        getOwnPropertyDescriptor() {
+          throw new Error("boom");
+        },
+      },
+    );
+    const out1 = freshOutput();
+    // Must resolve (not throw) and arm nothing.
+    await h.hooks["chat.headers"](headersInput("s1", { provider: hostile }), out1);
+    expect(out1.headers[SESSION_HEADER]).toBeUndefined();
+    expect(h.hooks.$state.has("s1")).toBe(false);
+    // The failed inspection did NOT consume the session's one arming opportunity.
+    const out2 = freshOutput();
+    await h.hooks["chat.headers"](headersInput("s1"), out2);
+    expect(out2.headers[SESSION_HEADER]).toBe("s1");
+  });
+
+  it("does not arm a missing provider, and a later eligible request still arms", async () => {
+    const h = makeHarness();
+    await seedMeta(h);
+    const out1 = freshOutput();
+    await h.hooks["chat.headers"](headersInput("s1", { provider: undefined }), out1);
+    expect(out1.headers[SESSION_HEADER]).toBeUndefined();
+    expect(h.hooks.$state.has("s1")).toBe(false);
+    const out2 = freshOutput();
+    await h.hooks["chat.headers"](headersInput("s1"), out2);
+    expect(out2.headers[SESSION_HEADER]).toBe("s1");
+  });
+});
+
+describe("native-title plugin — process-wide duplicate-load idempotence", () => {
+  /** A plain Map-backed registry seam, so tests never touch real globalThis state. */
+  function makeMapRegistry(): HooksRegistry {
+    const store = new Map<symbol, NativeTitleHooks>();
+    return {
+      get: (key) => store.get(key),
+      set: (key, value) => {
+        store.set(key, value);
+      },
+    };
+  }
+
+  it("two loader initializations share one hooks/state instance and create deps once", () => {
+    const registry = makeMapRegistry();
+    const key = Symbol("shared-hooks-test");
+    let created = 0;
+    const makeDeps = (): NativeTitleDeps => {
+      created++;
+      return {
+        client: { session: { get: vi.fn(), update: vi.fn() } },
+        fetchImpl: vi.fn(() => Promise.resolve(makeResponse(404))),
+        sleep: autoSleep([]),
+        resolveConnection: () => ({ baseURL: BASE_URL, gatewayKey: GATEWAY_KEY }),
+        makeTimeoutSignal: () => undefined,
+      };
+    };
+    const a = getOrCreateSharedHooks(makeDeps, registry, key);
+    const b = getOrCreateSharedHooks(makeDeps, registry, key);
+    expect(b).toBe(a); // same hooks instance
+    expect(a.$state).toBe(b.$state); // same shared state map
+    expect(created).toBe(1); // first-registration-wins; second load's deps unused
+  });
+
+  it("duplicate registration is behaviorally idempotent: one header, one poller, one lookup, one update", async () => {
+    const registry = makeMapRegistry();
+    const key = Symbol("dup-load-test");
+    const sleeps: number[] = [];
+    const get = vi.fn(() => Promise.resolve({ id: "s1", title: DEFAULT_TITLE }));
+    const update = vi.fn(() => Promise.resolve(undefined));
+    const fetchImpl = vi.fn(() =>
+      Promise.resolve(makeResponse(200, { status: "ready", title: "Native title" })),
+    );
+    const makeDeps = (): NativeTitleDeps => ({
+      client: { session: { get, update } },
+      fetchImpl,
+      sleep: autoSleep(sleeps),
+      resolveConnection: () => ({ baseURL: BASE_URL, gatewayKey: GATEWAY_KEY }),
+      makeTimeoutSignal: () => undefined,
+    });
+    // Two "loads" (project-local + global symlink) resolve to the same instance.
+    const a = getOrCreateSharedHooks(makeDeps, registry, key);
+    const b = getOrCreateSharedHooks(makeDeps, registry, key);
+    expect(b).toBe(a);
+
+    // Lifecycle metadata (shared) → both refs see the same cached default title.
+    await a.event({
+      event: { type: "session.created", properties: { info: { id: "s1", title: DEFAULT_TITLE } } },
+    });
+
+    // Invoke chat.headers on BOTH references for the same session: exactly one arms.
+    const outA = freshOutput();
+    const outB = freshOutput();
+    await a["chat.headers"](headersInput("s1"), outA);
+    await b["chat.headers"](headersInput("s1"), outB);
+    const armed = [outA, outB].filter((o) => o.headers[SESSION_HEADER] === "s1");
+    expect(armed.length).toBe(1);
+
+    // Idle on BOTH references: exactly one poller runs.
+    await a.event({ event: { type: "session.idle", properties: { sessionID: "s1" } } });
+    await b.event({ event: { type: "session.idle", properties: { sessionID: "s1" } } });
+    await a.$settle();
+    await b.$settle();
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1); // one immediate 200-ready fetch
+    expect(get).toHaveBeenCalledTimes(1); // cached arm did no lookup; one rename-side recheck
+    expect(update).toHaveBeenCalledTimes(1); // at most one title update
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Loader-contract regressions: the entry module must load under OpenCode 1.18.21.
+//
+// OpenCode resolves a plugin entry by first trying to read a V1 default plugin
+// module `{ id, server }` (readV1Plugin); only if the default is NOT that object
+// does it fall through to the LEGACY path, which scans the module's runtime exports
+// and rejects the first non-function with `Plugin export is not a function`. The
+// earlier bare-FUNCTION default fell through and OpenCode rejected the module on a
+// non-function named export (e.g. UPDATE_TIMEOUT_MS), so the plugin never loaded.
+// These tests inspect the ACTUAL runtime module namespace (not just types).
+// ---------------------------------------------------------------------------
+
+/** Faithful model of OpenCode's readV1Plugin-BEFORE-legacy-scan selection order. */
+type LoaderSelection = { kind: "v1"; server: unknown } | { kind: "legacy"; server: unknown };
+
+function isV1Module(value: unknown): value is { id: string; server: unknown } {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as { id?: unknown }).id === "string" &&
+    typeof (value as { server?: unknown }).server === "function"
+  );
+}
+
+function selectPluginEntry(mod: Record<string, unknown>): LoaderSelection {
+  const def = mod["default"];
+  // V1 FIRST: a default `{ id: string, server: fn }` is used directly — the module's
+  // other (possibly non-function) exports are never scanned.
+  if (isV1Module(def)) return { kind: "v1", server: def.server };
+  // LEGACY fallback: every runtime export must be a function, else OpenCode throws.
+  for (const value of Object.values(mod)) {
+    if (typeof value !== "function") {
+      throw new Error("Plugin export is not a function");
+    }
+  }
+  return { kind: "legacy", server: def };
+}
+
+describe("native-title plugin — OpenCode loader contract (V1 default module)", () => {
+  // The default server writes into the process-global singleton slot; clear it so
+  // no case leaks the Symbol.for(...) instance into another.
+  const clearGlobalSingleton = (): void => {
+    delete (globalThis as unknown as Record<symbol, unknown>)[SHARED_HOOKS_KEY];
+  };
+  afterEach(clearGlobalSingleton);
+
+  function fakePluginInput(): {
+    client: { session: { get: () => Promise<unknown>; update: () => Promise<unknown> } };
+  } {
+    return {
+      client: {
+        session: {
+          get: () => Promise.resolve({}),
+          update: () => Promise.resolve({}),
+        },
+      },
+    };
+  }
+
+  it("default export is a V1 object with the stable id and the plugin server function", () => {
+    expect(typeof pluginDefault).toBe("object");
+    expect(pluginDefault).not.toBeNull();
+    expect(pluginDefault.id).toBe("collectiviq-native-title");
+    expect(pluginDefault.id).toBe(PLUGIN_ID);
+    // `default.server` is EXACTLY the plugin server function (identity), and callable.
+    expect(pluginDefault.server).toBe(CollectivIQNativeTitlePlugin);
+    expect(typeof pluginDefault.server).toBe("function");
+  });
+
+  it("selection recognizes the real module as V1 and never enters the legacy scan", () => {
+    // The real module DOES contain non-function named exports that would trip the
+    // legacy scan; prove one exists...
+    expect(typeof (pluginModule as Record<string, unknown>)["UPDATE_TIMEOUT_MS"]).toBe("number");
+    // ...yet selection returns V1 (no throw), so the legacy scan is bypassed.
+    const selected = selectPluginEntry({ ...pluginModule });
+    expect(selected.kind).toBe("v1");
+    expect(selected.server).toBe(CollectivIQNativeTitlePlugin);
+  });
+
+  it("models the legacy failure: a bare-function default + non-function export is rejected", () => {
+    // This is exactly the OLD shape's failure mode under the legacy scan.
+    expect(() => selectPluginEntry({ default: () => undefined, UPDATE_TIMEOUT_MS: 1000 })).toThrow(
+      "Plugin export is not a function",
+    );
+    // A V1 default bypasses the scan even with non-function named exports present.
+    const selected = selectPluginEntry({
+      default: { id: "x", server: () => undefined },
+      UPDATE_TIMEOUT_MS: 1000,
+    });
+    expect(selected.kind).toBe("v1");
+  });
+
+  it("the selected server returns the expected hook surface with no network access", async () => {
+    const selected = selectPluginEntry({ ...pluginModule });
+    expect(selected.kind).toBe("v1");
+    const server = selected.server as typeof CollectivIQNativeTitlePlugin;
+    const hooks = await server(fakePluginInput());
+    expect(typeof hooks["chat.headers"]).toBe("function");
+    expect(typeof hooks.event).toBe("function");
+    expect(hooks.$state).toBeInstanceOf(Map);
+    expect(typeof hooks.$settle).toBe("function");
+  });
+
+  it("two selected-server initializations share one hooks/state instance (first-init-wins)", async () => {
+    clearGlobalSingleton(); // start from a clean global slot
+    const selected = selectPluginEntry({ ...pluginModule });
+    const server = selected.server as typeof CollectivIQNativeTitlePlugin;
+    const hooksA = await server(fakePluginInput());
+    const hooksB = await server(fakePluginInput());
+    expect(hooksB).toBe(hooksA); // shared instance
+    expect(hooksB.$state).toBe(hooksA.$state); // shared state map
+    // afterEach clears the global slot so this does not leak into other cases.
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Connection resolution: gateway key from resolved CollectivIQ provider config
+// (`provider.collectiviq.options.apiKey`), with COLLECTIVIQ_GATEWAY_KEY fallback.
+// ---------------------------------------------------------------------------
+
+/** Build a config with `provider.collectiviq.options.{baseURL,apiKey}` as given. */
+function providerCfg(opts: { baseURL?: unknown; apiKey?: unknown }): unknown {
+  const options: Record<string, unknown> = {};
+  if ("baseURL" in opts) options["baseURL"] = opts.baseURL;
+  if ("apiKey" in opts) options["apiKey"] = opts.apiKey;
+  return { provider: { collectiviq: { options } } };
+}
+
+/**
+ * A synthetic, lazy fallback reader that RECORDS how many times it is invoked and
+ * returns a fixed synthetic value. Injected in place of the real credential
+ * environment lookup so no test can touch the real credential environment.
+ */
+function recordingReader(value: string | undefined): { read: ReadGatewayKey; calls: () => number } {
+  let calls = 0;
+  return {
+    read: () => {
+      calls++;
+      return value;
+    },
+    calls: () => calls,
+  };
+}
+
+/** A synthetic lazy reader that throws when invoked (hostile fallback source). */
+function throwingReader(): ReadGatewayKey {
+  return () => {
+    throw new Error("boom");
+  };
+}
+
+describe("native-title plugin — connection resolution (pure precedence + validation)", () => {
+  it("1. resolves a provider-config apiKey and never reads the environment", () => {
+    const env = recordingReader("env-key");
+    const conn = resolveConnectionConfig({
+      merged: providerCfg({ baseURL: BASE_URL, apiKey: "cfg-key" }),
+      readEnvKey: env.read,
+    });
+    expect(conn).toEqual({
+      baseURL: BASE_URL,
+      gatewayKey: "cfg-key",
+    });
+    expect(env.calls()).toBe(0); // provider-config path: zero environment reads
+  });
+
+  it("2. prefers the provider-config key and does not read the environment", () => {
+    const env = recordingReader("env-key");
+    const conn = resolveConnectionConfig({
+      merged: providerCfg({ baseURL: BASE_URL, apiKey: "cfg-key" }),
+      readEnvKey: env.read,
+    });
+    expect(conn?.gatewayKey).toBe("cfg-key");
+    expect(env.calls()).toBe(0);
+  });
+
+  it("2b. resolves an embedded provider key and never reads the environment", () => {
+    const env = recordingReader("env-key");
+    const conn = resolveConnectionConfig({
+      merged: undefined,
+      embedded: providerCfg({ baseURL: BASE_URL, apiKey: "embedded-key" }),
+      readEnvKey: env.read,
+    });
+    expect(conn).toEqual({
+      baseURL: BASE_URL,
+      gatewayKey: "embedded-key",
+    });
+    expect(env.calls()).toBe(0);
+  });
+
+  it("3. falls back to the environment reader exactly once when no provider key", () => {
+    const env = recordingReader("env-key");
+    const conn = resolveConnectionConfig({
+      merged: providerCfg({ baseURL: BASE_URL }),
+      readEnvKey: env.read,
+    });
+    expect(conn).toEqual({
+      baseURL: BASE_URL,
+      gatewayKey: "env-key",
+    });
+    expect(env.calls()).toBe(1); // fallback path: exactly one read
+  });
+
+  it("4. prefers merged SDK config over embedded and env (base URL and key)", () => {
+    const env = recordingReader("env-key");
+    const conn = resolveConnectionConfig({
+      merged: providerCfg({ baseURL: "http://merged", apiKey: "merged-key" }),
+      embedded: providerCfg({ baseURL: "http://embedded", apiKey: "embedded-key" }),
+      readEnvKey: env.read,
+    });
+    expect(conn?.baseURL).toBe("http://merged");
+    expect(conn?.gatewayKey).toBe("merged-key");
+    expect(env.calls()).toBe(0);
+  });
+
+  it("5. uses embedded config as a compatibility fallback when merged is absent", () => {
+    const env = recordingReader("env-key");
+    const conn = resolveConnectionConfig({
+      merged: undefined,
+      embedded: providerCfg({ baseURL: "http://embedded", apiKey: "embedded-key" }),
+      readEnvKey: env.read,
+    });
+    expect(conn).toEqual({
+      baseURL: "http://embedded",
+      gatewayKey: "embedded-key",
+    });
+    expect(env.calls()).toBe(0);
+  });
+
+  it("7. an empty config key falls back to the env reader exactly once", () => {
+    const env = recordingReader("env-key");
+    const conn = resolveConnectionConfig({
+      merged: providerCfg({ baseURL: BASE_URL, apiKey: "" }),
+      readEnvKey: env.read,
+    });
+    expect(conn?.gatewayKey).toBe("env-key");
+    expect(env.calls()).toBe(1);
+  });
+
+  it("8. a non-string config key falls back to the env reader exactly once", () => {
+    const env = recordingReader("env-key");
+    const conn = resolveConnectionConfig({
+      merged: providerCfg({ baseURL: BASE_URL, apiKey: 123 }),
+      readEnvKey: env.read,
+    });
+    expect(conn?.gatewayKey).toBe("env-key");
+    expect(env.calls()).toBe(1);
+  });
+
+  it("9. accepts a key exactly at 8192 UTF-8 bytes and rejects one over", () => {
+    const exact = "a".repeat(8192);
+    expect(
+      resolveConnectionConfig({
+        merged: providerCfg({ baseURL: BASE_URL, apiKey: exact }),
+      })?.gatewayKey,
+    ).toBe(exact);
+    const over = "a".repeat(8193);
+    const env = recordingReader(undefined);
+    expect(
+      resolveConnectionConfig({
+        merged: providerCfg({ baseURL: BASE_URL, apiKey: over }),
+        readEnvKey: env.read,
+      }),
+    ).toBeUndefined();
+    expect(env.calls()).toBe(1); // overlong config key → fallback attempted once
+  });
+
+  it("10. rejects literal unresolved {env:...} and {file:...} placeholders", () => {
+    const env = recordingReader(undefined);
+    expect(
+      resolveConnectionConfig({
+        merged: providerCfg({ baseURL: BASE_URL, apiKey: "{env:COLLECTIVIQ_GATEWAY_KEY}" }),
+        readEnvKey: env.read,
+      }),
+    ).toBeUndefined();
+    expect(
+      resolveConnectionConfig({
+        merged: providerCfg({ baseURL: BASE_URL, apiKey: "{file:/etc/collectiviq/key}" }),
+        readEnvKey: env.read,
+      }),
+    ).toBeUndefined();
+    expect(env.calls()).toBe(2); // one fallback attempt per unusable provider key
+  });
+
+  it("11. counts key size by UTF-8 bytes, not characters (multibyte boundary)", () => {
+    const at = "a".repeat(8189) + "€"; // 8189 + 3 (€) = 8192 bytes
+    expect(
+      resolveConnectionConfig({
+        merged: providerCfg({ baseURL: BASE_URL, apiKey: at }),
+      })?.gatewayKey,
+    ).toBe(at);
+    const over = "a".repeat(8190) + "€"; // 8190 + 3 = 8193 bytes
+    expect(
+      resolveConnectionConfig({
+        merged: providerCfg({ baseURL: BASE_URL, apiKey: over }),
+      }),
+    ).toBeUndefined();
+  });
+
+  it("12. never invokes an accessor apiKey (falls back to env exactly once)", () => {
+    let called = 0;
+    const options: Record<string, unknown> = { baseURL: BASE_URL };
+    Object.defineProperty(options, "apiKey", {
+      enumerable: true,
+      configurable: true,
+      get() {
+        called++;
+        return "SECRET";
+      },
+    });
+    const env = recordingReader("env-key");
+    const conn = resolveConnectionConfig({
+      merged: { provider: { collectiviq: { options } } },
+      readEnvKey: env.read,
+    });
+    expect(called).toBe(0); // accessor never invoked
+    expect(conn?.gatewayKey).toBe("env-key");
+    expect(env.calls()).toBe(1);
+  });
+
+  it("13. ignores an inherited (non-own) apiKey and falls back to env once", () => {
+    const options = Object.create({ apiKey: "SECRET" }) as Record<string, unknown>;
+    options["baseURL"] = BASE_URL;
+    const env = recordingReader("env-key");
+    const conn = resolveConnectionConfig({
+      merged: { provider: { collectiviq: { options } } },
+      readEnvKey: env.read,
+    });
+    expect(conn?.gatewayKey).toBe("env-key"); // inherited apiKey ignored
+    expect(env.calls()).toBe(1);
+  });
+
+  it("14. fails closed (no throw) on a hostile proxy whose descriptor lookup throws", () => {
+    const merged = new Proxy(
+      {},
+      {
+        getOwnPropertyDescriptor() {
+          throw new Error("boom");
+        },
+      },
+    );
+    let conn: NativeTitleConnectionConfig | undefined;
+    expect(() => {
+      conn = resolveConnectionConfig({ merged });
+    }).not.toThrow();
+    expect(conn).toBeUndefined();
+  });
+
+  it("6b. missing base URL never invokes the environment reader", () => {
+    const env = recordingReader("env-key");
+    expect(
+      resolveConnectionConfig({
+        merged: providerCfg({ apiKey: "cfg-key" }), // no base URL, provider key present
+        readEnvKey: env.read,
+      }),
+    ).toBeUndefined();
+    expect(env.calls()).toBe(0); // no complete connection possible → no fallback read
+  });
+
+  it("6c. invalid (placeholder) base URL never invokes the environment reader", () => {
+    const env = recordingReader("env-key");
+    expect(
+      resolveConnectionConfig({
+        merged: providerCfg({ baseURL: "{env:BASE}" }), // unusable base URL, no key
+        readEnvKey: env.read,
+      }),
+    ).toBeUndefined();
+    expect(env.calls()).toBe(0);
+  });
+
+  it("7b. a throwing environment reader fails open (no throw, no connection)", () => {
+    let conn: NativeTitleConnectionConfig | undefined;
+    expect(() => {
+      conn = resolveConnectionConfig({
+        merged: providerCfg({ baseURL: BASE_URL }), // no provider key → fallback path
+        readEnvKey: throwingReader(),
+      });
+    }).not.toThrow();
+    expect(conn).toBeUndefined();
+  });
+
+  it("8b. an unusable synthetic env value fails open on the fallback path", () => {
+    for (const bad of ["", "{env:X}", "a".repeat(8193)]) {
+      const env = recordingReader(bad);
+      expect(
+        resolveConnectionConfig({
+          merged: providerCfg({ baseURL: BASE_URL }),
+          readEnvKey: env.read,
+        }),
+      ).toBeUndefined();
+      expect(env.calls()).toBe(1); // read once, then rejected
+    }
+  });
+
+  it("17. returns no partial connection when base URL or key is missing", () => {
+    const env = recordingReader(undefined);
+    expect(
+      resolveConnectionConfig({ merged: providerCfg({ apiKey: "cfg-key" }), readEnvKey: env.read }),
+    ).toBeUndefined(); // no base URL
+    expect(
+      resolveConnectionConfig({ merged: providerCfg({ baseURL: BASE_URL }), readEnvKey: env.read }),
+    ).toBeUndefined(); // no key (fallback read, still nothing)
+  });
+});
+
+describe("native-title plugin — connection resolution (production resolver I/O)", () => {
+  it("6. calls client.config.get() at most once and never reads env on the provider path", async () => {
+    let calls = 0;
+    const input: unknown = {
+      client: {
+        session: { get: () => Promise.resolve({}), update: () => Promise.resolve({}) },
+        config: {
+          get: () => {
+            calls++;
+            return Promise.resolve({ data: providerCfg({ baseURL: BASE_URL, apiKey: "cfg-key" }) });
+          },
+        },
+      },
+    };
+    // Inject a throwing reader: if the provider path ever reads env, this throws.
+    const conn = await defaultResolveConnection(input as PluginInput, throwingReader());
+    expect(calls).toBe(1);
+    expect(conn).toEqual({
+      baseURL: BASE_URL,
+      gatewayKey: "cfg-key",
+    });
+  });
+
+  it("6d. with no usable provider key, invokes the injected env reader exactly once", async () => {
+    const input: unknown = {
+      client: {
+        session: { get: () => Promise.resolve({}), update: () => Promise.resolve({}) },
+        config: {
+          get: () => Promise.resolve({ data: providerCfg({ baseURL: BASE_URL }) }), // no key
+        },
+      },
+    };
+    const env = recordingReader("env-key");
+    const conn = await defaultResolveConnection(input as PluginInput, env.read);
+    expect(env.calls()).toBe(1);
+    expect(conn).toEqual({
+      baseURL: BASE_URL,
+      gatewayKey: "env-key",
+    });
+  });
+});
+
+describe("native-title plugin — credential env lookup is confined to the wrapper", () => {
+  const CRED_ENV = "COLLECTIVIQ_GATEWAY_KEY";
+  const pluginSrc = readFileSync(
+    new URL("../../.opencode/plugins/collectiviq-native-title.ts", import.meta.url),
+    "utf8",
+  );
+  const testSrc = readFileSync(new URL("./opencode-title-plugin.test.ts", import.meta.url), "utf8");
+
+  it("11a. reads the credential env var in exactly one place in the plugin (the wrapper)", () => {
+    // Count `process.env` reads of the credential var (any quote/access style),
+    // excluding placeholder string literals like "{env:COLLECTIVIQ_GATEWAY_KEY}".
+    const reads = pluginSrc.match(
+      new RegExp(
+        `process\\.env\\s*(?:\\.${CRED_ENV}\\b|\\[\\s*["'\`]${CRED_ENV}["'\`]\\s*\\])`,
+        "g",
+      ),
+    );
+    expect(reads).not.toBeNull();
+    expect(reads).toHaveLength(1);
+  });
+
+  it("11b. no test source path reads the real credential env var", () => {
+    const testReads = testSrc.match(
+      new RegExp(
+        `process\\.env\\s*(?:\\.${CRED_ENV}\\b|\\[\\s*["'\`]${CRED_ENV}["'\`]\\s*\\])`,
+        "g",
+      ),
+    );
+    expect(testReads).toBeNull();
+  });
+});
+
+describe("native-title plugin — connection resolution (bounded/fail-open through the poller)", () => {
+  it("15. bounds a hung connection resolution and issues no fetch", async () => {
+    const h = makeHarness({ resolveConnection: () => new Promise<never>(() => {}) });
+    await armCached(h);
+    await idle(h);
+    await h.hooks.$settle();
+    expect(h.sleeps).toEqual([RESOLVE_TIMEOUT_MS]); // exactly one bounded pre-poll sleep
+    expect(h.fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("16. session deletion during a hung resolution prevents any later fetch", async () => {
+    const h = makeHarness({
+      resolveConnection: () => new Promise<never>(() => {}),
+      sleep: abortOnlySleep,
+    });
+    await armCached(h);
+    await idle(h);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(h.fetchImpl).not.toHaveBeenCalled();
+    await h.hooks.event({ event: { type: "session.deleted", properties: { info: { id: "s1" } } } });
+    await h.hooks.$settle(); // must complete (not hang)
+    expect(h.fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("17b. an unavailable connection (undefined) fails open and issues no fetch", async () => {
+    const h = makeHarness({ resolveConnection: () => undefined });
+    await armCached(h);
+    await idle(h);
+    await h.hooks.$settle();
+    expect(h.fetchImpl).not.toHaveBeenCalled();
   });
 });
 

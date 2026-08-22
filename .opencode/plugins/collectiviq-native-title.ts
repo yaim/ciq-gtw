@@ -1,4 +1,8 @@
-// CollectivIQ native-title bridge (OpenCode project-local plugin).
+// CollectivIQ native-title bridge (OpenCode plugin; committed project-local by
+// default, and optionally installed globally via a manual symlink for cross-project
+// use — see README). The default export is process-wide idempotent: global +
+// project-local discovery in one process share a single hooks instance (see the
+// singleton section at the bottom of this file).
 //
 // Purpose: OpenCode's hidden LLM `title` agent is DISABLED in opencode.jsonc so it
 // creates no separate title thread/completion. Instead, for the first ELIGIBLE
@@ -38,11 +42,21 @@
 //   * Only the exact configured gateway origin is contacted.
 //
 // The OpenCode plugin API is approximated with NARROW LOCAL STRUCTURAL TYPES below
-// (this file imports no `opencode` package), aligned to the installed
-// `@opencode-ai/plugin` + `@opencode-ai/sdk` declarations: `chat.headers` carries
-// `sessionID`, `agent`, and `provider.info.id`; the `session.created`/`.updated`/
+// (this file imports no `opencode` package). The `session.created`/`.updated`/
 // `.deleted` events carry the full session `info` (`id`, `parentID`, `title`). The
 // types are fully injectable so tests can fake them.
+//
+// PROVIDER SHAPE — the `chat.headers` hook receives a provider whose id location
+// DIFFERS between the SDK type declaration and the OpenCode runtime:
+//   * SDK-DECLARED (`@opencode-ai/plugin` `ProviderContext`, `@opencode-ai/sdk`
+//     `Provider`): NESTED — the provider id is at `provider.info.id`.
+//   * OpenCode v1.18.20 RUNTIME: FLAT — it passes a `Provider.Info` directly, so
+//     the provider id is at `provider.id` (see the upstream type/runtime mismatch,
+//     opencode issue #20562 and `session/llm/request.ts`). The installed type
+//     declarations lag the runtime and describe only the nested shape.
+// `readProviderId` (below) tolerates BOTH: a flat own `id` is authoritative when
+// present; only when it is absent does it fall back to the nested `info.id`. It
+// reads own data-property descriptors only and never invokes accessors.
 
 // ---------------------------------------------------------------------------
 // Local structural approximations of the OpenCode plugin API.
@@ -87,14 +101,17 @@ export interface PluginInput {
 }
 
 /**
- * `chat.headers` hook input (subset, aligned to the installed declarations):
- * the session id, the resolved `agent` name, and the provider context whose
- * `info.id` is the provider id (e.g. `collectiviq`).
+ * `chat.headers` hook input (subset): the session id, the resolved `agent` name,
+ * and the provider whose id (e.g. `collectiviq`) is read structurally by
+ * `readProviderId`. The provider is typed `unknown` because its shape differs
+ * between the SDK declaration (nested `provider.info.id`) and the OpenCode
+ * v1.18.20 runtime (flat `provider.id`); both are tolerated. It is never accessed
+ * by property — only via own data-property descriptors — so no getter is invoked.
  */
 export interface ChatHeadersInput {
   sessionID: string;
   agent?: string;
-  provider?: { info?: { id?: string } };
+  provider?: unknown;
 }
 
 /** `chat.headers` hook output: mutable outbound header map. */
@@ -132,14 +149,33 @@ export type FetchLike = (
   },
 ) => Promise<FetchResponseLike>;
 
+/**
+ * A fully resolved connection to the gateway's session-title extension: the base
+ * URL and the exact gateway key. Produced by a single bounded resolution; never
+ * partial (both `baseURL` and `gatewayKey` are valid). The key is used only for the
+ * in-flight poll fetch and is never stored in singleton/session/metadata state,
+ * errors, or logs.
+ */
+export interface NativeTitleConnectionConfig {
+  baseURL: string;
+  gatewayKey: string;
+}
+
 /** Injectable seams for the core hooks factory. */
 export interface NativeTitleDeps {
   client: TitleClient;
   fetchImpl: FetchLike;
   /** Abortable delay: resolves after `ms`, or early (clearing its timer) if `signal` aborts. */
   sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
-  resolveBaseURL: () => Promise<string | undefined> | string | undefined;
-  resolveGatewayKey: () => string | undefined;
+  /**
+   * ONE bounded connection resolution: returns a complete `{ baseURL, gatewayKey }`
+   * or `undefined` when either the base URL or a usable key is unavailable. Replaces
+   * the former separate `resolveBaseURL`/`resolveGatewayKey` seams so the whole
+   * lookup (including `client.config.get()`) sits behind a single timeout/
+   * cancellation boundary.
+   */
+  resolveConnection: () =>
+    Promise<NativeTitleConnectionConfig | undefined> | NativeTitleConnectionConfig | undefined;
   /** Returns a per-request timeout abort signal, or undefined for no bound. */
   makeTimeoutSignal?: (ms: number) => AbortSignal | undefined;
 }
@@ -180,10 +216,21 @@ const SESSION_LOOKUP_TIMEOUT_MS = 1000;
 // task pending. Exported so tests can assert the exact bound without a real wait.
 export const UPDATE_TIMEOUT_MS = 1000;
 
-// Bound on resolving the gateway base URL before polling. The production resolver
-// may await `client.config.get()`, which can stall; this caps that wait so a
-// poller task always settles (and settles promptly on deletion).
+// Bound on resolving the gateway connection (base URL + key) before polling. The
+// production resolver may await `client.config.get()`, which can stall; this caps
+// that wait so a poller task always settles (and settles promptly on deletion).
 export const RESOLVE_TIMEOUT_MS = 1500;
+
+// Maximum UTF-8 byte length of an accepted gateway key. Mirrors the server-side
+// `GATEWAY_KEY_LIMITS.maxKeyBytes` (src/config/schema.ts) so the plugin never
+// forwards a key the gateway would reject; gateway auth is EXACT-match, so a valid
+// key is used verbatim (never trimmed/normalized).
+const MAX_GATEWAY_KEY_BYTES = 8192;
+
+// Rejects an unresolved OpenCode config placeholder (e.g. `{env:VAR}`/`{file:/p}`)
+// that reached the plugin without substitution — such a value is not a usable key
+// or base URL.
+const UNRESOLVED_PLACEHOLDER_RE = /\{(?:env|file):[^}]*\}/;
 
 // OpenCode session-title display bound (Unicode code points).
 const TITLE_MAX_CODE_POINTS = 100;
@@ -237,6 +284,67 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
+/**
+ * The own DATA-property value at `key` when it is a string, else undefined.
+ * Inspects ONLY the own property descriptor: an inherited property, an accessor
+ * (getter/setter), a non-string value, or a descriptor/proxy trap failure all
+ * yield undefined. No user code (getter/`toJSON`/iterator) is ever invoked.
+ */
+function ownDataString(obj: object, key: string): string | undefined {
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(obj, key);
+  } catch {
+    return undefined; // hostile proxy trap → fail closed
+  }
+  if (!descriptor) return undefined; // absent or inherited-only
+  if ("get" in descriptor || "set" in descriptor) return undefined; // accessor → never invoke
+  return typeof descriptor.value === "string" ? descriptor.value : undefined;
+}
+
+/**
+ * Descriptor-safe provider-id reader tolerating BOTH provider shapes (see the
+ * PROVIDER SHAPE note at the top of the file):
+ *   1. A flat own `id` property is AUTHORITATIVE when present — its string data
+ *      value is returned; an accessor or non-string flat `id` fails closed and
+ *      does NOT fall back to the nested shape.
+ *   2. Only when a flat `id` property is ABSENT is the own data-property `info`
+ *      inspected, then its own data-property `id` (string only).
+ * Inherited properties are ignored, accessors/hooks are never invoked, and any
+ * descriptor/proxy failure returns undefined. This function never throws.
+ */
+function readProviderId(provider: unknown): string | undefined {
+  try {
+    if (typeof provider !== "object" || provider === null) return undefined;
+
+    // 1. Flat shape: an own `id` property, when present, is authoritative.
+    let flat: PropertyDescriptor | undefined;
+    try {
+      flat = Object.getOwnPropertyDescriptor(provider, "id");
+    } catch {
+      return undefined;
+    }
+    if (flat) {
+      if ("get" in flat || "set" in flat) return undefined; // accessor → fail closed, no fallback
+      return typeof flat.value === "string" ? flat.value : undefined;
+    }
+
+    // 2. Nested shape: only reached when there is no own flat `id`.
+    let infoDesc: PropertyDescriptor | undefined;
+    try {
+      infoDesc = Object.getOwnPropertyDescriptor(provider, "info");
+    } catch {
+      return undefined;
+    }
+    if (!infoDesc || "get" in infoDesc || "set" in infoDesc) return undefined;
+    const info: unknown = infoDesc.value;
+    if (typeof info !== "object" || info === null) return undefined;
+    return ownDataString(info, "id");
+  } catch {
+    return undefined; // belt-and-braces: never throw out of the reader
+  }
+}
+
 /** Compose up to two abort signals; returns undefined only when both are absent. */
 function composeSignals(a?: AbortSignal, b?: AbortSignal): AbortSignal | undefined {
   if (a && b) return AbortSignal.any([a, b]);
@@ -286,37 +394,157 @@ function joinTitleUrl(baseURL: string): string {
   return baseURL.replace(/\/+$/, "") + ENDPOINT_PATH;
 }
 
-// Best-effort structural probe for the configured gateway base URL. OpenCode may
-// expose the resolved config to plugins differently across versions; probe safe
-// locations and fail open. Tests inject their own resolver instead.
-function pickBaseURL(config: unknown): string | undefined {
-  if (!isRecord(config)) return undefined;
-  const provider = config["provider"];
-  if (!isRecord(provider)) return undefined;
-  const collectiviq = provider[PROVIDER_ID];
-  if (!isRecord(collectiviq)) return undefined;
-  const options = collectiviq["options"];
-  if (!isRecord(options)) return undefined;
-  const baseURL = options["baseURL"];
-  return typeof baseURL === "string" && baseURL.length > 0 ? baseURL : undefined;
+/**
+ * The own DATA-property object value at `key`, else undefined. Descriptor-safe:
+ * inspects only the own property descriptor, ignores inherited/accessor properties,
+ * and fails closed on a throwing proxy trap. No getter/hook is ever invoked.
+ */
+function ownDataObject(obj: unknown, key: string): object | undefined {
+  if (typeof obj !== "object" || obj === null) return undefined;
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(obj, key);
+  } catch {
+    return undefined; // hostile proxy trap → fail closed
+  }
+  if (!descriptor) return undefined; // absent or inherited-only
+  if ("get" in descriptor || "set" in descriptor) return undefined; // accessor → never invoke
+  const value: unknown = descriptor.value;
+  return typeof value === "object" && value !== null ? value : undefined;
 }
 
-async function defaultResolveBaseURL(input: PluginInput): Promise<string | undefined> {
+/**
+ * Descriptor-safe read of `config.provider.collectiviq.options.{baseURL,apiKey}`.
+ * Uses own data-property descriptors at every level (never bracket access, `in`, or
+ * a getter), so accessors, inherited members, and throwing proxies are treated as
+ * absent. Returns raw strings (or undefined); validation happens in the caller.
+ */
+function pickProviderOptions(config: unknown): {
+  baseURL: string | undefined;
+  apiKey: string | undefined;
+} {
+  const provider = ownDataObject(config, "provider");
+  const collectiviq = ownDataObject(provider, PROVIDER_ID);
+  const options = ownDataObject(collectiviq, "options");
+  if (!options) return { baseURL: undefined, apiKey: undefined };
+  return { baseURL: ownDataString(options, "baseURL"), apiKey: ownDataString(options, "apiKey") };
+}
+
+/** UTF-8 byte length (not code points / not chars). */
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).length;
+}
+
+/**
+ * A usable gateway key: a non-empty string with no unresolved config placeholder
+ * and at most `MAX_GATEWAY_KEY_BYTES` UTF-8 bytes. Returned EXACTLY (never trimmed
+ * or normalized) because gateway authentication is exact-match. Otherwise undefined.
+ */
+function usableKey(value: string | undefined): string | undefined {
+  if (typeof value !== "string" || value.length === 0) return undefined;
+  if (UNRESOLVED_PLACEHOLDER_RE.test(value)) return undefined;
+  if (utf8ByteLength(value) > MAX_GATEWAY_KEY_BYTES) return undefined;
+  return value;
+}
+
+/** A usable base URL: a non-empty string with no unresolved config placeholder. */
+function usableBaseURL(value: string | undefined): string | undefined {
+  if (typeof value !== "string" || value.length === 0) return undefined;
+  if (UNRESOLVED_PLACEHOLDER_RE.test(value)) return undefined;
+  return value;
+}
+
+/**
+ * Lazy, injectable reader for the fallback gateway credential. Returns the raw
+ * candidate (or `undefined`); validation is applied by the caller. It is invoked
+ * ONLY when a usable base URL exists but provider config has no usable key, so the
+ * environment is never inspected on the provider-config or no-base-URL paths.
+ */
+export type ReadGatewayKey = () => string | undefined;
+
+/** Sources consulted by {@link resolveConnectionConfig}. */
+export interface ConnectionSources {
+  /** OpenCode's merged SDK config (`client.config.get()` result), preferred. */
+  merged?: unknown;
+  /** Embedded plugin-input config (`input.config`), compatibility fallback. */
+  embedded?: unknown;
+  /**
+   * Lazy fallback reader for `COLLECTIVIQ_GATEWAY_KEY`. Invoked at most once, and
+   * only when a usable base URL exists but no usable provider-config key does, so
+   * the environment is never evaluated on the provider-config or no-base-URL paths.
+   * A throwing reader is caught and treated as an absent fallback.
+   */
+  readEnvKey?: ReadGatewayKey | undefined;
+}
+
+/**
+ * Pure connection resolution with deterministic precedence and no direct I/O:
+ *   base URL  = merged provider config → embedded provider config
+ *   key       = merged provider `apiKey` → embedded provider `apiKey` → env fallback
+ * Provider-config keys always win over the environment fallback. The lazy
+ * `readEnvKey` reader is consulted ONLY when a usable base URL exists but no usable
+ * provider-config key does — never when a provider key already resolves and never
+ * when the base URL is missing (no complete connection is possible either way) — and
+ * at most once. A throwing reader fails open. Returns a complete connection only
+ * when BOTH a valid base URL and a usable key are available (never partial);
+ * otherwise undefined. Never throws.
+ */
+export function resolveConnectionConfig(
+  sources: ConnectionSources,
+): NativeTitleConnectionConfig | undefined {
+  const merged = pickProviderOptions(sources.merged);
+  const embedded = pickProviderOptions(sources.embedded);
+  const baseURL = usableBaseURL(merged.baseURL) ?? usableBaseURL(embedded.baseURL);
+  const providerKey = usableKey(merged.apiKey) ?? usableKey(embedded.apiKey);
+  if (providerKey) {
+    // Provider config is complete on its own: never consult the environment.
+    if (!baseURL) return undefined;
+    return { baseURL, gatewayKey: providerKey };
+  }
+  // No usable base URL means no complete connection is possible: skip the fallback.
+  if (!baseURL) return undefined;
+  let rawEnvKey: string | undefined;
   try {
-    const anyInput = input as unknown as Record<string, unknown>;
-    const embedded = pickBaseURL(anyInput["config"]);
-    if (embedded) return embedded;
+    rawEnvKey = sources.readEnvKey?.(); // AT MOST ONCE, fallback path only
+  } catch {
+    rawEnvKey = undefined; // fail open: a throwing reader is an absent fallback
+  }
+  const envKey = usableKey(rawEnvKey);
+  if (!envKey) return undefined;
+  return { baseURL, gatewayKey: envKey };
+}
+
+/**
+ * Production connection resolver. Reads the embedded `input.config` and calls
+ * `client.config.get()` AT MOST ONCE for OpenCode's merged config, then applies the
+ * pure precedence in {@link resolveConnectionConfig}. Fails open (undefined) and
+ * never throws. The base URL and the gateway key both come from the resolved
+ * CollectivIQ provider — `provider.collectiviq.options.{baseURL,apiKey}` — so no
+ * separate terminal `COLLECTIVIQ_GATEWAY_KEY` export is required when OpenCode has
+ * already resolved a working provider credential; the env var is only a fallback.
+ *
+ * The fallback reader is REQUIRED and injected (no default that reads
+ * `process.env`), so unit tests supply a synthetic reader and can never touch the
+ * real credential environment. The reader is invoked lazily by
+ * {@link resolveConnectionConfig} — at most once, and only on the fallback path.
+ */
+export async function defaultResolveConnection(
+  input: PluginInput,
+  readEnvKey: ReadGatewayKey,
+): Promise<NativeTitleConnectionConfig | undefined> {
+  const anyInput = input as unknown as Record<string, unknown>;
+  const embedded = ownDataObject(anyInput, "config");
+  let merged: unknown;
+  try {
     const client = anyInput["client"] as { config?: { get?: () => Promise<unknown> } } | undefined;
     if (client?.config?.get) {
-      const res = await client.config.get();
-      const data = isRecord(res) && "data" in res ? res["data"] : res;
-      const fromClient = pickBaseURL(data);
-      if (fromClient) return fromClient;
+      const res = await client.config.get(); // AT MOST ONCE per resolution
+      merged = ownDataObject(res, "data") ?? res; // unwrap a `{ data }` envelope, else raw
     }
   } catch {
-    // Fail open: no base URL means the plugin silently does nothing.
+    merged = undefined; // fail open: no merged config
   }
-  return undefined;
+  return resolveConnectionConfig({ merged, embedded, readEnvKey });
 }
 
 // ---------------------------------------------------------------------------
@@ -324,7 +552,7 @@ async function defaultResolveBaseURL(input: PluginInput): Promise<string | undef
 // ---------------------------------------------------------------------------
 
 export function createNativeTitleHooks(deps: NativeTitleDeps): NativeTitleHooks {
-  const { client, fetchImpl, sleep, resolveBaseURL, resolveGatewayKey } = deps;
+  const { client, fetchImpl, sleep, resolveConnection } = deps;
   const makeTimeoutSignal = deps.makeTimeoutSignal ?? ((ms: number) => AbortSignal.timeout(ms));
 
   // Armed sessions (with a poller + cancellation). Exposed to tests as `$state`.
@@ -449,8 +677,9 @@ export function createNativeTitleHooks(deps: NativeTitleDeps): NativeTitleHooks 
     // Cancelled while the lookup was pending, or the lookup timed out.
     if (signal.aborted || !current) return;
     // Guard against a manual rename or another integration during polling.
-    if (current.title !== initialTitle) return;
+    const titleStillDefault = current.title === initialTitle;
     const normalized = normalizeTitle(providerTitle);
+    if (!titleStillDefault) return;
     if (normalized.length === 0) return;
     // Final cancellation check immediately before the write.
     if (signal.aborted) return;
@@ -493,22 +722,32 @@ export function createNativeTitleHooks(deps: NativeTitleDeps): NativeTitleHooks 
   }
 
   /**
-   * Bounded, lifecycle-aware base-URL resolution. The production `resolveBaseURL`
-   * may await `client.config.get()`, which can stall indefinitely; this races it
-   * against a small timeout AND the session's cancellation signal, so the poller
-   * NEVER awaits it permanently and settles PROMPTLY on deletion/eviction. A
-   * timeout, cancellation, rejection, or malformed (non-string) result yields
-   * `undefined` (stop). The underlying resolver promise is detached and swallowed
-   * — it is not physically cancelled (the API offers no signal); the plugin simply
-   * stops awaiting it and does no further work.
+   * Bounded, lifecycle-aware CONNECTION resolution (base URL + gateway key). The
+   * production `resolveConnection` may await `client.config.get()`, which can stall
+   * indefinitely; this races the WHOLE lookup against a single small timeout AND the
+   * session's cancellation signal, so the poller NEVER awaits it permanently and
+   * settles PROMPTLY on deletion/eviction. A timeout, cancellation, rejection, or a
+   * partial/malformed result yields `undefined` (stop). The underlying resolver
+   * promise is detached and swallowed — it is not physically cancelled (the API
+   * offers no signal); the plugin simply stops awaiting it and does no further work.
    */
-  async function resolveBaseURLBounded(signal: AbortSignal): Promise<string | undefined> {
+  async function resolveConnectionBounded(
+    signal: AbortSignal,
+  ): Promise<NativeTitleConnectionConfig | undefined> {
     if (signal.aborted) return undefined;
     const sleepAbort = new AbortController();
     const waitSignal = composeSignals(sleepAbort.signal, signal);
     const resolveP = Promise.resolve()
-      .then(() => resolveBaseURL())
-      .then((v) => (typeof v === "string" && v.length > 0 ? v : undefined))
+      .then(() => resolveConnection())
+      .then((c) =>
+        c &&
+        typeof c.baseURL === "string" &&
+        c.baseURL.length > 0 &&
+        typeof c.gatewayKey === "string" &&
+        c.gatewayKey.length > 0
+          ? c
+          : undefined,
+      )
       .catch(() => undefined);
     const stopP = sleep(RESOLVE_TIMEOUT_MS, waitSignal).then(() => "__stop__" as const);
     try {
@@ -527,12 +766,14 @@ export function createNativeTitleHooks(deps: NativeTitleDeps): NativeTitleHooks 
     signal: AbortSignal,
   ): Promise<void> {
     if (signal.aborted) return;
-    // Resolve config under a lifecycle-bounded race BEFORE any polling, so a
-    // stalled resolver cannot leave this task permanently unsettled.
-    const baseURL = await resolveBaseURLBounded(signal);
-    if (signal.aborted || !baseURL) return;
-    const key = resolveGatewayKey();
-    if (signal.aborted || !key) return; // Fail open: missing config → do nothing.
+    // Resolve the connection under a single lifecycle-bounded race BEFORE any
+    // polling, so a stalled resolver cannot leave this task permanently unsettled.
+    const connection = await resolveConnectionBounded(signal);
+    if (signal.aborted) return;
+    if (!connection) return; // Fail open: no complete connection → do nothing.
+    // The resolved key stays LOCAL to this poll operation — never stored in
+    // singleton/session/metadata state, errors, or logs.
+    const { baseURL, gatewayKey: key } = connection;
 
     for (let i = 0; i < SCHEDULE_MS.length; i++) {
       if (signal.aborted) return;
@@ -577,7 +818,10 @@ export function createNativeTitleHooks(deps: NativeTitleDeps): NativeTitleHooks 
       // Eligibility gate FIRST, so an ineligible agent/provider never consumes the
       // session's one arming opportunity (and never triggers a session lookup).
       if (input.agent !== FOREGROUND_AGENT) return;
-      if (input.provider?.info?.id !== PROVIDER_ID) return;
+      // Provider gate — tolerant of the flat runtime shape (`provider.id`) and the
+      // nested SDK shape (`provider.info.id`); descriptor-safe, never invokes a
+      // getter, and fails closed on anything else (so no lookup/arm occurs).
+      if (readProviderId(input.provider) !== PROVIDER_ID) return;
       // Already reserved (pending) or armed — do not lookup/arm/replace again.
       if (sessions.has(sessionId)) return;
 
@@ -725,17 +969,121 @@ function realSleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Process-wide singleton (idempotent duplicate-load).
+// ---------------------------------------------------------------------------
+//
+// The committed plugin is discovered project-locally (`.opencode/plugins/`), but
+// operators may ALSO install it globally for cross-project use via a symlink under
+// `~/.config/opencode/plugins/` (see README). When the gateway repository is the
+// active project, OpenCode discovers BOTH paths and initializes the plugin twice
+// in the SAME process. To keep that harmless, the default plugin shares ONE hooks
+// instance (and therefore one state map, one arming opportunity per session, one
+// poller per session, one rename workflow) across duplicate initialization,
+// keyed on a stable `Symbol.for(...)` slot on `globalThis`. First initialization
+// wins and creates the hooks (lazily, so the second load's `input`/deps are never
+// used); later initialization returns the same instance. Process exit remains the
+// lifetime boundary. `createNativeTitleHooks` stays the isolated per-call factory
+// used by unit tests; only THIS default wrapper shares an instance.
+
+/** Stable global slot for the shared hooks instance. */
+export const SHARED_HOOKS_KEY: symbol = Symbol.for("collectiviq.native-title.hooks.v1");
+
+/**
+ * Narrow, injectable registry seam. The default is backed by `globalThis`; tests
+ * inject a plain `Map`-backed registry so they never pollute real global state.
+ */
+export interface HooksRegistry {
+  get(key: symbol): NativeTitleHooks | undefined;
+  set(key: symbol, value: NativeTitleHooks): void;
+}
+
+/** The `globalThis`-backed registry used by the default plugin. */
+export function globalHooksRegistry(): HooksRegistry {
+  const store = globalThis as unknown as Record<symbol, NativeTitleHooks | undefined>;
+  return {
+    get: (key) => store[key],
+    set: (key, value) => {
+      store[key] = value;
+    },
+  };
+}
+
+/**
+ * Return the process-shared hooks, creating them once via `createNativeTitleHooks`
+ * on first initialization and returning the same instance thereafter. `makeDeps`
+ * is invoked ONLY on first creation (first-registration-wins). The `registry` and
+ * `key` seams are injectable for hermetic tests.
+ */
+export function getOrCreateSharedHooks(
+  makeDeps: () => NativeTitleDeps,
+  registry: HooksRegistry = globalHooksRegistry(),
+  key: symbol = SHARED_HOOKS_KEY,
+): NativeTitleHooks {
+  const existing = registry.get(key);
+  if (existing) return existing;
+  const created = createNativeTitleHooks(makeDeps());
+  registry.set(key, created);
+  return created;
+}
+
 const CollectivIQNativeTitlePlugin: Plugin = (input: PluginInput) => {
   return Promise.resolve(
-    createNativeTitleHooks({
+    getOrCreateSharedHooks(() => ({
       client: input.client,
       fetchImpl: globalThis.fetch,
       sleep: realSleep,
-      resolveBaseURL: () => defaultResolveBaseURL(input),
-      resolveGatewayKey: () => process.env["COLLECTIVIQ_GATEWAY_KEY"],
-    }),
+      // One bounded resolution: base URL + gateway key from the resolved
+      // CollectivIQ provider config, with COLLECTIVIQ_GATEWAY_KEY as a LAZY
+      // fallback. This closure is the ONLY place in the plugin that reads the
+      // credential environment variable, and it stays unevaluated until the
+      // fallback path actually needs it.
+      resolveConnection: () =>
+        defaultResolveConnection(input, () => process.env["COLLECTIVIQ_GATEWAY_KEY"]),
+    })),
   );
 };
 
+// ---------------------------------------------------------------------------
+// V1 default plugin module — LOAD-BEARING export shape (do not revert).
+// ---------------------------------------------------------------------------
+//
+// OpenCode's loader (1.18.21) resolves a plugin entry by FIRST trying to read a V1
+// default plugin module shaped as `{ id: string, server: <plugin fn> }`
+// (`readV1Plugin`). Only when the default is NOT that object does it fall through
+// to the LEGACY path, which scans the module's runtime exports and rejects the
+// first non-function with `error="Plugin export is not a function"`.
+//
+// This module intentionally exposes named runtime helpers/constants that unit
+// tests rely on (`UPDATE_TIMEOUT_MS`, `RESOLVE_TIMEOUT_MS`, `SHARED_HOOKS_KEY`,
+// `normalizeTitle`, `createNativeTitleHooks`, `globalHooksRegistry`,
+// `getOrCreateSharedHooks`, …). Several of those are NOT functions, so a bare
+// FUNCTION default (the earlier shape) fell through to the legacy scan and OpenCode
+// rejected the module with `Plugin export is not a function` — the plugin never
+// loaded at all (confirmed 2026-08-21 for both the global-symlink and project-local
+// paths), so none of the arming/header/poll/rename logic ever ran.
+//
+// Therefore the default export MUST remain the V1 `{ id, server }` object below so
+// OpenCode invokes ONLY `default.server` and never enters the legacy export scan.
+// Do NOT revert this to a bare function, and do NOT migrate to the V2 `setup` API.
+
+/** Stable plugin id advertised in the V1 default module. */
+export const PLUGIN_ID = "collectiviq-native-title";
+
+/**
+ * Narrow local structural type for OpenCode's V1 default plugin module. Declared
+ * locally so this file adds no `@opencode-ai/*` runtime dependency.
+ */
+export interface V1PluginModule {
+  id: string;
+  server: Plugin;
+}
+
+/** The V1 default module OpenCode's `readV1Plugin` recognizes (bypasses legacy scan). */
+const nativeTitleV1Module: V1PluginModule = {
+  id: PLUGIN_ID,
+  server: CollectivIQNativeTitlePlugin,
+};
+
 export { CollectivIQNativeTitlePlugin };
-export default CollectivIQNativeTitlePlugin;
+export default nativeTitleV1Module;
