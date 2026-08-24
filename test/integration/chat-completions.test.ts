@@ -74,6 +74,7 @@ function fakeService(run: RunFn): ChatCompletionService {
       model: ctx.request.model,
       prompt: "PROMPT",
       policy: ctx.model,
+      selectedLlms: ctx.model.selectedLlms,
       keyId: ctx.keyId,
     }),
     run,
@@ -81,7 +82,7 @@ function fakeService(run: RunFn): ChatCompletionService {
 }
 
 const okAnswer: RunFn = () =>
-  Promise.resolve({ upstreamThreadId: "thread-test", content: "hello answer" });
+  Promise.resolve({ kind: "text", upstreamThreadId: "thread-test", content: "hello answer" });
 
 /** A no-op title bridge: these tests do not exercise native-title correlation. */
 const noopTitleBridge: TitleBridge = {
@@ -195,7 +196,11 @@ describe("POST /v1/chat/completions — request rejections", () => {
     let called = false;
     app = build(() => {
       called = true;
-      return Promise.resolve({ upstreamThreadId: "thread-test", content: "unreachable" });
+      return Promise.resolve({
+        kind: "text",
+        upstreamThreadId: "thread-test",
+        content: "unreachable",
+      });
     });
     const unknown = await app.inject({
       method: "POST",
@@ -323,7 +328,11 @@ describe("POST /v1/chat/completions — tool-metadata compatibility (disabled mo
     let called = false;
     app = build(() => {
       called = true;
-      return Promise.resolve({ upstreamThreadId: "thread-test", content: "unreachable" });
+      return Promise.resolve({
+        kind: "text",
+        upstreamThreadId: "thread-test",
+        content: "unreachable",
+      });
     });
     const response = await app.inject({
       method: "POST",
@@ -582,7 +591,11 @@ describe("POST /v1/chat/completions — direct prompt mode", () => {
     let ran = false;
     const spy: RunFn = () => {
       ran = true;
-      return Promise.resolve({ upstreamThreadId: "thread-test", content: "should not happen" });
+      return Promise.resolve({
+        kind: "text",
+        upstreamThreadId: "thread-test",
+        content: "should not happen",
+      });
     };
     app = build(spy, directConfig);
     const response = await app.inject({

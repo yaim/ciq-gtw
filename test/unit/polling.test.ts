@@ -144,7 +144,7 @@ describe("createPoller", () => {
     const poller = createPoller(adapter, { clock, sleep, random: () => 0.5 });
 
     const outcome = await poller.poll(params());
-    expect(outcome).toEqual({ kind: "answer", content: "answer" });
+    expect(outcome).toMatchObject({ kind: "answer", content: "answer" });
     expect(getMessages).toHaveBeenCalledTimes(2);
     expect(sleeps).toEqual([500]);
   });
@@ -154,7 +154,7 @@ describe("createPoller", () => {
     const { clock, sleep } = timeSeam();
     const poller = createPoller(adapter, { clock, sleep, random: () => 0.5 });
     const outcome = await poller.poll(params());
-    expect(outcome).toEqual({ kind: "answer", content: "done" });
+    expect(outcome).toMatchObject({ kind: "answer", content: "done" });
   });
 
   it("retries a retryable UpstreamError then succeeds", async () => {
@@ -165,7 +165,7 @@ describe("createPoller", () => {
     const poller = createPoller(adapter, { clock, sleep, random: () => 0.5 });
 
     const outcome = await poller.poll(params());
-    expect(outcome).toEqual({ kind: "answer", content: "recovered" });
+    expect(outcome).toMatchObject({ kind: "answer", content: "recovered" });
     expect(getMessages).toHaveBeenCalledTimes(2);
   });
 

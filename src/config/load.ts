@@ -489,6 +489,21 @@ function validateModel(
     });
   }
 
+  // Cross-field tool policy: experimental emulated tool calling depends on the
+  // full-history protocol serializer (the tool-or-final control prompt and the
+  // versioned conversation envelope with prior tool calls/results). The
+  // intentionally lossy `direct` profile submits only the latest user message and
+  // cannot carry the tool protocol, so `toolMode: "emulated"` requires
+  // `promptMode: "protocol"` (an omitted `promptMode` normalizes to `protocol`
+  // and is therefore compatible). `native` mode stays unimplemented and is
+  // rejected at request time; it is not constrained here.
+  if (model.toolMode === "emulated" && (model.promptMode ?? "protocol") !== "protocol") {
+    issues.push({
+      field: `models[${index}].promptMode`,
+      reason: "must be protocol when toolMode is emulated",
+    });
+  }
+
   if (issues.length > 0) return { issues };
   // Normalize the optional `promptMode` to an explicit value: an omitted field
   // means `protocol` (the full-history serializer), preserving backward

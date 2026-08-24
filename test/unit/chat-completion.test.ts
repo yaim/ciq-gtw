@@ -112,9 +112,11 @@ function makeService(deps: Partial<ChatCompletionDeps> & { trace: Trace }) {
     capacity: rest.capacity ?? fakeCapacity(trace),
     adapter: rest.adapter ?? fakeAdapter(trace),
     poller:
-      rest.poller ?? fakePoller(() => Promise.resolve({ kind: "answer", content: "answer text" })),
+      rest.poller ??
+      fakePoller(() => Promise.resolve({ kind: "answer", content: "answer text", messages: [] })),
     ids: rest.ids ?? { completionId: () => "chatcmpl_ciq_test" },
     clock: rest.clock ?? { nowMs: () => 1_000_000 },
+    toolCallIds: rest.toolCallIds ?? { toolCallId: () => "call_ciq_test" },
   };
   return createChatCompletionService(full);
 }
@@ -152,7 +154,8 @@ describe("chat-completion orchestration", () => {
     const service = makeService({ trace });
     const result = await run(service);
 
-    expect(result.content).toBe("answer text");
+    expect(result.kind).toBe("text");
+    if (result.kind === "text") expect(result.content).toBe("answer text");
 
     // Capacity is acquired BEFORE the thread is created; the permit is released.
     expect(trace.events).toEqual(["acquire", "createThread", "processMessage", "release"]);

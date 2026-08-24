@@ -34,9 +34,19 @@ import {
   CONTEXT_LENGTH_EXCEEDED_ERROR,
   COMPLETION_TIMEOUT_ERROR,
   GATEWAY_CAPACITY_EXCEEDED_ERROR,
+  INVALID_TOOL_RESPONSE_ERROR,
   openAIErrorForUpstream,
   type OpenAIApiError,
 } from "../openai/errors.js";
+import {
+  selectGeneration,
+  type CompiledToolset,
+  type NormalizedToolChoice,
+  type ParsedToolCall,
+  type SourceCandidate,
+  type ToolCallIdGenerator,
+} from "../tools/index.js";
+import { selectWinningMessage } from "./polling.js";
 import type { CapacityController, Clock, IdGenerator, Poller, PromptSerializer } from "./types.js";
 
 /**
@@ -104,6 +114,8 @@ export interface ChatCompletionDeps {
   readonly poller: Poller;
   readonly ids: IdGenerator;
   readonly clock: Clock;
+  /** Gateway-owned tool-call id generator (emulated mode only). */
+  readonly toolCallIds: ToolCallIdGenerator;
 }
 
 /** Per-request context (already authenticated, validated, and model-resolved). */
@@ -114,6 +126,19 @@ export interface ChatCompletionRequestContext {
   readonly keyId: string;
   /** Combined client-disconnect + shutdown abort signal (the deadline is added here). */
   readonly signal: AbortSignal;
+  /**
+   * The per-request compiled toolset (emulated mode with tools only). Carried
+   * through {@link PreparedCompletion.toolContext} so `run` can parse/vote over
+   * upstream tool-call candidates using the same compiled validators.
+   */
+  readonly toolset?: CompiledToolset;
+}
+
+/** The active tool policy threaded into `run` for emulated-mode selection. */
+export interface PreparedToolContext {
+  readonly toolset: CompiledToolset;
+  readonly choice: NormalizedToolChoice;
+  readonly parallelToolCalls: boolean;
 }
 
 /**
@@ -136,19 +161,30 @@ export interface PreparedCompletion {
   readonly policy: VirtualModel;
   /** Opaque gateway-key identity for per-key capacity accounting. */
   readonly keyId: string;
+  /**
+   * The active emulated-tool policy, present only when tools are active (emulated
+   * model, non-empty tools, `tool_choice` ≠ `none`). Absent means the completion
+   * produces ordinary text. `run` uses it to parse/vote over upstream tool-call
+   * candidates.
+   */
+  readonly toolContext?: PreparedToolContext;
+  /** Configured source order, used for deterministic tool-consensus tie-breaks. */
+  readonly selectedLlms: readonly string[];
 }
 
-/** The trusted result of a completed generation: parsed assistant answer text. */
-export interface CompletionResult {
-  /** The parsed assistant answer (may be an empty string). */
-  readonly content: string;
-  /**
-   * The normalized upstream thread id created for this completion. Used ONLY for
-   * process-local native-title correlation (see `src/opencode/title-bridge.ts`);
-   * it is NEVER exposed in the OpenAI JSON or SSE output.
-   */
-  readonly upstreamThreadId: string;
-}
+/**
+ * The trusted result of a completed generation: either parsed assistant text or
+ * validated tool calls (specification section 8.7). Both variants carry the
+ * upstream thread id used ONLY for process-local native-title correlation (see
+ * `src/opencode/title-bridge.ts`); it is NEVER exposed in the OpenAI JSON/SSE.
+ */
+export type CompletionResult =
+  | { readonly kind: "text"; readonly content: string; readonly upstreamThreadId: string }
+  | {
+      readonly kind: "tool_calls";
+      readonly toolCalls: readonly ParsedToolCall[];
+      readonly upstreamThreadId: string;
+    };
 
 /** The narrow completion use case consumed by the route (prepare then run). */
 export interface ChatCompletionService {
@@ -184,6 +220,22 @@ export function createChatCompletionService(deps: ChatCompletionDeps): ChatCompl
       if (Buffer.byteLength(prompt, "utf8") > model.maximumPromptBytes) {
         throw new ChatCompletionError(CONTEXT_LENGTH_EXCEEDED_ERROR);
       }
+      // Tools are active only for an emulated model with a compiled toolset, a
+      // non-empty tool set, and a `tool_choice` other than `none`. Otherwise the
+      // completion produces ordinary text and no tool selection runs.
+      const toolsActive =
+        ctx.toolset !== undefined &&
+        (request.tools?.length ?? 0) > 0 &&
+        request.toolChoice !== undefined &&
+        request.toolChoice.kind !== "none";
+      const toolContext: PreparedToolContext | undefined =
+        toolsActive && ctx.toolset !== undefined && request.toolChoice !== undefined
+          ? {
+              toolset: ctx.toolset,
+              choice: request.toolChoice,
+              parallelToolCalls: request.parallelToolCalls ?? true,
+            }
+          : undefined;
       return {
         id: deps.ids.completionId(),
         created: Math.floor(deps.clock.nowMs() / 1000),
@@ -191,6 +243,8 @@ export function createChatCompletionService(deps: ChatCompletionDeps): ChatCompl
         prompt,
         policy: model,
         keyId: ctx.keyId,
+        selectedLlms: model.selectedLlms,
+        ...(toolContext !== undefined ? { toolContext } : {}),
       };
     },
 
@@ -247,9 +301,54 @@ export function createChatCompletionService(deps: ChatCompletionDeps): ChatCompl
           if (outcome.kind === "timeout") {
             throw new ChatCompletionError(COMPLETION_TIMEOUT_ERROR);
           }
-          // Carry the created thread id out for process-local native-title
-          // correlation only; it never enters the public JSON/SSE response.
-          return { content: outcome.content, upstreamThreadId: thread.threadId };
+          // The thread id is carried out ONLY for process-local native-title
+          // correlation; it never enters the public JSON/SSE response.
+          const threadId = thread.threadId;
+
+          // Text mode (no active tools): return the desired-source answer.
+          const toolContext = prepared.toolContext;
+          if (toolContext === undefined) {
+            return { kind: "text", content: outcome.content, upstreamThreadId: threadId };
+          }
+
+          // Emulated tool mode: parse/vote over the validated message snapshot.
+          const individuals: SourceCandidate[] = [];
+          for (const source of prepared.selectedLlms) {
+            const message = selectWinningMessage(outcome.messages, source);
+            if (message !== null && typeof message.content === "string") {
+              individuals.push({
+                source,
+                content: message.content,
+                percentUsage: message.percentUsage ?? null,
+              });
+            }
+          }
+          const selection = selectGeneration({
+            desired: { content: outcome.content },
+            individuals,
+            toolset: toolContext.toolset,
+            choice: toolContext.choice,
+            parallelToolCalls: toolContext.parallelToolCalls,
+            selectedLlms: prepared.selectedLlms,
+            idGen: deps.toolCallIds,
+          });
+          if (!selection.ok) {
+            // `required`/named choice with no valid tool call → 502 (never a
+            // silent text fallback).
+            throw new ChatCompletionError(INVALID_TOOL_RESPONSE_ERROR);
+          }
+          if (selection.generation.kind === "tool_calls") {
+            return {
+              kind: "tool_calls",
+              toolCalls: selection.generation.calls,
+              upstreamThreadId: threadId,
+            };
+          }
+          return {
+            kind: "text",
+            content: selection.generation.content,
+            upstreamThreadId: threadId,
+          };
         } finally {
           acquisition.permit.release();
         }

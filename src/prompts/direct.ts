@@ -35,7 +35,9 @@ export function serializeDirectPrompt(request: NormalizedChatRequest): string {
   const messages = request.messages;
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const message = messages[i];
-    if (message !== undefined && message.role === "user") return message.content;
+    // A user-role message always carries string content (only an assistant
+    // tool-call turn can have null content); coalesce defensively for the type.
+    if (message !== undefined && message.role === "user") return message.content ?? "";
   }
   // Unreachable on the public request path: a direct-mode request with no
   // user-role message is rejected before prepare(). Return an empty prompt

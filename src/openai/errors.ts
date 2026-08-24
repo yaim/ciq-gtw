@@ -201,6 +201,19 @@ export const UPSTREAM_REQUEST_FAILED_ERROR: OpenAIApiError = apiError(
   null,
 );
 
+/**
+ * `502` — emulated tool mode required a tool call (`tool_choice: "required"` or a
+ * named function) but the upstream produced no valid permitted tool call
+ * (specification section 12.3.2). Never a silent text fallback. Content-free.
+ */
+export const INVALID_TOOL_RESPONSE_ERROR: OpenAIApiError = apiError(
+  502,
+  "CollectivIQ did not return a valid required tool call.",
+  "upstream_protocol_error",
+  "invalid_tool_response",
+  "tool_choice",
+);
+
 /** `504` — the completion exceeded the model's total request deadline. */
 export const COMPLETION_TIMEOUT_ERROR: OpenAIApiError = apiError(
   504,

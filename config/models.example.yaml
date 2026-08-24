@@ -5,8 +5,20 @@
 # `answerSource` are configurable examples only; they are NOT verified against
 # any CollectivIQ account and carry no context-window or token-limit claims.
 #
-# All examples set toolMode: disabled because emulated/native tool calling is
-# not implemented in this foundation.
+# Most examples set toolMode: disabled. The single exception,
+# collectiviq-claude-tools, sets toolMode: emulated to opt into EXPERIMENTAL
+# emulated tool calling (see .agent/docs/tech-software-spec.md sections 12 and
+# 30). Emulated tool mode is experimental and NOT production-ready: its release
+# gates (spec section 30) have not been run or met, and it must never be the
+# foreground/default model. `toolMode: emulated` REQUIRES `promptMode: protocol`;
+# `toolMode: native` remains unavailable and is rejected at request time.
+#
+# The gateway returns model-PROPOSED tool calls but never executes, authorizes,
+# or simulates a tool; OpenCode remains responsible for tool permissions and
+# execution. In emulated mode the validated tool schemas, prior tool arguments,
+# and prior tool results ARE serialized into the prompt sent to CollectivIQ (they
+# are not logged or retained by the gateway). Each tool-loop round creates a new
+# upstream thread.
 #
 # `promptMode` selects prompt serialization:
 #   - protocol (default when omitted): the normative full-history COLLECTIVIQ
@@ -81,6 +93,24 @@ models:
     toolMode: disabled
     promptMode: protocol
     requestTimeoutMs: 60000
+    pollIntervalMs: 2000
+    maxPollIntervalMs: 5000
+    maximumPromptBytes: 6291456
+
+  # EXPERIMENTAL emulated tool-calling model (opt-in; NOT a default). Claude-only
+  # source; protocol prompt mode is required for emulated tools. Release gates
+  # (spec section 30) have not been run or met; keep this out of foreground/
+  # default use. The gateway returns proposed tool calls only — it never executes
+  # a tool.
+  collectiviq-claude-tools:
+    displayName: CollectivIQ Claude (Tools, experimental)
+    selectedLlms:
+      - claude
+    generateCombined: false
+    answerSource: claude
+    toolMode: emulated
+    promptMode: protocol
+    requestTimeoutMs: 90000
     pollIntervalMs: 2000
     maxPollIntervalMs: 5000
     maximumPromptBytes: 6291456

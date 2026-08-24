@@ -12,6 +12,7 @@
  * usage).
  */
 import type { OpenAIErrorBody } from "./errors.js";
+import type { ParsedToolCall } from "../tools/index.js";
 
 /** The stable identity shared by every frame of one streamed response. */
 export interface StreamMeta {
@@ -25,11 +26,23 @@ export interface StreamMeta {
   readonly index: number;
 }
 
-/** The delta payload of a chunk: a role opener, a content piece, or empty. */
+/** One streamed tool-call delta (a complete, indexed function call). */
+export interface StreamToolCallDelta {
+  readonly index: number;
+  readonly id: string;
+  readonly type: "function";
+  readonly function: { readonly name: string; readonly arguments: string };
+}
+
+/** The delta payload of a chunk: a role opener, a content piece, tool calls, or empty. */
 export interface ChunkDelta {
   readonly role?: "assistant";
   readonly content?: string;
+  readonly tool_calls?: readonly StreamToolCallDelta[];
 }
+
+/** The terminal `finish_reason` for a stream: text `stop` or `tool_calls`. */
+export type StreamFinishReason = "stop" | "tool_calls" | null;
 
 /** One `chat.completion.chunk` streaming object. */
 export interface ChatCompletionChunk {
@@ -40,7 +53,7 @@ export interface ChatCompletionChunk {
   readonly choices: readonly {
     readonly index: number;
     readonly delta: ChunkDelta;
-    readonly finish_reason: "stop" | null;
+    readonly finish_reason: StreamFinishReason;
   }[];
 }
 
@@ -56,7 +69,11 @@ export const KEEP_ALIVE_COMMENT = ": collectiviq-gateway keep-alive\n\n";
 /** The terminal SSE record that ends every stream. */
 export const DONE_FRAME = "data: [DONE]\n\n";
 
-function chunk(meta: StreamMeta, delta: ChunkDelta, finish: "stop" | null): ChatCompletionChunk {
+function chunk(
+  meta: StreamMeta,
+  delta: ChunkDelta,
+  finish: StreamFinishReason,
+): ChatCompletionChunk {
   return {
     id: meta.id,
     object: "chat.completion.chunk",
@@ -76,9 +93,32 @@ export function contentChunk(meta: StreamMeta, content: string): ChatCompletionC
   return chunk(meta, { content }, null);
 }
 
+/**
+ * A single chunk carrying every tool call as a complete, indexed delta
+ * (specification section 14.4). Ids are the gateway-generated `call_ciq_*` ids
+ * and are stable across the response; arguments are the validated JSON strings.
+ */
+export function toolCallsChunk(
+  meta: StreamMeta,
+  calls: readonly ParsedToolCall[],
+): ChatCompletionChunk {
+  const tool_calls: StreamToolCallDelta[] = calls.map((call, index) => ({
+    index,
+    id: call.id,
+    type: "function",
+    function: { name: call.name, arguments: call.argumentsJson },
+  }));
+  return chunk(meta, { tool_calls }, null);
+}
+
 /** The terminal chunk: empty delta, `finish_reason: "stop"`. */
 export function terminalChunk(meta: StreamMeta): ChatCompletionChunk {
   return chunk(meta, {}, "stop");
+}
+
+/** The terminal chunk for a tool-call stream: empty delta, `finish_reason: "tool_calls"`. */
+export function terminalToolChunk(meta: StreamMeta): ChatCompletionChunk {
+  return chunk(meta, {}, "tool_calls");
 }
 
 /** Serialize any chunk object into one SSE `data:` record (record + blank line). */

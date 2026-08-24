@@ -72,8 +72,15 @@ describe("loadConfig — environment", () => {
     expect(config.LOG_CONTENT).toBe(false);
     expect(config.ENVIRONMENT).toBe("production");
     expect(config.COLLECTIVIQ_GATEWAY_KEYS).toEqual(["gw-fake-a", "gw-fake-b"]);
-    expect(config.models).toHaveLength(5);
+    expect(config.models).toHaveLength(6);
     expect(config.models.map((m) => m.id)).toContain("collectiviq-fast");
+    // The experimental emulated tool model opts into tool mode (protocol prompt).
+    expect(config.models.find((m) => m.id === "collectiviq-claude-tools")).toMatchObject({
+      selectedLlms: ["claude"],
+      answerSource: "claude",
+      toolMode: "emulated",
+      promptMode: "protocol",
+    });
     expect(config.models.find((m) => m.id === "collectiviq-claude")).toMatchObject({
       selectedLlms: ["claude"],
       generateCombined: false,
@@ -554,6 +561,32 @@ describe("loadConfig — model file validation", () => {
       // The submitted value is never echoed.
       expect(serialized).not.toContain("verbose");
     }
+  });
+
+  it("rejects toolMode: emulated with a non-protocol promptMode (invariant)", () => {
+    const path = writeModelFile(
+      "emulated-direct.yaml",
+      stringify({ models: { m1: { ...validModel, toolMode: "emulated", promptMode: "direct" } } }),
+    );
+    try {
+      loadConfig({ env: baseEnv({ MODEL_CONFIG_PATH: path }) });
+      throw new Error("expected ConfigError");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfigError);
+      const issues = (error as ConfigError).issues;
+      expect(issues.some((i) => i.field === "models[0].promptMode")).toBe(true);
+    }
+  });
+
+  it("accepts toolMode: emulated with promptMode: protocol", () => {
+    const config = expectLoads(
+      writeModelFile(
+        "emulated-protocol.yaml",
+        modelFileFrom({ toolMode: "emulated", promptMode: "protocol" }),
+      ),
+    );
+    expect(config.models[0]?.toolMode).toBe("emulated");
+    expect(config.models[0]?.promptMode).toBe("protocol");
   });
 });
 

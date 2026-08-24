@@ -77,10 +77,11 @@ const fakeService: ChatCompletionService = {
     model: ctx.request.model,
     prompt: "PROMPT",
     policy: ctx.model,
+    selectedLlms: ctx.model.selectedLlms,
     keyId: ctx.keyId,
   }),
   run: (): Promise<CompletionResult> =>
-    Promise.resolve({ upstreamThreadId: "thread-test", content: ANSWER }),
+    Promise.resolve({ kind: "text", upstreamThreadId: "thread-test", content: ANSWER }),
 };
 
 /** A no-op title bridge: the compatibility suite does not exercise native titles. */

@@ -196,7 +196,15 @@ export function registerChatCompletionsRoute(
         // an oversized prompt) always stays a normal JSON error — never SSE.
         let prepared;
         try {
-          prepared = deps.service.prepare({ request: normalized, model, keyId, signal });
+          prepared = deps.service.prepare({
+            request: normalized,
+            model,
+            keyId,
+            signal,
+            // The compiled toolset (emulated mode only) lets `run` parse/vote over
+            // upstream tool-call candidates; it is not part of the frozen request.
+            ...(validated.toolset !== undefined ? { toolset: validated.toolset } : {}),
+          });
         } catch (error) {
           reply.raw.removeListener("close", onClose);
           if (isChatCompletionError(error)) return sendError(error.apiError);
@@ -236,12 +244,12 @@ export function registerChatCompletionsRoute(
           if (normalized.ignoredParameters.length > 0) {
             reply.header(IGNORED_HEADER, normalized.ignoredParameters.join(","));
           }
-          return encodeChatCompletion({
-            id: prepared.id,
-            created: prepared.created,
-            model: prepared.model,
-            content: result.content,
-          });
+          const identity = { id: prepared.id, created: prepared.created, model: prepared.model };
+          return encodeChatCompletion(
+            result.kind === "tool_calls"
+              ? { ...identity, kind: "tool_calls", toolCalls: result.toolCalls }
+              : { ...identity, content: result.content },
+          );
         } catch (error) {
           // Identify gateway errors by identity (trap-safe: no property read, no
           // instanceof/prototype trap). An untrusted thrown value is NEVER

@@ -825,30 +825,266 @@ describe("validateChatRequest — tool-collection byte budget + descriptor-only 
   });
 });
 
-describe("validateChatRequest — tool metadata against non-disabled models", () => {
-  it("fails closed for tools sent to an emulated or native model (mode not activated)", () => {
-    for (const resolve of [resolveEmulated, resolveNative]) {
+describe("validateChatRequest — tool metadata against a native model", () => {
+  // native tool mode stays unimplemented and is rejected at request time.
+  it("fails closed for tools sent to a native model", () => {
+    expectReject(
+      { model: "m", messages: [user("hi")], tools: [openCodeTool("read")] },
+      400,
+      "unsupported_parameter",
+      "tools",
+      resolveNative,
+    );
+  });
+
+  it("fails closed for tool_choice sent to a native model, even 'auto'/'none'", () => {
+    for (const choice of ["auto", "none"] as const) {
       expectReject(
-        { model: "m", messages: [user("hi")], tools: [openCodeTool("read")] },
+        { model: "m", messages: [user("hi")], tool_choice: choice },
         400,
         "unsupported_parameter",
-        "tools",
-        resolve,
+        "tool_choice",
+        resolveNative,
       );
     }
   });
 
-  it("fails closed for tool_choice sent to an emulated or native model, even 'auto'/'none'", () => {
-    for (const resolve of [resolveEmulated, resolveNative]) {
-      for (const choice of ["auto", "none"] as const) {
-        expectReject(
-          { model: "m", messages: [user("hi")], tool_choice: choice },
-          400,
-          "unsupported_parameter",
-          "tool_choice",
-          resolve,
-        );
-      }
+  it("fails closed for an ordinary parallel_tool_calls sent to a native model", () => {
+    expectReject(
+      { model: "m", messages: [user("hi")], parallel_tool_calls: true },
+      400,
+      "unsupported_parameter",
+      "parallel_tool_calls",
+      resolveNative,
+    );
+  });
+
+  it("fails closed for an accessor-backed parallel_tool_calls without invoking its getter", () => {
+    let getterInvoked = false;
+    const body: Record<string, unknown> = { model: "m", messages: [user("hi")] };
+    Object.defineProperty(body, "parallel_tool_calls", {
+      enumerable: true,
+      configurable: true,
+      get() {
+        getterInvoked = true;
+        return true;
+      },
+    });
+    expectReject(body, 400, "unsupported_parameter", "parallel_tool_calls", resolveNative);
+    expect(getterInvoked).toBe(false);
+  });
+
+  it("ignores an INHERITED parallel_tool_calls and normalizes an otherwise valid native request", () => {
+    const body = Object.create({ parallel_tool_calls: true }) as Record<string, unknown>;
+    body["model"] = "m";
+    body["messages"] = [user("hi")];
+    const result = validateChatRequest(body, resolveNative);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.model.toolMode).toBe("native");
+      expect(result.request.ignoredParameters).not.toContain("parallel_tool_calls");
+      expect(result.request.ignoredParameters).toEqual([]);
+    }
+  });
+
+  it("rejects in deterministic field order (tools → tool_choice → parallel_tool_calls)", () => {
+    // All three present at once: the earliest field (`tools`) determines the error.
+    expectReject(
+      {
+        model: "m",
+        messages: [user("hi")],
+        tools: [openCodeTool("read")],
+        tool_choice: "auto",
+        parallel_tool_calls: true,
+      },
+      400,
+      "unsupported_parameter",
+      "tools",
+      resolveNative,
+    );
+    // With `tools` absent, `tool_choice` precedes `parallel_tool_calls`.
+    expectReject(
+      { model: "m", messages: [user("hi")], tool_choice: "auto", parallel_tool_calls: true },
+      400,
+      "unsupported_parameter",
+      "tool_choice",
+      resolveNative,
+    );
+  });
+});
+
+describe("validateChatRequest — emulated tool acceptance (Phase 3)", () => {
+  it("accepts tools + explicit auto and retains the normalized policy + toolset", () => {
+    const result = validateChatRequest(
+      {
+        model: "m",
+        messages: [user("read a file")],
+        tools: [openCodeTool("read")],
+        tool_choice: "auto",
+      },
+      resolveEmulated,
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.request.tools?.map((tool) => tool.name)).toEqual(["read"]);
+      expect(result.request.toolChoice).toEqual({ kind: "auto" });
+      expect(result.request.parallelToolCalls).toBe(true);
+      expect(result.toolset?.has("read")).toBe(true);
+      // Consumed tool parameters are never reported as ignored.
+      expect(result.request.ignoredParameters).toEqual([]);
+    }
+  });
+
+  it("defaults an omitted tool_choice to auto when tools are present", () => {
+    const result = validateChatRequest(
+      { model: "m", messages: [user("hi")], tools: [openCodeTool("read")] },
+      resolveEmulated,
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.request.toolChoice).toEqual({ kind: "auto" });
+  });
+
+  it("accepts an OpenCode 1.18.21 draft-2020-12 function-tool wrapper", () => {
+    // The full OpenAI wrapper containing OpenCode's `read` schema, which stamps
+    // `$schema: draft/2020-12`. Normalization must accept it and compile the tool.
+    const readTool2020 = {
+      type: "function",
+      function: {
+        name: "read",
+        description: "Read a file.",
+        parameters: {
+          $schema: "https://json-schema.org/draft/2020-12/schema",
+          type: "object",
+          properties: {
+            filePath: { type: "string" },
+            offset: { type: "integer", minimum: 0 },
+            limit: { type: "integer", minimum: 0 },
+          },
+          required: ["filePath"],
+          additionalProperties: false,
+        },
+      },
+    };
+    const result = validateChatRequest(
+      { model: "m", messages: [user("read a.ts")], tools: [readTool2020], tool_choice: "auto" },
+      resolveEmulated,
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.request.tools?.map((t) => t.name)).toEqual(["read"]);
+      expect(result.toolset?.has("read")).toBe(true);
+      expect(result.toolset?.validateArguments("read", { filePath: "a.ts", offset: 0 })).toBe(true);
+      expect(result.toolset?.validateArguments("read", {})).toBe(false); // missing required
+      expect(result.toolset?.validateArguments("read", { filePath: "a.ts", extra: 1 })).toBe(false);
+    }
+  });
+
+  it("rejects an unsupported $schema dialect with a content-free 400 (param tools)", () => {
+    expectReject(
+      {
+        model: "m",
+        messages: [user("hi")],
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "read",
+              parameters: {
+                $schema: "https://json-schema.org/draft/2019-09/schema",
+                type: "object",
+              },
+            },
+          },
+        ],
+        tool_choice: "auto",
+      },
+      400,
+      "unsupported_parameter",
+      "tools",
+      resolveEmulated,
+    );
+  });
+
+  it("honors parallel_tool_calls: false without reporting it as ignored", () => {
+    const result = validateChatRequest(
+      {
+        model: "m",
+        messages: [user("hi")],
+        tools: [openCodeTool("read")],
+        parallel_tool_calls: false,
+      },
+      resolveEmulated,
+    );
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.request.parallelToolCalls).toBe(false);
+      expect(result.request.ignoredParameters).toEqual([]);
+    }
+  });
+
+  it("rejects required/named tool_choice with no declared tools before upstream work", () => {
+    for (const choice of ["required", { type: "function", function: { name: "read" } }] as const) {
+      expectReject(
+        { model: "m", messages: [user("hi")], tool_choice: choice },
+        400,
+        "unsupported_parameter",
+        "tool_choice",
+        resolveEmulated,
+      );
+    }
+  });
+
+  it("rejects a named tool_choice that does not reference a declared tool", () => {
+    expectReject(
+      {
+        model: "m",
+        messages: [user("hi")],
+        tools: [openCodeTool("read")],
+        tool_choice: { type: "function", function: { name: "write" } },
+      },
+      400,
+      "unsupported_parameter",
+      "tool_choice",
+      resolveEmulated,
+    );
+  });
+
+  it("rejects a non-boolean parallel_tool_calls (param parallel_tool_calls)", () => {
+    // Regression: a non-boolean must be a stable 400, not tolerated as default true.
+    for (const value of [null, "true", 1, {}] as const) {
+      expectReject(
+        {
+          model: "m",
+          messages: [user("hi")],
+          tools: [openCodeTool("read")],
+          parallel_tool_calls: value,
+        },
+        400,
+        "unsupported_parameter",
+        "parallel_tool_calls",
+        resolveEmulated,
+      );
+    }
+  });
+
+  it("rejects an accessor-backed parallel_tool_calls without invoking the getter", () => {
+    const body: Record<string, unknown> = {
+      model: "m",
+      messages: [user("hi")],
+      tools: [openCodeTool("read")],
+    };
+    Object.defineProperty(body, "parallel_tool_calls", {
+      enumerable: true,
+      configurable: true,
+      get() {
+        throw new Error("getter must never be invoked");
+      },
+    });
+    const result = validateChatRequest(body, resolveEmulated);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.status).toBe(400);
+      expect(result.error.body.error.param).toBe("parallel_tool_calls");
     }
   });
 });
@@ -897,6 +1133,76 @@ describe("validateChatRequest — immutability", () => {
     expect(req.model).toBe("m");
     expect(req.messages[0]?.content).toBe("a");
     expect(req.ignoredParameters).toEqual(["top_p"]);
+  });
+
+  it("deeply freezes an emulated request including a default schema and named choice", () => {
+    // Regression: an omitted `function.parameters` (default `{}`) and a normalized
+    // `tool_choice` object were previously mutable even though the tools array and
+    // wrapper were frozen. Every retained nested object/array must be immutable.
+    const result = validateChatRequest(
+      {
+        model: "m",
+        messages: [
+          user("hi"),
+          {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              {
+                id: "call_ciq_1",
+                type: "function",
+                function: { name: "noparams", arguments: "{}" },
+              },
+            ],
+          },
+          { role: "tool", tool_call_id: "call_ciq_1", content: "result" },
+        ],
+        tools: [{ type: "function", function: { name: "noparams" } }], // omitted parameters
+        tool_choice: { type: "function", function: { name: "noparams" } },
+      },
+      resolveEmulated,
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const req = result.request;
+    expect(Object.isFrozen(req)).toBe(true);
+    expect(Object.isFrozen(req.tools)).toBe(true);
+    expect(Object.isFrozen(req.tools?.[0])).toBe(true);
+    // The synthesized default `{}` schema is frozen (the prior gap).
+    expect(Object.isFrozen(req.tools?.[0]?.parameters)).toBe(true);
+    // The named `tool_choice` object is frozen (the prior gap).
+    expect(Object.isFrozen(req.toolChoice)).toBe(true);
+    expect(req.toolChoice).toEqual({ kind: "function", name: "noparams" });
+    // Messages, tool-call history, and the outer request are all frozen.
+    expect(Object.isFrozen(req.messages)).toBe(true);
+    const assistant = req.messages[1];
+    expect(Object.isFrozen(assistant)).toBe(true);
+    expect(Object.isFrozen(assistant?.toolCalls)).toBe(true);
+    expect(Object.isFrozen(assistant?.toolCalls?.[0])).toBe(true);
+  });
+
+  it("throws on mutation of the default schema and named choice (strict ESM)", () => {
+    const result = validateChatRequest(
+      {
+        model: "m",
+        messages: [user("hi")],
+        tools: [{ type: "function", function: { name: "noparams" } }],
+        tool_choice: { type: "function", function: { name: "noparams" } },
+      },
+      resolveEmulated,
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const req = result.request;
+    expect(() => {
+      (req.tools?.[0]?.parameters as Record<string, unknown>)["injected"] = 1;
+    }).toThrow();
+    expect(() => {
+      (req.toolChoice as { name: string }).name = "hacked";
+    }).toThrow();
+    // Values remain unchanged after the failed mutations.
+    expect(req.tools?.[0]?.parameters).toEqual({});
+    expect(req.toolChoice).toEqual({ kind: "function", name: "noparams" });
   });
 });
 

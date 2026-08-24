@@ -24,6 +24,7 @@ interface ParsedId {
 
 /** A usable candidate paired with its parsed, comparable metadata. */
 interface Candidate {
+  readonly message: UpstreamMessage;
   readonly content: string;
   readonly ts: ParsedTimestamp;
   readonly id: ParsedId;
@@ -83,22 +84,24 @@ function outranks(a: Candidate, b: Candidate): boolean {
 }
 
 /**
- * Select the single answer for `answerSource` from the thread's messages, or
- * `null` when no usable candidate exists. Returns the original (untrimmed)
- * content of the winning candidate.
+ * Select the single winning MESSAGE for `source` from the thread's messages, or
+ * `null` when no usable candidate exists, under the deterministic ordering
+ * policy. Exposed so the tool engine can read per-source content AND metadata
+ * (e.g. `percentUsage`) for consensus voting.
  */
-export function selectAnswer(
+export function selectWinningMessage(
   messages: readonly UpstreamMessage[],
-  answerSource: string,
-): string | null {
+  source: string,
+): UpstreamMessage | null {
   let best: Candidate | null = null;
   for (let index = 0; index < messages.length; index += 1) {
     const message = messages[index];
     if (message === undefined) continue;
-    if (message.source !== answerSource) continue;
+    if (message.source !== source) continue;
     const content = message.content;
     if (typeof content !== "string" || content.trim().length === 0) continue;
     const candidate: Candidate = {
+      message,
       content,
       ts: parseTimestamp(message.createdAt),
       id: parseId(message.id),
@@ -106,7 +109,19 @@ export function selectAnswer(
     };
     if (best === null || outranks(candidate, best)) best = candidate;
   }
-  return best === null ? null : best.content;
+  return best === null ? null : best.message;
+}
+
+/**
+ * Select the single answer for `answerSource`, or `null` when no usable candidate
+ * exists. Returns the original (untrimmed) content of the winning candidate.
+ */
+export function selectAnswer(
+  messages: readonly UpstreamMessage[],
+  answerSource: string,
+): string | null {
+  const winner = selectWinningMessage(messages, answerSource);
+  return winner === null ? null : winner.content;
 }
 
 const defaultClock: Clock = { nowMs: () => Date.now() };
@@ -196,7 +211,9 @@ export function createPoller(adapter: CollectivIQAdapter, seams: PollerSeams = {
         // never a successful completion.
         if (clock.nowMs() >= params.deadlineMs) return { kind: "timeout" };
         const answer = selectAnswer(messages, params.answerSource);
-        if (answer !== null) return { kind: "answer", content: answer };
+        // Return the full validated snapshot alongside the selected desired-source
+        // answer so the tool engine can parse/vote over per-source candidates.
+        if (answer !== null) return { kind: "answer", content: answer, messages };
       }
 
       // Next sleep: the base/jittered interval never exceeds the configured

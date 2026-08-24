@@ -55,6 +55,8 @@ import {
   sseData,
   sseError,
   terminalChunk,
+  terminalToolChunk,
+  toolCallsChunk,
   type StreamMeta,
 } from "../openai/chat-stream.js";
 
@@ -403,18 +405,31 @@ export async function streamChatCompletion(opts: StreamChatCompletionOptions): P
     }
 
     if (!failed && result !== undefined) {
-      // 4. Content deltas → terminal chunk → [DONE]. An empty answer emits no
-      //    content frames but still emits the terminal chunk and [DONE]. Every
-      //    write is checked so we stop the instant the transport closes.
-      for (const piece of splitAnswerIntoChunks(result.content)) {
-        if ((await writer.write(sseData(contentChunk(meta, piece)))) === "closed") {
+      // 4. Emit the body then the terminal chunk then [DONE]. Every write is
+      //    checked so we stop the instant the transport closes.
+      if (result.kind === "tool_calls") {
+        // One complete, indexed tool-call delta, then the tool-calls terminal.
+        if ((await writer.write(sseData(toolCallsChunk(meta, result.toolCalls)))) === "closed") {
           finish();
           return;
         }
-      }
-      if ((await writer.write(sseData(terminalChunk(meta)))) === "closed") {
-        finish();
-        return;
+        if ((await writer.write(sseData(terminalToolChunk(meta)))) === "closed") {
+          finish();
+          return;
+        }
+      } else {
+        // Text content deltas then the `stop` terminal. An empty answer emits no
+        // content frames but still emits the terminal chunk and [DONE].
+        for (const piece of splitAnswerIntoChunks(result.content)) {
+          if ((await writer.write(sseData(contentChunk(meta, piece)))) === "closed") {
+            finish();
+            return;
+          }
+        }
+        if ((await writer.write(sseData(terminalChunk(meta)))) === "closed") {
+          finish();
+          return;
+        }
       }
       const doneOutcome = await writer.write(DONE_FRAME);
       // Only a fully delivered terminal + [DONE] counts as a streamed success.

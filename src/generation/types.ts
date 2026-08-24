@@ -8,6 +8,7 @@
  */
 import type { NormalizedChatRequest } from "../openai/chat-types.js";
 import type { PromptMode } from "../config/schema.js";
+import type { UpstreamMessage } from "../collectiviq/types.js";
 
 // --- Time / randomness / IDs seams -------------------------------------------
 
@@ -93,9 +94,19 @@ export interface PollParams {
  * The result of a polling run. A terminal upstream failure or cancellation is
  * thrown as an {@link import("../collectiviq/errors.js").UpstreamError} rather
  * than returned, so the orchestrator maps it once via the shared error mapper.
+ *
+ * On success `content` is the selected desired-source answer text and `messages`
+ * is the full validated message snapshot at the moment the desired source became
+ * available. The snapshot lets the tool engine parse and vote over per-source
+ * candidates; the text path uses only `content`.
  */
 export type PollOutcome =
-  { readonly kind: "answer"; readonly content: string } | { readonly kind: "timeout" };
+  | {
+      readonly kind: "answer";
+      readonly content: string;
+      readonly messages: readonly UpstreamMessage[];
+    }
+  | { readonly kind: "timeout" };
 
 /** Waits for a usable CollectivIQ message via the adapter's `getMessages`. */
 export interface Poller {

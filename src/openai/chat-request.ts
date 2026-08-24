@@ -10,20 +10,29 @@
  * (`response_format`, `logprobs`, audio) are rejected by own-property presence
  * with stable `400` envelopes rather than silently ignored.
  *
- * Tool metadata is handled by a MODEL-POLICY-AWARE compatibility bridge (Phase
- * 2.1). OpenCode automatically attaches `tools`/`tool_choice` to every request
- * even when every tool permission is denied; a text-only (`toolMode:
- * "disabled"`) model must therefore TOLERATE that metadata. A tool definition is
- * never semantically interpreted, retained, serialized into the upstream prompt,
- * forwarded, logged, reflected, persisted, or executed — it is traversed only
- * through data-property descriptors for bounded JSON-shape and byte accounting
- * (count ≤ `MAX_TOOLS`, aggregate JSON ≤ `MAX_TOOL_SCHEMA_BYTES`), and submitted
- * accessors and executable hooks are never invoked. Only the parameter NAMES are
- * recorded for the diagnostic header. Actual tool calling stays disabled: any
- * tool metadata sent to a model whose mode is `emulated`/`native` (both
- * unimplemented) fails closed, and a `tool_choice` that REQUIRES or NAMES a tool
- * is always rejected. See the per-field contract on
- * {@link validateToolCompatibility}.
+ * Tool metadata handling is MODEL-POLICY-AWARE:
+ *
+ *  - `toolMode: "disabled"` (Phase 2.1 compatibility bridge): OpenCode attaches
+ *    `tools`/`tool_choice` to every request even when every tool permission is
+ *    denied, so a text-only model must TOLERATE that metadata. In this mode a
+ *    tool definition is never semantically interpreted, retained, serialized into
+ *    the upstream prompt, forwarded, logged, reflected, persisted, or executed —
+ *    it is traversed only through data-property descriptors for bounded JSON-shape
+ *    and byte accounting (count ≤ `MAX_TOOLS`, aggregate JSON ≤
+ *    `MAX_TOOL_SCHEMA_BYTES`), submitted accessors and executable hooks are never
+ *    invoked, and only the parameter NAMES are recorded for the diagnostic header.
+ *    `parallel_tool_calls` stays an ignored compatibility name here. A
+ *    `tool_choice` that REQUIRES or NAMES a tool is always rejected.
+ *  - `toolMode: "emulated"` (Phase 3, experimental / opt-in / non-default): the
+ *    tool policy is NORMALIZED and RETAINED, the toolset is compiled once, prior
+ *    tool history is validated, and `parallel_tool_calls` is CONSUMED (a
+ *    non-boolean is rejected with `param: "parallel_tool_calls"`). The validated
+ *    schemas are later serialized into the upstream prompt by the prompt layer
+ *    (never logged or retained), and the gateway can emit model-PROPOSED tool
+ *    calls — it never executes them. See {@link normalizeToolRequest}.
+ *  - `toolMode: "native"` is not implemented: any tool metadata fails closed.
+ *
+ * See the per-field contract on {@link validateToolCompatibility} (disabled mode).
  *
  * Documented optional sampling/storage parameters are accepted but their VALUES
  * are never read, logged, or retained — only their names are recorded.
@@ -37,37 +46,22 @@ import {
   MODEL_NOT_FOUND_ERROR,
   type OpenAIApiError,
 } from "./errors.js";
+import {
+  MAX_TOOLS,
+  MAX_TOOL_SCHEMA_BYTES,
+  MAX_TOOL_JSON_DEPTH,
+  normalizeToolRequest,
+  type CompiledToolset,
+  type ProbedField,
+} from "../tools/index.js";
 
-export { MAX_TEXT_PARTS_PER_MESSAGE };
+// `MAX_TOOLS`/`MAX_TOOL_SCHEMA_BYTES` are the single source of truth in
+// `src/tools/limits.ts`; re-exported here for the request-boundary API surface
+// (the Phase 2.1 disabled-mode accounting and existing tests import them here).
+export { MAX_TEXT_PARTS_PER_MESSAGE, MAX_TOOLS, MAX_TOOL_SCHEMA_BYTES };
 
 /** Conservative initial safety bound on the number of messages per request. */
 export const MAX_MESSAGES = 512;
-
-/**
- * Conservative upper bound on the number of `tools` entries tolerated from a
- * text-only client (specification section 21.6, `MAX_TOOL_COUNT`). Entries are
- * never semantically interpreted; the count is bounded so a hostile client
- * cannot force unbounded work merely by sending a giant tool collection.
- */
-export const MAX_TOOLS = 128;
-
-/**
- * Aggregate byte budget for the ENTIRE `tools` JSON array (specification section
- * 21.6, `MAX_TOOL_SCHEMA_BYTES = 2 MiB`). Array/object framing, property names,
- * tool names, descriptions, schema keys, schema values, and every nested JSON
- * value all count toward the exact UTF-8 JSON representation. This bounds a
- * hostile client that stays within {@link MAX_TOOLS} but sends enormous
- * individual schemas.
- */
-export const MAX_TOOL_SCHEMA_BYTES = 2_097_152;
-
-/**
- * Conservative maximum JSON nesting depth for the `tools` collection. Deeper
- * structures fail closed. The iterative accounting below cannot overflow the
- * call stack, so this is a resource/anomaly bound (a real tool schema nests only
- * a handful of levels), not a stack-safety crutch.
- */
-const MAX_TOOL_JSON_DEPTH = 512;
 
 /**
  * The bounded set of accepted-but-ignored optional parameters (already sorted).
@@ -93,7 +87,19 @@ export type ModelResolver = (id: string) => VirtualModel | undefined;
 
 /** The outcome of validating a full chat-completion request. */
 export type ChatRequestResult =
-  | { readonly ok: true; readonly request: NormalizedChatRequest; readonly model: VirtualModel }
+  | {
+      readonly ok: true;
+      readonly request: NormalizedChatRequest;
+      readonly model: VirtualModel;
+      /**
+       * The per-request compiled toolset for an emulated-mode request (present
+       * only when `model.toolMode === "emulated"` and tools were supplied). It
+       * carries the ajv-compiled argument validators reused by the generation
+       * layer to parse upstream tool-call envelopes — it is deliberately NOT part
+       * of the frozen `NormalizedChatRequest` (it holds functions, not data).
+       */
+      readonly toolset?: CompiledToolset;
+    }
   | { readonly ok: false; readonly error: OpenAIApiError };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -144,7 +150,7 @@ function probeOwn(body: Record<string, unknown>, key: string): PropertyProbe {
 }
 
 /** Stable content-free tool rejection (`param` is only the static field name). */
-function toolUnsupported(param: "tools" | "tool_choice"): OpenAIApiError {
+function toolUnsupported(param: "tools" | "tool_choice" | "parallel_tool_calls"): OpenAIApiError {
   return invalidRequest(
     `${param} is not supported for this request.`,
     param,
@@ -317,8 +323,9 @@ type ToolBridgeResult =
  * Model-policy-aware `tools`/`tool_choice` compatibility bridge (Phase 2.1).
  *
  * Validated AFTER exact model resolution and in deterministic order — `tools`
- * first, then `tool_choice` — so two invalid fields always yield the same
- * envelope. A tool definition is never semantically interpreted, retained,
+ * first, then `tool_choice`, then `parallel_tool_calls` — so multiple invalid or
+ * present fields always yield the same (earliest) envelope. A tool definition is
+ * never semantically interpreted, retained,
  * serialized into the upstream prompt, forwarded, logged, reflected, persisted,
  * or executed; it is traversed only through data-property descriptors for
  * bounded JSON-shape and byte accounting, and submitted accessors and executable
@@ -337,9 +344,11 @@ type ToolBridgeResult =
  *    explicit `undefined`, an accessor, or a malformed value is rejected — a
  *    request that REQUIRES or NAMES a tool is never silently ignored.
  *
- * For an `emulated`/`native` model (neither implemented), any presence of
- * `tools`/`tool_choice` fails closed with the same unsupported-parameter
- * envelope so those modes are never partially activated.
+ * This bridge is only reached for `disabled` and `native` models; `emulated`
+ * requests are normalized by {@link normalizeToolRequest} before reaching here.
+ * For a `native` model (not implemented), any presence of `tools`,
+ * `tool_choice`, or `parallel_tool_calls` fails closed with the same
+ * unsupported-parameter envelope so that mode is never partially activated.
  */
 function validateToolCompatibility(
   body: Record<string, unknown>,
@@ -381,6 +390,19 @@ function validateToolCompatibility(
     ignored.push("tool_choice");
   }
 
+  // 3. `parallel_tool_calls` (validated third). A `native` model (not
+  //    implemented) fails closed on own-property PRESENCE — value, accessor, or a
+  //    descriptor/proxy failure — without ever reading the value or invoking a
+  //    getter (an inherited property probes as `absent` and does not count). A
+  //    `disabled` model does NOT reject it here: it stays an accepted-but-ignored
+  //    compatibility name recorded (by name only) in the caller's step 10.
+  if (!disabled) {
+    const parallel = probeOwn(body, "parallel_tool_calls");
+    if (parallel.kind !== "absent") {
+      return { ok: false, error: toolUnsupported("parallel_tool_calls") };
+    }
+  }
+
   return { ok: true, ignored };
 }
 
@@ -417,9 +439,10 @@ export function validateChatRequest(body: unknown, resolveModel: ModelResolver):
   // 2. Model-independent deferred feature surfaces are rejected by own-property
   //    PRESENCE alone — even an empty value, `null`, or explicit `undefined` —
   //    so the narrow contract never partially accepts a structured-output/audio
-  //    signal, and their values are never read. (`tools`/`tool_choice` are
-  //    handled by the model-aware bridge in step 7; `parallel_tool_calls` stays
-  //    an ignored compatibility name below.)
+  //    signal, and their values are never read. (`tools`/`tool_choice`/
+  //    `parallel_tool_calls` are handled by the model-aware bridge/normalizer
+  //    below: ignored for `disabled`, rejected for `native`, consumed for
+  //    `emulated`.)
   for (const field of ["response_format", "audio", "logprobs"] as const) {
     if (present(body, field)) {
       return fail(invalidRequest(`${field} is not supported yet.`, field, "unsupported_parameter"));
@@ -438,7 +461,7 @@ export function validateChatRequest(body: unknown, resolveModel: ModelResolver):
     return fail(invalidRequest("Only n=1 is supported.", "n"));
   }
 
-  // 5. Required non-empty, bounded `messages`.
+  // 5. Required non-empty, bounded `messages` (array-level, model-independent).
   const rawMessages = body["messages"];
   if (!Array.isArray(rawMessages) || rawMessages.length === 0) {
     return fail(invalidRequest("The messages field must be a non-empty array.", "messages"));
@@ -447,53 +470,115 @@ export function validateChatRequest(body: unknown, resolveModel: ModelResolver):
     return fail(invalidRequest("Too many messages.", "messages"));
   }
 
+  // 6. Resolve the internal model policy (exact-case) BEFORE per-message
+  //    normalization, so tool-role / assistant-`tool_calls` acceptance is
+  //    MODEL-AWARE: only an emulated model parses them; a text-only model still
+  //    rejects them. An unknown id or case mismatch is a `404` (never reflected).
+  const policy = resolveModel(model);
+  if (policy === undefined) return fail(MODEL_NOT_FOUND_ERROR);
+  const allowTools = policy.toolMode === "emulated";
+
+  // 7. Per-message normalization (model-aware tool handling).
   const messages: NormalizedMessage[] = [];
   for (const raw of rawMessages) {
-    const result = normalizeMessage(raw);
+    const result = normalizeMessage(raw, allowTools);
     if (!result.ok) return fail(result.error);
     messages.push(result.message);
   }
 
-  // 6. Resolve the internal model policy (exact-case). An unknown id or case
-  //    mismatch is a `404`; the submitted id is never reflected back.
-  const policy = resolveModel(model);
-  if (policy === undefined) return fail(MODEL_NOT_FOUND_ERROR);
-
-  // 7. Direct-mode prompt policy (model-aware). A `promptMode: "direct"` model
-  //    submits ONLY the latest normalized user-role message, so a request with
-  //    no user-role message cannot produce a prompt. Reject it here — at the
-  //    model-aware boundary — with a fixed, content-free `400` so the failure
-  //    happens BEFORE prepare(), capacity acquisition, thread creation,
-  //    submission, or any SSE header commitment. Prompt behaviour is driven from
-  //    the validated `promptMode`, never a model-id comparison.
+  // 8. Direct-mode prompt policy (model-aware): a `promptMode: "direct"` model
+  //    submits ONLY the latest normalized user-role message, so a request with no
+  //    user-role message cannot produce a prompt. Rejected here with a fixed,
+  //    content-free `400` BEFORE prepare/capacity/thread/submit/SSE header.
   if (policy.promptMode === "direct" && !messages.some((message) => message.role === "user")) {
     return fail(invalidRequest("A user message is required.", "messages", "invalid_request"));
   }
 
-  // 8. Model-aware `tools`/`tool_choice` bridge (Phase 2.1). Its accepted names
-  //    join the ignored-parameter collection; a rejection is a stable `400`.
-  const toolBridge = validateToolCompatibility(body, policy.toolMode);
-  if (!toolBridge.ok) return fail(toolBridge.error);
+  // 9. Model-aware tool handling.
+  let tools: NormalizedChatRequest["tools"];
+  let toolChoice: NormalizedChatRequest["toolChoice"];
+  let parallelToolCalls: boolean | undefined;
+  let toolset: CompiledToolset | undefined;
+  let bridgeIgnored: readonly string[] = [];
+  let parallelConsumed = false;
 
-  // 9. Record ignored parameter names by own-property presence only — the value
-  //    is never read (no getter is invoked merely to record a name) — then merge
-  //    the accepted tool names and sort deterministically.
+  if (allowTools) {
+    // EMULATED (experimental): normalize and RETAIN the tool policy, compile the
+    // schemas once, and validate prior tool history. Top-level descriptor probes
+    // fail closed on an accessor-backed / proxy-throwing `tools`/`tool_choice`
+    // without ever reading it; all deep traversal is descriptor-safe.
+    const toolsProbe = probeOwn(body, "tools");
+    if (toolsProbe.kind === "accessor" || toolsProbe.kind === "error") {
+      return fail(toolUnsupported("tools"));
+    }
+    const choiceProbe = probeOwn(body, "tool_choice");
+    if (choiceProbe.kind === "accessor" || choiceProbe.kind === "error") {
+      return fail(toolUnsupported("tool_choice"));
+    }
+    const parallelProbe = probeOwn(body, "parallel_tool_calls");
+    if (parallelProbe.kind === "accessor" || parallelProbe.kind === "error") {
+      return fail(toolUnsupported("parallel_tool_calls"));
+    }
+    const toField = (probe: PropertyProbe): ProbedField =>
+      probe.kind === "value"
+        ? { present: true, value: probe.value }
+        : { present: false, value: undefined };
+
+    const normalized = normalizeToolRequest({
+      tools: toField(toolsProbe),
+      toolChoice: toField(choiceProbe),
+      parallelToolCalls: toField(parallelProbe),
+      messages,
+    });
+    if (!normalized.ok) {
+      if (normalized.param === "messages") {
+        return fail(
+          invalidRequest(
+            "A tool-call history relationship is invalid.",
+            "messages",
+            "invalid_request",
+          ),
+        );
+      }
+      return fail(toolUnsupported(normalized.param));
+    }
+    tools = normalized.value.tools;
+    toolChoice = normalized.value.choice;
+    parallelToolCalls = normalized.value.parallelToolCalls;
+    toolset = normalized.value.toolset;
+    parallelConsumed = true; // parallel_tool_calls is honored, not ignored
+  } else {
+    // DISABLED or NATIVE: the tolerate-and-discard Phase 2.1 bridge (native mode
+    // rejects any tool metadata). Accepted names join the ignored collection.
+    const bridge = validateToolCompatibility(body, policy.toolMode);
+    if (!bridge.ok) return fail(bridge.error);
+    bridgeIgnored = bridge.ignored;
+  }
+
+  // 10. Record ignored parameter names by own-property presence only (the value
+  //     is never read). In emulated mode `parallel_tool_calls` is consumed, so it
+  //     is not reported as ignored. Merge accepted bridge names and sort.
   const ignoredParameters = [
-    ...IGNORED_PARAMETER_NAMES.filter((name) => present(body, name)),
-    ...toolBridge.ignored,
+    ...IGNORED_PARAMETER_NAMES.filter(
+      (name) => (!parallelConsumed || name !== "parallel_tool_calls") && present(body, name),
+    ),
+    ...bridgeIgnored,
   ].sort();
 
-  // The normalized request is deeply immutable: each message object is frozen
-  // (by `normalizeMessage`), and the message array, the ignored-name collection,
-  // and the outer request object are frozen here.
-  return {
-    ok: true,
-    model: policy,
-    request: Object.freeze({
-      model,
-      messages: Object.freeze(messages),
-      ignoredParameters: Object.freeze(ignoredParameters),
-      stream,
-    }),
+  // The normalized request is immutable: each message object is frozen (by
+  // `normalizeMessage`), and the message array, tool collection, ignored-name
+  // collection, and outer request object are frozen here.
+  const base = {
+    model,
+    messages: Object.freeze(messages),
+    ignoredParameters: Object.freeze(ignoredParameters),
+    stream,
   };
+  const request: NormalizedChatRequest = allowTools
+    ? Object.freeze({ ...base, tools: Object.freeze(tools ?? []), toolChoice, parallelToolCalls })
+    : Object.freeze(base);
+
+  return toolset === undefined
+    ? { ok: true, model: policy, request }
+    : { ok: true, model: policy, request, toolset };
 }

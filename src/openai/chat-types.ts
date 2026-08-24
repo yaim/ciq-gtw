@@ -12,14 +12,25 @@
  * it without importing each other.
  */
 
-/**
- * The text-only roles supported in the initial release. `tool` is intentionally
- * absent: tool-role messages are rejected until Phase 3.
- */
-export type NormalizedRole = "system" | "developer" | "user" | "assistant";
+import type {
+  NormalizedPriorToolCall,
+  NormalizedTool,
+  NormalizedToolChoice,
+} from "../tools/types.js";
 
-/** The ordered list of accepted roles (used for exact membership checks). */
-export const NORMALIZED_ROLES: readonly NormalizedRole[] = [
+/**
+ * The supported message roles. `tool` is accepted ONLY for `toolMode: "emulated"`
+ * models (experimental Phase 3); a `disabled`/`native` model still rejects a
+ * tool-role message and the model-aware boundary enforces that.
+ */
+export type NormalizedRole = "system" | "developer" | "user" | "assistant" | "tool";
+
+/**
+ * The four text roles (used for exact membership checks in message
+ * normalization). `tool` is intentionally NOT in this list — it is handled
+ * separately and only enabled in emulated tool mode.
+ */
+export const NORMALIZED_ROLES: readonly Exclude<NormalizedRole, "tool">[] = [
   "system",
   "developer",
   "user",
@@ -27,15 +38,23 @@ export const NORMALIZED_ROLES: readonly NormalizedRole[] = [
 ];
 
 /**
- * One normalized message. `content` is the flattened text of a string body or
- * an array of `{ type: "text", text }` parts; the declared `role` is preserved
+ * One normalized message. `content` is the flattened text of a string body or an
+ * array of `{ type: "text", text }` parts. For an assistant turn that proposed
+ * tool calls (emulated mode only), `content` may be `null` and `toolCalls`
+ * carries the prior calls; for a tool-result turn, `role` is `"tool"` and
+ * `toolCallId` links it to the assistant call it answers. Text-only requests
+ * never populate `toolCalls`/`toolCallId`. The declared `role` is preserved
  * distinctly (a `system`/`developer` distinction is kept even though the single
  * upstream `prompt` field weakens its trust boundary).
  */
 export interface NormalizedMessage {
   readonly role: NormalizedRole;
-  /** Flattened text content. May be an empty string; never null or undefined. */
-  readonly content: string;
+  /** Flattened text content; `null` only on an assistant tool-call turn. */
+  readonly content: string | null;
+  /** Prior tool calls (assistant turns, emulated mode only). */
+  readonly toolCalls?: readonly NormalizedPriorToolCall[];
+  /** The linked assistant call id (tool-result turns, emulated mode only). */
+  readonly toolCallId?: string;
 }
 
 /**
@@ -57,4 +76,16 @@ export interface NormalizedChatRequest {
    * at the validation boundary and never reaches this type.
    */
   readonly stream: boolean;
+  /**
+   * Normalized function-tool definitions for an emulated-mode request. Absent for
+   * a text-only (`disabled`) model, where any tool metadata is tolerated and
+   * discarded by the Phase 2.1 bridge. An empty array means the emulated model
+   * received no tools (no tool protocol is added). These plain-data definitions
+   * are serialized into the protocol prompt.
+   */
+  readonly tools?: readonly NormalizedTool[];
+  /** Normalized `tool_choice` (emulated mode only). */
+  readonly toolChoice?: NormalizedToolChoice;
+  /** Honored parallel-call policy (emulated mode only; default `true`). */
+  readonly parallelToolCalls?: boolean;
 }

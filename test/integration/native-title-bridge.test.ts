@@ -76,13 +76,15 @@ function fakeService(run: RunFn): ChatCompletionService {
       model: ctx.request.model,
       prompt: "PROMPT",
       policy: ctx.model,
+      selectedLlms: ctx.model.selectedLlms,
       keyId: ctx.keyId,
     }),
     run,
   };
 }
 
-const okRun: RunFn = () => Promise.resolve({ content: "the answer", upstreamThreadId: THREAD_ID });
+const okRun: RunFn = () =>
+  Promise.resolve({ kind: "text", content: "the answer", upstreamThreadId: THREAD_ID });
 const failRun: RunFn = () => Promise.reject(new ChatCompletionError(COMPLETION_TIMEOUT_ERROR));
 
 function spyBridge(): { bridge: TitleBridge; registrations: TitleRegistration[] } {

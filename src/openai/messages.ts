@@ -1,18 +1,32 @@
 /**
  * OpenAI message normalization (specification sections 8.2, 8.4, 9.4.4).
  *
- * Converts one raw request message into a normalized, text-only
- * {@link NormalizedMessage}, or a value-free OpenAI rejection envelope. Only the
- * text-only roles are accepted; tool-role messages, assistant `tool_calls`, and
- * non-text content parts are rejected. No submitted value ever appears in a
- * returned error — `param` is only the static field name `"messages"`.
+ * Converts one raw request message into a normalized {@link NormalizedMessage},
+ * or a value-free OpenAI rejection envelope. Behaviour is MODEL-POLICY-AWARE via
+ * `allowTools`: a text-only (`disabled`/`native`) model rejects tool-role
+ * messages and assistant `tool_calls` exactly as before; an emulated model parses
+ * them into normalized prior-tool-call / tool-result fields (their deeper
+ * linkage/schema validation happens in the tool request normalizer). No submitted
+ * value ever appears in a returned error — `param` is only the static field name
+ * `"messages"`.
  */
 import type { NormalizedMessage, NormalizedRole } from "./chat-types.js";
 import { NORMALIZED_ROLES } from "./chat-types.js";
+import type { NormalizedPriorToolCall } from "../tools/types.js";
+import { MAX_TOOL_CALLS_PER_RESPONSE } from "../tools/limits.js";
 import { invalidRequest, UNSUPPORTED_CONTENT_TYPE_ERROR, type OpenAIApiError } from "./errors.js";
 
 /** Conservative initial safety bound on text content parts per message. */
 export const MAX_TEXT_PARTS_PER_MESSAGE = 256;
+
+/**
+ * Maximum tool calls in one assistant `tool_calls` history message. This is the
+ * SAME bound the protocol parser enforces on a freshly generated response
+ * ({@link MAX_TOOL_CALLS_PER_RESPONSE} = 8): a prior assistant turn can carry no
+ * more calls than the gateway would ever emit, so there is one shared ceiling
+ * rather than a separate, larger history limit.
+ */
+export const MAX_TOOL_CALLS_PER_MESSAGE = MAX_TOOL_CALLS_PER_RESPONSE;
 
 /** The outcome of normalizing one message. */
 export type MessageResult =
@@ -23,7 +37,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isRole(value: unknown): value is NormalizedRole {
+function isRole(value: unknown): value is Exclude<NormalizedRole, "tool"> {
   return typeof value === "string" && (NORMALIZED_ROLES as readonly string[]).includes(value);
 }
 
@@ -63,40 +77,121 @@ function normalizeContentParts(parts: readonly unknown[]): OpenAIApiError | stri
   return texts.join("\n");
 }
 
+/** Normalize a string / text-parts content body into a string, or an error. */
+function normalizeTextContent(content: unknown): OpenAIApiError | string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) return normalizeContentParts(content);
+  return invalidRequest("A message content is invalid.", "messages");
+}
+
 /**
- * Normalize one raw message. Returns the normalized message or a value-free
- * OpenAI error. An optional `name` field is ignored (never used or rejected).
+ * Parse an assistant `tool_calls` array (emulated mode). Each entry must be
+ * `{ id, type?: "function", function: { name, arguments } }` with a non-empty
+ * string `id`, a non-empty string function `name`, and a string `arguments`
+ * (the JSON-string argument form). Structural only; schema validation and id
+ * linkage happen later against the compiled toolset.
  */
-export function normalizeMessage(raw: unknown): MessageResult {
+function normalizeToolCalls(raw: unknown): OpenAIApiError | NormalizedPriorToolCall[] {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return invalidRequest("A message has invalid tool calls.", "messages");
+  }
+  if (raw.length > MAX_TOOL_CALLS_PER_MESSAGE) {
+    return invalidRequest("A message has too many tool calls.", "messages");
+  }
+  const calls: NormalizedPriorToolCall[] = [];
+  for (const entry of raw) {
+    if (!isRecord(entry)) return invalidRequest("A message tool call is invalid.", "messages");
+    const type = entry["type"];
+    if (type !== undefined && type !== "function") {
+      return invalidRequest("A message tool call is invalid.", "messages");
+    }
+    const id = entry["id"];
+    if (typeof id !== "string" || id.length === 0) {
+      return invalidRequest("A message tool call is invalid.", "messages");
+    }
+    const fn = entry["function"];
+    if (!isRecord(fn)) return invalidRequest("A message tool call is invalid.", "messages");
+    const name = fn["name"];
+    if (typeof name !== "string" || name.length === 0) {
+      return invalidRequest("A message tool call is invalid.", "messages");
+    }
+    const argumentsJson = fn["arguments"];
+    if (typeof argumentsJson !== "string") {
+      return invalidRequest("A message tool call is invalid.", "messages");
+    }
+    calls.push(Object.freeze({ id, name, argumentsJson }));
+  }
+  return calls;
+}
+
+/** Normalize a tool-result (`role: "tool"`) message (emulated mode). */
+function normalizeToolResult(raw: Record<string, unknown>): MessageResult {
+  const toolCallId = raw["tool_call_id"];
+  if (typeof toolCallId !== "string" || toolCallId.length === 0) {
+    return reject("A tool message is missing a tool_call_id.");
+  }
+  const content = normalizeTextContent(raw["content"]);
+  if (typeof content !== "string") return { ok: false, error: content };
+  return { ok: true, message: Object.freeze({ role: "tool", content, toolCallId }) };
+}
+
+/** Normalize an assistant message that proposed tool calls (emulated mode). */
+function normalizeAssistantWithToolCalls(raw: Record<string, unknown>): MessageResult {
+  const calls = normalizeToolCalls(raw["tool_calls"]);
+  if (!Array.isArray(calls)) return { ok: false, error: calls };
+  // Content is optional and may be null on a tool-call turn.
+  const rawContent = raw["content"];
+  let content: string | null;
+  if (rawContent === null || rawContent === undefined) {
+    content = null;
+  } else {
+    const normalized = normalizeTextContent(rawContent);
+    if (typeof normalized !== "string") return { ok: false, error: normalized };
+    content = normalized;
+  }
+  return {
+    ok: true,
+    message: Object.freeze({ role: "assistant", content, toolCalls: Object.freeze(calls) }),
+  };
+}
+
+/**
+ * Normalize one raw message. `allowTools` enables emulated-mode tool-role and
+ * assistant `tool_calls` parsing; when false, tool metadata is rejected exactly
+ * as the text-only surface always has. An optional `name` field is ignored.
+ */
+export function normalizeMessage(raw: unknown, allowTools: boolean): MessageResult {
   if (!isRecord(raw)) return reject("A message must be an object.");
 
   const role = raw["role"];
+
+  // Tool-result role: only valid in emulated mode.
+  if (role === "tool") {
+    if (!allowTools) return reject("A message has an unsupported role.");
+    return normalizeToolResult(raw);
+  }
+
   if (!isRole(role)) return reject("A message has an unsupported role.");
 
-  // Tool calls are a Phase 3 feature; the strict boundary rejects the own-property
-  // PRESENCE of `tool_calls` — even an empty array, `null`, or explicit
-  // `undefined` — never silently dropping it and never reading its value.
+  // Assistant `tool_calls`: rejected by PRESENCE for text-only models (even an
+  // empty array / null / explicit undefined — the value is never read); parsed
+  // for emulated models.
   if (Object.hasOwn(raw, "tool_calls")) {
-    return {
-      ok: false,
-      error: invalidRequest(
-        "Assistant tool calls are not supported yet.",
-        "messages",
-        "unsupported_parameter",
-      ),
-    };
+    if (!allowTools) {
+      return {
+        ok: false,
+        error: invalidRequest(
+          "Assistant tool calls are not supported yet.",
+          "messages",
+          "unsupported_parameter",
+        ),
+      };
+    }
+    if (role !== "assistant") return reject("Only assistant messages may include tool calls.");
+    return normalizeAssistantWithToolCalls(raw);
   }
 
-  const content = raw["content"];
-  if (typeof content === "string") {
-    return { ok: true, message: Object.freeze({ role, content }) };
-  }
-  if (Array.isArray(content)) {
-    const flattened = normalizeContentParts(content);
-    if (typeof flattened === "string") {
-      return { ok: true, message: Object.freeze({ role, content: flattened }) };
-    }
-    return { ok: false, error: flattened };
-  }
-  return reject("A message content is invalid.");
+  const content = normalizeTextContent(raw["content"]);
+  if (typeof content !== "string") return { ok: false, error: content };
+  return { ok: true, message: Object.freeze({ role, content }) };
 }
