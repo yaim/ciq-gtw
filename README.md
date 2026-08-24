@@ -34,8 +34,12 @@ direct` (latest-user-only prompt, no protocol wrapper) — is the committed Open
 > streaming duration, and general non-Claude routing remain **not** verified.
 > Streaming is
 > **synthetic** (the answer is obtained by polling, then split into deltas), not
-> true upstream streaming. It does **not** implement tool calling,
-> Redis/idempotency, or metrics/tracing; those remain planned per
+> true upstream streaming. It now also includes **experimental, opt-in emulated
+> tool calling** (Phase 3), which is **non-default** and whose release gates and
+> live evaluator have **not been run or met** — the gateway returns
+> model-proposed tool calls but never executes a tool. It does **not** implement
+> native CollectivIQ tools, Redis/idempotency, or metrics/tracing; those remain
+> planned per
 > [`.agent/docs/tech-software-spec.md`](.agent/docs/tech-software-spec.md). This
 > is the bounded OpenCode Chat Completions profile, not full OpenAI API
 > compatibility or production readiness. The grounded upstream contract is
@@ -71,9 +75,11 @@ direct` (latest-user-only prompt, no protocol wrapper) — is the committed Open
 - **Authenticated, text-only `POST /v1/chat/completions`** (Phase 1B +
   Phase 2), wired through the adapter. It validates/normalizes the OpenAI
   request (text roles and string/text-part content; `n` must be `1`; `stream`
-  absent/`false`/`true`), rejects `response_format`, `logprobs`, audio,
-  image/binary content, tool-role messages, and assistant `tool_calls` with
-  stable content-free `400`s, tolerates the tool metadata OpenCode attaches
+  absent/`false`/`true`), rejects `response_format`, `logprobs`, audio, and
+  image/binary content with stable content-free `400`s (tool-role messages and
+  assistant `tool_calls` are rejected the same way for text-only `disabled` and
+  `native` models, but PARSED for the experimental emulated model, which returns
+  model-proposed calls it never executes — see below), tolerates the tool metadata OpenCode attaches
   automatically for text-only models (a bounded `tools` array plus an
   `auto`/`none` `tool_choice`) by discarding it while rejecting any tool use that
   requires or names a tool (Phase 2.1; see below),
@@ -106,10 +112,46 @@ keep-alive` comments every 15 s while polling waits, deterministic
   client disconnect stops polling, releases capacity, and sends no body.
   Streaming is **synthetic** — it keeps the connection alive but cannot improve
   time-to-first-answer content, and it is **not** true upstream streaming.
+- **Experimental, opt-in emulated tool calling** (Phase 3; **non-default**). A
+  `toolMode: "emulated"` model asks CollectivIQ to emit a strict versioned
+  `tool-or-final` JSON envelope that the gateway parses (in `src/tools/`, using a
+  descriptor-safe bounded copy and a per-request Ajv validator whose dialect is
+  chosen from each tool schema's root `$schema` — draft-07 by default, and
+  draft-07 or draft 2020-12 by an exact URI allowlist, so OpenCode 1.18.21's
+  draft-2020-12 built-in tool schemas compile; a non-string or unknown `$schema`
+  fails closed) into OpenAI `tool_calls` — for both the JSON path (`content: null`,
+  `finish_reason: "tool_calls"`) and the synthetic-SSE path (one complete indexed
+  tool-call delta, then a `tool_calls` terminal, then `[DONE]`, no `usage`). It
+  validates tool schemas, `tool_choice` (`auto`/`none`/`required`/named),
+  `parallel_tool_calls`, and prior tool-call/result history; a required/named
+  choice with no valid upstream call maps to `502 invalid_tool_response`. The
+  gateway returns model-**proposed** calls only — it never executes, authorizes,
+  or simulates a tool; OpenCode still owns permission prompts and execution, and
+  each tool-loop round creates a new upstream thread. In emulated mode the
+  validated tool schemas, prior arguments, and tool results are serialized into
+  the prompt sent to CollectivIQ (never logged or retained). This mode is
+  **experimental**: the section-30 release gates and the approval-gated live
+  evaluator (`npm run eval:tools`) have **not been run or met**. The draft-2020-12
+  dialect support closes the confirmed OpenCode 1.18.21 schema-compilation gap both
+  **offline** (hermetic suites) and in one **sanitized, user-authorized live smoke
+  on 2026-08-24**: OpenCode's built-in `read` schema (draft-2020-12) passed
+  validation with no `tools is not supported for this request.` warning, OpenCode
+  prompted for permission, the user approved once, `read` executed only after
+  approval, and the post-tool completion returned a relevant answer over the two
+  expected tool-loop upstream threads (a proposal round and a final-answer round —
+  not a hidden title request). That is one observation for the tested
+  local/account configuration — not production readiness, repeatability, or a
+  cross-account/cross-version guarantee; the gateway only proposes calls while
+  OpenCode owns permission and execution. To enable it,
+  copy the `collectiviq-claude-tools` model into your ignored `config/models.yaml`
+  (see the example file) and use the `collectiviq-tools-experimental` OpenCode
+  agent; every existing default stays tool-disabled.
 
 ## What is not implemented yet
 
-`GET /metrics`, emulated/native tool calling, and Redis/idempotency. (Gateway
+`GET /metrics`, native CollectivIQ tool calling, and Redis/idempotency.
+(Experimental emulated tool calling is implemented but non-default; its release
+gates and live evaluator have not been run — see "What works today".) (Gateway
 authentication, the model endpoints, the non-streamed `POST /v1/chat/completions`
 path, and text-only synthetic SSE streaming are implemented — see "What works
 today". A basic live OpenCode/CollectivIQ foreground **transport** smoke was
@@ -150,7 +192,8 @@ Both `.env` and `config/models.yaml` are git-ignored. All example credentials
 are unmistakably fake placeholders — replace them with your own and never commit
 real secrets. The model IDs and source names in the example
 (`collectiviq-claude`, `collectiviq-claude-direct`, `collectiviq-consensus`,
-`collectiviq-coder`, `collectiviq-fast`, and the `selectedLlms` entries) are
+`collectiviq-coder`, `collectiviq-fast`, the experimental
+`collectiviq-claude-tools`, and the `selectedLlms` entries) are
 configurable examples only; they are not verified against any CollectivIQ account
 and carry no context-window or token-limit claims. `collectiviq-claude` is the
 single-source text policy (`selectedLlms: [claude]`, `generateCombined: false`,
@@ -244,36 +287,46 @@ curl -N http://127.0.0.1:8787/v1/chat/completions \
 ```
 
 The request surface is strict: a non-boolean `stream`, and the
-mere **own-property presence** of `response_format`, `logprobs`, `audio`,
-message `tool_calls`, or a tool-role message — even when empty, `null`, an
-explicit `undefined`, or otherwise harmless — is rejected with a stable `400`, as
-is any image/binary content. (Presence is decided without reading the field's
-value, so a value getter is never invoked and an inherited property never
-counts.)
+mere **own-property presence** of `response_format`, `logprobs`, or `audio` — even
+when empty, `null`, an explicit `undefined`, or otherwise harmless — is rejected
+with a stable `400`, as is any image/binary content. Message `tool_calls` and
+tool-role messages are likewise presence-rejected for text-only
+(`toolMode: disabled`) models, but an `emulated` model PARSES them into normalized
+prior tool calls / tool results (see below). (Presence is decided without reading
+the field's value, so a value getter is never invoked and an inherited property
+never counts.)
 
-`tools` and `tool_choice` are handled by a **model-policy-aware
-compatibility bridge (Phase 2.1)**, because OpenCode attaches tool definitions to
-every request even when all tool permissions are denied. A tool definition is
+For **`toolMode: disabled`** models (every committed default), `tools` and
+`tool_choice` are handled by a **model-policy-aware compatibility bridge (Phase
+2.1)**, because OpenCode attaches tool definitions to every request even when all
+tool permissions are denied. In this disabled-mode bridge a tool definition is
 never semantically interpreted, retained, serialized into the prompt, forwarded
 upstream, logged, reflected, persisted, or executed; it is traversed only through
 data-property descriptors for bounded JSON-shape and byte accounting, and
 submitted accessors and executable hooks (getters, `toJSON`, iterators) are never
-invoked. For a text-only (`toolMode: disabled`) model the gateway TOLERATES the
-metadata: it accepts an own `tools` array of at most **128** entries whose
-**entire JSON encoding is at most 2 MiB** (`MAX_TOOL_SCHEMA_BYTES`, spec §21.6),
-and a `tool_choice` of exactly `"auto"` or `"none"`, records only the parameter
-NAMES in the ignored-parameter header, and never emits a tool call. Actual tool
-calling stays disabled: a `tool_choice` of `"required"` or a named function; a
-non-array, over-count, or over-budget `tools` value; an accessor, cycle,
-sparse/exotic/over-deep structure, or unsupported value anywhere in the
-collection; or any tool metadata sent to an `emulated`/`native` model (neither
-implemented) is rejected with a stable content-free `400`
-(`unsupported_parameter`). `tools` is validated before `tool_choice`. Accepted-but-ignored optional fields (`temperature`,
+invoked. The gateway TOLERATES the metadata: it accepts an own `tools` array of at
+most **128** entries whose **entire JSON encoding is at most 2 MiB**
+(`MAX_TOOL_SCHEMA_BYTES`, spec §21.6), and a `tool_choice` of exactly `"auto"` or
+`"none"`, records only the parameter NAMES in the ignored-parameter header, and
+never emits a tool call. Actual tool calling stays disabled here: a `tool_choice`
+of `"required"` or a named function; a non-array, over-count, or over-budget
+`tools` value; an accessor, cycle, sparse/exotic/over-deep structure, or
+unsupported value anywhere in the collection; or any tool metadata sent to a
+`native` model (not implemented) is rejected with a stable content-free `400`
+(`unsupported_parameter`). `tools` is validated before `tool_choice`.
+
+For an **`emulated`** model (experimental, opt-in, non-default) the tool policy is
+instead NORMALIZED and RETAINED: the toolset is compiled once, prior tool history
+is validated, the validated schemas/arguments/results **ARE** serialized into the
+upstream prompt (never logged or retained), `parallel_tool_calls` is CONSUMED (a
+non-boolean is rejected with `param: "parallel_tool_calls"`), and the gateway can
+return model-**proposed** tool calls — which it never executes. Accepted-but-ignored optional fields (`temperature`,
 `top_p`, `max_tokens`, `max_completion_tokens`, `stop`, `seed`, `user`, `store`,
-`parallel_tool_calls`) are surfaced by NAME only in an optional
-`X-CollectivIQ-Ignored-Parameters` response header (on the streamed path this
-header is set before the SSE body is committed); their values are never read or
-logged. Non-streamed responses report `usage` zeros, which denote **unavailable**
+and — for `disabled` models only — `parallel_tool_calls`) are surfaced by NAME
+only in an optional `X-CollectivIQ-Ignored-Parameters` response header (on the
+streamed path this header is set before the SSE body is committed); their values
+are never read or logged. (In `emulated` mode `parallel_tool_calls` is consumed,
+not ignored, so it is not reported in that header.) Non-streamed responses report `usage` zeros, which denote **unavailable**
 token counts — not estimates and not exact billing usage; streamed responses omit
 `usage` entirely.
 
@@ -466,10 +519,28 @@ checks. The contract suite runs against a local mock HTTP server.
 (`test/compatibility/`, its own `vitest.compatibility.config.ts`) that drives the
 pinned `ai` + `@ai-sdk/openai-compatible` SDK (matching the OpenCode client) via
 `streamText`/`generateText` against an ephemeral loopback gateway with a **fake**
-completion — no CollectivIQ, no real credential, no network. It is intentionally
-excluded from `validate`/CI and is run on its own. `ai` and
-`@ai-sdk/openai-compatible` are pinned **dev** dependencies used only by this
-suite.
+completion — no CollectivIQ, no real credential, no network. It includes the
+experimental tool-calling checks (a real tool call and an in-memory three-step
+read/edit/test loop). It is intentionally excluded from `validate`/CI and is run
+on its own. `ai` and `@ai-sdk/openai-compatible` are pinned **dev** dependencies
+used only by this suite.
+
+`npm run test:adversarial` is another **separate** hermetic suite
+(`test/adversarial/`, its own `vitest.adversarial.config.ts`): the tool-protocol
+release-gate corpus (≥200 deterministic cases — malformed envelopes, fence edge
+cases, injection-shaped prose, schema edge cases, choice/parallel enforcement,
+candidate disagreement, hostile object structures, determinism) run against the
+pure engine. No network, credentials, or CollectivIQ. Excluded from `validate`/CI.
+
+`npm run eval:tools` is the **approval-gated LIVE tool evaluator** that would
+measure the section-30 release gates against the real CollectivIQ origin. Its
+default invocation is a credential-free, network-free **preflight**; the
+fully-approved live path (`--execute-approved --cost-approved --cleanup-approved
+--recovery-journal-approved`, password auth only, 200 single-round + 20 three-step
+scenarios, hard cap 280 completions, per-request thread cleanup, ID-only recovery
+journal) is network-only, must **never** be added to `validate`/CI, and has **not
+been run**. The gates are therefore not met and emulated tool mode stays
+experimental.
 
 ## CollectivIQ contract tooling
 

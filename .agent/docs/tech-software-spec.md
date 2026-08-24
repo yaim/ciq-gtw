@@ -958,9 +958,9 @@ reflected back.
 | `model`                 | Required and enforced                                |
 | `messages`              | Required and enforced                                |
 | `stream`                | Supported                                            |
-| `tools`                 | Tolerated + discarded for disabled models (Phase 2.1); executed only through native/emulated mode (Phase 3, unimplemented) |
-| `tool_choice`           | `auto`/`none` tolerated + discarded for disabled models (Phase 2.1); `required`/named rejected until tool mode ships |
-| `parallel_tool_calls`   | Accepted; best-effort                                |
+| `tools`                 | Tolerated + discarded for disabled models (Phase 2.1); normalized + retained (and proposed calls emitted) for `emulated` models (Phase 3, experimental/opt-in/non-default); rejected for `native` (unimplemented) |
+| `tool_choice`           | `auto`/`none` tolerated + discarded for disabled models (Phase 2.1); `auto`/`none`/`required`/named honored for `emulated` models; `required`/named rejected for disabled/`native` |
+| `parallel_tool_calls`   | Ignored (name only) for disabled models; consumed for `emulated` models (absent → `true`; non-boolean rejected) |
 | `temperature`           | Accepted but ignored unless CollectivIQ adds support |
 | `top_p`                 | Accepted but ignored                                 |
 | `max_tokens`            | Accepted but not guaranteed                          |
@@ -1021,14 +1021,18 @@ Behavior:
 
 If a required tool call cannot be parsed, the gateway must not silently return ordinary text. It must return a structured gateway failure.
 
-**Implementation status (Phase 2.1).** The behaviors above describe the eventual
-tool-calling target (Phase 3). Today, tool calling is unimplemented and every
-virtual model is `toolMode: "disabled"`, so the request boundary only TOLERATES
-the tool metadata OpenCode sends automatically: it accepts a `tool_choice` of
-exactly `"auto"` or `"none"` (discarded, name recorded) and rejects `"required"`
-and named-function choices with a stable `unsupported_parameter` `400` — a
-request that requires or names a tool is never silently answered with text. See
-the Phase 2.1 note in section 9.4.4.
+**Implementation status.** Emulated tool calling (Phase 3) is implemented offline
+but **experimental, opt-in, and non-default**: only the `collectiviq-claude-tools`
+model / `collectiviq-tools-experimental` agent enable it, and its section-30
+release gates and the live evaluator have not been run or met. Every committed
+default virtual model is `toolMode: "disabled"`, so the request boundary only
+TOLERATES the tool metadata OpenCode sends automatically: it accepts a
+`tool_choice` of exactly `"auto"` or `"none"` (discarded, name recorded) and
+rejects `"required"` and named-function choices with a stable
+`unsupported_parameter` `400` — a request that requires or names a tool is never
+silently answered with text. An `emulated` model instead honors
+`auto`/`none`/`required`/named and can emit model-proposed calls (see section
+9.4.4 and section 12). `native` tool mode is not implemented.
 
 ### 9.4.4 Text-only constraints
 
@@ -1087,13 +1091,17 @@ sampling/storage fields (`temperature`, `top_p`, `max_tokens`,
 `max_completion_tokens`, `stop`, `seed`, `user`, `store`, `parallel_tool_calls`)
 are accepted but ignored — only their **names** are recorded and echoed in the
 optional `X-CollectivIQ-Ignored-Parameters` header (values are never read or
-logged). `parallel_tool_calls` remains an ignored compatibility option regardless of tool
-mode. Rejected with stable content-free
+logged). `parallel_tool_calls` is an ignored compatibility option for `disabled`
+models; for an `emulated` model it is instead CONSUMED (absent → `true`; a
+non-boolean is rejected with `param: "parallel_tool_calls"`). Rejected with stable
+content-free
 `400`s — by **own-property presence alone**, including an empty value, `null`,
 an explicit `undefined` supplied directly to the normalization boundary, or any
 otherwise-harmless value: a non-boolean `stream`,
-`response_format`, `logprobs`,
-audio parameters, message `tool_calls`, tool-role messages, and
+`response_format`, `logprobs`, and
+audio parameters (model-independent); plus, for a text-only (`disabled`/`native`)
+model, message `tool_calls` and tool-role messages (an `emulated` model PARSES
+these into normalized prior tool calls / tool results); and
 image/audio/file/binary content parts. Presence is decided with `Object.hasOwn`
 (the field value is never read for a presence decision, so a value getter is
 never invoked and an inherited/prototype property never counts as supplied);
@@ -1124,10 +1132,13 @@ requires or names a tool); a non-array, over-count (`> 128`), or over-budget
 (non-plain) object, over-deep nesting, or unsupported value
 (function/symbol/bigint/`undefined`/non-finite number) anywhere in the
 collection; a descriptor/proxy failure; or ANY presence of `tools`/`tool_choice`
-against an `emulated`/`native` model (neither implemented) is rejected with the
+against a `native` model (not implemented) is rejected with the
 stable content-free `unsupported_parameter` `400` (`param` = `tools` or
-`tool_choice`). No tool definition ever reaches the prompt, upstream, logs,
-storage, or the response, and no tool call can be emitted or executed.
+`tool_choice`). In this disabled-mode bridge no tool definition ever reaches the
+prompt, upstream, logs, storage, or the response, and no tool call is emitted or
+executed. (An `emulated` model — experimental, opt-in, non-default — instead
+normalizes and retains the policy, serializes the validated schemas into the
+upstream prompt, and can emit model-proposed calls; see section 12.)
 Conservative initial collection bounds apply (`MAX_MESSAGES = 512`,
 `MAX_TOOLS = 128`, `MAX_TOOL_SCHEMA_BYTES = 2 MiB`,
 `MAX_TEXT_PARTS_PER_MESSAGE = 256`); the body-byte and final-prompt-byte limits
@@ -1501,6 +1512,14 @@ Emulated tool calling converts a strict JSON response generated as ordinary text
 
 It is required only if CollectivIQ does not provide native structured tool calling.
 
+**Implementation status (Phase 3, implemented offline, EXPERIMENTAL).** The
+parsing algorithm (§12.2), candidate selection and consensus fallback (§12.3),
+final-answer fallback (§12.3.2), `call_ciq_<ULID>` ids (§12.4), the parallel-call
+policy (§12.5), and the tool-loop model (§12.6) are all implemented in `src/tools/`
+and wired into the `toolMode: "emulated"` completion path. The gateway returns
+model-PROPOSED calls only and never executes a tool. Release gates (§30) are not
+met; the feature is opt-in and non-default. See the Phase 3 status note in §32.
+
 ### 12.2 Parsing algorithm
 
 For every candidate message:
@@ -1819,9 +1838,14 @@ exact answer with no trimming or loss.
 
 ### 14.4 Tool-call streaming
 
-Tool-call streaming remains a **Phase 3** concern and is not implemented; the
-Phase 2 stream is text-only. Tool calls may be emitted in one complete delta
-rather than character-by-character.
+Tool-call streaming is **implemented (Phase 3, EXPERIMENTAL)**: for a
+`toolMode: "emulated"` model a streamed tool-call response emits one complete,
+indexed tool-call delta (using the trusted `call_ciq_*` ids) rather than
+character-by-character, then a terminal chunk with `finish_reason: "tool_calls"`,
+then `data: [DONE]`, with no `usage` (`src/openai/chat-stream.ts`
+`toolCallsChunk`/`terminalToolChunk`, `src/api/chat-stream-response.ts`). The
+Phase 2 text stream is unchanged. Emulated tool mode remains experimental and
+non-default (§30).
 
 Example:
 
@@ -2615,9 +2639,10 @@ Recommended OpenCode configuration:
 
 OpenCode documents provider-level timeout and streamed-chunk timeout settings, as well as custom models and separate `small_model` selection.
 
-Because tool calling is not implemented (Phase 3), the committed `opencode.jsonc`
-ships a text-only default primary agent — a `collectiviq-text` agent with a
-wildcard permission `deny`, selected as the `default_agent`. Denying permissions
+Because emulated tool calling is experimental and non-default (Phase 3), the
+committed `opencode.jsonc` ships a text-only default primary agent — a
+`collectiviq-text` agent with a wildcard permission `deny`, selected as the
+`default_agent`. Denying permissions
 stops OpenCode from EXECUTING tools but does not stop it from SENDING tool
 definitions to the model, so the agent depends on the disabled-mode
 tool-metadata compatibility bridge (section 9.4.4, Phase 2.1) to discard that
@@ -2780,9 +2805,10 @@ catalog for manual/other-account use. The sanitized 2026-08-18 smoke that
 first attempt is **historical** evidence from before the hidden agent was disabled;
 it is not current behavior and does not prove general GPT/non-Claude foreground
 routing (section 34.7), which remains unverified. This keeps the streamed and
-non-streamed foreground text paths within the implemented, tool-free contract (tool
-DEFINITIONS tolerated and discarded, tool CALLS never emitted) until Phase 3
-lands.
+non-streamed foreground text paths within the disabled-mode, tool-free contract
+(tool DEFINITIONS tolerated and discarded, tool CALLS never emitted). Emulated tool
+calling (Phase 3) is implemented but experimental, opt-in, and non-default, so it
+is not part of the committed foreground default.
 
 No context-window values should be declared until CollectivIQ’s effective limits are measured or documented.
 
@@ -3088,6 +3114,18 @@ Emulated tool mode must not be enabled as the default production OpenCode model 
 8. **Parser determinism:** Identical upstream fixtures always produce identical gateway results.
 
 These are release criteria, not guarantees of model reasoning quality.
+
+**Implementation status.** The emulated engine, its hermetic unit/integration/
+contract/compatibility coverage, and a deterministic **adversarial corpus**
+(`npm run test:adversarial`, ≥200 protocol cases covering §29.4) are implemented.
+The approval-gated **live evaluator** that measures these numerical gates against
+the real origin (`npm run eval:tools`, `src/eval/`) is implemented — preflight by
+default, password-only, fixed origin, 200 single-round + 20 three-step scenarios,
+hard cap 280 upstream completions, per-request immediate cleanup, ID-only recovery
+journal, abort-on-cleanup-failure, value-free output — but it has **NOT been run**.
+These gates are therefore **NOT met**; emulated tool mode stays experimental and
+non-default. Do not mark any gate passed without reproducible evidence from the
+required live suites.
 
 If the thresholds are not met, the gateway may still expose:
 
@@ -3479,11 +3517,12 @@ automatically even when all tool permissions are denied:
   iterative (cycle- and depth-guarded) JSON-shape and byte accounting; accessors
   and executable hooks (getters, `toJSON`, iterators) are never invoked and
   descriptor/proxy failures fail closed.
-* Tool CALLING stays disabled: `required`/named `tool_choice`; a non-array,
-  over-count, or over-budget `tools`; an accessor, cycle, sparse/exotic/over-deep
-  structure, or unsupported value anywhere; and any tool metadata against an
-  `emulated`/`native` model are rejected with the stable `unsupported_parameter`
-  `400`.
+* For a disabled model, tool CALLING stays off: `required`/named `tool_choice`; a
+  non-array, over-count, or over-budget `tools`; an accessor, cycle,
+  sparse/exotic/over-deep structure, or unsupported value anywhere; and any tool
+  metadata against a `native` model (not implemented) are rejected with the stable
+  `unsupported_parameter` `400`. An `emulated` model (experimental, opt-in,
+  non-default) instead normalizes and retains the policy — see section 12.
 * `collectiviq-claude-direct` (a Claude source with `promptMode: "direct"`, section
   8.3/8.4) is the committed OpenCode foreground/`small_model` default because
   non-Claude routing is blocked account-side (section 34.7) and the account
@@ -3518,6 +3557,60 @@ Deliverables:
 Exit criterion:
 
 * tool-calling release thresholds are met or the feature remains explicitly experimental.
+
+**Implemented (offline; EXPERIMENTAL; live upstream only at request time).** The
+emulated engine lives in `src/tools/` (`copy.ts` descriptor-safe bounded JSON
+copy; `schema.ts` per-request Ajv compile that selects the meta-schema dialect
+from each tool schema's ROOT `$schema` — **draft-07** is the default when
+`$schema` is absent (or a boolean root), and **draft-07** and **draft 2020-12**
+are each recognized by an exact URI allowlist (`http`/`https`, with and without a
+trailing `#`); OpenCode 1.18.21 stamps its built-in tool schemas with draft
+2020-12, so this compiles them offline, while a non-string or any other `$schema`
+value fails closed — with no coercion/defaults/property-removal, no remote `$ref`,
+and no cross-request retention; `protocol.ts` the strict §12.2 parser;
+`select.ts` the §12.3 desired-source → individual-consensus voting with
+percent-usage/agreement scoring and configured-order tie-breaks; `ids.ts`
+`call_ciq_<ULID>`; `request.ts` normalization + prior tool-history linkage/schema
+validation; `limits.ts` the §21.6 bounds). Pinned deps `ajv` 8.20.0,
+`ajv-formats` 3.0.1, `ulid` 2.4.0. The request boundary retains and validates the
+tool policy for a `toolMode: "emulated"` model (which REQUIRES
+`promptMode: "protocol"`, enforced at config load); `conversation.ts` adds the
+`tool-or-final` protocol + `AVAILABLE_TOOLS_JSON` block when tools are active (the
+text-only prompt is byte-for-byte unchanged); polling returns the validated
+message snapshot; the completion layer returns a discriminated text-or-tool-calls
+result; and the JSON and synthetic-SSE encoders emit `tool_calls` with
+`finish_reason: "tool_calls"` and no `usage`. The gateway returns model-PROPOSED
+calls and NEVER executes, authorizes, or simulates a tool; OpenCode owns
+permissions and execution. Each tool-loop round creates a new upstream thread. The
+opt-in `collectiviq-claude-tools` model + `collectiviq-tools-experimental` agent
+(wildcard `"ask"`) are the only tool-enabled surfaces; every default stays
+`toolMode: "disabled"`. Hermetic unit/integration/contract/compatibility/
+adversarial suites pass (see §29–30 status notes). The section-30 release gates and
+the approval-gated live evaluator (`npm run eval:tools`, implemented under
+`src/eval/`) have **NOT been run or met**, so the feature remains explicitly
+experimental and non-default. The draft-2020-12 dialect support closes the
+confirmed OpenCode 1.18.21 schema-compilation gap both **offline** (hermetic
+suites, including a pinned-SDK `read` tool declaring draft 2020-12) and in one
+**sanitized, user-authorized live smoke on 2026-08-24** (the experimental
+`collectiviq-tools-experimental` agent + `collectiviq-claude-tools` model):
+OpenCode's built-in `read` tool schema (draft-2020-12 root `$schema`) passed
+request validation with no `tools is not supported for this request.` warning;
+OpenCode presented a permission prompt, the user granted one-time approval, and
+`read` executed only after that approval; no other tool was requested or executed;
+and the post-tool completion returned a relevant final answer. Exactly two new
+CollectivIQ threads were observed — the tool-proposal completion and the
+post-tool-result final-answer completion — which are the expected stateless
+one-new-thread-per-completion-round tool-loop rounds (spec §5, §11.2), **not** a
+hidden title request, and no hidden title-generation thread was created. This
+confirms the live OpenCode permission/execution boundary behaved correctly for the
+tested local/account configuration; the gateway only PROPOSED the call while
+OpenCode owned authorization and execution. It is **one sanitized observation** —
+not production readiness, repeatability, a cross-account/cross-version guarantee,
+or proof of general provider routing — and the smoke threads are not claimed
+deleted (no cleanup result was supplied). The section-30 release gates remain
+**unmet** and `npm run eval:tools` remains **unrun**, so Phase 3 stays
+experimental, opt-in, and non-default. `native` tool mode,
+Redis/idempotency, and true upstream streaming remain unimplemented.
 
 ### Phase 4 — Production hardening
 

@@ -2,32 +2,75 @@
 
 ## Status and Trust Boundary
 
-Emulated tool calling is experimental. It converts an upstream text response containing a strict protocol JSON object into OpenAI `tool_calls`. It does not make the response trusted and must not be enabled as the default production OpenCode model until every release gate in `.agent/docs/tech-software-spec.md` section 30 passes.
+Emulated tool calling is **implemented offline and EXPERIMENTAL** (Phase 3). It
+converts an upstream text response containing a strict protocol JSON object into
+OpenAI `tool_calls`. It does not make the response trusted and must not be enabled
+as the default production OpenCode model until every release gate in
+`.agent/docs/tech-software-spec.md` section 30 passes. Those gates and the
+approval-gated live evaluator (`npm run eval:tools`) have **not been run or met**,
+so emulated mode stays experimental even though every offline test passes.
 
 Read specification sections 5.2–5.3, 8.7, 11.2, 12–13, 14.4, 21.4–21.5, 29.4, 30, and 34.1–34.2 before changing this area.
 
-The gateway never executes, authorizes, simulates, or claims execution of a tool. OpenCode owns permissions, execution, results, and loop limits.
+The gateway never executes, authorizes, simulates, or claims execution of a tool.
+It returns model-PROPOSED calls only; OpenCode owns permissions, execution,
+results, and loop limits.
 
-**Phase 2.1 text-compatibility bridge (current behavior).** Tool calling is not
-yet implemented and every virtual model is `toolMode: "disabled"`. Because
+**Implemented engine (offline, `src/tools/`).** The emulated engine lives under
+`src/tools/`: `limits.ts` (the single source of truth for `MAX_TOOLS`=128,
+`MAX_TOOL_SCHEMA_BYTES`=2 MiB, `MAX_TOOL_ARGUMENT_BYTES`=1 MiB,
+`MAX_TOOL_CALLS_PER_RESPONSE`=8, `MAX_TOOL_JSON_DEPTH`=512), `copy.ts`
+(`safeJsonCopy` — a descriptor-safe bounded deep copy to trusted plain JSON that
+never triggers a getter/`[[Get]]`/`toJSON`/iterator and fails closed on
+accessors/cycles/sparse/exotic/over-deep/non-finite/symbol/function/bigint),
+`ids.ts` (`call_ciq_<ULID>` seam, `ulid` dependency), `schema.ts` (`compileToolset`
+— a per-request Ajv compile that picks the meta-schema dialect from each schema's
+root `$schema`: draft-07 by default when `$schema` is absent, and draft-07 or
+draft 2020-12 by an exact URI allowlist (OpenCode 1.18.21's draft-2020-12 built-in
+schemas compile; a non-string or unknown `$schema` fails closed); at most one
+fresh instance per dialect per call, no coercion/defaults/property-removal, no
+remote `$ref`, no cross-request retention), `normalize.ts`, `protocol.ts`
+(`parseToolEnvelope`),
+`canonicalize.ts`, `select.ts` (`selectGeneration`), and `request.ts`
+(`normalizeToolRequest` + prior tool-history validation). Pinned deps: `ajv`
+8.20.0, `ajv-formats` 3.0.1, `ulid` 2.4.0.
+
+Only a `toolMode: "emulated"` model activates the engine; that mode REQUIRES
+`promptMode: "protocol"` (enforced at config load). The opt-in
+`collectiviq-claude-tools` model and the `collectiviq-tools-experimental` OpenCode
+agent (wildcard permission `"ask"`) are the only tool-enabled surfaces; every
+existing default stays `toolMode: "disabled"`. `toolMode: "native"` remains
+unimplemented and is rejected at request time.
+
+**Phase 2.1 text-compatibility bridge (unchanged for disabled models).** Because
 OpenCode attaches `tools`/`tool_choice` to every request even when all tool
 permissions are denied, the request boundary runs a model-policy-aware bridge
-(`src/openai/chat-request.ts`, after model resolution) that TOLERATES that
-metadata for a disabled model: it accepts a bounded `tools` array (≤128 entries
-AND ≤2 MiB aggregate JSON — `MAX_TOOL_SCHEMA_BYTES`, spec §21.6) and a
-`tool_choice` of exactly `"auto"`/`"none"`, records only the NAME for the
-diagnostic header. A tool definition is never semantically interpreted, retained,
-serialized into the prompt, forwarded upstream, logged, reflected, persisted, or
-executed; it is traversed ONLY through data-property descriptors for bounded
-JSON-shape and byte accounting (`getOwnPropertyDescriptor`/`Reflect.ownKeys`, no
-`[[Get]]`), so submitted accessors and executable hooks (getters, `toJSON`,
-iterators) are never invoked. This is NOT tool calling: `required`/named
-`tool_choice`; a non-array, over-count, or over-budget `tools`; an accessor,
-cycle, sparse/exotic/over-deep structure, unsupported value, or descriptor/proxy
-failure anywhere; and any tool metadata against an `emulated`/`native` model fail
-closed with a stable `unsupported_parameter` `400`. Do not use this bridge to
-activate emulated/native mode or emit tool calls; those stay Phase 3 and gated by
-section 30.
+(`src/openai/chat-request.ts`, after model resolution) that, for a
+`toolMode: "disabled"` model, TOLERATES that metadata: it accepts a bounded
+`tools` array (≤`MAX_TOOLS` entries AND ≤`MAX_TOOL_SCHEMA_BYTES` aggregate JSON)
+and a `tool_choice` of exactly `"auto"`/`"none"`, records only the NAME for the
+diagnostic header, and DISCARDS the definitions. For a disabled model a tool
+definition is never semantically interpreted, retained, serialized into the
+prompt, forwarded upstream, logged, reflected, persisted, or executed; it is
+traversed ONLY through data-property descriptors (`getOwnPropertyDescriptor`/
+`Reflect.ownKeys`, no `[[Get]]`), so submitted accessors and executable hooks are
+never invoked. For a disabled model, `required`/named `tool_choice`; a non-array,
+over-count, or over-budget `tools`; an accessor, cycle, sparse/exotic/over-deep
+structure, unsupported value, or descriptor/proxy failure; and any tool metadata
+against a `native` model fail closed with a stable `unsupported_parameter` `400`.
+
+**Emulated mode (the one exception to "tools are discarded").** For a
+`toolMode: "emulated"` model the boundary instead NORMALIZES and RETAINS the tool
+policy: it descriptor-safe-copies the definitions into trusted plain data,
+compiles the JSON Schemas once, validates prior assistant `tool_calls` + linked
+tool results (unique ids, declared names, schema-valid arguments, exactly-one
+correctly-linked result — orphan/duplicate/unresolved/mismatched relationships are
+rejected before upstream work), and carries the compiled toolset through
+`prepare`/`run`. In emulated mode the validated tool schemas, prior arguments, and
+tool results ARE serialized into the prompt sent to CollectivIQ — they are still
+never logged or retained by the gateway. A `required`/named `tool_choice` with no
+declared tools is a stable `400 unsupported_parameter` before capacity/headers/
+upstream. Each tool-loop round creates a NEW upstream thread.
 
 ## Prompt Protocol
 
@@ -78,15 +121,17 @@ Canonicalization must be pure, stable, and covered by fixtures. Parser output sh
 
 ## Parallel Calls and Streaming
 
-- Enforce the configured maximum, with the specification's initial default of eight calls.
-- When `parallel_tool_calls` is false, reject multiple calls by default. Selecting only the first requires an explicit compatibility mode and tests.
+- Enforce the configured maximum, with the specification's initial default of eight calls (`MAX_TOOL_CALLS_PER_RESPONSE`).
+- When `parallel_tool_calls` is false, reject multiple calls (implemented — there is NO silent "select the first call" fallback).
 - Generate all IDs before SSE encoding and keep them stable in every related chunk.
-- A complete tool-call delta is acceptable; character-level argument streaming is not required.
+- A complete tool-call delta is acceptable; character-level argument streaming is not required. Tool-call streaming is **implemented** (`src/openai/chat-stream.ts` `toolCallsChunk`/`terminalToolChunk`, driven by `src/api/chat-stream-response.ts`): one complete indexed delta using the trusted `call_ciq_*` ids, then a terminal chunk with `finish_reason: "tool_calls"`, then `data: [DONE]`, with no `usage`.
 
 ## Validation and Release Evidence
 
 Changes require unit and adversarial fixtures for valid, malformed, fenced, injected, unknown-name, schema-invalid, oversized, too-many, choice-mismatched, parallel, and deterministic-consensus cases.
 
-Multi-round compatibility tests must include actual assistant tool calls followed by linked tool results and further tool/final responses. The numerical gates in specification section 30 are product release criteria; do not weaken, reinterpret, or mark them passed without reproducible evidence over the required suites.
+**Implemented hermetic coverage (offline).** Unit: `test/unit/tools-{copy,schema,protocol,select,request,encoding}.test.ts` plus emulated-acceptance cases in `chat-request.test.ts` and the config invariant in `config.test.ts`. Integration: `test/integration/chat-completions-tools.test.ts` (JSON tool_calls, SSE tool deltas, pre-header `400`, ignored-header, native-title-after-tool-call). Contract: `test/contract/completion-flow-tools.test.ts` (real runtime + mock upstream — full flow with one create + one submit, `502` for required-with-no-call, `auto` text fallback, and a no-leak logger/response assertion while the schema is serialized into the prompt by design). Pinned-SDK compatibility (out of `validate`/CI): `test/compatibility/ai-sdk-tools.test.ts` (`generateText`/`streamText` real tool call + an in-memory three-step read/edit/test loop with synthetic tools only — no shell/fs/MCP/network). The **adversarial release-gate suite** `test/adversarial/tool-protocol-corpus.test.ts` (≥200 protocol cases; own `vitest.adversarial.config.ts`; `npm run test:adversarial`; excluded from `validate`/CI).
 
-If gates fail, keep text-only models available and label tool mode experimental. A parser implementation alone is not evidence that OpenCode agent workflows are production-ready.
+Multi-round compatibility tests must include actual assistant tool calls followed by linked tool results and further tool/final responses. The numerical gates in specification section 30 are product release criteria; do not weaken, reinterpret, or mark them passed without reproducible evidence over the required suites. The approval-gated `npm run eval:tools` live evaluator that would measure those gates is **implemented but has NOT been run** (network-only; never in `validate`/CI).
+
+If gates fail, keep text-only models available and label tool mode experimental. A parser implementation and passing offline suites alone are not evidence that OpenCode agent workflows are production-ready. The current account may still reject the protocol wrapper; do not change the default or weaken parsing to work around that.

@@ -23,9 +23,11 @@ a fix and disclosure timeline privately.
 
 This repository is a **runnable foundation**, the Phase 1A authenticated public
 model surface, the Phase 1B non-streamed chat-completions path wired through the
-CollectivIQ adapter, and Phase 2 text-only synthetic SSE streaming
-(`stream: true`). Tool calling, Redis, and metrics/tracing are not implemented.
-The completion path calls CollectivIQ only
+CollectivIQ adapter, Phase 2 text-only synthetic SSE streaming
+(`stream: true`), and Phase 3 **experimental, opt-in, non-default** emulated tool
+calling (implemented offline; its section-30 release gates and the live evaluator
+have NOT been run or met). Redis, metrics/tracing, true upstream streaming, and
+native tool mode are not implemented. The completion path calls CollectivIQ only
 when a real request is served (never during import/construction/build smoke). A
 user-observed, sanitized live OpenCode/CollectivIQ foreground **transport** smoke
 was reported on **2026-08-15** (protocol-mode `collectiviq-claude` response
@@ -136,9 +138,11 @@ and any further live run is approval-gated. The controls that exist today are:
   generation; the strict surface rejects, by **own-property presence**
   (`Object.hasOwn` — even empty/`null`/explicit `undefined`/harmless values,
   never reading the value or an inherited property), `response_format`,
-  `logprobs`, `audio`, message `tool_calls`,
-  tool-role messages, and image/binary content — all with stable, content-free
-  `400`s. Request `tools`/`tool_choice` are handled by a **model-policy-aware
+  `logprobs`, `audio`, and image/binary content — all with stable, content-free
+  `400`s that are model-independent. Message `tool_calls` and tool-role messages
+  are rejected the same way for `disabled`/`native` models, but are PARSED and
+  normalized into validated prior tool-call history for a `toolMode: "emulated"`
+  model (see below). Request `tools`/`tool_choice` are handled by a **model-policy-aware
   compatibility bridge (Phase 2.1)** that accepts bounded metadata ONLY for a
   `toolMode: "disabled"` model: an own `tools` JSON array of at most **128**
   entries whose entire JSON encoding is at most the **2 MiB**
@@ -149,10 +153,30 @@ and any further live run is approval-gated. The controls that exist today are:
   accessors, `toJSON`, iterators, and other executable hooks are never invoked;
   accessors, cycles, sparse/exotic/over-deep structures, unsupported values, an
   over-count/over-budget collection, `required`/named `tool_choice`, and any tool
-  metadata against an `emulated`/`native` model all fail closed with the stable
-  content-free `unsupported_parameter` `400`. A tool definition never reaches the
-  prompt, upstream, logs, persistence, errors, or a tool-call response, and no
-  tool call can be emitted or executed (actual tool calling stays Phase 3).
+  metadata against a `native` model all fail closed with the stable
+  content-free `unsupported_parameter` `400`. For a `disabled` model a tool
+  definition never reaches the prompt, upstream, logs, persistence, errors, or a
+  tool-call response, and no tool call is emitted or executed. **EXPERIMENTAL
+  emulated tool mode (Phase 3, opt-in, non-default):** a `toolMode: "emulated"`
+  model instead NORMALIZES and RETAINS the tool policy — a descriptor-safe bounded
+  deep copy of the definitions into trusted plain JSON (never invoking a getter/
+  `[[Get]]`/`toJSON`/iterator; failing closed on accessors/cycles/sparse/exotic/
+  over-deep/non-finite/symbol/function/bigint and the byte/depth bounds), a
+  per-request Ajv validator whose dialect is chosen from the schema's root
+  `$schema` (draft-07 by default; draft-07 or draft 2020-12 by an exact URI
+  allowlist so OpenCode 1.18.21's draft-2020-12 built-in schemas validate, while a
+  non-string or unknown `$schema` fails closed; no coercion/defaults/property-
+  removal, no remote `$ref`, no cross-request retention), argument/count/depth
+  bounds, and
+  gateway-minted `call_ciq_<ULID>` ids (upstream ids are never trusted). In this
+  mode the validated tool schemas, prior tool arguments, and tool results **ARE**
+  serialized into the prompt sent to CollectivIQ (they are still never logged or
+  retained); each tool-loop round creates a new upstream thread; and the gateway
+  returns model-**proposed** calls but never executes, authorizes, or simulates a
+  tool (OpenCode owns permissions and execution). Emulated mode is experimental:
+  its section-30 release gates and the approval-gated live evaluator
+  (`npm run eval:tools`) have **not been run or met**. `native` tool mode remains
+  unimplemented.
   `stream` is normalized to a boolean: absent or exactly `false` selects
   the non-streamed JSON path, exactly `true` selects the synthetic-SSE path
   (below), and every other value is rejected with the same content-free `400`. Public errors come only from the shared owner
@@ -428,8 +452,12 @@ errorCode, resolved, resolution, persisted }] }` (no longer `succeeded`/
   any further live run is approval-gated. No live CollectivIQ request is made from
   this repository except when a real completion request is served against a
   configured upstream credential.
-- Tool calling and Redis/idempotency are not implemented; those requests are
-  rejected or unavailable rather than silently degraded. Streaming
+- Emulated tool calling is implemented but **experimental, opt-in, and
+  non-default** (only the `collectiviq-claude-tools` model / `collectiviq-tools-experimental`
+  agent enable it; every committed default stays `toolMode: "disabled"` and
+  discards tool metadata). `native` tool mode and Redis/idempotency are not
+  implemented; those requests are rejected or unavailable rather than silently
+  degraded. Streaming
   (`stream: true`/SSE) is implemented as text-only buffered synthetic SSE, not
   true upstream streaming; a basic live stream completed on 2026-08-15, but the
   long-running / keep-alive streaming smoke test is not run.

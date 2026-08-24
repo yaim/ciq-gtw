@@ -33,8 +33,11 @@ explicit `undefined`, `"true"`, `0`, `1`, objects) → stable `400`. Deferred
 features are rejected by **own-property presence alone** (`Object.hasOwn`; even
 empty/`null`/explicit `undefined`/harmless values, never reading
 the value or counting an inherited property): `response_format`, `logprobs`,
-audio, image/binary content parts, tool-role messages, and message `tool_calls`.
-`parallel_tool_calls` stays an ignored compatibility option. Request `tools` and
+audio, and image/binary content parts. Tool-role messages and message
+`tool_calls` are rejected by presence for text-only (`toolMode: "disabled"`)
+models but PARSED for `emulated` models (below). `parallel_tool_calls` stays an
+ignored compatibility name for text-only models and is CONSUMED in emulated mode.
+Request `tools` and
 `tool_choice` are handled by a **model-policy-aware compatibility bridge (Phase
 2.1)** that runs AFTER exact model resolution (validate `tools` first, then
 `tool_choice`): for a `toolMode: "disabled"` model it TOLERATES the tool metadata
@@ -48,10 +51,23 @@ bounded shape/byte accounting, so accessors and executable hooks (getters,
 `toJSON`, iterators) are never invoked. It rejects `required`/named choices; a
 non-array, over-count, or over-budget `tools`; accessors, cycles,
 sparse/exotic/over-deep structures, unsupported values, or descriptor/proxy
-failures; and ANY tool metadata against an `emulated`/`native` model with the
-stable `unsupported_parameter` `400`. The ignored optional-parameter NAMES are
-echoed in `X-CollectivIQ-Ignored-Parameters`. Actual tool CALLING (and tool-call
-streaming) remain planned (Phase 3).
+failures; and ANY tool metadata against a `native` model (not implemented) with
+the stable `unsupported_parameter` `400`. The ignored optional-parameter NAMES are
+echoed in `X-CollectivIQ-Ignored-Parameters`.
+
+For a `toolMode: "emulated"` model (Phase 3, EXPERIMENTAL, implemented offline)
+the boundary instead NORMALIZES and RETAINS the tool policy: it descriptor-safe-
+copies `tools` into trusted plain data (deep-frozen so the retained schemas are
+immutable), normalizes `tool_choice` (`auto`/`none`/`required`/named) and
+`parallel_tool_calls` (absent → `true`; a non-boolean is rejected with
+`param: "parallel_tool_calls"`), compiles each
+JSON Schema once (`src/tools/`), and validates prior assistant `tool_calls` +
+linked tool-result messages (unique gateway ids, declared names, schema-valid
+arguments, exactly one correctly-linked result). A `required`/named `tool_choice`
+with no declared tools is a stable `400 unsupported_parameter` before capacity/
+headers/upstream. Emulated tool calling and tool-call streaming are implemented
+but stay experimental (see the tool-calling guide and spec §30); the gateway
+returns model-PROPOSED calls and never executes a tool.
 
 - Require a configured `model` and an ordered non-empty `messages` collection according to the public schema.
 - Accept supported roles and text content forms exactly as specified.
@@ -114,7 +130,7 @@ Phase 3.
 4. Split text on code-point-safe boundaries (target 128 / max 256 / min 32 code
    points), preferring paragraph, then sentence, then whitespace boundaries;
    concatenating all content deltas reproduces the answer exactly.
-5. (Planned, Phase 3) emit tool calls with stable IDs and indices.
+5. (Implemented, Phase 3, experimental) for a tool-call result, emit one complete indexed tool-call delta with the stable gateway `call_ciq_*` ids, then a terminal chunk with `finish_reason: "tool_calls"` — never `usage`.
 6. Emit a terminal chunk with `finish_reason: "stop"`, then `data: [DONE]`. An
    empty answer emits role + terminal + `[DONE]` and no content frames. No
    `usage` is emitted on a stream.
