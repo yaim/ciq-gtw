@@ -25,8 +25,9 @@ This repository is a **runnable foundation**, the Phase 1A authenticated public
 model surface, the Phase 1B non-streamed chat-completions path wired through the
 CollectivIQ adapter, Phase 2 text-only synthetic SSE streaming
 (`stream: true`), and Phase 3 **experimental, opt-in, non-default** emulated tool
-calling (implemented offline; its section-30 release gates and the live evaluator
-have NOT been run or met). Redis, metrics/tracing, true upstream streaming, and
+calling (implemented offline; its section-30 release gates are NOT met — the
+approval-gated live evaluator was run once, a partial 2026-08-24 run that
+established no gate, and its complete post-hardening run has not been run). Redis, metrics/tracing, true upstream streaming, and
 native tool mode are not implemented. The completion path calls CollectivIQ only
 when a real request is served (never during import/construction/build smoke). A
 user-observed, sanitized live OpenCode/CollectivIQ foreground **transport** smoke
@@ -174,9 +175,21 @@ and any further live run is approval-gated. The controls that exist today are:
   retained); each tool-loop round creates a new upstream thread; and the gateway
   returns model-**proposed** calls but never executes, authorizes, or simulates a
   tool (OpenCode owns permissions and execution). Emulated mode is experimental:
-  its section-30 release gates and the approval-gated live evaluator
-  (`npm run eval:tools`) have **not been run or met**. `native` tool mode remains
-  unimplemented.
+  its section-30 release gates are **not met**. The approval-gated live evaluator
+  (`npm run eval:tools`) has been run once — a single approved 2026-08-24 run
+  attempted 149 rounds (all 149 created threads confirmed deleted; single-round
+  snapshots at 99.3%; the multi-step scenarios never reached and so unmeasured, not
+  a measured 0%) but aborted operationally and established no gate. The evaluator
+  has since been hardened (offline; content-free resume checkpoint gated behind
+  `--resume-approved`, versioned value-free output union, four-state gate status),
+  and its complete post-hardening run has **not been run**. The resume checkpoint is
+  now semantically validated against the real evaluation plan before any credential
+  read or network I/O, so a forged or inconsistent checkpoint — including any
+  "complete + passing, zero-attempt" claim — cannot grant a zero-network pass; a
+  non-resumable abort writes a durable value-free `blocked` tombstone that a resume
+  run rejects until an operator deliberately archives or removes it (no automatic
+  destructive restart), and checkpoint files are accepted only at an exact `0600`
+  mode with symlink-safe ancestry. `native` tool mode remains unimplemented.
   `stream` is normalized to a boolean: absent or exactly `false` selects
   the non-streamed JSON path, exactly `true` selects the synthetic-SSE path
   (below), and every other value is rejected with the same content-free `400`. Public errors come only from the shared owner

@@ -16,7 +16,7 @@
 | `npm run test:contract` | Upstream contract | Vitest `test/contract` only (hermetic mock HTTP server, no network) |
 | `npm run test:compatibility` | SDK compatibility | Standalone hermetic suite (`test/compatibility`, own `vitest.compatibility.config.ts`); pinned `ai`/`@ai-sdk/openai-compatible` SDK vs an ephemeral loopback gateway with a **fake** completion — no network/credentials/CollectivIQ. **Excluded from `validate`/CI** |
 | `npm run test:adversarial` | Tool release gate | Standalone hermetic suite (`test/adversarial`, own `vitest.adversarial.config.ts`); ≥200 deterministic tool-protocol cases against the pure engine — no network/credentials/CollectivIQ. **Excluded from `validate`/CI** |
-| `npm run eval:tools` | Live tool gate | Approval-gated LIVE evaluator (`src/eval/`). Default is a credential-free/network-free preflight; the fully-approved path probes the fixed CollectivIQ origin. Network-only; **must NEVER be added to `validate`/CI**; **not run** |
+| `npm run eval:tools` | Live tool gate | Approval-gated LIVE evaluator (`src/eval/`). Default is a credential-free/network-free preflight; the fully-approved path probes the fixed CollectivIQ origin. Network-only; **must NEVER be added to `validate`/CI**. Run once (a partial 2026-08-24 run that established no gate); its complete post-hardening run has **not been run** |
 | `npm run test:coverage` | Coverage | Vitest with V8 coverage |
 | `npm run build` | Build | `tsc -p tsconfig.json`, emits `dist/` |
 | `npm run test:build` | Build smoke | Imports compiled `dist/*.js`; asserts no listening socket |
@@ -85,8 +85,32 @@ gate-metric fix that invalid/missing output earns ZERO schema/name/argument cred
 `defaultToolsEvalDeps` deleter is a real bounded single-attempt DELETE
 (`observeThreadDeletion`, 2xx-only success) — not a rejection stub — and the
 gate report's `parserDeterminism` is a locally MEASURED result, never a hardcoded
-`true`. No live upstream, OpenCode, or network call occurs in any of these; the section-30 gates and the live evaluator
-have **not** been run or met.
+`true`. No live upstream, OpenCode, or network call occurs in any of these. The
+approval-gated live evaluator (`npm run eval:tools`) has been run exactly once — a
+single approved live run on 2026-08-24 attempted 149 rounds (all 149 created
+threads confirmed deleted; partial single-round snapshots read 99.3%) but aborted
+operationally under the evaluator's earlier ambiguous report, with the three-step
+multi-step scenarios never reached and therefore unmeasured (NOT a measured 0%), so
+it established no section-30 gate. The evaluator has since been hardened (offline):
+a versioned value-free output union (`preflight | progress | blocked | executed`),
+a four-state gate status (`passed | failed | incomplete | not_evaluated`; a zero
+denominator is `not_evaluated`, never 0%; a partial sample is `incomplete`, never
+`passed`), structured value-free abort diagnostics with a `resumable` flag, and a
+content-free durable resume checkpoint at the ignored path
+`.agent/sessions/eval/tools-eval-checkpoint.json` gated behind `--resume-approved`
+(hermetic coverage lives in `test/contract/tools-eval-cli.test.ts`). Four further
+remediations are now enforced and hermetically covered by the new
+`src/eval/checkpoint.ts` / `src/eval/report.ts` and
+`test/contract/eval-checkpoint.test.ts`: semantic (corpus-bound) checkpoint
+validation against the actual `EvalPlan` before any credential/network I/O (so a
+forged "complete + passing, zero-attempt" checkpoint can never grant a
+zero-network `executed` pass); a durable `resumeState: "resumable" | "blocked"`
+tombstone that a `--resume-approved` run rejects before credentials/network; exact
+`0o600` file-mode + non-recursive-`mkdir` safe-ancestry acceptance; and a
+recovery-journal finalized exactly once with a `recovery-journal-finalize` closed
+abort stage that durably blocks the checkpoint and prevents a pass. The section-30
+gates remain **not met** and the evaluator's complete post-hardening run remains
+**unrun**.
 
 ## Validation Order
 

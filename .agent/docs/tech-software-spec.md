@@ -1024,7 +1024,11 @@ If a required tool call cannot be parsed, the gateway must not silently return o
 **Implementation status.** Emulated tool calling (Phase 3) is implemented offline
 but **experimental, opt-in, and non-default**: only the `collectiviq-claude-tools`
 model / `collectiviq-tools-experimental` agent enable it, and its section-30
-release gates and the live evaluator have not been run or met. Every committed
+release gates are not met: a single approved live evaluator run on 2026-08-24
+(149 rounds attempted, all threads cleaned, single-round snapshots at 99.3%,
+multi-step scenarios unmeasured) aborted operationally and established no gate, and
+the hardened evaluator's complete run remains approval-gated and unrun. Every
+committed
 default virtual model is `toolMode: "disabled"`, so the request boundary only
 TOLERATES the tool metadata OpenCode sends automatically: it accepts a
 `tool_choice` of exactly `"auto"` or `"none"` (discarded, name recorded) and
@@ -3122,10 +3126,134 @@ The approval-gated **live evaluator** that measures these numerical gates agains
 the real origin (`npm run eval:tools`, `src/eval/`) is implemented — preflight by
 default, password-only, fixed origin, 200 single-round + 20 three-step scenarios,
 hard cap 280 upstream completions, per-request immediate cleanup, ID-only recovery
-journal, abort-on-cleanup-failure, value-free output — but it has **NOT been run**.
-These gates are therefore **NOT met**; emulated tool mode stays experimental and
-non-default. Do not mark any gate passed without reproducible evidence from the
-required live suites.
+journal, abort-on-cleanup-failure, value-free output. It has been run exactly once:
+a **single approved live run on 2026-08-24** attempted 149 rounds (all 149 created
+threads confirmed deleted — cleanup healthy; partial single-round snapshots read
+99.3%) but aborted operationally under the evaluator's earlier ambiguous report.
+The three-step multi-step scenarios were never reached and are therefore
+**unmeasured** — the old report's `multiStepSuccessPct: 0` meant unmeasured, NOT a
+measured 0%. That single partial run establishes **NO** section-30 release gate.
+
+The evaluator has since been **hardened** (implemented offline). It now emits a
+versioned, value-free **output union** (`preflight | progress | blocked` — a
+pre-execution precondition failure — `| executed`) and a **four-state gate status**
+(`passed | failed | incomplete | not_evaluated`): a zero denominator is
+`not_evaluated` (never 0%); a partial sample is `incomplete` (never `passed`); a
+threshold gate is `passed`/`failed` only when its planned denominator is complete,
+and each threshold gate now carries explicit `numerator`, `denominator`, and
+`plannedDenominator`. Overall `passed` requires a complete corpus, no abort, all
+gates passed, zero cleanup/journal failures, AND successful checkpoint
+finalization. It emits **structured value-free abort diagnostics** — a stable
+reason, a closed stage set, a normalized `UpstreamError` code, a safe HTTP status
+(read trap-safely via `isUpstreamError`, never inspecting a hostile thrown value),
+and a `resumable` boolean (a create-stage interruption is ambiguous and therefore
+non-resumable; a submit/poll failure is resumable only after confirmed thread
+deletion and durable checkpoint persistence; cleanup/journal/checkpoint-persistence
+failures are non-resumable). JSON **progress** events are emitted only after a
+cleaned attempt AND a successful durable checkpoint write, and stay value-free (no
+prompts, answers, ids, schemas, args, or credentials). A private, content-free
+resume **checkpoint** lives at the ignored fixed path
+`.agent/sessions/eval/tools-eval-checkpoint.json` (0700 dir, 0600 file,
+`O_NOFOLLOW`, atomic temp+rename, strict
+version/origin/auth/corpus-fingerprint/bounded-count validation), gated behind a
+new `--resume-approved` CLI flag: an existing checkpoint requires it, and an
+incompatible or approval-absent checkpoint fails closed BEFORE any credential read
+or network I/O.
+
+Four additional remediations are now **enforced by code and hermetic tests**
+(`src/eval/checkpoint.ts`, `src/eval/report.ts`,
+`test/contract/eval-checkpoint.test.ts`). First, **semantic (corpus-bound)
+checkpoint validation**: on resume a decoded checkpoint is validated against the
+actual `EvalPlan` BEFORE any credential read or network I/O, with all planned
+bounds taken from the real plan and never from checkpoint-claimed sizes.
+`nextCaseIndex` must lie strictly within `0..corpus-length` (a resumable
+checkpoint can never encode a complete corpus — a genuinely complete run removes
+its checkpoint); committed single/multi case counts must be EXACTLY cursor-derived;
+gate denominators must equal the committed counts (single = committedSingle,
+multi = committedMulti, expected-call = committedSingle + committedMulti·3, where the
+·3 is the corpus's expected-tool-call rounds per scenario); every numerator must be
+an integer in `[0, denominator]`; the upstream-round counters are bounded by the
+corpus-derived plan — a committed three-step scenario performs FOUR upstream rounds
+(read/edit/test/final answer), NOT the three expected-tool-call rounds, so the
+committed upstream-round floor is `committedSingle + committedMulti·maxRoundsPerCase`
+(·4), distinct from the gate denominator. Because the counters accumulate across
+resume segments but a segment aborts at its first non-committing case (leaving at
+most one in-flight scenario's uncommitted partial rounds plus one terminal failed
+round), they are ALSO bounded ABOVE — completedRounds ≤ committedUpstreamRounds +
+runSegments·(maxRoundsPerCase−1) and attemptedRounds ≤ committedUpstreamRounds +
+runSegments·maxRoundsPerCase, with completedRounds ≤ attemptedRounds — so an
+arbitrarily inflated counter is rejected; resumable cleanup accounting must be truthful
+(deleted + failed == attempted, failed == 0, journalFailures == 0,
+attempted == deleted == attemptedRounds); runSegments ≥ 1; and the fresh
+zero-count anchor is valid. A forged or inconsistent checkpoint — including any
+"complete + passing, zero-attempt" claim — is rejected as content-free invalid
+state, so a checkpoint can NEVER manufacture a zero-network `executed` pass.
+Second, **durable resumable-vs-blocked state**: the checkpoint schema carries
+`resumeState: "resumable" | "blocked"` plus a value-free closed abort
+`{ stage, reason }` (null when resumable). Every NON-resumable abort (ambiguous
+create, cleanup-delete failure, recovery-journal persistence failure,
+checkpoint-persist failure, journal-finalize failure, toolset-compile,
+signal/lifecycle) attempts to replace the checkpoint with a durable `blocked`
+**tombstone** carrying only closed lifecycle metadata plus the abort stage/reason —
+never prompts, answers, ids, credentials, titles, or bodies. A `--resume-approved`
+run REJECTS a blocked checkpoint before credentials/network; recovery requires
+deliberate operator archival or removal (no automatic destructive restart). If the
+tombstone write itself fails, the report stays non-resumable and truthfully
+surfaces the checkpoint persistence failure. A complete successful run still
+removes the checkpoint. Third, **exact 0600 file mode + safe ancestry**: a
+checkpoint file is accepted only when `(mode & 0o777) === 0o600` (0400/0200/0000,
+group/world bits, non-regular, or symlink are all rejected); the checkpoint location
+is an explicit TRUSTED BASE plus its ordered managed components (`.agent`/`sessions`/
+`eval`), and EVERY managed component is `lstat`-validated TOP-DOWN from the base as a
+real, non-symlink directory on read/write/delete/exists — so a symlink at ANY managed
+level, even one whose descendants already exist through it, is caught before the OS
+would traverse it (closing the earlier immediate-parent-only gap where a symlinked
+`.agent` with a real `sessions/eval` underneath went undetected); directory creation
+no longer uses recursive `mkdir` (which can follow a redirected/symlinked ancestor) —
+missing components are created ONE AT A TIME with the private 0700 mode and
+re-validated, and the file open keeps `O_NOFOLLOW` with atomic temp+rename and bounded
+size. Nothing AT or ABOVE the trusted base is symlink-validated, so a legitimate
+platform symlink above it (e.g. macOS `/var`→`/private/var`) is not falsely rejected. Fourth,
+**lifecycle/output guarantees via one explicit finalization state machine**: the
+recovery journal is finalized EXACTLY ONCE on every executed AND blocked path after
+successful init, through one idempotent helper (closing a prior gap where the
+working-tree evaluator did not finalize it on all paths — including the initial-
+anchor-write-failure path, which now routes the finalize through that helper instead
+of swallowing it and reports a journal-finalize failure there as its OWN closed
+blocked reason `recovery-journal-finalize-failed`, distinct from the
+`checkpoint-write-failed` anchor failure, before any credential read or network call),
+and a journal-finalization failure is a closed abort stage/reason
+(`recovery-journal-finalize` / `recovery-journal-finalize-failed`), is non-resumable,
+durably blocks the checkpoint, and prevents a pass; progress ordering is exact — a
+cleaned-but-uncommitted TERMINAL resumable attempt (a submit/poll failure or
+interruption whose thread was created and confirmed deleted with no journal failure)
+carries a bounded, value-free pending-progress descriptor that finalization emits
+EXACTLY ONCE, and only AFTER the resumable checkpoint durably persists, so no cleaned
+attempt is silently dropped and the descriptor never claims the case cursor advanced;
+a journal-finalize or checkpoint persistence failure emits no resumability progress,
+and no duplicate progress record is emitted for the same completed multi-step case; and
+all abort/blocked reasons are CLOSED literal unions (`AbortReason` / `BlockedReason`
+/ `AbortStage`) constructed through typed helpers, so no free-form exception text
+ever reaches output or checkpoints. The overall finalization order is: finish/abort
+round → bounded cleanup → finalize recovery journal exactly once → persist a
+validated resumable checkpoint OR a blocked tombstone → emit progress only when a
+resumable checkpoint durably persisted → emit final report → on complete success
+remove the checkpoint and report success only after all finalization succeeds.
+`create`/`process_message` are never auto-replayed (only GET
+polling keeps its existing idempotent retry); a single-round cursor advances only
+after cleanup is confirmed, a multi-step scenario commits gate measurements and
+advances only at scenario end (so a mid-scenario interruption restarts that
+scenario, prior partial rounds counting only as attempts/cleanup); a controlled
+first SIGINT/SIGTERM cleans a recorded thread on an independent (non-aborted)
+signal, a second forceful interrupt terminates, and the ID-only recovery journal
+remains the final recovery mechanism; on complete success the checkpoint is
+finalized (removed). A value-free password-auth observation (login attempts, last
+HTTP status or null, normalized boolean) is now surfaced in the final report.
+
+These gates therefore remain **NOT met**, and the evaluator's complete
+post-hardening live run remains approval-gated and **UNRUN**; emulated tool mode
+stays experimental and non-default. Do not mark any gate passed without
+reproducible evidence from the required live suites.
 
 If the thresholds are not met, the gateway may still expose:
 
@@ -3585,10 +3713,19 @@ permissions and execution. Each tool-loop round creates a new upstream thread. T
 opt-in `collectiviq-claude-tools` model + `collectiviq-tools-experimental` agent
 (wildcard `"ask"`) are the only tool-enabled surfaces; every default stays
 `toolMode: "disabled"`. Hermetic unit/integration/contract/compatibility/
-adversarial suites pass (see §29–30 status notes). The section-30 release gates and
-the approval-gated live evaluator (`npm run eval:tools`, implemented under
-`src/eval/`) have **NOT been run or met**, so the feature remains explicitly
-experimental and non-default. The draft-2020-12 dialect support closes the
+adversarial suites pass (see §29–30 status notes). The approval-gated live
+evaluator (`npm run eval:tools`, implemented under `src/eval/`) has been run
+exactly once — a **single approved live run on 2026-08-24** attempted 149 rounds
+(all 149 created threads confirmed deleted; partial single-round snapshots read
+99.3%) but aborted operationally under the evaluator's earlier ambiguous report,
+with the three-step multi-step scenarios never reached and therefore unmeasured
+(NOT a measured 0%), so it established **NO** section-30 release gate. The evaluator
+has since been hardened (offline; see the §30 status notes for the versioned
+value-free output union, four-state gate status, structured abort diagnostics, and
+content-free resume checkpoint gated behind `--resume-approved`), and its complete
+post-hardening live run remains approval-gated and **UNRUN**. The section-30 release
+gates therefore remain **not met**, so the feature remains explicitly experimental,
+opt-in, and non-default. The draft-2020-12 dialect support closes the
 confirmed OpenCode 1.18.21 schema-compilation gap both **offline** (hermetic
 suites, including a pinned-SDK `read` tool declaring draft 2020-12) and in one
 **sanitized, user-authorized live smoke on 2026-08-24** (the experimental
@@ -3607,9 +3744,11 @@ tested local/account configuration; the gateway only PROPOSED the call while
 OpenCode owned authorization and execution. It is **one sanitized observation** —
 not production readiness, repeatability, a cross-account/cross-version guarantee,
 or proof of general provider routing — and the smoke threads are not claimed
-deleted (no cleanup result was supplied). The section-30 release gates remain
-**unmet** and `npm run eval:tools` remains **unrun**, so Phase 3 stays
-experimental, opt-in, and non-default. `native` tool mode,
+deleted (no cleanup result was supplied). This tool-schema smoke is a separate
+event from the approved live evaluator run of the same date described above and
+proves nothing about the section-30 gates. The section-30 release gates remain
+**unmet** and the evaluator's complete post-hardening run remains **unrun**, so
+Phase 3 stays experimental, opt-in, and non-default. `native` tool mode,
 Redis/idempotency, and true upstream streaming remain unimplemented.
 
 ### Phase 4 — Production hardening

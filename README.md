@@ -35,9 +35,11 @@ direct` (latest-user-only prompt, no protocol wrapper) — is the committed Open
 > Streaming is
 > **synthetic** (the answer is obtained by polling, then split into deltas), not
 > true upstream streaming. It now also includes **experimental, opt-in emulated
-> tool calling** (Phase 3), which is **non-default** and whose release gates and
-> live evaluator have **not been run or met** — the gateway returns
-> model-proposed tool calls but never executes a tool. It does **not** implement
+> tool calling** (Phase 3), which is **non-default** and whose section-30 release
+> gates are **not met** (the approval-gated live evaluator was run once — a partial
+> 2026-08-24 run that established no gate — and its complete post-hardening run has
+> not been run) — the gateway returns model-proposed tool calls but never executes
+> a tool. It does **not** implement
 > native CollectivIQ tools, Redis/idempotency, or metrics/tracing; those remain
 > planned per
 > [`.agent/docs/tech-software-spec.md`](.agent/docs/tech-software-spec.md). This
@@ -130,8 +132,14 @@ keep-alive` comments every 15 s while polling waits, deterministic
   each tool-loop round creates a new upstream thread. In emulated mode the
   validated tool schemas, prior arguments, and tool results are serialized into
   the prompt sent to CollectivIQ (never logged or retained). This mode is
-  **experimental**: the section-30 release gates and the approval-gated live
-  evaluator (`npm run eval:tools`) have **not been run or met**. The draft-2020-12
+  **experimental**: the section-30 release gates are **not met**. The approval-gated
+  live evaluator (`npm run eval:tools`) has been run once — a single approved
+  2026-08-24 run attempted 149 rounds (all 149 threads confirmed deleted;
+  single-round snapshots at 99.3%; the multi-step scenarios never reached and so
+  unmeasured, not a measured 0%) but aborted operationally and established no gate.
+  It has since been hardened (offline), and its complete post-hardening run has not
+  been run. This evaluator run is a separate event from the tool-schema live smoke
+  described next. The draft-2020-12
   dialect support closes the confirmed OpenCode 1.18.21 schema-compilation gap both
   **offline** (hermetic suites) and in one **sanitized, user-authorized live smoke
   on 2026-08-24**: OpenCode's built-in `read` schema (draft-2020-12) passed
@@ -150,8 +158,10 @@ keep-alive` comments every 15 s while polling waits, deterministic
 ## What is not implemented yet
 
 `GET /metrics`, native CollectivIQ tool calling, and Redis/idempotency.
-(Experimental emulated tool calling is implemented but non-default; its release
-gates and live evaluator have not been run — see "What works today".) (Gateway
+(Experimental emulated tool calling is implemented but non-default; its section-30
+release gates are not met — the live evaluator was run once (a partial 2026-08-24
+run that established no gate) and its complete post-hardening run has not been run —
+see "What works today".) (Gateway
 authentication, the model endpoints, the non-streamed `POST /v1/chat/completions`
 path, and text-only synthetic SSE streaming are implemented — see "What works
 today". A basic live OpenCode/CollectivIQ foreground **transport** smoke was
@@ -532,14 +542,32 @@ cases, injection-shaped prose, schema edge cases, choice/parallel enforcement,
 candidate disagreement, hostile object structures, determinism) run against the
 pure engine. No network, credentials, or CollectivIQ. Excluded from `validate`/CI.
 
-`npm run eval:tools` is the **approval-gated LIVE tool evaluator** that would
-measure the section-30 release gates against the real CollectivIQ origin. Its
-default invocation is a credential-free, network-free **preflight**; the
-fully-approved live path (`--execute-approved --cost-approved --cleanup-approved
---recovery-journal-approved`, password auth only, 200 single-round + 20 three-step
-scenarios, hard cap 280 completions, per-request thread cleanup, ID-only recovery
-journal) is network-only, must **never** be added to `validate`/CI, and has **not
-been run**. The gates are therefore not met and emulated tool mode stays
+`npm run eval:tools` is the **approval-gated LIVE tool evaluator** that measures the
+section-30 release gates against the real CollectivIQ origin. Its default invocation
+is a credential-free, network-free **preflight**; the fully-approved live path
+(`--execute-approved --cost-approved --cleanup-approved --recovery-journal-approved`,
+password auth only, 200 single-round + 20 three-step scenarios, hard cap 280
+completions, per-request thread cleanup, ID-only recovery journal) is network-only
+and must **never** be added to `validate`/CI. It has been run exactly once: a single
+approved run on **2026-08-24** attempted 149 rounds (all 149 created threads
+confirmed deleted; partial single-round snapshots read 99.3%) but aborted
+operationally under the evaluator's earlier ambiguous report, with the three-step
+multi-step scenarios never reached and therefore unmeasured (NOT a measured 0%), so
+it established no gate. The evaluator has since been hardened (offline): a versioned
+value-free output union (`preflight | progress | blocked | executed`), a four-state
+gate status (`passed | failed | incomplete | not_evaluated`; a zero denominator is
+`not_evaluated`, never 0%; a partial sample is `incomplete`, never `passed`),
+structured value-free abort diagnostics, and a content-free resume checkpoint at the
+ignored `.agent/sessions/eval/tools-eval-checkpoint.json` gated behind a new
+`--resume-approved` flag. Four further remediations are now enforced (code +
+hermetic tests): the checkpoint is semantically validated against the real
+evaluation plan before any credential or network I/O — so a forged
+"complete + passing, zero-attempt" checkpoint can never grant a zero-network pass;
+a non-resumable abort writes a durable `blocked` tombstone that a resume run rejects
+until an operator archives or removes it; checkpoint files require an exact `0600`
+mode with symlink-safe ancestry; and the recovery journal is finalized exactly once
+through one explicit finalization state machine. Its complete post-hardening run has
+**not been run**, so the gates remain not met and emulated tool mode stays
 experimental.
 
 ## CollectivIQ contract tooling
