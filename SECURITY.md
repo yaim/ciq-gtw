@@ -25,9 +25,14 @@ This repository is a **runnable foundation**, the Phase 1A authenticated public
 model surface, the Phase 1B non-streamed chat-completions path wired through the
 CollectivIQ adapter, Phase 2 text-only synthetic SSE streaming
 (`stream: true`), and Phase 3 **experimental, opt-in, non-default** emulated tool
-calling (implemented offline; its section-30 release gates are NOT met — the
-approval-gated live evaluator was run once, a partial 2026-08-24 run that
-established no gate, and its complete post-hardening run has not been run). Redis, metrics/tracing, true upstream streaming, and
+calling (implemented offline; its section-30 release gates are NOT met — two
+authorized live evaluator campaigns have been executed: a **partial 2026-08-24
+campaign** that established no gate and a **completed 2026-08-26 campaign**
+across two resumable execution segments that scored the full corpus but failed
+tool-name accuracy at 254/260 (97.7%) vs the 98% minimum; a diagnostic-emitting
+live rerun (report v3 / checkpoint v2) is approval-gated and unrun, and no
+prompt/parser/selection/threshold change is authorized until it produces
+evidence). Redis, metrics/tracing, true upstream streaming, and
 native tool mode are not implemented. The completion path calls CollectivIQ only
 when a real request is served (never during import/construction/build smoke). A
 user-observed, sanitized live OpenCode/CollectivIQ foreground **transport** smoke
@@ -176,20 +181,41 @@ and any further live run is approval-gated. The controls that exist today are:
   returns model-**proposed** calls but never executes, authorizes, or simulates a
   tool (OpenCode owns permissions and execution). Emulated mode is experimental:
   its section-30 release gates are **not met**. The approval-gated live evaluator
-  (`npm run eval:tools`) has been run once — a single approved 2026-08-24 run
-  attempted 149 rounds (all 149 created threads confirmed deleted; single-round
-  snapshots at 99.3%; the multi-step scenarios never reached and so unmeasured, not
-  a measured 0%) but aborted operationally and established no gate. The evaluator
-  has since been hardened (offline; content-free resume checkpoint gated behind
-  `--resume-approved`, versioned value-free output union, four-state gate status),
-  and its complete post-hardening run has **not been run**. The resume checkpoint is
-  now semantically validated against the real evaluation plan before any credential
-  read or network I/O, so a forged or inconsistent checkpoint — including any
-  "complete + passing, zero-attempt" claim — cannot grant a zero-network pass; a
-  non-resumable abort writes a durable value-free `blocked` tombstone that a resume
-  run rejects until an operator deliberately archives or removes it (no automatic
-  destructive restart), and checkpoint files are accepted only at an exact `0600`
-  mode with symlink-safe ancestry. `native` tool mode remains unimplemented.
+  (`npm run eval:tools`) has been run in two authorized campaigns. The **partial
+  2026-08-24 campaign** attempted 149 rounds (all 149 created threads confirmed
+  deleted; single-round snapshots at 99.3%; the multi-step scenarios never
+  reached and so unmeasured, not a measured 0%) but aborted operationally and
+  established no gate. The **completed 2026-08-26 campaign** ran across two
+  resumable execution segments and scored the full corpus (200/200 single-round
+  cases, 20/20 multi-step scenarios, 281/281 created threads deleted, zero
+  cleanup or journal failures, checkpoint finalized): **tool-name accuracy
+  failed** at 254/260 (97.7%) vs the 98% / 255/260 minimum; seven other gates
+  passed; overall `passed: false`. The evaluator was hardened offline before the
+  2026-08-26 campaign (content-free resume checkpoint gated behind
+  `--resume-approved`, versioned value-free output union, four-state gate
+  status), and the on-disk report and checkpoint payloads are now bounded and
+  value-free by construction: **report v3** adds a `diagnostics.failures`
+  collection (only on `executed` reports) whose entries carry only ordinals, a
+  closed `choiceKind` union, and a closed nine-member `EvalFailureReason` union
+  — never prompts, answers, arguments, schemas, tool names, model names, IDs,
+  credentials, titles, bodies, URLs, timestamps, or exception text; **checkpoint
+  v2** persists diagnostics as a compact `[caseOrdinal, roundOrdinal,
+reasonCode]` ledger with fixed integer reason codes and rejects v1 checkpoints
+  with no migration path. `MAX_CHECKPOINT_BYTES` stays at 8192; the worst valid
+  280-entry ledger fits comfortably in compact JSON. The resume checkpoint is
+  semantically validated against the real evaluation plan before any credential
+  read or network I/O — including every diagnostic entry (case ordinal within
+  `nextCaseIndex`, round ordinal within that corpus case, reason code in the
+  fixed set, reason structurally compatible with whether the referenced round
+  expects a tool or final text) — so a forged or inconsistent checkpoint —
+  including any "complete + passing, zero-attempt" claim — cannot grant a
+  zero-network pass; a non-resumable abort writes a durable value-free `blocked`
+  tombstone that a resume run rejects until an operator deliberately archives or
+  removes it (no automatic destructive restart), and checkpoint files are
+  accepted only at an exact `0600` mode with symlink-safe ancestry. A
+  **diagnostic-emitting live rerun** is approval-gated and unrun; no
+  prompt/parser/selection/threshold change is authorized until it produces
+  evidence. `native` tool mode remains unimplemented.
   `stream` is normalized to a boolean: absent or exactly `false` selects
   the non-streamed JSON path, exactly `true` selects the synthetic-SSE path
   (below), and every other value is rejected with the same content-free `400`. Public errors come only from the shared owner
