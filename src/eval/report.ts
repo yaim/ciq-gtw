@@ -19,7 +19,147 @@ import type { UpstreamErrorCode } from "../collectiviq/errors.js";
 import type { AuthObservation } from "../collectiviq/auth.js";
 
 /** The output-model version. Bump on any breaking shape change. */
-export const EVAL_REPORT_VERSION = 2 as const;
+export const EVAL_REPORT_VERSION = 3 as const;
+
+/**
+ * The closed set of value-free failure reasons a scored round can produce.
+ *
+ * Each reason names WHY the scoring engine could not credit a round without
+ * revealing the prompt, answer, arguments, tool schema, tool name, model name,
+ * thread id, credential, title, URL, body, or any thrown value. The union is
+ * closed and stable: a new reason is a breaking change (bump {@link
+ * EVAL_REPORT_VERSION}). The mapping is:
+ *
+ * - `expected-tool-*` — a round with an `expectedTool` failed for the stated
+ *   reason (the model returned ordinary text, produced no valid call,
+ *   was unavailable, or invoked something else with an allowed name).
+ * - `unauthorized-tool-call` — a tool call named something outside the
+ *   request's allowlist (an injection-resistance violation). It applies to
+ *   both an expected-tool round and a final round.
+ * - `transcript-invalid` — the expected tool was correctly named and allowed,
+ *   but the normalized tool-call/tool-result linkage the gateway would build
+ *   for the next round failed re-validation (see `transcriptValid`).
+ * - `final-*` / `unexpected-tool-call-on-final` — a round with NO `expectedTool`
+ *   (the final answer round of a three-step scenario) failed for the stated
+ *   reason.
+ */
+export type EvalFailureReason =
+  | "expected-tool-returned-text"
+  | "expected-tool-no-valid-call"
+  | "expected-tool-unavailable"
+  | "expected-tool-not-invoked"
+  | "unauthorized-tool-call"
+  | "transcript-invalid"
+  | "unexpected-tool-call-on-final"
+  | "final-no-valid-call"
+  | "final-unavailable";
+
+/**
+ * The fixed internal numeric mapping used ONLY by the compact on-disk
+ * checkpoint ledger. The mapping is not part of the emitted report shape;
+ * callers rehydrate diagnostics into the string union at report-build time.
+ * The codes are stable — a new reason must extend the codes here, not renumber
+ * existing entries, and any change is a checkpoint-format-breaking change.
+ */
+export const EVAL_FAILURE_REASON_CODES: Readonly<Record<EvalFailureReason, number>> = Object.freeze(
+  {
+    "expected-tool-returned-text": 1,
+    "expected-tool-no-valid-call": 2,
+    "expected-tool-unavailable": 3,
+    "expected-tool-not-invoked": 4,
+    "unauthorized-tool-call": 5,
+    "transcript-invalid": 6,
+    "unexpected-tool-call-on-final": 7,
+    "final-no-valid-call": 8,
+    "final-unavailable": 9,
+  },
+);
+
+/**
+ * Reverse lookup for the closed reason ↔ code mapping. Deliberately implemented
+ * as a pure closed `switch` so the trust source is the FUNCTION identity, not a
+ * mutable container: no consumer can `.set(42, ...)` its way into the allowlist
+ * (a `ReadonlyMap` type only hides mutation at compile time — the underlying
+ * `Map` remains mutable, and `Object.freeze(new Map())` does not disable
+ * `Map.prototype.set`). Returns the mapped reason for one of the fixed codes
+ * 1–9 and `undefined` for anything else, including a non-number or NaN. Adding
+ * a new reason requires a new case here AND a new `EVAL_FAILURE_REASON_CODES`
+ * entry AND a checkpoint-format-version bump.
+ */
+export function evalFailureReasonForCode(code: unknown): EvalFailureReason | undefined {
+  if (typeof code !== "number" || !Number.isFinite(code)) return undefined;
+  switch (code) {
+    case 1:
+      return "expected-tool-returned-text";
+    case 2:
+      return "expected-tool-no-valid-call";
+    case 3:
+      return "expected-tool-unavailable";
+    case 4:
+      return "expected-tool-not-invoked";
+    case 5:
+      return "unauthorized-tool-call";
+    case 6:
+      return "transcript-invalid";
+    case 7:
+      return "unexpected-tool-call-on-final";
+    case 8:
+      return "final-no-valid-call";
+    case 9:
+      return "final-unavailable";
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Which category of round a reason applies to. `expected-tool` reasons and
+ * `transcript-invalid` are structurally compatible ONLY with rounds carrying an
+ * `expectedTool`; `final-*` and `unexpected-tool-call-on-final` are compatible
+ * ONLY with a final round (no `expectedTool`); `unauthorized-tool-call` is
+ * compatible with either. Checkpoint validation uses this to reject a
+ * `[caseOrdinal, roundOrdinal, reasonCode]` triple whose reason cannot match
+ * the referenced round in the corpus.
+ */
+export type EvalFailureReasonScope = "expected" | "final" | "any";
+
+/** Which round categories each closed reason may be attributed to. */
+export const EVAL_FAILURE_REASON_SCOPE: Readonly<
+  Record<EvalFailureReason, EvalFailureReasonScope>
+> = Object.freeze({
+  "expected-tool-returned-text": "expected",
+  "expected-tool-no-valid-call": "expected",
+  "expected-tool-unavailable": "expected",
+  "expected-tool-not-invoked": "expected",
+  "unauthorized-tool-call": "any",
+  "transcript-invalid": "expected",
+  "unexpected-tool-call-on-final": "final",
+  "final-no-valid-call": "final",
+  "final-unavailable": "final",
+});
+
+/**
+ * A single value-free failure record for one scored round. It carries only the
+ * corpus-position identifiers a diagnostic run needs to locate the case + round
+ * against the fingerprint-bound corpus — never a prompt, answer, argument,
+ * schema, tool name, model name, thread id, credential, title, URL, body, or
+ * thrown value. The 1-based ordinals match the JSON progress event shape.
+ */
+export interface EvalFailureDiagnostic {
+  /** `single` for a single-round case, `multi` for a three-step scenario. */
+  readonly phase: "single" | "multi";
+  /** 1-based ordinal within the whole corpus (single first, then multi). */
+  readonly caseOrdinal: number;
+  /** 1-based round ordinal within the case (single = 1; multi = 1..N). */
+  readonly roundOrdinal: number;
+  /** The `tool_choice` kind for this round (auto / required / named function). */
+  readonly choiceKind: "auto" | "required" | "function";
+  /** The closed value-free reason the scoring engine could not credit this round. */
+  readonly reason: EvalFailureReason;
+}
+
+/** Hard cap on persisted diagnostic entries; matches the fixed 280-round corpus. */
+export const MAX_DIAGNOSTIC_FAILURES = 280 as const;
 
 /**
  * A gate's outcome. `not_evaluated` means the scored denominator is zero (never
@@ -234,6 +374,16 @@ export interface ExecutedReport {
   readonly auth: AuthObservation | null;
   readonly checkpoint: CheckpointStateReport;
   readonly aborted: AbortInfo | null;
+  /**
+   * Value-free failure diagnostics for a diagnostic-guided rerun. `failures`
+   * lists at most one PRIMARY diagnostic per FAILED round (see the classifier
+   * in `tools-eval-cli.ts`), bounded by the fixed 280-round corpus and stripped
+   * of every prompt/answer/id/credential/tool-name/model-name value. A complete
+   * passing run emits an empty `failures` array. Only present on `executed`.
+   */
+  readonly diagnostics: {
+    readonly failures: readonly EvalFailureDiagnostic[];
+  };
   readonly passed: boolean;
 }
 

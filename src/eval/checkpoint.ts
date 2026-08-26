@@ -47,10 +47,25 @@ import {
 } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ABORT_REASONS, ABORT_STAGES, type AbortReason, type AbortStage } from "./report.js";
+import {
+  ABORT_REASONS,
+  ABORT_STAGES,
+  EVAL_FAILURE_REASON_SCOPE,
+  evalFailureReasonForCode,
+  MAX_DIAGNOSTIC_FAILURES,
+  type AbortReason,
+  type AbortStage,
+  type EvalFailureDiagnostic,
+} from "./report.js";
+import type { EvalCorpusProjection } from "./cases.js";
 
-/** The only supported on-disk checkpoint format version. */
-export const CHECKPOINT_FORMAT_VERSION = 1 as const;
+/**
+ * The only supported on-disk checkpoint format version. Format 2 adds a
+ * compact, content-free `diagnosticFailures` ledger to persist scored-round
+ * failure diagnostics across resume segments. Format 1 is REJECTED on read (no
+ * migration): a resumed diagnostic run must start from a fresh anchor.
+ */
+export const CHECKPOINT_FORMAT_VERSION = 2 as const;
 /** Fixed checkpoint filename. */
 export const CHECKPOINT_FILENAME = "tools-eval-checkpoint.json";
 
@@ -107,6 +122,28 @@ export function __setCheckpointFsForTests(overrides: Partial<CheckpointFsOps>): 
     fsOps = previous;
   };
 }
+
+/**
+ * A single value-free entry in the compact on-disk diagnostic ledger. Each
+ * triple is `[caseOrdinal, roundOrdinal, reasonCode]`:
+ *  - `caseOrdinal` is a 1-based global corpus ordinal (singles first, then
+ *    multi-step scenarios);
+ *  - `roundOrdinal` is a 1-based round ordinal within the case;
+ *  - `reasonCode` is one of the fixed integers accepted by
+ *    {@link evalFailureReasonForCode} (see `report.ts`).
+ *
+ * The ledger carries NO phase, choice, prompt, answer, argument, tool schema,
+ * tool name, model name, thread id, credential, title, URL, body, or thrown
+ * value. Phase, choice, and human-readable reason are rehydrated from the
+ * fingerprint-bound {@link buildEvalCases} corpus at report-build time. Storage
+ * is deliberately compact so the worst valid 280-entry ledger stays well below
+ * {@link MAX_CHECKPOINT_BYTES}.
+ */
+export type CheckpointDiagnosticFailure = readonly [
+  caseOrdinal: number,
+  roundOrdinal: number,
+  reasonCode: number,
+];
 
 /** Cumulative cleanup counters persisted across resume segments. */
 export interface CheckpointCleanup {
@@ -172,6 +209,15 @@ export interface CheckpointData {
   readonly cleanup: CheckpointCleanup;
   readonly gates: CheckpointGates;
   readonly invariants: CheckpointInvariants;
+  /**
+   * The compact, content-free ledger of scored-round failure diagnostics
+   * committed by the run. Bounded to {@link MAX_DIAGNOSTIC_FAILURES} entries,
+   * with unique `(caseOrdinal, roundOrdinal)` pairs, and validated against the
+   * fingerprint-bound corpus during {@link validateResumableCheckpoint}. A
+   * complete passing run persists an empty ledger before finalization removes
+   * the checkpoint.
+   */
+  readonly diagnosticFailures: readonly CheckpointDiagnosticFailure[];
 }
 
 /**
@@ -272,10 +318,13 @@ function parseCheckpoint(
       "cleanup",
       "gates",
       "invariants",
+      "diagnosticFailures",
     ],
     "root",
   );
 
+  // Version 1 predates the compact diagnostic ledger; there is deliberately NO
+  // migration path — the resumed run must start from a fresh anchor.
   if (obj["formatVersion"] !== CHECKPOINT_FORMAT_VERSION) {
     throw new Error("checkpoint version is unsupported");
   }
@@ -329,6 +378,8 @@ function parseCheckpoint(
   assertExactKeys(multiObj, ["total", "success"], "gates.multi");
   const invariantsObj = asObject(obj["invariants"], "invariants");
   assertExactKeys(invariantsObj, ["noSilentFallback", "injectionResistance"], "invariants");
+
+  const diagnosticFailures = parseDiagnosticFailures(obj["diagnosticFailures"]);
 
   return {
     formatVersion: CHECKPOINT_FORMAT_VERSION,
@@ -384,7 +435,59 @@ function parseCheckpoint(
         "invariants.injectionResistance",
       ),
     },
+    diagnosticFailures,
   };
+}
+
+/**
+ * Strictly parse the compact `diagnosticFailures` field into a frozen array of
+ * `[caseOrdinal, roundOrdinal, reasonCode]` triples. Bounds are checked here at
+ * the SHAPE level only (safe positive ordinal integers within
+ * {@link MAX_COUNT}, a known reason code, no over-count, and no duplicate
+ * (case, round) pairs). Corpus-bound consistency — that the ordinals reference
+ * a real round at or before `nextCaseIndex` and that the reason matches the
+ * round's expected-tool disposition — lives in
+ * {@link validateResumableCheckpoint}, which is the only place that also owns
+ * the corpus-derived plan.
+ */
+function parseDiagnosticFailures(value: unknown): CheckpointDiagnosticFailure[] {
+  if (!Array.isArray(value)) throw new Error("checkpoint diagnosticFailures shape is invalid");
+  if (value.length > MAX_DIAGNOSTIC_FAILURES) {
+    throw new Error("checkpoint diagnosticFailures exceeds bound");
+  }
+  const seen = new Set<string>();
+  const out: CheckpointDiagnosticFailure[] = [];
+  for (let i = 0; i < value.length; i += 1) {
+    const entry: unknown = value[i];
+    if (!Array.isArray(entry) || entry.length !== 3) {
+      throw new Error("checkpoint diagnosticFailures entry shape is invalid");
+    }
+    const co: unknown = entry[0];
+    const ro: unknown = entry[1];
+    const rc: unknown = entry[2];
+    if (
+      typeof co !== "number" ||
+      !Number.isSafeInteger(co) ||
+      co < 1 ||
+      co > MAX_COUNT ||
+      typeof ro !== "number" ||
+      !Number.isSafeInteger(ro) ||
+      ro < 1 ||
+      ro > MAX_COUNT ||
+      typeof rc !== "number" ||
+      !Number.isSafeInteger(rc)
+    ) {
+      throw new Error("checkpoint diagnosticFailures entry is out of range");
+    }
+    if (evalFailureReasonForCode(rc) === undefined) {
+      throw new Error("checkpoint diagnosticFailures reason code is unknown");
+    }
+    const key = `${co}:${ro}`;
+    if (seen.has(key)) throw new Error("checkpoint diagnosticFailures has duplicate ordinal pair");
+    seen.add(key);
+    out.push(Object.freeze([co, ro, rc]));
+  }
+  return out;
 }
 
 /** Read the exact bytes of an opened descriptor under a hard cap. */
@@ -534,7 +637,12 @@ export function checkpointExists(loc: CheckpointLocation): boolean {
   }
 }
 
-/** Serialize a checkpoint payload with all counts revalidated defensively. */
+/**
+ * Serialize a checkpoint payload with all counts revalidated defensively. The
+ * output is COMPACT JSON (no indentation) so the worst valid 280-entry
+ * diagnostic ledger stays comfortably below {@link MAX_CHECKPOINT_BYTES}; this
+ * is a private on-disk artifact and never intended for human hand-editing.
+ */
 function serialize(data: CheckpointData): string {
   if (data.formatVersion !== CHECKPOINT_FORMAT_VERSION) {
     throw new Error("checkpoint version is unsupported");
@@ -576,7 +684,49 @@ function serialize(data: CheckpointData): string {
   assertCount(data.gates.multi.success, "gates.multi.success");
   assertBoolean(data.invariants.noSilentFallback, "invariants.noSilentFallback");
   assertBoolean(data.invariants.injectionResistance, "invariants.injectionResistance");
-  return JSON.stringify(data, null, 2) + "\n";
+  assertDiagnosticFailuresShape(data.diagnosticFailures);
+  return JSON.stringify(data) + "\n";
+}
+
+/**
+ * Shape-check a diagnostic ledger before serialization. This mirrors the
+ * post-parse checks in {@link parseDiagnosticFailures} so a hostile caller
+ * cannot slip a malformed ledger onto disk via {@link writeCheckpoint}.
+ */
+function assertDiagnosticFailuresShape(
+  entries: readonly CheckpointDiagnosticFailure[] | undefined,
+): void {
+  if (!Array.isArray(entries)) throw new Error("checkpoint diagnosticFailures shape is invalid");
+  if (entries.length > MAX_DIAGNOSTIC_FAILURES) {
+    throw new Error("checkpoint diagnosticFailures exceeds bound");
+  }
+  const seen = new Set<string>();
+  for (const entry of entries) {
+    if (!Array.isArray(entry) || entry.length !== 3) {
+      throw new Error("checkpoint diagnosticFailures entry shape is invalid");
+    }
+    const co: unknown = entry[0];
+    const ro: unknown = entry[1];
+    const rc: unknown = entry[2];
+    if (
+      typeof co !== "number" ||
+      !Number.isSafeInteger(co) ||
+      co < 1 ||
+      co > MAX_COUNT ||
+      typeof ro !== "number" ||
+      !Number.isSafeInteger(ro) ||
+      ro < 1 ||
+      ro > MAX_COUNT ||
+      typeof rc !== "number" ||
+      !Number.isSafeInteger(rc) ||
+      evalFailureReasonForCode(rc) === undefined
+    ) {
+      throw new Error("checkpoint diagnosticFailures entry is invalid");
+    }
+    const key = `${co}:${ro}`;
+    if (seen.has(key)) throw new Error("checkpoint diagnosticFailures has duplicate ordinal pair");
+    seen.add(key);
+  }
 }
 
 /**
@@ -652,69 +802,100 @@ export function writeCheckpoint(loc: CheckpointLocation, data: CheckpointData): 
 }
 
 /**
- * The corpus-derived plan projection the resumable-checkpoint validator needs
- * (finding 1). It keeps the two per-scenario multipliers explicitly DISTINCT: a
- * committed three-step scenario contributes {@link expectedCallsPerScenario} to
- * the GATE denominators (rounds with an expected tool call) but
- * {@link maxRoundsPerCase} UPSTREAM ROUNDS (read + edit + test + final answer).
- * All values are derived from the real corpus, never from checkpoint-claimed sizes.
- */
-export interface ResumableCheckpointPlan {
-  readonly plannedSingle: number;
-  readonly plannedMulti: number;
-  /** Expected-tool-call rounds per committed multi scenario (gate-denominator multiplier). */
-  readonly expectedCallsPerScenario: number;
-  /** Upstream rounds per committed multi scenario (round-counter multiplier). */
-  readonly maxRoundsPerCase: number;
-}
-
-/**
- * Semantic (corpus-bound) validation of a RESUMABLE checkpoint against the actual
- * plan (finding 1). Enforces that a persisted resumable checkpoint's cursor,
- * committed case counts, gate denominators/numerators, upstream-round counters,
- * and cleanup accounting are consistent with the plan, so a forged or internally-
- * inconsistent checkpoint (e.g. a "complete + passing, zero-attempt" file, a
- * scenario that skipped its final-answer round, or an arbitrarily inflated counter)
- * is rejected BEFORE any credential read or network I/O and can never grant an
- * executed pass. All planned bounds come from the supplied plan.
+ * Semantic (corpus-bound) validation of a RESUMABLE checkpoint against the
+ * ACTUAL fingerprint-bound corpus projection (findings 1 + 2). Enforces that a
+ * persisted resumable checkpoint's cursor, committed case counts, gate
+ * denominators/numerators, upstream-round counters, and cleanup accounting are
+ * consistent with the projection, so a forged or internally-inconsistent
+ * checkpoint (e.g. a "complete + passing, zero-attempt" file, a scenario that
+ * skipped its final-answer round, or an arbitrarily inflated counter) is
+ * rejected BEFORE any credential read or network I/O and can never grant an
+ * executed pass. All planned bounds and per-round layout come from the
+ * supplied projection — never from checkpoint-claimed sizes.
  *
- * A resumable checkpoint MUST have `nextCaseIndex` STRICTLY less than the corpus
- * length: a genuinely complete run removes its checkpoint during finalization, so
- * a persisted resumable checkpoint can never legitimately encode a complete
- * corpus. Because `cursor < length` implies at least one gate denominator is below
- * its planned denominator, a resumed run can never report `passed` without
- * executing the remaining cases live.
+ * The per-case diagnostic checks read `projection.cases[caseIdx0]` DIRECTLY,
+ * so a non-uniform corpus (a case with more/fewer rounds than its peers, or an
+ * expected/final round in an unusual position) is validated round-by-round
+ * rather than reduced to a "first N rounds are expected" inference.
  *
- * Round-counter bounds. A committed multi scenario performs `maxRoundsPerCase`
- * upstream rounds (three tool steps PLUS one final-answer round), so the committed
- * upstream floor is `committedSingle + committedMulti * maxRoundsPerCase` — NOT the
+ * A resumable checkpoint MUST have `nextCaseIndex` STRICTLY less than the
+ * corpus length: a genuinely complete run removes its checkpoint during
+ * finalization, so a persisted resumable checkpoint can never legitimately
+ * encode a complete corpus. Because `cursor < length` implies at least one
+ * gate denominator is below its planned denominator, a resumed run can never
+ * report `passed` without executing the remaining cases live.
+ *
+ * Round-counter bounds. A committed multi scenario performs
+ * `projection.maxRoundsPerCase` upstream rounds (three tool steps PLUS one
+ * final-answer round), so the committed upstream floor is
+ * `committedSingle + committedMulti * maxRoundsPerCase` — NOT the
  * `* expectedCallsPerScenario` gate count. The operational counters
- * (`attemptedRounds`/`completedRounds`) accumulate across resume segments, but a
- * segment aborts at its FIRST non-committing case, so a segment can leave at most
- * ONE in-flight case's worth of uncommitted work: up to `maxRoundsPerCase - 1`
- * completed-but-uncommitted partial-scenario rounds (a mid-scenario interruption
- * restarts and re-counts the scenario) plus at most one terminal failed attempted
- * round. Across `runSegments` segments the counters are therefore bounded ABOVE by
- * the committed floor plus that per-segment slack; an arbitrarily inflated counter
- * is rejected. Throws value-free on any inconsistency.
+ * (`attemptedRounds`/`completedRounds`) accumulate across resume segments, but
+ * a segment aborts at its FIRST non-committing case, so a segment can leave at
+ * most ONE in-flight case's worth of uncommitted work: up to
+ * `maxRoundsPerCase - 1` completed-but-uncommitted partial-scenario rounds (a
+ * mid-scenario interruption restarts and re-counts the scenario) plus at most
+ * one terminal failed attempted round. Across `runSegments` segments the
+ * counters are therefore bounded ABOVE by the committed floor plus that
+ * per-segment slack; an arbitrarily inflated counter is rejected. Throws
+ * value-free on any inconsistency.
  */
 export function validateResumableCheckpoint(
   data: CheckpointData,
-  plan: ResumableCheckpointPlan,
+  projection: EvalCorpusProjection,
 ): void {
   if (data.resumeState !== "resumable" || data.abort !== null) {
     throw new Error("checkpoint is not a resumable checkpoint");
   }
-  const { plannedSingle, plannedMulti, expectedCallsPerScenario, maxRoundsPerCase } = plan;
+  const { plannedSingle, plannedMulti, maxRoundsPerCase, cases } = projection;
+  // Defense-in-depth against a corrupt or hand-crafted projection (finding 2):
+  // production always constructs the projection through
+  // `buildEvalCorpusProjection`, which fails closed on any `choiceKind`
+  // outside the diagnostic union `"auto" | "required" | "function"`. A
+  // supplied projection that bypasses the builder (in a test or a hostile
+  // caller) is re-checked here BEFORE any credential read or network I/O so
+  // a rehydrated diagnostic can never be relabeled to a supported value —
+  // `"none"` in particular must fail closed at this boundary.
+  for (const projectedCase of cases) {
+    for (const projectedRound of projectedCase.rounds) {
+      if (
+        projectedRound.choiceKind !== "auto" &&
+        projectedRound.choiceKind !== "required" &&
+        projectedRound.choiceKind !== "function"
+      ) {
+        throw new Error(
+          "checkpoint validation rejects a projection containing an unsupported tool choice kind",
+        );
+      }
+    }
+  }
   const length = plannedSingle + plannedMulti;
   const cursor = data.nextCaseIndex;
   // A resumable checkpoint is strictly within the corpus (never complete).
   if (!Number.isInteger(cursor) || cursor < 0 || cursor >= length) {
     throw new Error("checkpoint cursor is out of resumable range");
   }
-  const committedSingle = Math.min(cursor, plannedSingle);
-  const committedMulti = Math.max(0, cursor - plannedSingle);
+  // Committed counts + denominators + upstream-round floor come directly from
+  // the ACTUAL first-`cursor` projection cases — never from the aggregate
+  // shortcut `single + multi * maxRoundsPerCase`. For the uniform production
+  // corpus the sums match that shortcut byte-for-byte; for a non-uniform
+  // corpus they honor the actual per-case round layout.
+  let committedSingle = 0;
+  let committedMulti = 0;
+  let committedUpstreamRounds = 0;
+  let expectedCallDenom = 0;
+  for (let idx = 0; idx < cursor; idx += 1) {
+    const projectedCase = cases[idx];
+    if (projectedCase === undefined) {
+      throw new Error("checkpoint cursor references unknown case");
+    }
+    if (projectedCase.phase === "single") committedSingle += 1;
+    else committedMulti += 1;
+    committedUpstreamRounds += projectedCase.rounds.length;
+    for (const r of projectedCase.rounds) if (r.hasExpectedTool) expectedCallDenom += 1;
+  }
   if (committedMulti > plannedMulti) throw new Error("checkpoint committed-multi exceeds plan");
+  if (committedSingle > plannedSingle) throw new Error("checkpoint committed-single exceeds plan");
 
   // Committed case counts are EXACTLY cursor-derived.
   if (data.completedSingleRoundCases !== committedSingle) {
@@ -724,8 +905,7 @@ export function validateResumableCheckpoint(
     throw new Error("checkpoint completed-multi mismatch");
   }
 
-  // Gate denominators exactly match committed cases × expected-calls-per-scenario.
-  const expectedCallDenom = committedSingle + committedMulti * expectedCallsPerScenario;
+  // Gate denominators sum the ACTUAL committed cases' expected-tool rounds.
   if (data.gates.single.total !== committedSingle) {
     throw new Error("checkpoint single denominator mismatch");
   }
@@ -759,9 +939,10 @@ export function validateResumableCheckpoint(
     throw new Error("checkpoint run-segment count is invalid");
   }
 
-  // Upstream-round counters: committed floor uses the FULL rounds-per-scenario, and
-  // the ceilings allow one in-flight case's slack per resume segment.
-  const committedUpstreamRounds = committedSingle + committedMulti * maxRoundsPerCase;
+  // Upstream-round counters: `committedUpstreamRounds` was computed above by
+  // summing the ACTUAL per-case round counts. The ceilings then allow one
+  // in-flight case's slack per resume segment, bounded above by the projection
+  // maximum (`maxRoundsPerCase`).
   const completedCeiling = committedUpstreamRounds + data.runSegments * (maxRoundsPerCase - 1);
   const attemptedCeiling = committedUpstreamRounds + data.runSegments * maxRoundsPerCase;
   if (data.completedRounds > data.attemptedRounds) {
@@ -786,6 +967,98 @@ export function validateResumableCheckpoint(
   if (c.attempted !== c.deleted) throw new Error("checkpoint resumable cleanup not fully deleted");
   if (data.attemptedRounds !== c.attempted)
     throw new Error("checkpoint attempted/cleanup mismatch");
+
+  // Diagnostic ledger: every entry must reference a real corpus round at or
+  // before the current cursor, and its reason must be structurally compatible
+  // with that round's ACTUAL expected-tool disposition — looked up directly
+  // from `projection.cases[caseIdx0].rounds[roundIdx0]`, never inferred from
+  // aggregate position. Duplicates + shape/bound checks were enforced during
+  // parsing; here we bind to the corpus.
+  const cursor1Based = data.nextCaseIndex; // = number of committed cases
+  for (const entry of data.diagnosticFailures) {
+    const [co, ro, rc] = entry;
+    if (co > cursor1Based) {
+      throw new Error("checkpoint diagnosticFailures references uncommitted case");
+    }
+    const caseIdx0 = co - 1;
+    const roundIdx0 = ro - 1;
+    const projectedCase = cases[caseIdx0];
+    if (projectedCase === undefined) {
+      throw new Error("checkpoint diagnosticFailures references unknown round");
+    }
+    const projectedRound = projectedCase.rounds[roundIdx0];
+    if (projectedRound === undefined) {
+      throw new Error("checkpoint diagnosticFailures references unknown round");
+    }
+    const reason = evalFailureReasonForCode(rc);
+    if (reason === undefined) {
+      throw new Error("checkpoint diagnosticFailures reason code is unknown");
+    }
+    const scope = EVAL_FAILURE_REASON_SCOPE[reason];
+    const isExpected = projectedRound.hasExpectedTool;
+    if (scope === "expected" && !isExpected) {
+      throw new Error("checkpoint diagnosticFailures reason incompatible with final round");
+    }
+    if (scope === "final" && isExpected) {
+      throw new Error("checkpoint diagnosticFailures reason incompatible with expected-tool round");
+    }
+  }
+}
+
+/**
+ * Rehydrate a persisted compact `diagnosticFailures` ledger into the report's
+ * expanded {@link EvalFailureDiagnostic} shape using the fingerprint-bound
+ * corpus projection (finding 2). Both `phase` and `choiceKind` are looked up
+ * directly from `projection.cases[caseIdx0]` — never from checkpoint-claimed
+ * data and never inferred from aggregate position. The reason is remapped
+ * through the immutable {@link evalFailureReasonForCode}.
+ *
+ * Fails CLOSED on any impossible entry: an unknown reason code, a case ordinal
+ * beyond the projection, a round ordinal beyond that case, or a `choiceKind`
+ * outside the diagnostic union (specifically `"none"`, which the synthetic
+ * corpus never contains and which {@link buildEvalCorpusProjection} rejects at
+ * build time in production; the check here is defense-in-depth for a
+ * hand-crafted projection). Each impossible entry throws value-free. The
+ * caller MUST have called {@link validateResumableCheckpoint} against the SAME
+ * projection first; this function assumes the ledger has already passed
+ * structural, bound, and semantic corpus-bound validation.
+ */
+export function rehydrateDiagnosticFailures(
+  entries: readonly CheckpointDiagnosticFailure[],
+  projection: EvalCorpusProjection,
+): EvalFailureDiagnostic[] {
+  const out: EvalFailureDiagnostic[] = [];
+  for (const [co, ro, rc] of entries) {
+    const reason = evalFailureReasonForCode(rc);
+    if (reason === undefined) {
+      throw new Error("checkpoint diagnosticFailures reason code is unknown");
+    }
+    const caseIdx0 = co - 1;
+    const roundIdx0 = ro - 1;
+    const projectedCase = projection.cases[caseIdx0];
+    if (projectedCase === undefined) {
+      throw new Error("checkpoint diagnosticFailures references unknown case");
+    }
+    const projectedRound = projectedCase.rounds[roundIdx0];
+    if (projectedRound === undefined) {
+      throw new Error("checkpoint diagnosticFailures references unknown round");
+    }
+    if (
+      projectedRound.choiceKind !== "auto" &&
+      projectedRound.choiceKind !== "required" &&
+      projectedRound.choiceKind !== "function"
+    ) {
+      throw new Error("checkpoint diagnosticFailures references unsupported tool choice");
+    }
+    out.push({
+      phase: projectedCase.phase,
+      caseOrdinal: co,
+      roundOrdinal: ro,
+      choiceKind: projectedRound.choiceKind,
+      reason,
+    });
+  }
+  return out;
 }
 
 /** Remove the checkpoint if present; refuses to unlink a symlink/non-regular file. */

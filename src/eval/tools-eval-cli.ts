@@ -76,6 +76,7 @@ import type { NormalizedChatRequest, NormalizedMessage } from "../openai/chat-ty
 import type { NormalizedTool, NormalizedToolChoice, ParsedToolCall } from "../tools/types.js";
 import {
   buildEvalCases,
+  buildEvalCorpusProjection,
   corpusFingerprint,
   evalPlan,
   SINGLE_ROUND_CASES,
@@ -84,15 +85,19 @@ import {
   type EvalRound,
 } from "./cases.js";
 import {
+  CHECKPOINT_FORMAT_VERSION,
   checkpointExists,
   deleteCheckpoint,
   defaultCheckpointLocation,
   readCheckpoint,
+  rehydrateDiagnosticFailures,
   validateResumableCheckpoint,
   writeCheckpoint,
   type CheckpointData,
+  type CheckpointDiagnosticFailure,
 } from "./checkpoint.js";
 import {
+  EVAL_FAILURE_REASON_CODES,
   EVAL_REPORT_VERSION,
   invariantGate,
   thresholdGate,
@@ -100,6 +105,8 @@ import {
   type AbortStage,
   type BlockedReason,
   type CleanupTotals,
+  type EvalFailureDiagnostic,
+  type EvalFailureReason,
   type EvalOutput,
   type ExecutedReport,
   type GateStatus,
@@ -501,8 +508,13 @@ async function runUpstreamRound(
   };
 }
 
-/** A round's classified generation (value-free; records no name, argument, or text). */
-type RoundDecision =
+/**
+ * A round's classified generation (value-free; records no name, argument, or
+ * text). Exported for the classifier's hermetic unit coverage — production
+ * callers still get it through `classifyDecision` and never construct one
+ * manually.
+ */
+export type RoundDecision =
   | {
       readonly kind: "tool_calls";
       readonly calls: readonly ParsedToolCall[];
@@ -553,6 +565,51 @@ function classifyDecision(
 /** Whether an expected-tool-call round produced the correct allowed call (pure). */
 function expectedCallNameOk(decision: RoundDecision): boolean {
   return decision.kind === "tool_calls" && decision.allAllowed && decision.expectedInvoked;
+}
+
+/**
+ * Deterministically classify a scored round into AT MOST ONE primary
+ * value-free failure reason, following the fixed precedence in
+ * `.agent/instructions/tool-calling.md` / spec §30. Returns `null` when the
+ * round scored acceptably (no diagnostic needed) or when transcript-linkage
+ * needs to be checked separately by the caller.
+ *
+ * For a round WITH `expectedTool`, the precedence is:
+ *   1. `unavailable`          → `expected-tool-unavailable`
+ *   2. `no_valid_call`        → `expected-tool-no-valid-call`
+ *   3. `text`                 → `expected-tool-returned-text`
+ *   4. tool_calls + unauthorized → `unauthorized-tool-call`
+ *   5. tool_calls but expected not invoked → `expected-tool-not-invoked`
+ *   6. tool_calls + expected-invoked → `null` (caller checks transcript
+ *      linkage; a linkage failure becomes `transcript-invalid`)
+ *
+ * For a FINAL round (no `expectedTool`):
+ *   1. `text`                 → `null` (the correct outcome)
+ *   2. `unavailable`          → `final-unavailable`
+ *   3. `no_valid_call`        → `final-no-valid-call`
+ *   4. tool_calls + unauthorized → `unauthorized-tool-call`
+ *   5. any other tool_calls   → `unexpected-tool-call-on-final`
+ *
+ * The classifier reads only kind + boolean flags — never a prompt/answer, tool
+ * name, argument, id, or credential — so it produces no content leakage.
+ */
+export function classifyRoundFailure(
+  decision: RoundDecision,
+  hasExpectedTool: boolean,
+): EvalFailureReason | null {
+  if (hasExpectedTool) {
+    if (decision.kind === "unavailable") return "expected-tool-unavailable";
+    if (decision.kind === "no_valid_call") return "expected-tool-no-valid-call";
+    if (decision.kind === "text") return "expected-tool-returned-text";
+    if (decision.unauthorized) return "unauthorized-tool-call";
+    if (!decision.expectedInvoked) return "expected-tool-not-invoked";
+    return null;
+  }
+  if (decision.kind === "text") return null;
+  if (decision.kind === "unavailable") return "final-unavailable";
+  if (decision.kind === "no_valid_call") return "final-no-valid-call";
+  if (decision.unauthorized) return "unauthorized-tool-call";
+  return "unexpected-tool-call-on-final";
 }
 
 /**
@@ -677,8 +734,21 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
   }
 
   const origin = EVAL_ORIGIN;
-  const fingerprint = corpusFingerprint();
-  const plan = evalPlan();
+  // Build the fingerprint-bound corpus EXACTLY ONCE per run and derive
+  // fingerprint, plan, projection, and the executed case loop from THIS
+  // `cases` value (finding 1). This is the single source of truth: the
+  // fingerprint the checkpoint records, the plan's denominators, the
+  // projection the validator + rehydrator + fresh-diagnostic constructor
+  // trust, and the case iteration below all read from the SAME array
+  // instance, so no divergent rebuilt corpus can slip into the executed
+  // path. `buildEvalCorpusProjection` also fails closed at build if any
+  // round's `choice.kind` is outside the diagnostic union `"auto" |
+  // "required" | "function"` (finding 2), so no downstream path needs a
+  // silent `"none" → "auto"` fallback.
+  const cases = buildEvalCases();
+  const fingerprint = corpusFingerprint(cases);
+  const plan = evalPlan(cases);
+  const projection = buildEvalCorpusProjection(cases);
   const base: TransportBase = { baseUrl: origin };
   const store = deps.makeCheckpointStore(origin, fingerprint);
 
@@ -712,17 +782,15 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
     if (resumed.resumeState === "blocked") {
       return emitBlocked(deps, "checkpoint-blocked", "checkpoint-init");
     }
-    // SEMANTIC (corpus-bound) validation against the ACTUAL plan (finding 1): a
-    // forged / internally-inconsistent checkpoint — including any claim of a
-    // complete + passing corpus — is rejected here, before any credential read
-    // or network I/O, so it can never produce a zero-network executed pass.
+    // SEMANTIC (corpus-bound) validation against the ACTUAL fingerprint-bound
+    // corpus projection (finding 2): a forged / internally-inconsistent
+    // checkpoint — including any claim of a complete + passing corpus, and any
+    // diagnostic entry referencing a round that does not exist in the corpus
+    // or whose reason is structurally incompatible with the ACTUAL round — is
+    // rejected here, before any credential read or network I/O, so it can
+    // never produce a zero-network executed pass.
     try {
-      validateResumableCheckpoint(resumed, {
-        plannedSingle: plan.single,
-        plannedMulti: plan.multi,
-        expectedCallsPerScenario: plan.expectedCallsPerScenario,
-        maxRoundsPerCase: plan.maxRoundsPerCase,
-      });
+      validateResumableCheckpoint(resumed, projection);
     } catch {
       return emitBlocked(deps, "checkpoint-inconsistent", "checkpoint-init");
     }
@@ -767,12 +835,38 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
   let noSilentFallback = resumed?.invariants.noSilentFallback ?? true;
   let injectionResistance = resumed?.invariants.injectionResistance ?? true;
 
+  // Committed value-free failure diagnostics, both the resumed slice (rehydrated
+  // from the compact on-disk ledger) and any new commits this segment will add.
+  // The array is bounded by the fixed 280-round corpus (there is one entry per
+  // FAILED committed round, at most). Multi-step scenarios accumulate their
+  // rounds' diagnostics locally and commit here only when the whole scenario
+  // commits; a mid-scenario abort discards those pending entries.
+  const committedDiagnostics: EvalFailureDiagnostic[] = [];
+  if (resumed !== null) {
+    // The projection above is the SAME projection the validator used, so a
+    // rehydrated entry's `phase` and `choiceKind` come directly from the
+    // actual case/round and cannot silently disagree with validation.
+    const rehydrated = rehydrateDiagnosticFailures(resumed.diagnosticFailures, projection);
+    for (const d of rehydrated) committedDiagnostics.push(d);
+  }
+
+  /** Snapshot the committed ledger into the compact on-disk representation. */
+  const diagnosticFailuresSnapshot = (): CheckpointDiagnosticFailure[] =>
+    committedDiagnostics.map(
+      (d) =>
+        [d.caseOrdinal, d.roundOrdinal, EVAL_FAILURE_REASON_CODES[d.reason]] as [
+          number,
+          number,
+          number,
+        ],
+    );
+
   const buildCheckpoint = (
     nextIdx: number,
     resumeState: "resumable" | "blocked",
     abort: { stage: AbortInfo["stage"]; reason: AbortInfo["reason"] } | null,
   ): CheckpointData => ({
-    formatVersion: 1,
+    formatVersion: CHECKPOINT_FORMAT_VERSION,
     origin,
     authMode: "password",
     corpusFingerprint: fingerprint,
@@ -796,6 +890,7 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
       multi: { ...multi },
     },
     invariants: { noSilentFallback, injectionResistance },
+    diagnosticFailures: diagnosticFailuresSnapshot(),
   });
 
   /** Persist a RESUMABLE checkpoint at `nextIdx`; returns an abort on failure. */
@@ -993,6 +1088,7 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
       persistFailed,
       scoredComplete,
       aborted,
+      diagnosticFailures: [...committedDiagnostics],
     });
     return report.passed ? 0 : 1;
   };
@@ -1041,7 +1137,6 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
   const poller = createPoller(adapter);
   const deleter: BoundDeleter = (threadId, signal) =>
     deps.deleteThread(base, provider, threadId, signal);
-  const cases = buildEvalCases();
 
   // Work signal (aborted on interruption) and an INDEPENDENT cleanup signal that
   // stays live so an interrupted round can still delete its recorded thread.
@@ -1187,6 +1282,10 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
       if (isMulti) {
         const history: NormalizedMessage[] = [];
         const pending: RoundDecision[] = [];
+        // Pending value-free diagnostics for this scenario's failed rounds.
+        // Committed into `committedDiagnostics` ONLY when the whole scenario
+        // commits; a mid-scenario abort discards them (spec §30 lifecycle).
+        const pendingScenarioDiagnostics: EvalFailureDiagnostic[] = [];
         let scenarioOk = true;
         let scenarioAbort: AbortInfo | null = null;
         for (let r = 0; r < evalCase.rounds.length; r += 1) {
@@ -1230,6 +1329,7 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
           }
           const decision = classifyDecision(step.outcome, toolset, round, evalCase.selectedLlms);
           flagViolations(decision, round.choice);
+          let reason = classifyRoundFailure(decision, round.expectedTool !== undefined);
           if (round.expectedTool !== undefined) {
             // Defer the SCORED gate accumulation until the whole scenario finishes.
             pending.push(decision);
@@ -1249,10 +1349,40 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
               for (const call of decision.calls) {
                 history.push({ role: "tool", content: SYNTHETIC_TOOL_RESULT, toolCallId: call.id });
               }
-              if (!transcriptValid(history, evalCase.tools)) scenarioOk = false;
+              if (!transcriptValid(history, evalCase.tools)) {
+                scenarioOk = false;
+                // Precedence step 6: the expected tool was selected and allowed,
+                // but the transcript linkage the gateway would build for the
+                // next round fails re-validation. Override any null classifier
+                // result with the specific `transcript-invalid` reason.
+                reason = "transcript-invalid";
+              }
             }
           } else if (decision.kind !== "text") {
             scenarioOk = false;
+          }
+          if (reason !== null) {
+            // Read `choiceKind` from the fingerprint-bound corpus projection
+            // (finding 2). The projection was built at the top of the run and
+            // is already narrowed to the closed diagnostic union `"auto" |
+            // "required" | "function"` — a corpus containing `"none"` would
+            // have failed `buildEvalCorpusProjection` above, before any
+            // credential read or network I/O. No fallback path is needed.
+            const projectedChoiceKind = projection.cases[i]?.rounds[r]?.choiceKind;
+            if (projectedChoiceKind === undefined) {
+              // Corrupt projection (would be caught by `validateResumableCheckpoint`
+              // on resume, but defense-in-depth for a fresh run too).
+              throw new Error(
+                "eval diagnostic references a case/round outside the corpus projection",
+              );
+            }
+            pendingScenarioDiagnostics.push({
+              phase: "multi",
+              caseOrdinal: i + 1,
+              roundOrdinal: r + 1,
+              choiceKind: projectedChoiceKind,
+              reason,
+            });
           }
           // Persist per-round: cleanup counters advance, but the case cursor and
           // the scenario's gate measurements do NOT until the scenario completes.
@@ -1270,8 +1400,11 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
           aborted = scenarioAbort;
           break outer;
         }
-        // Whole scenario completed: commit the deferred gate measurements now.
+        // Whole scenario completed: commit the deferred gate measurements AND
+        // the deferred diagnostics now. A mid-scenario abort above dropped
+        // both; a completed scenario commits both together, atomically.
         for (const decision of pending) commitExpectedCall(decision);
+        for (const d of pendingScenarioDiagnostics) committedDiagnostics.push(d);
         multi.total += 1;
         if (scenarioOk) multi.success += 1;
         completedMulti += 1;
@@ -1313,11 +1446,31 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
         }
         const decision = classifyDecision(step.outcome, toolset, round, evalCase.selectedLlms);
         flagViolations(decision, round.choice);
+        const singleReason = classifyRoundFailure(decision, round.expectedTool !== undefined);
         if (round.expectedTool !== undefined) {
           const nameOk = expectedCallNameOk(decision);
           commitExpectedCall(decision);
           single.total += 1;
           if (nameOk) single.success += 1;
+        }
+        if (singleReason !== null) {
+          // Same projection-bound narrowing as the multi-step commit above
+          // (finding 2). The projection is already validated to be within the
+          // diagnostic choice union at build time, so no `"none" → "auto"`
+          // fallback is ever needed.
+          const projectedChoiceKind = projection.cases[i]?.rounds[0]?.choiceKind;
+          if (projectedChoiceKind === undefined) {
+            throw new Error(
+              "eval diagnostic references a case/round outside the corpus projection",
+            );
+          }
+          committedDiagnostics.push({
+            phase: "single",
+            caseOrdinal: i + 1,
+            roundOrdinal: 1,
+            choiceKind: projectedChoiceKind,
+            reason: singleReason,
+          });
         }
         completedSingle += 1;
         nextCaseIndex = i + 1;
@@ -1374,6 +1527,7 @@ interface ExecutedParams {
   readonly persistFailed: boolean;
   readonly scoredComplete: boolean;
   readonly aborted: AbortInfo | null;
+  readonly diagnosticFailures: readonly EvalFailureDiagnostic[];
 }
 
 /** Assemble and emit the final executed report; returns it for the exit code. */
@@ -1468,6 +1622,7 @@ function emitExecuted(deps: ToolsEvalDeps, p: ExecutedParams): ExecutedReport {
       persistFailed: p.persistFailed,
     },
     aborted: p.aborted,
+    diagnostics: { failures: p.diagnosticFailures },
     passed,
   };
   deps.emit(report);

@@ -8,25 +8,30 @@
 import { describe, expect, it } from "vitest";
 import {
   buildPreflightReport,
+  classifyRoundFailure,
   defaultToolsEvalDeps,
   parseEvalArgs,
   runToolsEval,
   EVAL_ORIGIN,
   type BuiltProvider,
   type CheckpointStore,
+  type RoundDecision,
   type ToolsEvalDeps,
 } from "../../src/eval/tools-eval-cli.js";
 import {
   ABORT_REASONS,
   BLOCKED_REASONS,
+  EVAL_FAILURE_REASON_CODES,
+  EVAL_REPORT_VERSION,
   type BlockedReport,
+  type EvalFailureReason,
   type EvalOutput,
   type ExecutedReport,
   type PreflightReport,
   type ProgressEvent,
 } from "../../src/eval/report.js";
 import { corpusFingerprint, buildEvalCases } from "../../src/eval/cases.js";
-import type { CheckpointData } from "../../src/eval/checkpoint.js";
+import { CHECKPOINT_FORMAT_VERSION, type CheckpointData } from "../../src/eval/checkpoint.js";
 import type {
   CollectivIQAdapter,
   CollectivIQCredentialProvider,
@@ -274,7 +279,7 @@ function progressEvents(emitted: EvalOutput[]): ProgressEvent[] {
 /** Build a seed checkpoint pointing at `nextCaseIndex` with the real corpus fingerprint. */
 function seedCheckpoint(nextCaseIndex: number, over: Partial<CheckpointData> = {}): CheckpointData {
   return {
-    formatVersion: 1,
+    formatVersion: CHECKPOINT_FORMAT_VERSION,
     origin: EVAL_ORIGIN,
     authMode: "password",
     corpusFingerprint: corpusFingerprint(),
@@ -298,6 +303,7 @@ function seedCheckpoint(nextCaseIndex: number, over: Partial<CheckpointData> = {
       multi: { total: 0, success: 0 },
     },
     invariants: { noSilentFallback: true, injectionResistance: true },
+    diagnosticFailures: [],
     ...over,
   };
 }
@@ -1075,6 +1081,16 @@ describe("eval:tools — corpus fingerprint is deterministic and content-free", 
     // The corpus has the expected shape.
     expect(buildEvalCases()).toHaveLength(220);
   });
+
+  it("Finding 1: fingerprint(cases) matches fingerprint() when cases === buildEvalCases()", () => {
+    // The executed evaluator now builds `cases` ONCE and passes the same
+    // array to `corpusFingerprint(cases)` and `evalPlan(cases)`. Confirm the
+    // supplied form agrees with the zero-arg form byte-for-byte — a fresh
+    // rebuild inside those helpers would have been a redundant build, but the
+    // digest must remain stable for existing resumable checkpoints.
+    const cases = buildEvalCases();
+    expect(corpusFingerprint(cases)).toBe(corpusFingerprint());
+  });
 });
 
 /** An adapter whose createThread always rejects (an ambiguous-create failure). */
@@ -1563,5 +1579,538 @@ describe("eval:tools — production default deleter wiring (hermetic)", () => {
 
   it("the fixed origin is the production one and is never injectable", () => {
     expect(EVAL_ORIGIN).toBe("https://api.prod.collectiviq.ai");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Failure diagnostics (report v3 / checkpoint v2 / classifier + resume)
+// ---------------------------------------------------------------------------
+
+/**
+ * The sentinel values below are SYNTHETIC and match no real customer content.
+ * They exist only to prove absence-scans catch any leak into report/checkpoint.
+ */
+const NAME_SENTINEL = "read";
+const ARG_SENTINEL = "SYNTH-ARG-VALUE-eef2";
+const PROMPT_SENTINEL = "Synthetic single-round task"; // literal from cases.ts
+
+/** A poll-outcome-shaped synthetic response with a single Claude message. */
+function claudeMessage(envelope: string) {
+  return {
+    messages: [
+      {
+        source: "claude" as const,
+        content: envelope,
+        percentUsage: null,
+        createdAt: 1,
+        id: 1,
+      },
+    ],
+    rawStatus: 200,
+  };
+}
+
+/**
+ * An adapter that returns per-round envelopes based on a 1-based case ordinal
+ * (thread id counter). Single-round cases occupy ordinals 1..200 exactly; each
+ * multi-step scenario's four rounds occupy ordinals 201+.
+ */
+function ordinalAdapter(envelopePerOrdinal: (ordinal: number) => string): CollectivIQAdapter {
+  let created = 0;
+  return {
+    createThread: () => {
+      created += 1;
+      return Promise.resolve({ threadId: `t${created}`, rawStatus: 200 });
+    },
+    processMessage: () => Promise.resolve({ accepted: true, rawStatus: 202 }),
+    getMessages: () => Promise.resolve(claudeMessage(envelopePerOrdinal(created))),
+    getThreadTitle: () => Promise.resolve({ kind: "pending" as const }),
+  };
+}
+
+const readCallEnvelope = JSON.stringify({
+  gateway_protocol: "1.0",
+  type: "tool_calls",
+  calls: [{ name: "read", arguments: { path: "synthetic/x" } }],
+});
+const editCallEnvelope = JSON.stringify({
+  gateway_protocol: "1.0",
+  type: "tool_calls",
+  calls: [{ name: "edit", arguments: { path: "synthetic/x", text: "v2" } }],
+});
+const testCallEnvelope = JSON.stringify({
+  gateway_protocol: "1.0",
+  type: "tool_calls",
+  calls: [{ name: "test", arguments: {} }],
+});
+const finalEnvelope = JSON.stringify({
+  gateway_protocol: "1.0",
+  type: "final",
+  content: "synthetic summary",
+});
+const malformedEnvelope = "not a valid envelope at all";
+
+/**
+ * The scoring adapter used by the six-miss arithmetic and passing-run scans.
+ * Rounds map by 1-based ordinal:
+ *   1: auto     → final       → decision:text          (expected-tool-returned-text)
+ *   2: required → final       → decision:no_valid_call (expected-tool-no-valid-call)
+ *   3: function → final       → decision:no_valid_call (expected-tool-no-valid-call)
+ *   4: auto     → edit call   → decision:tool_calls allowed w/o expected (expected-tool-not-invoked)
+ *   5: required → edit call   → decision:tool_calls allowed w/o expected (expected-tool-not-invoked)
+ *   7: auto     → edit call   → decision:tool_calls allowed w/o expected (expected-tool-not-invoked)
+ * Every other single-round + multi-step round returns the expected tool call
+ * (or final for multi-step round 4). This yields exactly 6 diagnostics, gates
+ * schemaValid=257, nameAccurate=254, argValid=257 over the 260 expected-call
+ * denominator, single=194/200 (passes 90%), multi=20/20 (passes 85%), and
+ * toolNameAccuracy 254/260 = 97.7% fails the 98% threshold.
+ */
+function sixMissAdapter(): CollectivIQAdapter {
+  const missByOrdinal = new Map<number, string>([
+    [1, finalEnvelope],
+    [2, finalEnvelope],
+    [3, finalEnvelope],
+    [4, editCallEnvelope],
+    [5, editCallEnvelope],
+    [7, editCallEnvelope],
+  ]);
+  const forOrdinal = (ordinal: number): string => {
+    const injected = missByOrdinal.get(ordinal);
+    if (injected !== undefined) return injected;
+    // Multi-step rounds start at ordinal 201: read/edit/test/final per scenario.
+    if (ordinal > 200) {
+      const roundInScenario = ((ordinal - 201) % 4) + 1; // 1..4
+      if (roundInScenario === 1) return readCallEnvelope;
+      if (roundInScenario === 2) return editCallEnvelope;
+      if (roundInScenario === 3) return testCallEnvelope;
+      return finalEnvelope;
+    }
+    return readCallEnvelope;
+  };
+  return ordinalAdapter(forOrdinal);
+}
+
+/** All expected-tool rounds miss because the model always returns final text. */
+function alwaysFinalAdapter(): CollectivIQAdapter {
+  return ordinalAdapter(() => finalEnvelope);
+}
+
+/** All expected-tool rounds miss because the model always returns malformed output. */
+function alwaysMalformedAdapter(): CollectivIQAdapter {
+  return ordinalAdapter(() => malformedEnvelope);
+}
+
+describe("eval:tools — report version 3 across every mode", () => {
+  it("preflight emits version 3", async () => {
+    const h = harness({ argv: [] });
+    await runToolsEval(h.deps);
+    expect((h.emitted[0] as PreflightReport).version).toBe(3);
+    expect(EVAL_REPORT_VERSION).toBe(3);
+  });
+
+  it("blocked emits version 3 (with no failures collection)", async () => {
+    const h = harness({ argv: fullArgv, store: memCheckpointStore(seedCheckpoint(100)) });
+    await runToolsEval(h.deps);
+    const record = h.emitted[0] as BlockedReport;
+    expect(record.version).toBe(3);
+    // Blocked reports carry no diagnostics collection (only executed does).
+    expect(Object.hasOwn(record, "diagnostics")).toBe(false);
+  });
+
+  it("progress + executed emit version 3", async () => {
+    const h = harness({ argv: fullArgv });
+    await runToolsEval(h.deps);
+    for (const record of h.emitted) expect(record.version).toBe(3);
+    const record = executed(h.emitted);
+    expect(record.version).toBe(3);
+  });
+});
+
+describe("eval:tools — passing run emits an empty diagnostics.failures array", () => {
+  it("a fully-clean, fully-passing corpus has zero diagnostics", async () => {
+    const h = harness({ argv: fullArgv });
+    const code = await runToolsEval(h.deps);
+    expect(code).toBe(0);
+    const report = executed(h.emitted);
+    expect(report.passed).toBe(true);
+    expect(report.diagnostics).toEqual({ failures: [] });
+    // Not a proxy or hidden accessor: it is a genuine own array.
+    expect(Array.isArray(report.diagnostics.failures)).toBe(true);
+  });
+});
+
+describe("eval:tools — deterministic classifier precedence", () => {
+  const toolCallsDecision = (
+    over: Partial<Extract<RoundDecision, { kind: "tool_calls" }>> = {},
+  ): RoundDecision => ({
+    kind: "tool_calls",
+    calls: [] as never,
+    allAllowed: true,
+    expectedInvoked: true,
+    unauthorized: false,
+    ...over,
+  });
+
+  it("expected-tool round: unavailable → expected-tool-unavailable", () => {
+    expect(classifyRoundFailure({ kind: "unavailable" }, true)).toBe("expected-tool-unavailable");
+  });
+  it("expected-tool round: no_valid_call → expected-tool-no-valid-call", () => {
+    expect(classifyRoundFailure({ kind: "no_valid_call" }, true)).toBe(
+      "expected-tool-no-valid-call",
+    );
+  });
+  it("expected-tool round: text → expected-tool-returned-text", () => {
+    expect(classifyRoundFailure({ kind: "text" }, true)).toBe("expected-tool-returned-text");
+  });
+  it("expected-tool round: tool_calls unauthorized → unauthorized-tool-call", () => {
+    expect(
+      classifyRoundFailure(
+        toolCallsDecision({ allAllowed: false, unauthorized: true, expectedInvoked: false }),
+        true,
+      ),
+    ).toBe("unauthorized-tool-call");
+  });
+  it("expected-tool round: allowed but expected-not-invoked → expected-tool-not-invoked", () => {
+    expect(classifyRoundFailure(toolCallsDecision({ expectedInvoked: false }), true)).toBe(
+      "expected-tool-not-invoked",
+    );
+  });
+  it("expected-tool round: expected-invoked + allowed → null (caller checks transcript linkage)", () => {
+    expect(classifyRoundFailure(toolCallsDecision(), true)).toBeNull();
+  });
+
+  it("final round: text → null (correct outcome)", () => {
+    expect(classifyRoundFailure({ kind: "text" }, false)).toBeNull();
+  });
+  it("final round: unavailable → final-unavailable", () => {
+    expect(classifyRoundFailure({ kind: "unavailable" }, false)).toBe("final-unavailable");
+  });
+  it("final round: no_valid_call → final-no-valid-call", () => {
+    expect(classifyRoundFailure({ kind: "no_valid_call" }, false)).toBe("final-no-valid-call");
+  });
+  it("final round: unauthorized tool_calls → unauthorized-tool-call", () => {
+    expect(
+      classifyRoundFailure(toolCallsDecision({ allAllowed: false, unauthorized: true }), false),
+    ).toBe("unauthorized-tool-call");
+  });
+  it("final round: any other tool_calls → unexpected-tool-call-on-final", () => {
+    expect(classifyRoundFailure(toolCallsDecision(), false)).toBe("unexpected-tool-call-on-final");
+  });
+
+  it("classifier precedence: unauthorized beats expected-tool-not-invoked", () => {
+    // Both flags set — the closed union prioritizes the authorization violation.
+    expect(
+      classifyRoundFailure(
+        toolCallsDecision({
+          allAllowed: false,
+          unauthorized: true,
+          expectedInvoked: false,
+        }),
+        true,
+      ),
+    ).toBe("unauthorized-tool-call");
+  });
+
+  it("every closed reason has a fixed numeric code", () => {
+    const codes: readonly EvalFailureReason[] = [
+      "expected-tool-returned-text",
+      "expected-tool-no-valid-call",
+      "expected-tool-unavailable",
+      "expected-tool-not-invoked",
+      "unauthorized-tool-call",
+      "transcript-invalid",
+      "unexpected-tool-call-on-final",
+      "final-no-valid-call",
+      "final-unavailable",
+    ];
+    for (const reason of codes) {
+      expect(typeof EVAL_FAILURE_REASON_CODES[reason]).toBe("number");
+    }
+    // Codes are unique.
+    const codeSet = new Set(Object.values(EVAL_FAILURE_REASON_CODES));
+    expect(codeSet.size).toBe(codes.length);
+  });
+});
+
+describe("eval:tools — six-miss arithmetic and diagnostic classification", () => {
+  it("produces exactly the story counts and one diagnostic per failed round", async () => {
+    const h = harness({ argv: fullArgv, makeAdapter: () => sixMissAdapter() });
+    const code = await runToolsEval(h.deps);
+    // toolNameAccuracy fails → passed = false.
+    expect(code).toBe(1);
+    const report = executed(h.emitted);
+    // Gate arithmetic matches the sanitized 2026-08-26 story shape.
+    expect(report.gates.schemaValidity.numerator).toBe(257);
+    expect(report.gates.schemaValidity.denominator).toBe(260);
+    expect(report.gates.schemaValidity.status).toBe("passed");
+    expect(report.gates.toolNameAccuracy.numerator).toBe(254);
+    expect(report.gates.toolNameAccuracy.denominator).toBe(260);
+    expect(report.gates.toolNameAccuracy.status).toBe("failed");
+    expect(report.gates.argValidity.numerator).toBe(257);
+    expect(report.gates.argValidity.denominator).toBe(260);
+    expect(report.gates.argValidity.status).toBe("passed");
+    // Diagnostics: exactly six primary reasons.
+    const failures = report.diagnostics.failures;
+    expect(failures).toHaveLength(6);
+    // Exactly one entry per failed round (unique (caseOrdinal, roundOrdinal)).
+    const keys = failures.map((d) => `${d.caseOrdinal}:${d.roundOrdinal}`);
+    expect(new Set(keys).size).toBe(6);
+    // Byte-for-byte closed unions with no other keys.
+    for (const d of failures) {
+      expect(new Set(Object.keys(d))).toEqual(
+        new Set(["phase", "caseOrdinal", "roundOrdinal", "choiceKind", "reason"]),
+      );
+      expect(d.phase).toBe("single");
+      expect(d.roundOrdinal).toBe(1);
+    }
+    // Sorted by classifier attribution:
+    //  cases 1,2,3 → 3 schema-invalid diagnostics; cases 4,5,7 → 3 wrong-name diagnostics.
+    const byOrdinal = new Map(failures.map((d) => [d.caseOrdinal, d]));
+    expect(byOrdinal.get(1)?.reason).toBe("expected-tool-returned-text");
+    expect(byOrdinal.get(1)?.choiceKind).toBe("auto");
+    expect(byOrdinal.get(2)?.reason).toBe("expected-tool-no-valid-call");
+    expect(byOrdinal.get(2)?.choiceKind).toBe("required");
+    expect(byOrdinal.get(3)?.reason).toBe("expected-tool-no-valid-call");
+    expect(byOrdinal.get(3)?.choiceKind).toBe("function");
+    for (const ord of [4, 5, 7] as const) {
+      expect(byOrdinal.get(ord)?.reason).toBe("expected-tool-not-invoked");
+    }
+    // Single-round success = 194/200 (six missed rounds), multi = 20/20.
+    expect(report.gates.singleRoundSuccess.numerator).toBe(194);
+    expect(report.gates.singleRoundSuccess.denominator).toBe(200);
+    expect(report.gates.singleRoundSuccess.status).toBe("passed");
+    expect(report.gates.multiStepSuccess.numerator).toBe(20);
+    expect(report.gates.multiStepSuccess.denominator).toBe(20);
+    expect(report.gates.multiStepSuccess.status).toBe("passed");
+  });
+
+  it("existing gate results are byte-for-byte identical to a diagnostics-blind snapshot", async () => {
+    // Prove that diagnostics do NOT influence gate accumulators or overall pass/fail.
+    const h = harness({ argv: fullArgv, makeAdapter: () => sixMissAdapter() });
+    await runToolsEval(h.deps);
+    const report = executed(h.emitted);
+    // Build a `diagnostics-blind` clone stripped of failures + reserialized.
+    const withoutDiags = JSON.parse(
+      JSON.stringify({ ...report, diagnostics: undefined }),
+    ) as ExecutedReport;
+    for (const key of [
+      "schemaValidity",
+      "toolNameAccuracy",
+      "argValidity",
+      "singleRoundSuccess",
+      "multiStepSuccess",
+    ] as const) {
+      expect(withoutDiags.gates[key]).toEqual(report.gates[key]);
+    }
+    expect(withoutDiags.passed).toBe(report.passed);
+  });
+
+  it("diagnostic entries never expose prompts, answers, tool names, model names, arguments, ids, or credentials", async () => {
+    const h = harness({ argv: fullArgv, makeAdapter: () => sixMissAdapter() });
+    await runToolsEval(h.deps);
+    const report = executed(h.emitted);
+    const serialized = JSON.stringify(report.diagnostics.failures);
+    for (const sentinel of [
+      NAME_SENTINEL,
+      "edit",
+      "test",
+      ARG_SENTINEL,
+      PROMPT_SENTINEL,
+      "synthetic/doc",
+      "call_ciq_",
+      CRED_SENTINEL,
+      "claude",
+      "synthetic summary",
+    ]) {
+      expect(serialized).not.toContain(sentinel);
+    }
+    // Nor the full emitted stream.
+    const full = JSON.stringify(h.emitted);
+    expect(full).not.toContain(CRED_SENTINEL);
+  });
+});
+
+describe("eval:tools — multi-step transcript and final-round diagnostics", () => {
+  it("classifies a final round returning a tool_call as unexpected-tool-call-on-final", async () => {
+    // Every round returns a `read` tool call, including the FINAL (round 4) of
+    // each multi-step scenario — which must instead be final text.
+    const h = harness({
+      argv: fullArgv,
+      makeAdapter: () => ordinalAdapter(() => readCallEnvelope),
+    });
+    const code = await runToolsEval(h.deps);
+    expect(code).toBe(1);
+    const report = executed(h.emitted);
+    const finalRoundFailures = report.diagnostics.failures.filter(
+      (d) => d.phase === "multi" && d.roundOrdinal === 4,
+    );
+    expect(finalRoundFailures).toHaveLength(20);
+    for (const d of finalRoundFailures) {
+      expect(d.reason).toBe("unexpected-tool-call-on-final");
+    }
+  });
+
+  it("classifies expected-tool rounds returning text uniformly, over the whole corpus", async () => {
+    const h = harness({ argv: fullArgv, makeAdapter: () => alwaysFinalAdapter() });
+    const code = await runToolsEval(h.deps);
+    expect(code).toBe(1);
+    const report = executed(h.emitted);
+    // 200 singles + 60 multi (auto) expected-tool rounds all classify as returned-text.
+    const returnedText = report.diagnostics.failures.filter(
+      (d) => d.reason === "expected-tool-returned-text",
+    );
+    // Every single-round `auto` (67), plus every multi-step `auto` round 1..3 (60).
+    // Cases 1,2,...,200 cycle auto/required/function. Autos in singles = ⌈200/3⌉ = 67.
+    // required/function returning final become `expected-tool-no-valid-call`.
+    const noValid = report.diagnostics.failures.filter(
+      (d) => d.reason === "expected-tool-no-valid-call",
+    );
+    expect(returnedText.length).toBe(67 + 60); // 127
+    expect(noValid.length).toBe(200 - 67); // 133 required/function singles
+    expect(report.diagnostics.failures).toHaveLength(260); // one per expected-tool round
+    // No final round produces a diagnostic (final text is the correct final-round outcome).
+    const finalDiags = report.diagnostics.failures.filter((d) => d.roundOrdinal === 4);
+    expect(finalDiags).toHaveLength(0);
+  });
+
+  it("does not credit a final round twice: choiceKind is a member of the closed narrow set", async () => {
+    const h = harness({ argv: fullArgv, makeAdapter: () => alwaysMalformedAdapter() });
+    await runToolsEval(h.deps);
+    const report = executed(h.emitted);
+    for (const d of report.diagnostics.failures) {
+      expect(["auto", "required", "function"]).toContain(d.choiceKind);
+    }
+  });
+});
+
+describe("eval:tools — resume persists diagnostics exactly once", () => {
+  it("prior-segment diagnostics survive resume without duplication", async () => {
+    // Segment 1: run the always-final adapter (all rounds miss).
+    const store = memCheckpointStore();
+    let created = 0;
+    // Fail the 100th `process_message` with an UpstreamError to trigger a
+    // resumable submit failure; segments 2..N will resume from the checkpoint.
+    const adapter: CollectivIQAdapter = {
+      createThread: () => {
+        created += 1;
+        return Promise.resolve({ threadId: `t${created}`, rawStatus: 200 });
+      },
+      processMessage: () => {
+        if (created === 100) return Promise.reject(new UpstreamError("network", undefined, "POST"));
+        return Promise.resolve({ accepted: true, rawStatus: 202 });
+      },
+      getMessages: () => Promise.resolve(claudeMessage(finalEnvelope)),
+      getThreadTitle: () => Promise.resolve({ kind: "pending" as const }),
+    };
+    const seg1 = harness({ argv: fullArgv, store, makeAdapter: () => adapter });
+    await runToolsEval(seg1.deps);
+    const executed1 = executed(seg1.emitted);
+    expect(executed1.aborted?.resumable).toBe(true);
+    // Segment 1 committed diagnostics for cases 1..99 (single-round misses).
+    const seg1Count = executed1.diagnostics.failures.length;
+    expect(seg1Count).toBe(99);
+    expect(store.data?.diagnosticFailures.length).toBe(99);
+
+    // Segment 2: resume with an adapter that returns malformed text for everything.
+    const seg2 = harness({
+      argv: resumeArgv,
+      store,
+      makeAdapter: () => alwaysMalformedAdapter(),
+    });
+    const code = await runToolsEval(seg2.deps);
+    expect(code).toBe(1); // gates still fail
+    const executed2 = executed(seg2.emitted);
+    // Every diagnostic is unique per (caseOrdinal, roundOrdinal).
+    const keys = executed2.diagnostics.failures.map((d) => `${d.caseOrdinal}:${d.roundOrdinal}`);
+    expect(new Set(keys).size).toBe(keys.length);
+    // Segment 1's diagnostics are preserved verbatim in the combined report.
+    const seg1Keys = new Set(
+      executed1.diagnostics.failures.map((d) => `${d.caseOrdinal}:${d.roundOrdinal}`),
+    );
+    for (const key of seg1Keys) expect(keys).toContain(key);
+    // The combined set covers 260 expected-call rounds (all miss).
+    expect(executed2.diagnostics.failures).toHaveLength(260);
+  });
+
+  it("discards mid-scenario pending diagnostics until the scenario commits", async () => {
+    // Interrupt mid-way through the very first multi-step scenario; nothing about
+    // that scenario should reach `diagnostics.failures` (spec §30 lifecycle).
+    const control = interruptSeam();
+    let created = 0;
+    // Envelope 201 returns a WRONG tool call → would-be diagnostic
+    // (`expected-tool-not-invoked`) if the scenario committed. Interrupt on the
+    // 2nd created thread so the scenario aborts before commit.
+    const adapter: CollectivIQAdapter = {
+      createThread: () => {
+        created += 1;
+        return Promise.resolve({ threadId: `t${created}`, rawStatus: 200 });
+      },
+      processMessage: () => {
+        if (created === 2) control.fire();
+        return Promise.resolve({ accepted: true, rawStatus: 202 });
+      },
+      getMessages: () =>
+        Promise.resolve(claudeMessage(created === 1 ? editCallEnvelope : readCallEnvelope)),
+      getThreadTitle: () => Promise.resolve({ kind: "pending" as const }),
+    };
+    const h = harness({
+      argv: resumeArgv,
+      store: memCheckpointStore(seedCheckpoint(200)),
+      makeAdapter: () => adapter,
+    });
+    const deps: ToolsEvalDeps = { ...h.deps, installInterruptHandler: control.seam };
+    const code = await runToolsEval(deps);
+    expect(code).toBe(1);
+    const report = executed(h.emitted);
+    // No multi-scenario diagnostic was committed (scenario aborted mid-flight).
+    for (const d of report.diagnostics.failures) expect(d.phase).toBe("single");
+    // Nothing about case 201 (1-based) leaked into the checkpoint either.
+    for (const [co] of h.store.data?.diagnosticFailures ?? []) {
+      expect(co).toBeLessThanOrEqual(200);
+    }
+  });
+});
+
+describe("eval:tools — credential-before-network guard still holds on v3/v2 rejection", () => {
+  it("blocks an invalid v2 checkpoint before any credential read or network call", async () => {
+    // A v2 checkpoint whose diagnosticFailures references an uncommitted case
+    // is semantically inconsistent and rejected by validateResumableCheckpoint
+    // BEFORE any credential build.
+    const forged = seedCheckpoint(5, {
+      diagnosticFailures: [[6, 1, EVAL_FAILURE_REASON_CODES["expected-tool-returned-text"]]],
+    });
+    const h = harness({ argv: resumeArgv, store: memCheckpointStore(forged) });
+    const code = await runToolsEval(h.deps);
+    expect(code).toBe(1);
+    expect((h.emitted[0] as BlockedReport).reason).toBe("checkpoint-inconsistent");
+    expect(h.ledger.find((e) => e.startsWith("buildProvider:"))).toBeUndefined();
+  });
+});
+
+describe("eval:tools — serialized report + checkpoint contain no live content", () => {
+  it("neither report nor persisted checkpoint carries prompts, names, args, ids, or credentials", async () => {
+    const h = harness({ argv: fullArgv, makeAdapter: () => sixMissAdapter() });
+    await runToolsEval(h.deps);
+    const report = executed(h.emitted);
+    // Serialize the ENTIRE emitted stream + the on-disk checkpoint the run
+    // would have persisted (via the memory store's captured last write, if any).
+    const dumps: string[] = [JSON.stringify(h.emitted), JSON.stringify(report)];
+    if (h.store.data !== null) dumps.push(JSON.stringify(h.store.data));
+    const forbidden = [
+      NAME_SENTINEL,
+      "edit",
+      "test",
+      ARG_SENTINEL,
+      PROMPT_SENTINEL,
+      "synthetic/doc",
+      "call_ciq_",
+      CRED_SENTINEL,
+      "gateway_protocol",
+      "claude",
+      "synthetic summary",
+    ];
+    for (const dump of dumps) {
+      for (const sentinel of forbidden) expect(dump).not.toContain(sentinel);
+    }
   });
 });
