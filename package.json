@@ -31,7 +31,8 @@
     "contract:openapi:check": "tsx scripts/openapi/check.ts",
     "contract:discovery": "tsx src/collectiviq/discovery-cli.ts",
     "contract:discovery:cleanup": "tsx src/collectiviq/discovery-recovery-cli.ts",
-    "eval:tools": "tsx src/eval/tools-eval-cli.ts"
+    "eval:tools": "tsx src/eval/tools-eval-cli.ts",
+    "eval:tools:diagnose": "tsx src/eval/tools-diagnostic-cli.ts"
   },
   "dependencies": {
     "@fastify/type-provider-typebox": "6.1.0",

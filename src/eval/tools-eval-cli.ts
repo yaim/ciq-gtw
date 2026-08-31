@@ -50,7 +50,6 @@ import {
 } from "../collectiviq/auth.js";
 import { CollectivIQHttpAdapter } from "../collectiviq/adapter.js";
 import { observeThreadDeletion, type DeleteDiagnostics } from "../collectiviq/cleanup.js";
-import { isUpstreamError, type UpstreamErrorCode } from "../collectiviq/errors.js";
 import {
   DEFAULT_OPERATION_TIMEOUTS,
   type CollectivIQAdapter,
@@ -65,15 +64,20 @@ import {
   type RecoveryJournalSink,
 } from "../collectiviq/recovery-journal.js";
 import { createPoller } from "../generation/polling.js";
-import type { PollOutcome, Poller } from "../generation/types.js";
+import type { PollOutcome } from "../generation/types.js";
 import { selectGeneration, type SourceCandidate } from "../tools/select.js";
 import { compileToolset, type CompiledToolset } from "../tools/schema.js";
 import { createToolCallIdGenerator } from "../tools/ids.js";
 import { parseToolEnvelope } from "../tools/protocol.js";
 import { normalizeToolRequest, type ProbedField } from "../tools/request.js";
-import { serializeConversationPrompt } from "../prompts/conversation.js";
-import type { NormalizedChatRequest, NormalizedMessage } from "../openai/chat-types.js";
+import type { NormalizedMessage } from "../openai/chat-types.js";
 import type { NormalizedTool, NormalizedToolChoice, ParsedToolCall } from "../tools/types.js";
+import {
+  buildRoundRequest,
+  runLiveRound,
+  type BoundDeleter,
+  type LiveRoundResult,
+} from "./live-round.js";
 import {
   buildEvalCases,
   buildEvalCorpusProjection,
@@ -119,11 +123,6 @@ import {
 export const EVAL_ORIGIN = "https://api.prod.collectiviq.ai";
 /** The evaluator only ever authenticates in password mode. */
 export const EVAL_AUTH_MODE = "password" as const;
-
-const POLL_INTERVAL_MS = 2_000;
-const MAX_POLL_INTERVAL_MS = 5_000;
-const REQUEST_TIMEOUT_MS = 90_000;
-const THREAD_TITLE = "New Thread";
 
 /** Section-30 threshold percentages (spec §30, gates 1–5). */
 const THRESHOLD = {
@@ -313,197 +312,6 @@ export function defaultToolsEvalDeps(): ToolsEvalDeps {
       };
     },
     emit: (output) => process.stdout.write(`${JSON.stringify(output)}\n`),
-  };
-}
-
-/** A deleter bound to the run's transport config; value-free diagnostics. */
-type BoundDeleter = (threadId: string, signal: AbortSignal) => Promise<DeleteDiagnostics>;
-
-/**
- * Trap-safely extract a normalized upstream code + safe status from a thrown
- * value. Uses {@link isUpstreamError} (WeakSet identity) BEFORE reading any
- * property, so an unknown or hostile thrown value yields null/null with no
- * property access, `instanceof`, prototype inspection, serialization, or
- * coercion.
- */
-function safeUpstream(error: unknown): {
-  readonly code: UpstreamErrorCode | null;
-  readonly status: number | null;
-} {
-  if (isUpstreamError(error)) return { code: error.code, status: error.rawStatus ?? null };
-  return { code: null, status: null };
-}
-
-/** Build a normalized request from an explicit accumulated message history. */
-function buildRequest(
-  tools: readonly NormalizedTool[],
-  choice: NormalizedToolChoice,
-  messages: readonly NormalizedMessage[],
-): NormalizedChatRequest {
-  return Object.freeze({
-    model: "eval",
-    messages: Object.freeze([...messages]),
-    ignoredParameters: Object.freeze([]),
-    stream: false,
-    tools: Object.freeze([...tools]),
-    toolChoice: choice,
-    parallelToolCalls: true,
-  });
-}
-
-/** The value-free outcome of ONE created-thread round (see {@link runUpstreamRound}). */
-interface StepResult {
-  /** A thread was created, so exactly one DELETE was attempted for it. */
-  readonly created: boolean;
-  /** Trap-safe upstream code/status when `createThread` threw (ambiguous). */
-  readonly createFailureCode: UpstreamErrorCode | null;
-  readonly createFailureStatus: number | null;
-  /** The DELETE returned a real HTTP 2xx. */
-  readonly httpDeleted: boolean;
-  /** Value-free code/status from a failed cleanup DELETE. */
-  readonly deleteCode: UpstreamErrorCode | null;
-  readonly deleteStatus: number | null;
-  /** The create-time `recordCreated` journal write rejected. */
-  readonly recordCreatedFailed: boolean;
-  /** The post-delete `recordDeleted` journal write rejected. */
-  readonly recordDeletedFailed: boolean;
-  /** Where the round failed operationally (submit vs poll), when it did. */
-  readonly failureStage: "process-message" | "get-messages" | null;
-  readonly failureCode: UpstreamErrorCode | null;
-  readonly failureStatus: number | null;
-  /** The poll outcome, or null when create/submit/poll threw (a round failure). */
-  readonly outcome: PollOutcome | null;
-}
-
-/**
- * Run ONE upstream round for a single request: create → journal → submit → poll,
- * then EXACTLY ONE immediate DELETE for the created thread regardless of how the
- * work resolved (submit/poll throw, timeout, or success). The deleter is invoked
- * at most once, on the INDEPENDENT `cleanupSignal` (never the already-aborted
- * `workSignal`), so a controlled interruption can still clean a recorded thread.
- * HTTP-delete truth and journal-persistence truth are reported separately;
- * nothing is retried inside the round. Never throws.
- */
-async function runUpstreamRound(
-  adapter: CollectivIQAdapter,
-  poller: Poller,
-  deleter: BoundDeleter,
-  journal: RecoveryJournalSink,
-  request: NormalizedChatRequest,
-  selectedLlms: readonly string[],
-  workSignal: AbortSignal,
-  cleanupSignal: AbortSignal,
-): Promise<StepResult> {
-  const prompt = serializeConversationPrompt(request);
-  let threadId: string;
-  try {
-    const thread = await adapter.createThread({ title: THREAD_TITLE, signal: workSignal });
-    threadId = thread.threadId;
-  } catch (error) {
-    // The thread creation was ambiguous (it may or may not have taken effect and
-    // no id is available); there is nothing safe to clean up.
-    const u = safeUpstream(error);
-    return {
-      created: false,
-      createFailureCode: u.code,
-      createFailureStatus: u.status,
-      httpDeleted: false,
-      deleteCode: null,
-      deleteStatus: null,
-      recordCreatedFailed: false,
-      recordDeletedFailed: false,
-      failureStage: null,
-      failureCode: null,
-      failureStatus: null,
-      outcome: null,
-    };
-  }
-
-  // From here the thread EXISTS: it must receive EXACTLY ONE deletion attempt on
-  // every path below.
-  let recordCreatedFailed = false;
-  try {
-    await journal.recordCreated(threadId);
-  } catch {
-    recordCreatedFailed = true;
-  }
-
-  // If the create-time journal write REJECTED, abort immediately: do NOT submit or
-  // poll. The thread is unjournaled and must not be left exposed while a request
-  // runs against it; it is deleted once below and the evaluator aborts on the
-  // journal-persistence failure. `outcome` stays null (no work).
-  let outcome: PollOutcome | null = null;
-  let failureStage: "process-message" | "get-messages" | null = null;
-  let failureCode: UpstreamErrorCode | null = null;
-  let failureStatus: number | null = null;
-  if (!recordCreatedFailed) {
-    try {
-      await adapter.processMessage({
-        threadId,
-        prompt,
-        selectedLlms,
-        generateCombined: false,
-        signal: workSignal,
-      });
-    } catch (error) {
-      const u = safeUpstream(error);
-      failureStage = "process-message";
-      failureCode = u.code;
-      failureStatus = u.status;
-    }
-    if (failureStage === null) {
-      try {
-        outcome = await poller.poll({
-          threadId,
-          answerSource: selectedLlms[0] ?? "claude",
-          pollIntervalMs: POLL_INTERVAL_MS,
-          maxPollIntervalMs: MAX_POLL_INTERVAL_MS,
-          deadlineMs: Date.now() + REQUEST_TIMEOUT_MS,
-          signal: workSignal,
-        });
-      } catch (error) {
-        const u = safeUpstream(error);
-        failureStage = "get-messages";
-        failureCode = u.code;
-        failureStatus = u.status;
-        outcome = null;
-      }
-    }
-  }
-
-  // The single, immediate DELETE attempt for this thread on the INDEPENDENT
-  // cleanup signal (runs on every path, including the aborted recordCreated path
-  // and a controlled interruption).
-  let diagnostics: DeleteDiagnostics;
-  try {
-    diagnostics = await deleter(threadId, cleanupSignal);
-  } catch {
-    diagnostics = { ok: false, status: null, errorCode: null };
-  }
-  let recordDeletedFailed = false;
-  if (diagnostics.ok) {
-    // Even when the create-time write failed, still attempt the journal drop: that
-    // failed write may have PARTIALLY persisted the id, so the removal is best-effort.
-    try {
-      await journal.recordDeleted(threadId);
-    } catch {
-      recordDeletedFailed = true;
-    }
-  }
-
-  return {
-    created: true,
-    createFailureCode: null,
-    createFailureStatus: null,
-    httpDeleted: diagnostics.ok,
-    deleteCode: diagnostics.ok ? null : diagnostics.errorCode,
-    deleteStatus: diagnostics.status,
-    recordCreatedFailed,
-    recordDeletedFailed,
-    failureStage,
-    failureCode,
-    failureStatus,
-    outcome,
   };
 }
 
@@ -1159,7 +967,7 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
    * in exactly one of `deleted`/`failed`; a journal-persistence failure is counted
    * separately and aborts even when the HTTP delete succeeded.
    */
-  const accountCleanup = (step: StepResult): AbortInfo | null => {
+  const accountCleanup = (step: LiveRoundResult): AbortInfo | null => {
     if (!step.created) {
       // createThread threw. The thread may or may not exist and no id is
       // available, so this is NOT resumable (an interruption here is ambiguous).
@@ -1334,8 +1142,8 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
           attemptedRounds += 1;
           segmentCompletions += 1;
           executedRounds += 1;
-          const request = buildRequest(evalCase.tools, round.choice, history);
-          const step = await runUpstreamRound(
+          const request = buildRoundRequest(evalCase.tools, round.choice, history);
+          const step = await runLiveRound(
             adapter,
             poller,
             deleter,
@@ -1485,10 +1293,10 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
         if (round === undefined) continue;
         attemptedRounds += 1;
         segmentCompletions += 1;
-        const request = buildRequest(evalCase.tools, round.choice, [
+        const request = buildRoundRequest(evalCase.tools, round.choice, [
           { role: "user", content: round.prompt },
         ]);
-        const step = await runUpstreamRound(
+        const step = await runLiveRound(
           adapter,
           poller,
           deleter,
