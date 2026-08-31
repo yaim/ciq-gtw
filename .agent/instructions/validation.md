@@ -16,7 +16,7 @@
 | `npm run test:contract` | Upstream contract | Vitest `test/contract` only (hermetic mock HTTP server, no network) |
 | `npm run test:compatibility` | SDK compatibility | Standalone hermetic suite (`test/compatibility`, own `vitest.compatibility.config.ts`); pinned `ai`/`@ai-sdk/openai-compatible` SDK vs an ephemeral loopback gateway with a **fake** completion — no network/credentials/CollectivIQ. **Excluded from `validate`/CI** |
 | `npm run test:adversarial` | Tool release gate | Standalone hermetic suite (`test/adversarial`, own `vitest.adversarial.config.ts`); ≥200 deterministic tool-protocol cases against the pure engine — no network/credentials/CollectivIQ. **Excluded from `validate`/CI** |
-| `npm run eval:tools` | Live tool gate | Approval-gated LIVE evaluator (`src/eval/`). Default is a credential-free/network-free preflight; the fully-approved path probes the fixed CollectivIQ origin. Network-only; **must NEVER be added to `validate`/CI**. Two authorized campaigns executed: a **partial 2026-08-24 campaign** that established no gate and a **completed 2026-08-26 campaign** across two resumable execution segments that scored the full corpus but **failed tool-name accuracy** at 254/260 (97.7%) vs the 98% minimum, so section-30 remains unmet. A diagnostic-emitting live rerun (report v3 / checkpoint v2) is approval-gated and unrun. |
+| `npm run eval:tools` | Live tool gate | Approval-gated LIVE evaluator (`src/eval/`). Default is a credential-free/network-free preflight; the fully-approved path probes the fixed CollectivIQ origin. Network-only; **must NEVER be added to `validate`/CI**. Three authorized campaigns executed: a **partial 2026-08-24 campaign** that established no gate, a **completed 2026-08-26 campaign** across two resumable execution segments that scored the full corpus but **failed tool-name accuracy** at 254/260 (97.7%) vs the 98% minimum, and the **latest diagnostic report-v3 campaign** across two resumable execution segments (first segment 111 attempted / 110 completed on a cleaned, resumable `process-message` HTTP `402` normalized as `upstream_unexpected_error`; resume 281 attempted / 280 completed, 200/200 single-round, 20/20 multi-step, 281/281 deleted) that **failed schema (245/260), tool-name (229/260), argument (245/260), and multi-step (0/20) gates** with 37 value-free diagnostics all in multi-step cases (every case first failed at round 2 — 13 `expected-tool-returned-text`, 7 `expected-tool-not-invoked` (a different ALLOWED tool; DISTINCT from `unauthorized-tool-call`) — and the older evaluator continued after those terminal failures and emitted 17 cascade diagnostics at rounds 3/4), motivating the report-v4 / checkpoint-v3 evaluator correction and establishing NO section-30 gate. Section-30 remains unmet. Post-2026-08-26 review found three evaluator ambiguities (fixed synthetic tool result, fresh user message per step, non-terminating loop) that mean the earlier numbers do not yet isolate a production defect; the evaluator has been revised offline (genuine agent loop, deterministic content-safe read/edit/test synthetic results, truthful early termination, report v4 / checkpoint v3, per-multi `executedScenarioRounds` ledger) and a live rerun is approval-gated and unrun. No production prompt, parser, selector, threshold, model default, or configuration change was made. |
 | `npm run test:coverage` | Coverage | Vitest with V8 coverage |
 | `npm run build` | Build | `tsc -p tsconfig.json`, emits `dist/` |
 | `npm run test:build` | Build smoke | Imports compiled `dist/*.js`; asserts no listening socket |
@@ -86,7 +86,7 @@ gate-metric fix that invalid/missing output earns ZERO schema/name/argument cred
 (`observeThreadDeletion`, 2xx-only success) — not a rejection stub — and the
 gate report's `parserDeterminism` is a locally MEASURED result, never a hardcoded
 `true`. No live upstream, OpenCode, or network call occurs in any of these. The
-approval-gated live evaluator (`npm run eval:tools`) has been run in two
+approval-gated live evaluator (`npm run eval:tools`) has been run in three
 authorized campaigns. The **partial 2026-08-24 campaign** attempted 149 rounds
 (all 149 created threads confirmed deleted; partial single-round snapshots read
 99.3%) but aborted operationally under the evaluator's earlier ambiguous report,
@@ -102,10 +102,37 @@ accuracy **254/260 (97.7%, failed against the 98% / 255/260 minimum — missed
 by ONE additional expected-tool-accurate round)**, argument validity 257/260
 (98.8%, passed), single-round success 199/200 (99.5%, passed), multi-step
 success 18/20 (90%, passed), no-silent-fallback + injection-resistance +
-parser-determinism all passed. Overall `passed: false`; section-30 remains
-**unmet**; a **diagnostic-emitting live rerun** to identify the six failure
-locations is approval-gated and unrun. No prompt/parser/selection/threshold
-change is authorized until it produces evidence.
+parser-determinism all passed. Overall `passed: false`; section-30 remained
+**unmet**. The **latest diagnostic report-v3 campaign** ran across two
+resumable execution segments: the first segment stopped after 111 attempted
+rounds and 110 completed rounds on a cleaned, resumable `process-message`
+failure (HTTP `402`, normalized as `upstream_unexpected_error`), cleanup was
+111/111 with zero remaining, 110 single-round cases were committed, and the
+cursor persisted at 110; the resume completed the corpus at 281 attempted
+rounds / 280 completed, 200/200 single-round cases, 20/20 multi-step
+scenarios, 281/281 threads deleted, zero cleanup/journal failures. Gate
+outcomes: schema validity **245/260 (94.2%, failed against 95%)**, tool-name
+accuracy **229/260 (88.1%, failed against 98%)**, argument validity
+**245/260 (94.2%, failed against 95%)**, single-round success 200/200
+(passed), multi-step success **0/20 (failed against 85%)**,
+no-silent-fallback + injection-resistance + parser-determinism all passed.
+It emitted 37 value-free diagnostics, all in multi-step cases; every
+multi-step case first failed at round 2 (13 returned final text, 7 selected
+a different tool), and the older evaluator continued after those terminal
+failures and produced 17 cascade diagnostics in later rounds (11 at round 3,
+6 at round 4). This campaign did not establish any section-30 release gate;
+section-30 remains **unmet**. Post-2026-08-26 review identified three
+evaluator ambiguities (fixed synthetic tool result, fresh user message per
+step, non-terminating loop) that mean those raw numbers do not yet isolate a
+production parser/selector/prompt defect; the evaluator has been revised
+offline (genuine OpenCode-style agent loop; deterministic content-safe
+`read`/`edit`/`test` synthetic results; truthful early termination) and
+emits report v4 / checkpoint v3 with a per-committed-multi-step-scenario
+`executedScenarioRounds` ledger. Only the evaluator itself was corrected —
+no production prompt, parser, selector, threshold, model default, or
+configuration change is being made. A **live rerun of the revised
+evaluator** is approval-gated and unrun. No prompt/parser/selection/
+threshold change is authorized until it produces evidence.
 
 The evaluator was hardened offline before the 2026-08-26 campaign: a versioned
 value-free output union (`preflight | progress | blocked | executed`), a
@@ -139,37 +166,68 @@ non-recursive-`mkdir` safe-ancestry acceptance; and a recovery-journal
 finalized exactly once with a `recovery-journal-finalize` closed abort stage
 that durably blocks the checkpoint and prevents a pass.
 
-**Report v3 / checkpoint v2 (2026-08-26).** `EVAL_REPORT_VERSION` was bumped
-from 2 to 3 across every mode (`preflight | progress | blocked | executed`);
-only the `executed` variant carries the new bounded, value-free
-`diagnostics.failures` collection (`EvalFailureDiagnostic { phase: "single" |
-"multi"; caseOrdinal; roundOrdinal; choiceKind: "auto" | "required" |
-"function"; reason }` with a closed nine-member `EvalFailureReason` union).
-Classification is deterministic and emits at most one primary reason per
-failed round; the classifier does not (and must not) alter any gate
-accumulator or `scenarioOk`. `CHECKPOINT_FORMAT_VERSION` was bumped from 1
-to 2; v1 checkpoints are **rejected** with no migration path. Diagnostics
-persist via a compact ledger `readonly [caseOrdinal, roundOrdinal,
-reasonCode][]` mapped to fixed integer codes 1..9;
-`MAX_CHECKPOINT_BYTES` stays at 8192 (the worst valid 280-entry ledger fits
-comfortably in compact JSON). Ledger validation is strict — max 280 entries,
-unique `(caseOrdinal, roundOrdinal)` pairs, case ordinals only refer to a
-case committed at or before `nextCaseIndex`, the round ordinal must exist in
-that corpus case, the reason code must be one of the fixed codes, and the
-reason must be structurally compatible with whether the referenced round
-expects a tool or final text — and validation runs against the freshly built
+**Report v4 / checkpoint v3 (revised evaluator, offline).** `EVAL_REPORT_VERSION` is
+`4` across every mode (`preflight | progress | blocked | executed`); only the
+`executed` variant carries the bounded, value-free `diagnostics.failures`
+collection (`EvalFailureDiagnostic { phase: "single" | "multi"; caseOrdinal;
+roundOrdinal; choiceKind: "auto" | "required" | "function"; reason }` with a
+closed nine-member `EvalFailureReason` union). Classification is
+deterministic and emits at most one primary reason per failed round — a
+multi-step scenario emits AT MOST ONE primary diagnostic at its terminal
+failure, and the evaluator never fabricates diagnostic entries for later
+rounds that never ran; the classifier does not (and must not) alter any gate
+accumulator or `scenarioOk`. `CHECKPOINT_FORMAT_VERSION` was bumped from 2
+to `3`; **v1 and v2 checkpoints are rejected** with no migration path.
+Diagnostics persist via the same compact ledger
+`readonly [caseOrdinal, roundOrdinal, reasonCode][]` mapped to fixed integer
+codes 1..9. Checkpoint v3 also adds a compact per-committed-multi-step-
+scenario `executedScenarioRounds` ledger: one integer per committed multi
+scenario, in commit order, each mapped in projection order to its
+corresponding committed multi-step case and bounded within
+`[1, that case's rounds.length]` — the per-CASE round count, NOT the
+projection-wide `maxRoundsPerCase`, so a non-uniform corpus is validated
+round-by-round rather than reduced to the projection maximum; `.length`
+MUST equal `completedMultiStepScenarios`; and the committed upstream-round
+floor becomes `committedSingle + Σ executedScenarioRounds` (NEVER
+`committedSingle + committedMulti·maxRoundsPerCase`, because a failed
+scenario may terminate early). The projection-wide `maxRoundsPerCase`
+remains legitimate only for the operational upstream-round ceilings
+(attempted/completed bounds and per-run-segment slack). `MAX_CHECKPOINT_BYTES` stays at 8192.
+Ledger validation is strict — max 280 diagnostic entries, unique
+`(caseOrdinal, roundOrdinal)` pairs, case ordinals only refer to a case
+committed at or before `nextCaseIndex`, the round ordinal must exist in
+that corpus case, the reason code must be one of the fixed codes, the reason
+must be structurally compatible with whether the referenced round expects a
+tool or final text; every `executedScenarioRounds` entry ≥ 1 and ≤ its
+committed multi case's `rounds.length`; upstream-round counters honor the
+executed-round layout — and validation runs against the freshly built
 corpus BEFORE any credential read or network I/O. Multi-step diagnostics
-accumulate locally and commit only on whole-scenario commit; a resumed final
-report re-emits every prior segment's committed diagnostics exactly once. New
-hermetic coverage lives in `test/contract/eval-checkpoint.test.ts` (v2
-enforcement, round-trip and shape validation, semantic corpus-bound
-validation, worst-case 280-entry ledger size, and rehydration to report
-shape) and `test/contract/tools-eval-cli.test.ts` (report v3 across every
-mode, deterministic classifier precedence, six-miss arithmetic and
+AND the `executedScenarioRounds` entry accumulate locally and commit only
+on whole-scenario commit (mid-scenario interruptions discard both); a
+resumed final report re-emits every prior segment's committed diagnostics
+exactly once. **Multi-step scenarios STOP at the first terminal failure**
+(premature final text, no valid call, unavailable, unauthorized call,
+allowed-but-unexpected tool, invalid transcript linkage); remaining
+planned expected-tool rounds count as gate MISSES in the section-30
+denominators — never as attempted upstream rounds — and no cascade
+diagnostics are fabricated for rounds that never ran. Synthetic tool
+results are content-safe deterministic in-memory values (`read` returns
+path+content; `edit` acknowledges an exact `path`+`text` match and flips
+the scenario state; `test` returns `testsPass` based only on prior
+synthetic state). `plannedUpstreamRounds` (280) is the complete-corpus
+UPPER BOUND, not the exact attempt count. Hermetic coverage lives in
+`test/contract/eval-checkpoint.test.ts` (v3 enforcement, v1/v2 rejection,
+round-trip and shape validation, semantic corpus-bound validation of the
+diagnostic + executed-round ledgers, worst-case 280-entry ledger size, and
+rehydration to report shape) and `test/contract/tools-eval-cli.test.ts`
+(report v4 across every mode, deterministic classifier precedence,
 diagnostic classification, multi-step transcript/final-round diagnostics,
-resume-persists-diagnostics-exactly-once, credential-before-network guard on
-invalid v2 checkpoints, and no-live-content scans of the serialized report
-and checkpoint).
+early-termination denominator handling, no cascade diagnostics after a
+terminal failure, `plannedUpstreamRounds` bound is unchanged and complete-
+corpus status is committed-count-based, resume-preserves-executed-round
+counts, resume-persists-diagnostics-exactly-once, credential-before-network
+guard on invalid v3 checkpoints, and no-live-content scans of the
+serialized report and checkpoint).
 
 ## Validation Order
 

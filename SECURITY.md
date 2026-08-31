@@ -29,10 +29,15 @@ calling (implemented offline; its section-30 release gates are NOT met — two
 authorized live evaluator campaigns have been executed: a **partial 2026-08-24
 campaign** that established no gate and a **completed 2026-08-26 campaign**
 across two resumable execution segments that scored the full corpus but failed
-tool-name accuracy at 254/260 (97.7%) vs the 98% minimum; a diagnostic-emitting
-live rerun (report v3 / checkpoint v2) is approval-gated and unrun, and no
-prompt/parser/selection/threshold change is authorized until it produces
-evidence). Redis, metrics/tracing, true upstream streaming, and
+tool-name accuracy at 254/260 (97.7%) vs the 98% minimum; post-2026-08-26
+review found three evaluator ambiguities (fixed synthetic tool result, fresh
+user message per step, non-terminating loop) that mean those raw numbers do
+not yet isolate a production defect; the evaluator has been revised offline
+(genuine OpenCode-style agent loop, deterministic content-safe
+read/edit/test synthetic results, truthful early termination, report v4 /
+checkpoint v3), a live rerun of the revised evaluator is approval-gated and
+unrun, and no prompt/parser/selection/threshold change is authorized until it
+produces evidence). Redis, metrics/tracing, true upstream streaming, and
 native tool mode are not implemented. The completion path calls CollectivIQ only
 when a real request is served (never during import/construction/build smoke). A
 user-observed, sanitized live OpenCode/CollectivIQ foreground **transport** smoke
@@ -181,41 +186,93 @@ and any further live run is approval-gated. The controls that exist today are:
   returns model-**proposed** calls but never executes, authorizes, or simulates a
   tool (OpenCode owns permissions and execution). Emulated mode is experimental:
   its section-30 release gates are **not met**. The approval-gated live evaluator
-  (`npm run eval:tools`) has been run in two authorized campaigns. The **partial
-  2026-08-24 campaign** attempted 149 rounds (all 149 created threads confirmed
-  deleted; single-round snapshots at 99.3%; the multi-step scenarios never
-  reached and so unmeasured, not a measured 0%) but aborted operationally and
-  established no gate. The **completed 2026-08-26 campaign** ran across two
+  (`npm run eval:tools`) has been run in three authorized campaigns. The
+  **partial 2026-08-24 campaign** attempted 149 rounds (all 149 created threads
+  confirmed deleted; single-round snapshots at 99.3%; the multi-step scenarios
+  never reached and so unmeasured, not a measured 0%) but aborted operationally
+  and established no gate. The **completed 2026-08-26 campaign** ran across two
   resumable execution segments and scored the full corpus (200/200 single-round
   cases, 20/20 multi-step scenarios, 281/281 created threads deleted, zero
   cleanup or journal failures, checkpoint finalized): **tool-name accuracy
   failed** at 254/260 (97.7%) vs the 98% / 255/260 minimum; seven other gates
-  passed; overall `passed: false`. The evaluator was hardened offline before the
+  passed; overall `passed: false`. The **latest diagnostic report-v3 campaign**
+  ran across two resumable execution segments (first segment 111 attempted /
+  110 completed / 110 committed single-round cases on a cleaned, resumable
+  `process-message` HTTP `402` normalized as `upstream_unexpected_error`,
+  cleanup 111/111 with zero remaining, cursor at 110; resume finished the
+  corpus at 281 attempted / 280 completed, 200/200 single-round, 20/20
+  multi-step, 281/281 deleted, zero cleanup/journal failures): schema validity
+  **245/260 (94.2%, failed against 95%)**, tool-name accuracy **229/260
+  (88.1%, failed against 98%)**, argument validity **245/260 (94.2%, failed
+  against 95%)**, single-round success 200/200 (passed), multi-step success
+  **0/20 (failed against 85%)**, no-silent-fallback + injection-resistance +
+  parser-determinism all passed; overall `passed: false`. It emitted 37
+  value-free diagnostics, all in multi-step cases, with every case first
+  failing at round 2 (13 returned final text — `expected-tool-returned-text`;
+  7 selected a different ALLOWED tool — `expected-tool-not-invoked`,
+  DISTINCT from `unauthorized-tool-call` which names a tool OUTSIDE the
+  allowlist and affects the injection-resistance gate) and 17 cascade
+  diagnostics in later rounds (11 at round 3, 6 at round 4)
+  under the older non-terminating evaluator. Those cascades motivated the
+  report-v4 / checkpoint-v3 evaluator correction; no production prompt,
+  parser, selector, threshold, model default, or configuration change was
+  made in response, and a live rerun of the corrected evaluator remains
+  approval-gated and unrun. The evaluator was hardened offline before the
   2026-08-26 campaign (content-free resume checkpoint gated behind
   `--resume-approved`, versioned value-free output union, four-state gate
   status), and the on-disk report and checkpoint payloads are now bounded and
-  value-free by construction: **report v3** adds a `diagnostics.failures`
+  value-free by construction: **report v4** adds a `diagnostics.failures`
   collection (only on `executed` reports) whose entries carry only ordinals, a
   closed `choiceKind` union, and a closed nine-member `EvalFailureReason` union
   — never prompts, answers, arguments, schemas, tool names, model names, IDs,
   credentials, titles, bodies, URLs, timestamps, or exception text; **checkpoint
-  v2** persists diagnostics as a compact `[caseOrdinal, roundOrdinal,
-reasonCode]` ledger with fixed integer reason codes and rejects v1 checkpoints
-  with no migration path. `MAX_CHECKPOINT_BYTES` stays at 8192; the worst valid
-  280-entry ledger fits comfortably in compact JSON. The resume checkpoint is
-  semantically validated against the real evaluation plan before any credential
-  read or network I/O — including every diagnostic entry (case ordinal within
-  `nextCaseIndex`, round ordinal within that corpus case, reason code in the
-  fixed set, reason structurally compatible with whether the referenced round
-  expects a tool or final text) — so a forged or inconsistent checkpoint —
-  including any "complete + passing, zero-attempt" claim — cannot grant a
-  zero-network pass; a non-resumable abort writes a durable value-free `blocked`
-  tombstone that a resume run rejects until an operator deliberately archives or
+  v3** persists diagnostics as a compact `[caseOrdinal, roundOrdinal,
+reasonCode]` ledger with fixed integer reason codes AND a compact per-committed-multi-step-scenario
+  `executedScenarioRounds` ledger (one integer per committed multi scenario,
+  each mapped in projection order to its corresponding committed multi-step
+  case and bounded within `[1, that case's rounds.length]` — the per-CASE
+  round count, NOT the global `maxRoundsPerCase`, so a non-uniform corpus is
+  validated round-by-round rather than reduced to the projection maximum;
+  `.length` = `completedMultiStepScenarios`), and rejects both v1 and v2
+  checkpoints with no migration path. `MAX_CHECKPOINT_BYTES` stays at 8192;
+  both ledgers fit comfortably in compact JSON. The evaluator has been
+  revised offline to represent a genuine OpenCode-style agent loop (one
+  initial user message accumulated with assistant `tool_calls` and exactly
+  linked `role: "tool"` synthetic result messages), render deterministic
+  content-safe synthetic `read`/`edit`/`test` results (no filesystem, shell,
+  MCP, external service, repository content, or real user data), and
+  TERMINATE truthfully at the first terminal failure (remaining planned
+  expected-tool rounds count as gate misses in the section-30 denominators
+  — never as attempted upstream rounds — and no cascade diagnostics are
+  fabricated). The resume checkpoint is semantically validated against the
+  real evaluation plan before any credential read or network I/O and every
+  claimed gate accumulator is required to EXACTLY equal the value derivable
+  from the two ledgers plus the fingerprint-bound projection (not merely a
+  loose upper bound): every diagnostic entry maps to a real committed case
+  and executed round (case ordinal within `nextCaseIndex`, round ordinal
+  within that corpus case AND within the scenario's `executedScenarioRounds`
+  entry, reason code in the fixed set, reason structurally compatible with
+  whether the referenced round expects a tool or final text); each committed
+  case carries AT MOST ONE primary diagnostic (a scenario terminates at its
+  first failure), and a multi-step scenario's diagnostic is AT its terminal
+  round; an early-terminated multi-step scenario MUST carry a terminal
+  diagnostic; `multi.success` counts ONLY full-length scenarios with no
+  terminal diagnostic; and the expected-call schema/argument/name-accurate
+  numerators are the exact sum of per-executed-round contributions derived
+  from each round's diagnostic reason (an unexecuted expected-tool round
+  contributes 0 to every numerator, so a forged `all-passing` claim over
+  partially-executed scenarios is rejected). The committed upstream-round
+  floor is computed as `committedSingle + Σ executedScenarioRounds`, so a
+  forged or inconsistent checkpoint — including any "complete + passing,
+  zero-attempt" claim, a numerator that exceeds the diagnostic-provable
+  evidence, or a ledger entry that fits the global `maxRoundsPerCase` but
+  exceeds its per-case `rounds.length` — cannot grant a zero-network pass;
+  a non-resumable abort writes a durable value-free `blocked` tombstone
+  that a resume run rejects until an operator deliberately archives or
   removes it (no automatic destructive restart), and checkpoint files are
-  accepted only at an exact `0600` mode with symlink-safe ancestry. A
-  **diagnostic-emitting live rerun** is approval-gated and unrun; no
-  prompt/parser/selection/threshold change is authorized until it produces
-  evidence. `native` tool mode remains unimplemented.
+  accepted only at an exact `0600` mode with symlink-safe ancestry. A **live rerun of the revised evaluator** is
+  approval-gated and unrun; no prompt/parser/selection/threshold change is
+  authorized until it produces evidence. `native` tool mode remains unimplemented.
   `stream` is normalized to a boolean: absent or exactly `false` selects
   the non-streamed JSON path, exactly `true` selects the synthetic-SSE path
   (below), and every other value is rejected with the same content-free `400`. Public errors come only from the shared owner
