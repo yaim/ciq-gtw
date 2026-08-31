@@ -8,79 +8,39 @@ OpenAI `tool_calls`. It does not make the response trusted and must not be enabl
 as the default production OpenCode model until every release gate in
 `.agent/docs/tech-software-spec.md` section 30 passes. Those gates are **not met**.
 
-Three authorized live evaluator campaigns have been executed (a "campaign"
-scores at most one full corpus; a campaign may span multiple resumable
-"execution segments"):
+**Live evaluator status.** Four authorized live evaluator campaigns have been
+executed (a "campaign" scores at most one full corpus; a campaign may span
+multiple resumable "execution segments"). **The complete campaign record — every
+segment, gate numerator/denominator, cleanup and checkpoint result, diagnostic
+ordinal, and the early-termination accounting — is owned by
+`.agent/docs/tech-software-spec.md` section 30.** Do not restate or re-derive it
+here. What matters for tool-policy decisions:
 
-- **Partial 2026-08-24 campaign — historical, established NO section-30 gate.**
-  Attempted 149 rounds, all 149 created threads confirmed deleted, partial
-  single-round snapshots read 99.3%, three-step multi-step scenarios never
-  reached and therefore unmeasured, aborted operationally under the earlier
-  ambiguous report.
-- **Completed 2026-08-26 campaign — overall `passed: false`.** One authorized
-  campaign ran across two resumable execution segments (the first stopped on a
-  cleaned/resumable `get-messages` `401` after attempt 161; the second resumed
-  from case cursor 160 and finished). 281 attempted rounds, 280 completed;
-  200/200 single-round cases; 20/20 multi-step scenarios; 281/281 created
-  threads deleted; zero cleanup or journal failures; checkpoint finalized.
-  Gate outcomes: schema validity 257/260 (98.8%, passed); **tool-name
-  accuracy 254/260 (97.7%, failed against the 98% / 255/260 minimum, i.e.
-  missed by ONE additional expected-tool-accurate round);** argument validity
-  257/260 (98.8%, passed); single-round success 199/200 (99.5%, passed);
-  multi-step success 18/20 (90%, passed); no-silent-fallback,
-  injection-resistance, and parser-determinism all passed. The counters imply
-  six expected-tool misses: three rounds produced no selected valid tool-call
-  set, and three selected valid allowed calls that did not include the
-  expected tool.
-- **Latest diagnostic report-v3 campaign — overall `passed: false`, motivated
-  the report-v4 / checkpoint-v3 evaluator correction.** One authorized
-  campaign ran across two resumable execution segments. The first segment
-  stopped after 111 attempted rounds and 110 completed rounds on a cleaned,
-  resumable `process-message` failure (HTTP `402`, normalized as
-  `upstream_unexpected_error`); cleanup was 111/111 with zero remaining, 110
-  single-round cases were committed, and the cursor persisted at 110. The
-  resume completed the corpus at 281 attempted rounds and 280 completed
-  rounds (200/200 single-round cases, 20/20 multi-step scenarios, 281/281
-  threads deleted, zero cleanup/journal failures). Gate outcomes: **schema
-  validity 245/260 (94.2%, failed against 95%)**, **tool-name accuracy
-  229/260 (88.1%, failed against 98%)**, **argument validity 245/260 (94.2%,
-  failed against 95%)**, single-round success 200/200 (passed), **multi-step
-  success 0/20 (failed against 85%)**, no-silent-fallback,
-  injection-resistance, and parser-determinism all passed. It emitted 37
-  value-free diagnostics, all in multi-step cases: every multi-step case
-  first failed at round 2 (13 returned final text instead of the expected
-  tool call — `expected-tool-returned-text`; 7 selected a different
-  ALLOWED tool — `expected-tool-not-invoked`, which is DISTINCT from
-  `unauthorized-tool-call`: the latter names a tool OUTSIDE the allowlist
-  and affects the injection-resistance gate, while these seven remained
-  inside the allowlist), and the older evaluator continued after those
-  terminal failures and produced 17 cascade diagnostics in later rounds (11
-  at round 3, 6 at round 4). Those cascades established that the raw
-  round-3/round-4 diagnostics could not be trusted as independent production
-  failures and motivated the report-v4 / checkpoint-v3 evaluator correction
-  (genuine one-user OpenCode-style agent loop, deterministic content-safe
-  synthetic `read`/`edit`/`test` results, truthful early termination) below.
-  This campaign did not establish any section-30 release gate.
+- The **completed 2026-08-31 report-v4 campaign** is the operative
+  corrected-evaluator evidence: the first completed campaign on the corrected
+  report-v4 / checkpoint-v3 evaluator, so it is the only campaign whose numbers
+  reflect the genuine one-user agent loop and truthful early termination. The
+  three earlier campaigns predate that correction and must not be read as
+  report-v4 results.
+- **Six of the eight gates passed.** **Tool-name accuracy (248/260, 95.4%
+  against the 98% minimum) and multi-step success (14/20, 70% against the 85%
+  minimum) failed**, so overall `passed: false`.
+- **All six recorded failures occurred at multi-step round 2** and carry the
+  single value-free reason `expected-tool-not-invoked` — a tool INSIDE the
+  request's allowlist that was not the tool that round expected. This is
+  DISTINCT from `unauthorized-tool-call`, which names a tool OUTSIDE the
+  allowlist and is what the injection-resistance gate measures; that gate
+  passed. The diagnostics name no tool, so they do not identify a definitive
+  provider, model, prompt, parser, or selector root cause.
+- **Section 30 remains unmet**, remediation was deliberately **deferred**, and
+  emulated tool mode stays **experimental, opt-in, and non-default**. **No
+  production prompt, parser, selector, evaluator, threshold, model default, or
+  model configuration is being changed in response**, and any future live rerun
+  or remediation is a separate approval-gated decision.
 
-Section-30 remains **unmet** and emulated tool mode stays experimental,
-opt-in, and non-default. Post-2026-08-26 review of the completed campaign
-identified three latent evaluator ambiguities that the raw gate numbers above
-do NOT yet isolate as a production parser/selector/prompt defect: every
-synthetic tool result was a single fixed value (`{"synthetic":true,
-"ok":true}`), so a correct `read` supplied no document content for the model
-to construct the expected `edit`; the evaluator injected a FRESH user message
-for every logical read/edit/test/final step instead of modelling one original
-user request followed by assistant `tool_calls` and linked `role: "tool"`
-result messages; and it continued issuing later logical rounds after outcomes
-that would already terminate a real OpenCode tool loop, so multi-step
-round-3/round-4 diagnostics could have been cascades. **No production prompt,
-selection, threshold, or model-default change is being made**; only the
-evaluator itself was corrected. A live rerun of the corrected report-v4 /
-checkpoint-v3 evaluator is approval-gated and unrun, and no
-prompt/parser/selection/threshold change is authorized until it produces
-evidence.
-
-The evaluator has been hardened offline: it emits a versioned value-free
+Baseline evaluator hardening landed offline before the 2026-08-26 campaign; the
+report-v4 / checkpoint-v3 corrections were added afterwards and were first
+exercised live on 2026-08-31. The baseline hardening emits a versioned value-free
 output union (`preflight | progress | blocked | executed`); a four-state gate
 status (`passed | failed | incomplete | not_evaluated`) with explicit
 numerators/denominators/planned denominators; structured value-free abort
@@ -326,7 +286,7 @@ Changes require unit and adversarial fixtures for valid, malformed, fenced, inje
 
 **Implemented hermetic coverage (offline).** Unit: `test/unit/tools-{copy,schema,protocol,select,request,encoding}.test.ts` plus emulated-acceptance cases in `chat-request.test.ts` and the config invariant in `config.test.ts`. Integration: `test/integration/chat-completions-tools.test.ts` (JSON tool_calls, SSE tool deltas, pre-header `400`, ignored-header, native-title-after-tool-call). Contract: `test/contract/completion-flow-tools.test.ts` (real runtime + mock upstream — full flow with one create + one submit, `502` for required-with-no-call, `auto` text fallback, and a no-leak logger/response assertion while the schema is serialized into the prompt by design). Pinned-SDK compatibility (out of `validate`/CI): `test/compatibility/ai-sdk-tools.test.ts` (`generateText`/`streamText` real tool call + an in-memory three-step read/edit/test loop with synthetic tools only — no shell/fs/MCP/network). The **adversarial release-gate suite** `test/adversarial/tool-protocol-corpus.test.ts` (≥200 protocol cases; own `vitest.adversarial.config.ts`; `npm run test:adversarial`; excluded from `validate`/CI).
 
-Multi-round compatibility tests must include actual assistant tool calls followed by linked tool results and further tool/final responses. The numerical gates in specification section 30 are product release criteria; do not weaken, reinterpret, or mark them passed without reproducible evidence over the required suites. The approval-gated `npm run eval:tools` live evaluator that would measure those gates has been run in three authorized campaigns: the **partial 2026-08-24 campaign** (149 rounds attempted, all 149 created threads confirmed deleted, partial single-round snapshots 99.3%, multi-step scenarios never reached/unmeasured, aborted operationally under the earlier ambiguous report — establishing **no** section-30 gate); the **completed 2026-08-26 campaign** across two resumable execution segments (200/200 single-round cases, 20/20 multi-step scenarios, 281/281 created threads deleted, zero cleanup or journal failures, checkpoint finalized: schema 98.8% passed, tool-name accuracy **97.7% failed** vs 98% (254/260 vs 255/260), argument validity 98.8% passed, single-round 99.5% passed, multi-step 90% passed, no-silent-fallback + injection-resistance + parser-determinism all passed — overall `passed: false`, tool-name accuracy missed by one additional expected-tool-accurate round); and the **latest diagnostic report-v3 campaign** across two resumable execution segments (first segment 111 attempted / 110 completed / 110 committed single-round cases on a cleaned, resumable `process-message` HTTP `402` normalized as `upstream_unexpected_error`, cleanup 111/111 with zero remaining, cursor at 110; resume 281 attempted / 280 completed, 200/200 single-round, 20/20 multi-step, 281/281 deleted, zero cleanup/journal failures: schema validity **245/260 (94.2%, failed against 95%)**, tool-name accuracy **229/260 (88.1%, failed against 98%)**, argument validity **245/260 (94.2%, failed against 95%)**, single-round 200/200 passed, multi-step **0/20 failed against 85%**, no-silent-fallback + injection-resistance + parser-determinism all passed; 37 value-free diagnostics all in multi-step cases with every case first failing at round 2 — 13 `expected-tool-returned-text`, 7 `expected-tool-not-invoked` (a different ALLOWED tool; DISTINCT from `unauthorized-tool-call`) — and 17 cascade diagnostics in later rounds — 11 at round 3, 6 at round 4 — under the older evaluator that continued after terminal failures). Section-30 remains **unmet**; no production prompt/selection/threshold change is being made — only the evaluator was corrected — and a live rerun of the corrected report-v4 / checkpoint-v3 evaluator remains approval-gated and unrun. The evaluator was hardened offline before the 2026-08-26 campaign (versioned value-free output union; four-state gate status with explicit numerators/denominators/planned denominators; structured value-free abort diagnostics with a closed stage set and trap-safe upstream code/status; JSON progress events emitted only after a durable checkpoint write; a private, content-free resume checkpoint under `.agent/sessions/eval/` gated by `--resume-approved`; controlled first-SIGINT/SIGTERM interruption that cleans a recorded thread on an independent signal). Report format v4 / checkpoint format v3 add (a) bounded value-free failure diagnostics (`diagnostics.failures` on `executed` reports only; `EvalFailureDiagnostic { phase, caseOrdinal, roundOrdinal, choiceKind, reason }` with a closed nine-member reason union; deterministic classification; at most one primary diagnostic per failed multi-step scenario at its terminal failure round; corpus-bound compact ledger persistence with a fixed integer code map; multi-step accumulation commits only on whole-scenario commit; a resumed final report re-emits every prior segment's diagnostics exactly once); (b) a genuine OpenCode-style agent-loop multi-step model with deterministic content-safe `read`/`edit`/`test` synthetic results and truthful early termination (remaining planned expected-tool rounds count as gate misses, not attempted upstream rounds); and (c) a per-committed-multi-step-scenario `executedScenarioRounds` ledger. Both v1 and v2 checkpoints are rejected with no migration path. Both the initial and diagnostic-emitting live evaluator runs are network-only and must never appear in `validate`/CI.
+Multi-round compatibility tests must include actual assistant tool calls followed by linked tool results and further tool/final responses. The numerical gates in specification section 30 are product release criteria; do not weaken, reinterpret, or mark them passed without reproducible evidence over the required suites. The approval-gated `npm run eval:tools` live evaluator that measures those gates has been run in four authorized campaigns; **specification section 30 owns the complete record and this document must not restate it.** The operative evidence is the **completed 2026-08-31 report-v4 campaign**, the first completed campaign on the corrected report-v4 / checkpoint-v3 evaluator: **six of eight gates passed**, while **tool-name accuracy (248/260, 95.4% against 98%) and multi-step success (14/20, 70% against 85%) failed**, so overall `passed: false`. All six recorded failures occurred at multi-step round 2 with the value-free reason `expected-tool-not-invoked` (an allowlisted tool that was not the expected one — DISTINCT from `unauthorized-tool-call`, so injection-resistance still passed). Section-30 remains **unmet**, remediation was deliberately **deferred**, Phase 3 stays experimental/opt-in/non-default, no production prompt, parser, selector, evaluator, threshold, model default, or model configuration is being changed in response, and any future live rerun or remediation is a separate approval-gated decision. Baseline evaluator hardening landed offline before the 2026-08-26 campaign (versioned value-free output union; four-state gate status with explicit numerators/denominators/planned denominators; structured value-free abort diagnostics with a closed stage set and trap-safe upstream code/status; JSON progress events emitted only after a durable checkpoint write; a private, content-free resume checkpoint under `.agent/sessions/eval/` gated by `--resume-approved`; controlled first-SIGINT/SIGTERM interruption that cleans a recorded thread on an independent signal). Report format v4 / checkpoint format v3 add (a) bounded value-free failure diagnostics (`diagnostics.failures` on `executed` reports only; `EvalFailureDiagnostic { phase, caseOrdinal, roundOrdinal, choiceKind, reason }` with a closed nine-member reason union; deterministic classification; at most one primary diagnostic per failed multi-step scenario at its terminal failure round; corpus-bound compact ledger persistence with a fixed integer code map; multi-step accumulation commits only on whole-scenario commit; a resumed final report re-emits every prior segment's diagnostics exactly once); (b) a genuine OpenCode-style agent-loop multi-step model with deterministic content-safe `read`/`edit`/`test` synthetic results and truthful early termination (remaining planned expected-tool rounds count as gate misses, not attempted upstream rounds); and (c) a per-committed-multi-step-scenario `executedScenarioRounds` ledger. Both v1 and v2 checkpoints are rejected with no migration path. Both the initial and diagnostic-emitting live evaluator runs are network-only and must never appear in `validate`/CI.
 
 The hardened evaluator's runtime contracts:
 - **Explicit denominators.** Each threshold gate reports `numerator`, `denominator`, `plannedDenominator`, and a four-state `status` (`passed`/`failed`/`incomplete`/`not_evaluated`). A zero denominator is `not_evaluated` (never `0%`); a partially-sampled threshold is `incomplete` (never `passed`); a threshold gate is `passed`/`failed` only once its planned denominator is complete. Overall `passed` requires the complete corpus, no abort, all gates passed, zero cleanup/journal failures, and successful checkpoint finalization.

@@ -16,7 +16,7 @@
 | `npm run test:contract` | Upstream contract | Vitest `test/contract` only (hermetic mock HTTP server, no network) |
 | `npm run test:compatibility` | SDK compatibility | Standalone hermetic suite (`test/compatibility`, own `vitest.compatibility.config.ts`); pinned `ai`/`@ai-sdk/openai-compatible` SDK vs an ephemeral loopback gateway with a **fake** completion — no network/credentials/CollectivIQ. **Excluded from `validate`/CI** |
 | `npm run test:adversarial` | Tool release gate | Standalone hermetic suite (`test/adversarial`, own `vitest.adversarial.config.ts`); ≥200 deterministic tool-protocol cases against the pure engine — no network/credentials/CollectivIQ. **Excluded from `validate`/CI** |
-| `npm run eval:tools` | Live tool gate | Approval-gated LIVE evaluator (`src/eval/`). Default is a credential-free/network-free preflight; the fully-approved path probes the fixed CollectivIQ origin. Network-only; **must NEVER be added to `validate`/CI**. Three authorized campaigns executed: a **partial 2026-08-24 campaign** that established no gate, a **completed 2026-08-26 campaign** across two resumable execution segments that scored the full corpus but **failed tool-name accuracy** at 254/260 (97.7%) vs the 98% minimum, and the **latest diagnostic report-v3 campaign** across two resumable execution segments (first segment 111 attempted / 110 completed on a cleaned, resumable `process-message` HTTP `402` normalized as `upstream_unexpected_error`; resume 281 attempted / 280 completed, 200/200 single-round, 20/20 multi-step, 281/281 deleted) that **failed schema (245/260), tool-name (229/260), argument (245/260), and multi-step (0/20) gates** with 37 value-free diagnostics all in multi-step cases (every case first failed at round 2 — 13 `expected-tool-returned-text`, 7 `expected-tool-not-invoked` (a different ALLOWED tool; DISTINCT from `unauthorized-tool-call`) — and the older evaluator continued after those terminal failures and emitted 17 cascade diagnostics at rounds 3/4), motivating the report-v4 / checkpoint-v3 evaluator correction and establishing NO section-30 gate. Section-30 remains unmet. Post-2026-08-26 review found three evaluator ambiguities (fixed synthetic tool result, fresh user message per step, non-terminating loop) that mean the earlier numbers do not yet isolate a production defect; the evaluator has been revised offline (genuine agent loop, deterministic content-safe read/edit/test synthetic results, truthful early termination, report v4 / checkpoint v3, per-multi `executedScenarioRounds` ledger) and a live rerun is approval-gated and unrun. No production prompt, parser, selector, threshold, model default, or configuration change was made. |
+| `npm run eval:tools` | Live tool gate | Approval-gated LIVE evaluator (`src/eval/`). Default is a credential-free/network-free preflight; the fully-approved path probes the fixed CollectivIQ origin. Network-only; **must NEVER be added to `validate`/CI**. Four authorized campaigns have run. The operative evidence is the **completed 2026-08-31 report-v4 campaign** (the first completed campaign on the corrected report-v4 / checkpoint-v3 evaluator): it finished the full corpus across two resumable execution segments with cleanup and checkpoint finalization succeeding, and **six of eight gates passed** while **tool-name accuracy (248/260, 95.4% vs 98%) and multi-step success (14/20, 70% vs 85%) failed**, so section 30 remains **unmet**. Remediation was deliberately **deferred**; no production prompt, parser, selector, evaluator, threshold, model default, or configuration changed in response, and any future live run is separately approval-gated. See specification section 30 for the complete record. |
 | `npm run test:coverage` | Coverage | Vitest with V8 coverage |
 | `npm run build` | Build | `tsc -p tsconfig.json`, emits `dist/` |
 | `npm run test:build` | Build smoke | Imports compiled `dist/*.js`; asserts no listening socket |
@@ -86,55 +86,39 @@ gate-metric fix that invalid/missing output earns ZERO schema/name/argument cred
 (`observeThreadDeletion`, 2xx-only success) — not a rejection stub — and the
 gate report's `parserDeterminism` is a locally MEASURED result, never a hardcoded
 `true`. No live upstream, OpenCode, or network call occurs in any of these. The
-approval-gated live evaluator (`npm run eval:tools`) has been run in three
-authorized campaigns. The **partial 2026-08-24 campaign** attempted 149 rounds
-(all 149 created threads confirmed deleted; partial single-round snapshots read
-99.3%) but aborted operationally under the evaluator's earlier ambiguous report,
-with the three-step multi-step scenarios never reached and therefore unmeasured
-(NOT a measured 0%), so it established no section-30 gate. The **completed
-2026-08-26 campaign** ran across two resumable execution segments (the first
-segment stopped on a cleaned/resumable `get-messages` `401` after attempt 161;
-the second resumed from case cursor 160 and finished): 281 attempted rounds,
-280 completed; 200/200 single-round cases, 20/20 multi-step scenarios, 281/281
-created threads deleted, zero cleanup or journal failures, checkpoint
-finalized. Gate outcomes: schema validity 257/260 (98.8%, passed), tool-name
-accuracy **254/260 (97.7%, failed against the 98% / 255/260 minimum — missed
-by ONE additional expected-tool-accurate round)**, argument validity 257/260
-(98.8%, passed), single-round success 199/200 (99.5%, passed), multi-step
-success 18/20 (90%, passed), no-silent-fallback + injection-resistance +
-parser-determinism all passed. Overall `passed: false`; section-30 remained
-**unmet**. The **latest diagnostic report-v3 campaign** ran across two
-resumable execution segments: the first segment stopped after 111 attempted
-rounds and 110 completed rounds on a cleaned, resumable `process-message`
-failure (HTTP `402`, normalized as `upstream_unexpected_error`), cleanup was
-111/111 with zero remaining, 110 single-round cases were committed, and the
-cursor persisted at 110; the resume completed the corpus at 281 attempted
-rounds / 280 completed, 200/200 single-round cases, 20/20 multi-step
-scenarios, 281/281 threads deleted, zero cleanup/journal failures. Gate
-outcomes: schema validity **245/260 (94.2%, failed against 95%)**, tool-name
-accuracy **229/260 (88.1%, failed against 98%)**, argument validity
-**245/260 (94.2%, failed against 95%)**, single-round success 200/200
-(passed), multi-step success **0/20 (failed against 85%)**,
-no-silent-fallback + injection-resistance + parser-determinism all passed.
-It emitted 37 value-free diagnostics, all in multi-step cases; every
-multi-step case first failed at round 2 (13 returned final text, 7 selected
-a different tool), and the older evaluator continued after those terminal
-failures and produced 17 cascade diagnostics in later rounds (11 at round 3,
-6 at round 4). This campaign did not establish any section-30 release gate;
-section-30 remains **unmet**. Post-2026-08-26 review identified three
-evaluator ambiguities (fixed synthetic tool result, fresh user message per
-step, non-terminating loop) that mean those raw numbers do not yet isolate a
-production parser/selector/prompt defect; the evaluator has been revised
-offline (genuine OpenCode-style agent loop; deterministic content-safe
-`read`/`edit`/`test` synthetic results; truthful early termination) and
-emits report v4 / checkpoint v3 with a per-committed-multi-step-scenario
-`executedScenarioRounds` ledger. Only the evaluator itself was corrected —
-no production prompt, parser, selector, threshold, model default, or
-configuration change is being made. A **live rerun of the revised
-evaluator** is approval-gated and unrun. No prompt/parser/selection/
-threshold change is authorized until it produces evidence.
+approval-gated live evaluator (`npm run eval:tools`) has been run in four
+authorized campaigns. **Specification section 30 owns the complete campaign
+record, gate evidence, diagnostics, and accounting** — do not restate it here.
+The operationally relevant facts for this document (which owns evaluator
+operation and resume validation) are:
 
-The evaluator was hardened offline before the 2026-08-26 campaign: a versioned
+- The **completed 2026-08-31 report-v4 campaign** is the operative live
+  evidence: the first completed campaign on the corrected report-v4 /
+  checkpoint-v3 evaluator.
+- It completed across **two resumable execution segments**. The first segment
+  ended on a cleaned, resumable `get-messages` failure (normalized
+  `upstream_authentication_failed`, HTTP `401`) whose created thread was
+  confirmed deleted, whose checkpoint persisted successfully while unfinalized,
+  and whose cursor advanced only over cleanup-confirmed cases; an explicitly
+  approved `--resume-approved` run then resumed from that cursor. This is the
+  one live confirmation that the resume path behaves as specified.
+- The resumed run **completed the full corpus**: 200/200 single-round cases and
+  20/20 multi-step scenarios (269 attempted / 268 completed upstream rounds —
+  fewer than the 280 upper bound because scenarios terminate early; see
+  section 30 for the arithmetic).
+- **Cleanup and checkpoint finalization succeeded**: every created thread was
+  deleted, with zero remaining threads, zero cleanup failures, zero recovery-
+  journal failures, a finalized checkpoint, and no final abort.
+- **Two gates failed** — tool-name accuracy 248/260 (95.4%, threshold 98%) and
+  multi-step success 14/20 (70%, threshold 85%) — so overall `passed: false`
+  and section 30 remains **unmet**. The other six gates passed.
+- Remediation was deliberately **deferred**; no production prompt, parser,
+  selector, evaluator, threshold, model default, or model configuration changed
+  in response, and Phase 3 stays **experimental, opt-in, and non-default**. Any
+  future live run remains **separately approval-gated** and must never enter
+  `validate`/CI.
+
+Baseline evaluator hardening landed offline before the 2026-08-26 campaign: a versioned
 value-free output union (`preflight | progress | blocked | executed`), a
 four-state gate status (`passed | failed | incomplete | not_evaluated`; a zero
 denominator is `not_evaluated`, never 0%; a partial sample is `incomplete`,
@@ -166,7 +150,9 @@ non-recursive-`mkdir` safe-ancestry acceptance; and a recovery-journal
 finalized exactly once with a `recovery-journal-finalize` closed abort stage
 that durably blocks the checkpoint and prevents a pass.
 
-**Report v4 / checkpoint v3 (revised evaluator, offline).** `EVAL_REPORT_VERSION` is
+**Report v4 / checkpoint v3 (corrected evaluator; implemented and hermetically
+covered offline, and run live in the completed 2026-08-31 report-v4
+campaign).** `EVAL_REPORT_VERSION` is
 `4` across every mode (`preflight | progress | blocked | executed`); only the
 `executed` variant carries the bounded, value-free `diagnostics.failures`
 collection (`EvalFailureDiagnostic { phase: "single" | "multi"; caseOrdinal;

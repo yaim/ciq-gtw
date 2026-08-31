@@ -36,31 +36,13 @@ direct` (latest-user-only prompt, no protocol wrapper) — is the committed Open
 > **synthetic** (the answer is obtained by polling, then split into deltas), not
 > true upstream streaming. It now also includes **experimental, opt-in emulated
 > tool calling** (Phase 3), which is **non-default** and whose section-30 release
-> gates are **not met** (three authorized live evaluator campaigns have been
-> run: a **partial 2026-08-24 campaign** that established no gate; a **completed
-> 2026-08-26 campaign** across two resumable execution segments that scored the
-> full corpus but **failed tool-name accuracy** at 254/260 (97.7%) vs the 98%
-> minimum with seven other gates passing; and the **latest diagnostic
-> report-v3 campaign** across two resumable execution segments (first segment
-> 111 attempted / 110 completed on a cleaned, resumable `process-message` HTTP
-> `402` normalized as `upstream_unexpected_error`; resume 281 attempted / 280
-> completed, 200/200 single-round, 20/20 multi-step, 281/281 deleted, zero
-> cleanup/journal failures) that failed schema (245/260), tool-name (229/260),
-> argument (245/260), and multi-step (0/20) gates and emitted 37 value-free
-> multi-step diagnostics (every case first failed at round 2 — 13 returned
-> final text (`expected-tool-returned-text`), 7 selected a different
-> ALLOWED tool (`expected-tool-not-invoked`, DISTINCT from
-> `unauthorized-tool-call`) — and the older non-terminating
-> evaluator produced 17 cascade diagnostics at rounds 3/4), motivating the
-> report-v4 / checkpoint-v3 evaluator correction; post-2026-08-26 review
-> also found three evaluator ambiguities (fixed synthetic tool result, fresh
-> user message per step, non-terminating loop) that mean the earlier numbers
-> do not yet isolate a production defect; the evaluator has been revised
-> offline (genuine OpenCode-style agent loop, deterministic content-safe
-> read/edit/test synthetic results, truthful early termination, report v4 /
-> checkpoint v3) and only the evaluator was corrected — no production prompt,
-> parser, selector, threshold, model default, or configuration change was
-> made; a live rerun is approval-gated and unrun) — the gateway returns
+> gates are **not met**: the corrected report-v4 evaluator completed a full live
+> campaign on 2026-08-31 in which **six of eight gates passed** while
+> **tool-name accuracy (248/260, 95.4% vs 98%) and multi-step success (14/20,
+> 70% vs 85%) failed**, remediation was deliberately **deferred**, and no
+> production behavior changed — see
+> [section 30](.agent/docs/tech-software-spec.md) for the full evidence. The
+> gateway returns
 > model-proposed tool calls but never executes
 > a tool. It does **not** implement
 > native CollectivIQ tools, Redis/idempotency, or metrics/tracing; those remain
@@ -155,81 +137,22 @@ keep-alive` comments every 15 s while polling waits, deterministic
   each tool-loop round creates a new upstream thread. In emulated mode the
   validated tool schemas, prior arguments, and tool results are serialized into
   the prompt sent to CollectivIQ (never logged or retained). This mode is
-  **experimental**: the section-30 release gates are **not met**. The approval-gated
-  live evaluator (`npm run eval:tools`) has been run in three authorized
-  campaigns (a campaign scores at most one full corpus; a campaign may span
-  multiple resumable execution segments). The **partial 2026-08-24 campaign**
-  attempted 149 rounds (all 149 threads confirmed deleted; single-round
-  snapshots at 99.3%; the multi-step scenarios never reached and so
-  unmeasured, not a measured 0%) but aborted operationally and established no
-  gate. The **completed 2026-08-26 campaign** ran across two resumable
-  execution segments (first segment stopped on a cleaned/resumable
-  `get-messages` `401` after attempt 161; second segment resumed from case
-  cursor 160 and finished): 281 attempted rounds, 280 completed; 200/200
-  single-round cases; 20/20 multi-step scenarios; 281/281 created threads
-  deleted; zero cleanup or journal failures; checkpoint finalized. Gate
-  outcomes: schema validity 98.8% (passed), **tool-name accuracy 97.7%
-  failed** vs the 98% minimum (254/260 vs 255/260 — missed by ONE additional
-  expected-tool-accurate round), argument validity 98.8% (passed),
-  single-round success 99.5% (passed), multi-step success 90% (passed), and
-  no-silent-fallback / injection-resistance / parser-determinism all passed;
-  overall `passed: false`. The counters imply six expected-tool misses (three
-  no-selected-valid-call, three allowed-calls-omit-expected). The **latest
-  diagnostic report-v3 campaign** ran across two resumable execution
-  segments: the first segment stopped after 111 attempted / 110 completed /
-  110 committed single-round cases on a cleaned, resumable `process-message`
-  failure (HTTP `402` normalized as `upstream_unexpected_error`), cleanup
-  111/111 with zero remaining, cursor at 110; the resume completed the
-  corpus at 281 attempted / 280 completed, 200/200 single-round, 20/20
-  multi-step, 281/281 deleted, zero cleanup/journal failures. Gate outcomes:
-  schema validity **245/260 (94.2%, failed against 95%)**, tool-name
-  accuracy **229/260 (88.1%, failed against 98%)**, argument validity
-  **245/260 (94.2%, failed against 95%)**, single-round success 200/200
-  (passed), multi-step success **0/20 (failed against 85%)**,
-  no-silent-fallback + injection-resistance + parser-determinism all passed;
-  overall `passed: false`. It emitted 37 value-free diagnostics, all in
-  multi-step cases; every multi-step case first failed at round 2 (13
-  returned final text — `expected-tool-returned-text`; 7 selected a
-  different ALLOWED tool — `expected-tool-not-invoked`, DISTINCT from
-  `unauthorized-tool-call`), and the older
-  evaluator continued after those terminal failures and produced 17 cascade
-  diagnostics in later rounds (11 at round 3, 6 at round 4). This campaign
-  did not establish any section-30 release gate; the cascades motivated the
-  report-v4 / checkpoint-v3 evaluator correction below, and no production
-  prompt, parser, selector, threshold, model default, or configuration
-  change was made in response — only the evaluator itself.
-  Post-2026-08-26 review identified three latent evaluator ambiguities that
-  mean those raw numbers do not yet isolate a production
-  parser/selector/prompt defect: every synthetic tool result was a single
-  fixed value (`{"synthetic":true,"ok":true}`), so a correct `read` supplied
-  no document content for the model to construct the expected `edit`; the
-  evaluator injected a FRESH user message for every logical read/edit/test/
-  final step instead of modelling one original user request followed by
-  assistant `tool_calls` and linked `role: "tool"` result messages; and it
-  continued issuing later logical rounds after outcomes that would already
-  terminate a real OpenCode tool loop, so multi-step round-3/round-4
-  diagnostics could have been cascades. To make a diagnostic rerun
-  scientifically valid without changing production behavior the evaluator
-  has been revised offline to represent a genuine OpenCode-style agent loop
-  over synthetic in-memory state (one initial user message accumulated with
-  assistant `tool_calls` and exactly linked `role: "tool"` synthetic result
-  messages; deterministic content-safe `read`/`edit`/`test` results;
-  truthful early termination — remaining planned expected-tool rounds count
-  as gate misses in the section-30 denominators, never as attempted
-  upstream rounds, and no cascade diagnostics are fabricated). It now emits
-  **report version 4** with the same bounded value-free
-  `diagnostics.failures` collection (only on `executed` reports) and
-  persists it via **checkpoint format version 3** (a compact ledger with
-  fixed integer reason codes PLUS a per-committed-multi-step-scenario
-  `executedScenarioRounds` ledger so the committed upstream-round floor is
-  `committedSingle + Σ executedScenarioRounds`; v1 and v2 rejected;
-  corpus-bound semantic validation before any credential read or network
-  I/O; multi-step diagnostics commit only on whole-scenario commit; resumed
-  reports re-emit each prior segment's diagnostics exactly once). A **live
-  rerun of the revised evaluator** is approval-gated and unrun; no
-  prompt/parser/selection/threshold change is authorized until it produces
-  evidence. This evaluator campaign is a
-  separate event from the tool-schema live smoke described next. The draft-2020-12
+  **experimental**: the section-30 release gates are **not met**. The
+  approval-gated live evaluator (`npm run eval:tools`) has been run in four
+  authorized campaigns. The corrected report-v4 evaluator completed a full live
+  campaign on **2026-08-31**: **six of the eight gates passed**, while
+  **tool-name accuracy (248/260, 95.4% against the 98% minimum) and multi-step
+  success (14/20, 70% against the 85% minimum) failed**, so overall
+  `passed: false`. Section 30 remains **unmet**, the user deliberately
+  **deferred** remediation, no production prompt, parser, selector, evaluator,
+  threshold, model default, or model configuration changed in response, Phase 3
+  stays experimental/opt-in/non-default, and any future live rerun is
+  separately approval-gated. See
+  [`.agent/docs/tech-software-spec.md`](.agent/docs/tech-software-spec.md)
+  section 30 for the complete campaign record, gate evidence, and accounting.
+  These evaluator
+  campaigns are
+  separate events from the tool-schema live smoke described next. The draft-2020-12
   dialect support closes the confirmed OpenCode 1.18.21 schema-compilation gap both
   **offline** (hermetic suites) and in one **sanitized, user-authorized live smoke
   on 2026-08-24**: OpenCode's built-in `read` schema (draft-2020-12) passed
@@ -249,24 +172,11 @@ keep-alive` comments every 15 s while polling waits, deterministic
 
 `GET /metrics`, native CollectivIQ tool calling, and Redis/idempotency.
 (Experimental emulated tool calling is implemented but non-default; its section-30
-release gates are not met — three authorized live evaluator campaigns have run
-(a partial 2026-08-24 campaign that established no gate; a completed 2026-08-26
-campaign that failed tool-name accuracy at 254/260 (97.7%) vs the 98% minimum;
-and the latest diagnostic report-v3 campaign across two resumable execution
-segments that scored the full corpus but failed schema (245/260), tool-name
-(229/260), argument (245/260), and multi-step (0/20) gates and emitted 37
-value-free multi-step diagnostics with 17 cascade entries at rounds 3/4 under
-the older non-terminating evaluator, motivating the report-v4 / checkpoint-v3
-evaluator correction), post-campaign review found evaluator ambiguities (fixed
-synthetic tool result, fresh user message per step, non-terminating loop) that
-mean the earlier numbers do not yet isolate a production defect; the evaluator
-has been revised offline (genuine OpenCode-style agent loop, deterministic
-content-safe read/edit/test synthetic results, truthful early termination,
-report v4 / checkpoint v3, per-multi `executedScenarioRounds` ledger), only the
-evaluator was corrected and no production prompt, parser, selector, threshold,
-model default, or configuration change was made, and a live rerun of the
-revised evaluator is approval-gated and unrun — see
-"What works today".) (Gateway
+release gates are not met — the corrected report-v4 evaluator completed a full
+live campaign on 2026-08-31 in which six of eight gates passed while tool-name
+accuracy (248/260, 95.4%) and multi-step success (14/20, 70%) failed,
+remediation was deliberately deferred, and no production behavior changed; see
+"What works today" and specification section 30.) (Gateway
 authentication, the model endpoints, the non-streamed `POST /v1/chat/completions`
 path, and text-only synthetic SSE streaming are implemented — see "What works
 today". A basic live OpenCode/CollectivIQ foreground **transport** smoke was
@@ -653,48 +563,24 @@ is a credential-free, network-free **preflight**; the fully-approved live path
 (`--execute-approved --cost-approved --cleanup-approved --recovery-journal-approved`,
 password auth only, 200 single-round + 20 three-step scenarios, hard cap 280
 completions, per-request thread cleanup, ID-only recovery journal) is network-only
-and must **never** be added to `validate`/CI. It has been run in three
-authorized campaigns (a campaign scores at most one full corpus; a campaign may
-span multiple resumable execution segments). The **partial 2026-08-24
-campaign** attempted 149 rounds (all 149 created threads confirmed deleted;
-partial single-round snapshots read 99.3%) but aborted operationally under the
-evaluator's earlier ambiguous report, with the three-step multi-step scenarios
-never reached and therefore unmeasured (NOT a measured 0%), so it established
-no gate. The **completed 2026-08-26 campaign** ran across two resumable
-execution segments (first segment stopped on a cleaned/resumable
-`get-messages` `401` after attempt 161; second segment resumed from case
-cursor 160 and finished): 281 attempted rounds, 280 completed; 200/200
-single-round cases; 20/20 multi-step scenarios; 281/281 created threads
-deleted; zero cleanup or journal failures; checkpoint finalized. Gate
-outcomes: schema validity 98.8% (passed), **tool-name accuracy 97.7% failed**
-vs the 98% minimum (254/260 vs 255/260 — missed by ONE additional
-expected-tool-accurate round), argument validity 98.8% (passed), single-round
-success 99.5% (passed), multi-step success 90% (passed), and
-no-silent-fallback / injection-resistance / parser-determinism all passed;
-overall `passed: false`. The **latest diagnostic report-v3 campaign** ran
-across two resumable execution segments (first segment stopped after 111
-attempted / 110 completed / 110 committed single-round cases on a cleaned,
-resumable `process-message` HTTP `402` normalized as
-`upstream_unexpected_error`, cleanup 111/111 with zero remaining, cursor at
-110; resume finished the corpus at 281 attempted / 280 completed, 200/200
-single-round, 20/20 multi-step, 281/281 deleted, zero cleanup/journal
-failures): schema validity **245/260 (94.2%, failed against 95%)**,
-tool-name accuracy **229/260 (88.1%, failed against 98%)**, argument
-validity **245/260 (94.2%, failed against 95%)**, single-round success
-200/200 (passed), multi-step success **0/20 (failed against 85%)**,
-no-silent-fallback + injection-resistance + parser-determinism all passed;
-overall `passed: false`. It emitted 37 value-free diagnostics, all in
-multi-step cases, with every case first failing at round 2 (13 returned
-final text — `expected-tool-returned-text`; 7 selected a different
-ALLOWED tool — `expected-tool-not-invoked`, DISTINCT from
-`unauthorized-tool-call`) and 17 cascade diagnostics in later
-rounds (11 at round 3, 6 at round 4) under the older non-terminating
-evaluator. Those cascades motivated the report-v4 / checkpoint-v3 evaluator
-correction; no production prompt, parser, selector, threshold, model
-default, or configuration change was made in response, and a live rerun of
-the corrected evaluator remains approval-gated and unrun.
+and must **never** be added to `validate`/CI. It has been run in four
+authorized campaigns. The operative evidence is the **completed 2026-08-31
+report-v4 campaign** — the first completed campaign on the corrected report-v4
+/ checkpoint-v3 evaluator — which finished the full corpus across two resumable
+execution segments (a cleaned, resumable first-segment failure followed by an
+explicitly approved resume) with cleanup and checkpoint finalization
+succeeding. **Six of the eight gates passed**, while **tool-name accuracy
+(248/260, 95.4% against the 98% minimum) and multi-step success (14/20, 70%
+against the 85% minimum) failed**, so overall `passed: false` and section 30
+remains **unmet**. Remediation was deliberately **deferred**; no production
+prompt, parser, selector, evaluator, threshold, model default, or model
+configuration changed in response, and any future live rerun is separately
+approval-gated. See
+[`.agent/docs/tech-software-spec.md`](.agent/docs/tech-software-spec.md)
+section 30 for the complete four-campaign record, gate evidence, diagnostics,
+and accounting.
 
-The evaluator was hardened offline before the 2026-08-26 campaign: a versioned
+Baseline evaluator hardening landed offline before the 2026-08-26 campaign: a versioned
 value-free output union (`preflight | progress | blocked | executed`), a
 four-state gate status (`passed | failed | incomplete | not_evaluated`; a zero
 denominator is `not_evaluated`, never 0%; a partial sample is `incomplete`,
@@ -789,15 +675,14 @@ in compact JSON). Multi-step diagnostics AND the `executedScenarioRounds` entry
 accumulate locally and commit only on whole-scenario commit; a resumed final
 report re-emits every prior segment's diagnostics exactly once.
 
-A **live rerun of the revised evaluator** is approval-gated and unrun; the
-gates remain not met and emulated tool mode stays experimental. No production
-prompt, parser, selection, threshold, model default, or model configuration is
-being changed; only the evaluator itself was corrected (the evaluator's
+This corrected evaluator **has been run live** — the completed 2026-08-31
+report-v4 campaign summarized above, whose gates remain not met — so emulated
+tool mode stays experimental. Only the evaluator itself was
+corrected before that campaign: its
 synthetic multi-step corpus/loop was updated to represent a genuine
-OpenCode-style tool loop, but that is an evaluator-corpus correction and
+OpenCode-style tool loop, which is an evaluator-corpus correction and
 does NOT change the production tool corpus, allowlists, thresholds, or
-protocol). A live rerun of the corrected evaluator remains approval-gated
-and unrun.
+protocol.
 
 ## CollectivIQ contract tooling
 
