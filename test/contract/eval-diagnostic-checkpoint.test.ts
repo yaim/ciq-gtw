@@ -7,6 +7,15 @@
  * mode cases use real temp directories. No network, no credential, and the fixed
  * production origin is never contacted.
  *
+ * Format 3 accompanies diagnostic report v3 and the shared STATE-AWARE
+ * transition engine: the per-scenario ledger records `[executedRounds,
+ * satisfiedSteps]`, a terminal diagnostic's reason SCOPE is checked against the
+ * SATISFIED STATE rather than the round's positional `hasExpectedTool`, and a
+ * diagnostic-free scenario needs every transition satisfied plus at least one
+ * final-answer round — not the whole four-round budget, because a parallel
+ * `[read, edit]` batch lets a successful scenario finish in three rounds.
+ * Formats 1 AND 2 are rejected with no migration path.
+ *
  * The most important property proven here is ISOLATION: the diagnostic store can
  * never read, overwrite, finalize, or remove the RELEASE evaluator's checkpoint,
  * even when both files live in the same directory.
@@ -42,6 +51,7 @@ import {
   type DiagnosticCheckpointLocation,
   type DiagnosticCorpusProjection,
   type DiagnosticScenario,
+  type DiagnosticScenarioEvidence,
 } from "../../src/eval/diagnostic-checkpoint.js";
 import {
   ALLOWED_CALL_RELATION_CODES,
@@ -51,6 +61,10 @@ import {
   MAX_TRANSITION_DIAGNOSTICS,
 } from "../../src/eval/diagnostic-report.js";
 import { EVAL_FAILURE_REASON_CODES } from "../../src/eval/report.js";
+import {
+  MIN_SUCCESSFUL_SCENARIO_ROUNDS,
+  SCENARIO_STEP_COUNT,
+} from "../../src/eval/scenario-engine.js";
 import { CHECKPOINT_FILENAME } from "../../src/eval/checkpoint.js";
 import { buildEvalCases, corpusFingerprint, type EvalCase } from "../../src/eval/cases.js";
 
@@ -85,6 +99,16 @@ function file(dir: string): string {
   return join(dir, DIAGNOSTIC_CHECKPOINT_FILENAME);
 }
 
+/** One committed scenario's format-3 evidence tuple. */
+function evidence(executedRounds: number, satisfiedSteps: number): DiagnosticScenarioEvidence {
+  return [executedRounds, satisfiedSteps];
+}
+
+/** A scenario that ran its whole budget and completed every transition. */
+function fullSuccess(): DiagnosticScenarioEvidence {
+  return evidence(4, SCENARIO_STEP_COUNT);
+}
+
 function data(over: Partial<DiagnosticCheckpointData> = {}): DiagnosticCheckpointData {
   return {
     formatVersion: DIAGNOSTIC_CHECKPOINT_FORMAT_VERSION,
@@ -101,7 +125,7 @@ function data(over: Partial<DiagnosticCheckpointData> = {}): DiagnosticCheckpoin
     completedScenarios: 3,
     successfulScenarios: 3,
     cleanup: { attempted: 12, deleted: 12, failed: 0, journalFailures: 0 },
-    executedScenarioRounds: [4, 4, 4],
+    scenarioEvidence: [fullSuccess(), fullSuccess(), fullSuccess()],
     diagnostics: [],
     ...over,
   };
@@ -118,7 +142,8 @@ function blockedData(over: Partial<DiagnosticCheckpointData> = {}): DiagnosticCh
 
 /**
  * A truthful all-successful resumable checkpoint at scenario cursor `k` for the
- * REAL corpus projection (every committed scenario ran its full four rounds).
+ * REAL corpus projection (every committed scenario ran its full four rounds and
+ * satisfied all three transitions).
  */
 function seed(k: number, over: Partial<DiagnosticCheckpointData> = {}): DiagnosticCheckpointData {
   const rounds = 4 * k;
@@ -131,9 +156,30 @@ function seed(k: number, over: Partial<DiagnosticCheckpointData> = {}): Diagnost
     completedScenarios: k,
     successfulScenarios: k,
     cleanup: { attempted: rounds, deleted: rounds, failed: 0, journalFailures: 0 },
-    executedScenarioRounds: Array.from({ length: k }, () => 4),
+    scenarioEvidence: Array.from({ length: k }, () => fullSuccess()),
     diagnostics: [],
     ...over,
+  });
+}
+
+/**
+ * The observed production failure shape: scenario 201 succeeded on its full
+ * budget, scenario 202 stopped at round 2 having satisfied only `read`.
+ */
+function terminatedAtRoundTwo(
+  diagnostics: readonly DiagnosticCheckpointEntry[],
+  satisfiedSteps = 1,
+): DiagnosticCheckpointData {
+  return data({
+    corpusFingerprint: corpusFingerprint(),
+    nextScenarioIndex: 2,
+    completedScenarios: 2,
+    successfulScenarios: 1,
+    scenarioEvidence: [fullSuccess(), evidence(2, satisfiedSteps)],
+    attemptedRounds: 6,
+    completedRounds: 6,
+    cleanup: { attempted: 6, deleted: 6, failed: 0, journalFailures: 0 },
+    diagnostics,
   });
 }
 
@@ -150,15 +196,39 @@ function priorOnlyEntry(caseOrdinal: number): DiagnosticCheckpointEntry {
 }
 
 /**
- * The history-aware shape added in format v2: round 2's expected tool had
- * already been invoked as a parallel call in an accepted earlier round.
+ * A whole-scenario terminal reason (report v3 / release v5): the scenario used
+ * its entire round budget without an accepted final answer. Its scope is `any`,
+ * so it agrees with every satisfied state, and all three dimensions are
+ * `not-applicable`.
  */
-function alreadyInvokedEntry(caseOrdinal: number): DiagnosticCheckpointEntry {
+function budgetExhaustedEntry(
+  caseOrdinal: number,
+  roundOrdinal: number,
+): DiagnosticCheckpointEntry {
+  return [
+    caseOrdinal,
+    roundOrdinal,
+    EVAL_FAILURE_REASON_CODES["scenario-round-budget-exhausted"],
+    ALLOWED_CALL_RELATION_CODES["not-applicable"],
+    DIAGNOSTIC_SELECTION_SOURCE_CODES["not-applicable"],
+    DIAGNOSTIC_CALL_MULTIPLICITY_CODES["not-applicable"],
+  ];
+}
+
+/**
+ * The REMOVED format-v2 relation code. v3 deleted `expected-already-invoked`
+ * (code 7) because a state-aware expectation can never name an already-satisfied
+ * transition, and the code was NOT reused, so a stale ledger entry must fail
+ * closed rather than decode to a different member.
+ */
+const REMOVED_V2_RELATION_CODE = 7;
+
+function removedRelationEntry(caseOrdinal: number): readonly number[] {
   return [
     caseOrdinal,
     2,
     EVAL_FAILURE_REASON_CODES["expected-tool-not-invoked"],
-    ALLOWED_CALL_RELATION_CODES["expected-already-invoked"],
+    REMOVED_V2_RELATION_CODE,
     DIAGNOSTIC_SELECTION_SOURCE_CODES["desired-source"],
     DIAGNOSTIC_CALL_MULTIPLICITY_CODES.single,
   ];
@@ -226,6 +296,10 @@ describe("diagnostic checkpoint — corpus selection and projection", () => {
 });
 
 describe("diagnostic checkpoint — round trip", () => {
+  it("pins the only supported on-disk format version to 3", () => {
+    expect(DIAGNOSTIC_CHECKPOINT_FORMAT_VERSION).toBe(3);
+  });
+
   it("writes 0600 inside a 0700 directory and reads back the same content", () => {
     const dir = tempDir();
     writeDiagnosticCheckpoint(loc(dir), data());
@@ -258,7 +332,7 @@ describe("diagnostic checkpoint — round trip", () => {
       nextScenarioIndex: 2,
       completedScenarios: 2,
       successfulScenarios: 1,
-      executedScenarioRounds: [4, 2],
+      scenarioEvidence: [fullSuccess(), evidence(2, 1)],
       attemptedRounds: 6,
       completedRounds: 6,
       cleanup: { attempted: 6, deleted: 6, failed: 0, journalFailures: 0 },
@@ -270,27 +344,47 @@ describe("diagnostic checkpoint — round trip", () => {
     expect(read?.diagnostics[0]).toHaveLength(6);
   });
 
-  it("round-trips the appended history-aware relation code", () => {
+  it("persists the per-scenario evidence as two-integer tuples and reads them back", () => {
     const dir = tempDir();
+    // Format 3 replaces the plain executed-round ledger with
+    // `[executedRounds, satisfiedSteps]`, so a satisfied-state claim is durable
+    // and checkable. A three-round success (a parallel `[read, edit]` batch)
+    // and an early-terminated scenario both round-trip.
     writeDiagnosticCheckpoint(
       loc(dir),
       data({
         nextScenarioIndex: 2,
         completedScenarios: 2,
         successfulScenarios: 1,
-        executedScenarioRounds: [4, 2],
-        attemptedRounds: 6,
-        completedRounds: 6,
-        cleanup: { attempted: 6, deleted: 6, failed: 0, journalFailures: 0 },
-        diagnostics: [alreadyInvokedEntry(202)],
+        scenarioEvidence: [evidence(3, SCENARIO_STEP_COUNT), evidence(2, 1)],
+        attemptedRounds: 5,
+        completedRounds: 5,
+        cleanup: { attempted: 5, deleted: 5, failed: 0, journalFailures: 0 },
+        diagnostics: [priorOnlyEntry(202)],
       }),
     );
     const read = readDiagnosticCheckpoint(loc(dir), EXPECTED);
-    expect(read?.diagnostics).toEqual([alreadyInvokedEntry(202)]);
-    expect(read?.diagnostics[0]?.[3]).toBe(7);
-    // The persisted tuple carries only integers — no relation NAME on disk.
-    const raw = readFileSync(file(dir), "utf8");
-    expect(raw).not.toContain("expected-already-invoked");
+    expect(read?.scenarioEvidence).toEqual([
+      [3, 3],
+      [2, 1],
+    ]);
+    expect(read?.scenarioEvidence[0]).toHaveLength(2);
+  });
+
+  it("refuses to persist the REMOVED v2 relation code", () => {
+    // Code 7 (`expected-already-invoked`) is unreachable under the state-aware
+    // engine and was deleted rather than reused, so neither the write path nor
+    // the read path may accept it.
+    const dir = tempDir();
+    expect(() =>
+      writeDiagnosticCheckpoint(
+        loc(dir),
+        data({
+          diagnostics: [removedRelationEntry(202) as unknown as DiagnosticCheckpointEntry],
+        }),
+      ),
+    ).toThrow();
+    expect(readDiagnosticCheckpoint(loc(dir), EXPECTED)).toBeNull();
   });
 
   it("writes compact, content-free bytes (no prompt, tool name, or path)", () => {
@@ -301,7 +395,7 @@ describe("diagnostic checkpoint — round trip", () => {
         nextScenarioIndex: 2,
         completedScenarios: 2,
         successfulScenarios: 1,
-        executedScenarioRounds: [4, 2],
+        scenarioEvidence: [fullSuccess(), evidence(2, 1)],
         attemptedRounds: 6,
         completedRounds: 6,
         cleanup: { attempted: 6, deleted: 6, failed: 0, journalFailures: 0 },
@@ -335,6 +429,28 @@ describe("diagnostic checkpoint — isolation from the release evaluator checkpo
     expect(DIAGNOSTIC_CHECKPOINT_FILENAME).toContain("diagnostic");
   });
 
+  it("imports nothing from the release checkpoint module and cannot name its file", () => {
+    // The STRUCTURAL guarantee: this module hard-codes its own filename and
+    // never references `./checkpoint.js`, so no code path here can resolve to
+    // the release evaluator's checkpoint. Reading the source keeps the property
+    // enforced rather than merely documented (a hermetic file read; no network,
+    // credential, or upstream call). Comments are stripped first — the module
+    // docstring legitimately NAMES the release file to explain the separation,
+    // and the property under test is that no CODE path can resolve it.
+    const source = readFileSync(
+      new URL("../../src/eval/diagnostic-checkpoint.ts", import.meta.url),
+      "utf8",
+    );
+    const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+    expect(code).not.toMatch(/from\s+["']\.\/checkpoint\.js["']/);
+    expect(code).not.toMatch(/import\s*\(\s*["']\.\/checkpoint\.js["']\s*\)/);
+    expect(code).not.toMatch(/\bCHECKPOINT_FILENAME\b/);
+    // The release filename literal appears in no executable position, so it can
+    // never be resolved, opened, written, or unlinked from here.
+    expect(code).not.toContain(CHECKPOINT_FILENAME);
+    expect(code).toContain(DIAGNOSTIC_CHECKPOINT_FILENAME);
+  });
+
   it("resolves the same ignored managed directory but its own filename", () => {
     const location = defaultDiagnosticCheckpointLocation();
     expect(location.components).toEqual([".agent", "sessions", "eval"]);
@@ -342,7 +458,7 @@ describe("diagnostic checkpoint — isolation from the release evaluator checkpo
 
   it("never reads a release checkpoint that sits in the same directory", () => {
     const dir = tempDir();
-    writeFileSync(join(dir, CHECKPOINT_FILENAME), '{"formatVersion":3}\n', { mode: 0o600 });
+    writeFileSync(join(dir, CHECKPOINT_FILENAME), '{"formatVersion":4}\n', { mode: 0o600 });
     chmodSync(dir, 0o700);
     expect(readDiagnosticCheckpoint(loc(dir), EXPECTED)).toBeNull();
     expect(diagnosticCheckpointExists(loc(dir))).toBe(false);
@@ -351,7 +467,7 @@ describe("diagnostic checkpoint — isolation from the release evaluator checkpo
   it("never overwrites, truncates, or removes a co-located release checkpoint", () => {
     const dir = tempDir();
     const releasePath = join(dir, CHECKPOINT_FILENAME);
-    const releaseBytes = '{"formatVersion":3,"origin":"x"}\n';
+    const releaseBytes = '{"formatVersion":4,"origin":"x"}\n';
     writeFileSync(releasePath, releaseBytes, { mode: 0o600 });
 
     writeDiagnosticCheckpoint(loc(dir), data());
@@ -384,8 +500,8 @@ describe("diagnostic checkpoint — fail-closed reads", () => {
     expect(() => readDiagnosticCheckpoint(loc(dir), EXPECTED)).toThrow();
   });
 
-  it("rejects any format version other than 2, including v1 (no migration path)", () => {
-    for (const version of [0, 1, 3, 4]) {
+  it("rejects any format version other than 3, including v1 and v2 (no migration path)", () => {
+    for (const version of [0, 1, 2, 4, 5]) {
       const dir = tempDir();
       writeRaw(dir, `${JSON.stringify({ ...data(), formatVersion: version })}\n`);
       expect(() => readDiagnosticCheckpoint(loc(dir), EXPECTED)).toThrow();
@@ -394,15 +510,15 @@ describe("diagnostic checkpoint — fail-closed reads", () => {
 
   it("rejects a v1 checkpoint BEFORE any credential access, even when otherwise valid", () => {
     // A v1 file's relation codes were derived under the POSITION-based rules, so
-    // replaying it under v2's history-aware accounting would mix two
-    // incompatible classifications. It must fail closed at read.
+    // replaying it under v3's state-aware accounting would mix two incompatible
+    // classifications. It must fail closed at read.
     const dir = tempDir();
     const v1 = {
       ...data({
         nextScenarioIndex: 2,
         completedScenarios: 2,
         successfulScenarios: 1,
-        executedScenarioRounds: [4, 2],
+        scenarioEvidence: [fullSuccess(), evidence(2, 1)],
         attemptedRounds: 6,
         completedRounds: 6,
         cleanup: { attempted: 6, deleted: 6, failed: 0, journalFailures: 0 },
@@ -414,6 +530,55 @@ describe("diagnostic checkpoint — fail-closed reads", () => {
     expect(() => readDiagnosticCheckpoint(loc(dir), EXPECTED)).toThrow();
     // The file is left in place for deliberate operator archival/removal.
     expect(readFileSync(file(dir), "utf8")).toContain('"formatVersion":1');
+  });
+
+  it("rejects a shape-legal v2 checkpoint BEFORE any credential access", () => {
+    // A v2 file carried `executedScenarioRounds` (no satisfied-state evidence)
+    // and could persist relation code 7 (`expected-already-invoked`), both of
+    // which were derived under INVOCATION-HISTORY rules. Replaying either under
+    // v3 accounting would mix incompatible classifications, so there is no
+    // migration path.
+    const dir = tempDir();
+    const { scenarioEvidence: _dropEvidence, ...withoutEvidence } = data({
+      nextScenarioIndex: 2,
+      completedScenarios: 2,
+      successfulScenarios: 1,
+      attemptedRounds: 6,
+      completedRounds: 6,
+      cleanup: { attempted: 6, deleted: 6, failed: 0, journalFailures: 0 },
+    });
+    void _dropEvidence;
+    const v2 = {
+      ...withoutEvidence,
+      formatVersion: 2,
+      executedScenarioRounds: [4, 2],
+      diagnostics: [removedRelationEntry(202)],
+    };
+    writeRaw(dir, `${JSON.stringify(v2)}\n`);
+    expect(() => readDiagnosticCheckpoint(loc(dir), EXPECTED)).toThrow();
+    expect(readFileSync(file(dir), "utf8")).toContain('"formatVersion":2');
+  });
+
+  it("rejects a v2 payload relabelled as v3, field by field", () => {
+    // Relabelling the version does not make a v2 record readable: the v2 field
+    // name is unexpected AND `scenarioEvidence` is missing, and the removed
+    // relation code stays undecodable even inside an otherwise well-formed v3
+    // record.
+    const relabelled = tempDir();
+    const { scenarioEvidence: _drop, ...withoutEvidence } = data();
+    void _drop;
+    writeRaw(
+      relabelled,
+      `${JSON.stringify({ ...withoutEvidence, executedScenarioRounds: [4, 4, 4] })}\n`,
+    );
+    expect(() => readDiagnosticCheckpoint(loc(relabelled), EXPECTED)).toThrow();
+
+    const staleCode = tempDir();
+    writeRaw(
+      staleCode,
+      `${JSON.stringify({ ...data(), diagnostics: [removedRelationEntry(202)] })}\n`,
+    );
+    expect(() => readDiagnosticCheckpoint(loc(staleCode), EXPECTED)).toThrow();
   });
 
   it("rejects an origin, auth-mode, or fingerprint mismatch", () => {
@@ -523,6 +688,7 @@ describe("diagnostic checkpoint — fail-closed reads", () => {
       [[201, 0, 4, 1, 1, 1]], // zero round
       [[201, 2, 42, 1, 1, 1]], // unknown reason code
       [[201, 2, 4, 99, 1, 1]], // unknown relation code
+      [[201, 2, 4, REMOVED_V2_RELATION_CODE, 1, 1]], // the removed v2 relation code
       [[201, 2, 4, 1, 99, 1]], // unknown source code
       [[201, 2, 4, 1, 1, 99]], // unknown multiplicity code
       [[201, 2, 4, 6, 1, 1]], // expected-tool-not-invoked + not-applicable relation
@@ -545,10 +711,24 @@ describe("diagnostic checkpoint — fail-closed reads", () => {
     expect(() => readDiagnosticCheckpoint(loc(dir), EXPECTED)).toThrow();
   });
 
-  it("rejects a malformed executed-round ledger", () => {
-    for (const ledger of ["nope", [0], [-1], [1.5], ["4"]]) {
+  it("rejects a malformed per-scenario evidence ledger", () => {
+    const ledgers: unknown[] = [
+      "nope",
+      [4], // an entry that is not a tuple (the v2 plain-integer shape)
+      [[4]], // wrong tuple arity
+      [[4, 3, 1]], // too many members
+      [[0, 3]], // a committed scenario always issued at least one round
+      [[-1, 3]],
+      [[1.5, 3]],
+      [["4", 3]],
+      [[4, -1]], // satisfied steps below zero
+      [[4, SCENARIO_STEP_COUNT + 1]], // more transitions than the workflow has
+      [[4, 1.5]],
+      [[4, "3"]],
+    ];
+    for (const ledger of ledgers) {
       const dir = tempDir();
-      writeRaw(dir, `${JSON.stringify({ ...data(), executedScenarioRounds: ledger })}\n`);
+      writeRaw(dir, `${JSON.stringify({ ...data(), scenarioEvidence: ledger })}\n`);
       expect(() => readDiagnosticCheckpoint(loc(dir), EXPECTED)).toThrow();
     }
   });
@@ -664,41 +844,110 @@ describe("diagnostic checkpoint — corpus-bound semantic validation", () => {
     expect(() => validateResumableDiagnosticCheckpoint(seed(0), PROJECTION)).not.toThrow();
   });
 
-  it("accepts a truthful early-terminated scenario carrying the history-aware relation", () => {
+  it("accepts a THREE-round successful scenario (a parallel batch finished early)", () => {
+    // The headline state-aware case: round 1 returns `[read, edit]`, round 2
+    // runs `test`, round 3 returns the final answer. Every transition is
+    // satisfied, no diagnostic is emitted, and the scenario used fewer rounds
+    // than its budget — which format 2 could not represent.
+    expect(MIN_SUCCESSFUL_SCENARIO_ROUNDS).toBe(2);
     const cp = data({
       corpusFingerprint: corpusFingerprint(),
       nextScenarioIndex: 2,
       completedScenarios: 2,
-      successfulScenarios: 1,
-      executedScenarioRounds: [4, 2],
-      attemptedRounds: 6,
-      completedRounds: 6,
-      cleanup: { attempted: 6, deleted: 6, failed: 0, journalFailures: 0 },
-      diagnostics: [alreadyInvokedEntry(202)],
+      successfulScenarios: 2,
+      scenarioEvidence: [fullSuccess(), evidence(3, SCENARIO_STEP_COUNT)],
+      attemptedRounds: 7,
+      completedRounds: 7,
+      cleanup: { attempted: 7, deleted: 7, failed: 0, journalFailures: 0 },
+      diagnostics: [],
     });
+    expect(() => validateResumableDiagnosticCheckpoint(cp, PROJECTION)).not.toThrow();
+  });
+
+  it("accepts a two-round success but rejects a one-round one", () => {
+    // A single parallel batch may complete all three transitions, but a
+    // successful scenario still needs its final-answer round.
+    const twoRound = data({
+      corpusFingerprint: corpusFingerprint(),
+      nextScenarioIndex: 1,
+      completedScenarios: 1,
+      successfulScenarios: 1,
+      scenarioEvidence: [evidence(MIN_SUCCESSFUL_SCENARIO_ROUNDS, SCENARIO_STEP_COUNT)],
+      attemptedRounds: 2,
+      completedRounds: 2,
+      cleanup: { attempted: 2, deleted: 2, failed: 0, journalFailures: 0 },
+      diagnostics: [],
+    });
+    expect(() => validateResumableDiagnosticCheckpoint(twoRound, PROJECTION)).not.toThrow();
+
+    const oneRound = data({
+      corpusFingerprint: corpusFingerprint(),
+      nextScenarioIndex: 1,
+      completedScenarios: 1,
+      successfulScenarios: 1,
+      scenarioEvidence: [evidence(1, SCENARIO_STEP_COUNT)],
+      attemptedRounds: 1,
+      completedRounds: 1,
+      cleanup: { attempted: 1, deleted: 1, failed: 0, journalFailures: 0 },
+      diagnostics: [],
+    });
+    expect(() => validateResumableDiagnosticCheckpoint(oneRound, PROJECTION)).toThrow();
+  });
+
+  it("rejects a diagnostic-free scenario that left a transition unsatisfied", () => {
+    const cp = data({
+      corpusFingerprint: corpusFingerprint(),
+      nextScenarioIndex: 1,
+      completedScenarios: 1,
+      successfulScenarios: 1,
+      scenarioEvidence: [evidence(4, SCENARIO_STEP_COUNT - 1)],
+      attemptedRounds: 4,
+      completedRounds: 4,
+      cleanup: { attempted: 4, deleted: 4, failed: 0, journalFailures: 0 },
+      diagnostics: [],
+    });
+    expect(() => validateResumableDiagnosticCheckpoint(cp, PROJECTION)).toThrow();
+  });
+
+  it("accepts a truthful early-terminated scenario with its terminal diagnostic", () => {
+    // Scenario 202 (index 1) stopped at round 2 with one terminal diagnostic
+    // and only its `read` transition satisfied.
+    const cp = terminatedAtRoundTwo([priorOnlyEntry(202)]);
     expect(() => validateResumableDiagnosticCheckpoint(cp, PROJECTION)).not.toThrow();
     expect(rehydrateTransitionDiagnostics(cp.diagnostics, PROJECTION)[0]).toMatchObject({
       caseOrdinal: 202,
       roundOrdinal: 2,
       reason: "expected-tool-not-invoked",
-      allowedCallRelation: "expected-already-invoked",
+      allowedCallRelation: "prior-only",
     });
   });
 
-  it("accepts a truthful early-terminated scenario with its terminal diagnostic", () => {
-    // Scenario 202 (index 1) stopped at round 2 with one terminal diagnostic.
-    const cp = data({
-      corpusFingerprint: corpusFingerprint(),
-      nextScenarioIndex: 2,
-      completedScenarios: 2,
-      successfulScenarios: 1,
-      executedScenarioRounds: [4, 2],
-      attemptedRounds: 6,
-      completedRounds: 6,
-      cleanup: { attempted: 6, deleted: 6, failed: 0, journalFailures: 0 },
-      diagnostics: [priorOnlyEntry(202)],
-    });
-    expect(() => validateResumableDiagnosticCheckpoint(cp, PROJECTION)).not.toThrow();
+  it("accepts a whole-scenario budget-exhausted diagnostic in either satisfied state", () => {
+    // `scenario-round-budget-exhausted` has scope `any`, so it agrees with a
+    // partially and a fully satisfied scenario alike — it is the scenario, not
+    // one round's call set, that failed.
+    for (const satisfied of [0, 1, SCENARIO_STEP_COUNT]) {
+      const cp = data({
+        corpusFingerprint: corpusFingerprint(),
+        nextScenarioIndex: 1,
+        completedScenarios: 1,
+        successfulScenarios: 0,
+        scenarioEvidence: [evidence(4, satisfied)],
+        attemptedRounds: 4,
+        completedRounds: 4,
+        cleanup: { attempted: 4, deleted: 4, failed: 0, journalFailures: 0 },
+        diagnostics: [budgetExhaustedEntry(201, 4)],
+      });
+      expect(() => validateResumableDiagnosticCheckpoint(cp, PROJECTION)).not.toThrow();
+      expect(rehydrateTransitionDiagnostics(cp.diagnostics, PROJECTION)[0]).toMatchObject({
+        caseOrdinal: 201,
+        roundOrdinal: 4,
+        reason: "scenario-round-budget-exhausted",
+        allowedCallRelation: "not-applicable",
+        selectionSource: "not-applicable",
+        callMultiplicity: "not-applicable",
+      });
+    }
   });
 
   it("rejects a checkpoint that encodes a COMPLETE corpus (a complete run removes it)", () => {
@@ -715,10 +964,10 @@ describe("diagnostic checkpoint — corpus-bound semantic validation", () => {
     ).toThrow();
   });
 
-  it("requires the executed-round ledger length to equal the cursor and the scenario count", () => {
+  it("requires the evidence ledger length to equal the cursor and the scenario count", () => {
     expect(() =>
       validateResumableDiagnosticCheckpoint(
-        seed(3, { executedScenarioRounds: [4, 4] }),
+        seed(3, { scenarioEvidence: [fullSuccess(), fullSuccess()] }),
         PROJECTION,
       ),
     ).toThrow();
@@ -731,7 +980,7 @@ describe("diagnostic checkpoint — corpus-bound semantic validation", () => {
     expect(() =>
       validateResumableDiagnosticCheckpoint(
         seed(2, {
-          executedScenarioRounds: [4, 5],
+          scenarioEvidence: [fullSuccess(), evidence(5, SCENARIO_STEP_COUNT)],
           attemptedRounds: 9,
           completedRounds: 9,
           cleanup: { attempted: 9, deleted: 9, failed: 0, journalFailures: 0 },
@@ -741,57 +990,49 @@ describe("diagnostic checkpoint — corpus-bound semantic validation", () => {
     ).toThrow();
   });
 
+  it("bounds each satisfied-step entry by the fixed workflow length", () => {
+    expect(() =>
+      validateResumableDiagnosticCheckpoint(
+        seed(2, {
+          scenarioEvidence: [fullSuccess(), evidence(4, SCENARIO_STEP_COUNT + 1)],
+        }),
+        PROJECTION,
+      ),
+    ).toThrow();
+  });
+
   it("rejects a forged successful-scenario count", () => {
-    const cp = data({
-      corpusFingerprint: corpusFingerprint(),
-      nextScenarioIndex: 2,
-      completedScenarios: 2,
-      successfulScenarios: 2, // forged: scenario 202 terminated early
-      executedScenarioRounds: [4, 2],
-      attemptedRounds: 6,
-      completedRounds: 6,
-      cleanup: { attempted: 6, deleted: 6, failed: 0, journalFailures: 0 },
-      diagnostics: [priorOnlyEntry(202)],
-    });
-    expect(() => validateResumableDiagnosticCheckpoint(cp, PROJECTION)).toThrow();
+    // Overstated: scenario 202 terminated early, so it cannot be successful.
+    expect(() =>
+      validateResumableDiagnosticCheckpoint(
+        { ...terminatedAtRoundTwo([priorOnlyEntry(202)]), successfulScenarios: 2 },
+        PROJECTION,
+      ),
+    ).toThrow();
+    // Understated: `successfulScenarios` must equal EXACTLY the diagnostic-free
+    // committed count, so a low claim is rejected too.
+    expect(() =>
+      validateResumableDiagnosticCheckpoint(seed(3, { successfulScenarios: 2 }), PROJECTION),
+    ).toThrow();
   });
 
   it("requires an early-terminated scenario to carry a terminal diagnostic", () => {
-    const cp = data({
-      corpusFingerprint: corpusFingerprint(),
-      nextScenarioIndex: 2,
-      completedScenarios: 2,
-      successfulScenarios: 1,
-      executedScenarioRounds: [4, 2],
-      attemptedRounds: 6,
-      completedRounds: 6,
-      cleanup: { attempted: 6, deleted: 6, failed: 0, journalFailures: 0 },
-      diagnostics: [],
-    });
-    expect(() => validateResumableDiagnosticCheckpoint(cp, PROJECTION)).toThrow();
+    expect(() =>
+      validateResumableDiagnosticCheckpoint(terminatedAtRoundTwo([]), PROJECTION),
+    ).toThrow();
   });
 
   it("rejects a diagnostic that is not at its scenario's terminal round", () => {
-    const cp = data({
-      corpusFingerprint: corpusFingerprint(),
-      nextScenarioIndex: 2,
-      completedScenarios: 2,
-      successfulScenarios: 1,
-      executedScenarioRounds: [4, 2],
-      attemptedRounds: 6,
-      completedRounds: 6,
-      cleanup: { attempted: 6, deleted: 6, failed: 0, journalFailures: 0 },
-      diagnostics: [
-        [
-          202,
-          1,
-          EVAL_FAILURE_REASON_CODES["expected-tool-not-invoked"],
-          ALLOWED_CALL_RELATION_CODES["prior-only"],
-          DIAGNOSTIC_SELECTION_SOURCE_CODES["desired-source"],
-          DIAGNOSTIC_CALL_MULTIPLICITY_CODES.single,
-        ],
+    const cp = terminatedAtRoundTwo([
+      [
+        202,
+        1,
+        EVAL_FAILURE_REASON_CODES["expected-tool-not-invoked"],
+        ALLOWED_CALL_RELATION_CODES["prior-only"],
+        DIAGNOSTIC_SELECTION_SOURCE_CODES["desired-source"],
+        DIAGNOSTIC_CALL_MULTIPLICITY_CODES.single,
       ],
-    });
+    ]);
     expect(() => validateResumableDiagnosticCheckpoint(cp, PROJECTION)).toThrow();
   });
 
@@ -828,54 +1069,57 @@ describe("diagnostic checkpoint — corpus-bound semantic validation", () => {
   });
 
   it("rejects two diagnostics for the same scenario", () => {
-    const cp = data({
-      corpusFingerprint: corpusFingerprint(),
-      nextScenarioIndex: 2,
-      completedScenarios: 2,
-      successfulScenarios: 1,
-      executedScenarioRounds: [4, 2],
-      attemptedRounds: 6,
-      completedRounds: 6,
-      cleanup: { attempted: 6, deleted: 6, failed: 0, journalFailures: 0 },
-      diagnostics: [
-        priorOnlyEntry(202),
-        [
-          202,
-          3,
-          EVAL_FAILURE_REASON_CODES["expected-tool-not-invoked"],
-          ALLOWED_CALL_RELATION_CODES["prior-only"],
-          DIAGNOSTIC_SELECTION_SOURCE_CODES["desired-source"],
-          DIAGNOSTIC_CALL_MULTIPLICITY_CODES.single,
-        ],
+    const cp = terminatedAtRoundTwo([
+      priorOnlyEntry(202),
+      [
+        202,
+        3,
+        EVAL_FAILURE_REASON_CODES["expected-tool-not-invoked"],
+        ALLOWED_CALL_RELATION_CODES["prior-only"],
+        DIAGNOSTIC_SELECTION_SOURCE_CODES["desired-source"],
+        DIAGNOSTIC_CALL_MULTIPLICITY_CODES.single,
       ],
-    });
+    ]);
     expect(() => validateResumableDiagnosticCheckpoint(cp, PROJECTION)).toThrow();
   });
 
-  it("rejects a reason whose scope disagrees with the referenced round", () => {
-    // `final-unavailable` is a FINAL-round reason attributed to round 2, which
-    // carries an expected tool.
-    const cp = data({
-      corpusFingerprint: corpusFingerprint(),
-      nextScenarioIndex: 2,
-      completedScenarios: 2,
-      successfulScenarios: 1,
-      executedScenarioRounds: [4, 2],
-      attemptedRounds: 6,
-      completedRounds: 6,
-      cleanup: { attempted: 6, deleted: 6, failed: 0, journalFailures: 0 },
-      diagnostics: [
-        [
-          202,
-          2,
-          EVAL_FAILURE_REASON_CODES["final-unavailable"],
-          ALLOWED_CALL_RELATION_CODES["not-applicable"],
-          DIAGNOSTIC_SELECTION_SOURCE_CODES["not-applicable"],
-          DIAGNOSTIC_CALL_MULTIPLICITY_CODES["not-applicable"],
-        ],
-      ],
-    });
-    expect(() => validateResumableDiagnosticCheckpoint(cp, PROJECTION)).toThrow();
+  it("checks a reason's scope against the SATISFIED STATE, not the round's position", () => {
+    // Round 2 positionally carries an `expectedTool`, but position no longer
+    // decides: with only `read` satisfied the scenario still expects a tool, so
+    // a FINAL-scope reason there is impossible.
+    const finalReasonAtRoundTwo: DiagnosticCheckpointEntry = [
+      202,
+      2,
+      EVAL_FAILURE_REASON_CODES["final-unavailable"],
+      ALLOWED_CALL_RELATION_CODES["not-applicable"],
+      DIAGNOSTIC_SELECTION_SOURCE_CODES["not-applicable"],
+      DIAGNOSTIC_CALL_MULTIPLICITY_CODES["not-applicable"],
+    ];
+    expect(() =>
+      validateResumableDiagnosticCheckpoint(
+        terminatedAtRoundTwo([finalReasonAtRoundTwo], 1),
+        PROJECTION,
+      ),
+    ).toThrow();
+
+    // The SAME round is a legitimate final-answer round once a parallel batch
+    // has satisfied every transition — which is exactly what format 2's
+    // positional rule got wrong.
+    expect(() =>
+      validateResumableDiagnosticCheckpoint(
+        terminatedAtRoundTwo([finalReasonAtRoundTwo], SCENARIO_STEP_COUNT),
+        PROJECTION,
+      ),
+    ).not.toThrow();
+
+    // And the mirror image: an EXPECTED-scope reason cannot be attributed to a
+    // scenario that already completed every transition.
+    expect(() =>
+      validateResumableDiagnosticCheckpoint(
+        terminatedAtRoundTwo([priorOnlyEntry(202)], SCENARIO_STEP_COUNT),
+        PROJECTION,
+      ),
+    ).toThrow();
   });
 
   it("bounds the upstream-round counters by the committed floor plus segment slack", () => {
@@ -941,7 +1185,7 @@ describe("diagnostic checkpoint — corpus-bound semantic validation", () => {
       nextScenarioIndex: 19,
       completedScenarios: 19,
       successfulScenarios: 19,
-      executedScenarioRounds: Array.from({ length: 19 }, () => 4),
+      scenarioEvidence: Array.from({ length: 19 }, () => fullSuccess()),
       attemptedRounds: 0,
       completedRounds: 0,
       cleanup: { attempted: 0, deleted: 0, failed: 0, journalFailures: 0 },
@@ -970,6 +1214,14 @@ describe("diagnostic checkpoint — rehydration", () => {
   it("fails closed on an unknown code, unknown scenario, or unknown round", () => {
     expect(() => rehydrateTransitionDiagnostics([[202, 2, 42, 1, 1, 1]], PROJECTION)).toThrow();
     expect(() => rehydrateTransitionDiagnostics([[202, 2, 4, 99, 1, 1]], PROJECTION)).toThrow();
+    // The removed v2 relation code decodes to nothing, so a stale entry cannot
+    // be rehydrated under v3.
+    expect(() =>
+      rehydrateTransitionDiagnostics(
+        [removedRelationEntry(202) as unknown as DiagnosticCheckpointEntry],
+        PROJECTION,
+      ),
+    ).toThrow();
     expect(() => rehydrateTransitionDiagnostics([priorOnlyEntry(1)], PROJECTION)).toThrow();
     expect(() =>
       rehydrateTransitionDiagnostics(

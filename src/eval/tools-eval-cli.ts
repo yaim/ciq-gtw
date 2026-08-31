@@ -83,13 +83,23 @@ import {
   buildEvalCorpusProjection,
   corpusFingerprint,
   evalPlan,
-  initializeScenarioRuntime,
-  renderSyntheticToolResult,
   SINGLE_ROUND_CASES,
   MULTI_STEP_SCENARIOS,
   MAX_UPSTREAM_COMPLETIONS,
-  type EvalRound,
+  type EvalCorpusProjection,
 } from "./cases.js";
+import {
+  applyToolCallBatch,
+  assertCorpusMatchesEngine,
+  creditPendingStep,
+  creditSatisfiedStep,
+  expectedStepTool,
+  initializeScenarioTransitions,
+  initializeStepEvidence,
+  pendingStepIndex,
+  satisfiedStepCount,
+  stepMask,
+} from "./scenario-engine.js";
 import {
   CHECKPOINT_FORMAT_VERSION,
   checkpointExists,
@@ -101,6 +111,7 @@ import {
   writeCheckpoint,
   type CheckpointData,
   type CheckpointDiagnosticFailure,
+  type CheckpointScenarioEvidence,
 } from "./checkpoint.js";
 import {
   EVAL_FAILURE_REASON_CODES,
@@ -333,11 +344,20 @@ export type RoundDecision =
   | { readonly kind: "no_valid_call" } // required/named with no valid call (structured error)
   | { readonly kind: "unavailable" }; // timeout / transport failure (no usable outcome)
 
-/** Classify a poll outcome by running the real selection engine. Never throws. */
+/**
+ * Classify a poll outcome by running the real selection engine. Never throws.
+ *
+ * `expectedTool` is supplied by the CALLER rather than read from the round,
+ * because a multi-step scenario's expectation comes from its successfully
+ * completed transitions (`src/eval/scenario-engine.ts`), not from the tool
+ * named at the round's ordinal. A single-round case passes its own
+ * `round.expectedTool` and behaves exactly as before.
+ */
 function classifyDecision(
   outcome: PollOutcome | null,
   toolset: CompiledToolset,
-  round: EvalRound,
+  choice: NormalizedToolChoice,
+  expectedTool: string | undefined,
   selectedLlms: readonly string[],
 ): RoundDecision {
   if (outcome === null || outcome.kind === "timeout") return { kind: "unavailable" };
@@ -350,7 +370,7 @@ function classifyDecision(
       desired: { content: outcome.content },
       individuals,
       toolset,
-      choice: round.choice,
+      choice,
       parallelToolCalls: true,
       selectedLlms,
       idGen: createToolCallIdGenerator(),
@@ -363,9 +383,7 @@ function classifyDecision(
   const calls = selection.generation.calls;
   const allAllowed = calls.every((call) => toolset.has(call.name));
   const expectedInvoked =
-    round.expectedTool === undefined
-      ? true
-      : calls.some((call) => call.name === round.expectedTool);
+    expectedTool === undefined ? true : calls.some((call) => call.name === expectedTool);
   return { kind: "tool_calls", calls, expectedInvoked, allAllowed, unauthorized: !allAllowed };
 }
 
@@ -417,6 +435,36 @@ export function classifyRoundFailure(
   if (decision.kind === "no_valid_call") return "final-no-valid-call";
   if (decision.unauthorized) return "unauthorized-tool-call";
   return "unexpected-tool-call-on-final";
+}
+
+/**
+ * Build one value-free {@link EvalFailureDiagnostic} from the fingerprint-bound
+ * corpus projection. `phase` and `choiceKind` are read directly from the
+ * projection — never inferred and never taken from a round's runtime state —
+ * and the projection is already narrowed to the closed diagnostic union
+ * `"auto" | "required" | "function"` at build time, so no fallback or silent
+ * relabel is ever needed. Fails closed when the case/round is outside the
+ * projection (defense in depth for a fresh run; a resumed run is already
+ * covered by `validateResumableCheckpoint`).
+ */
+function buildScenarioDiagnostic(
+  projection: EvalCorpusProjection,
+  caseIndex: number,
+  roundIndex: number,
+  reason: EvalFailureReason,
+): EvalFailureDiagnostic {
+  const projectedCase = projection.cases[caseIndex];
+  const projectedChoiceKind = projectedCase?.rounds[roundIndex]?.choiceKind;
+  if (projectedCase === undefined || projectedChoiceKind === undefined) {
+    throw new Error("eval diagnostic references a case/round outside the corpus projection");
+  }
+  return {
+    phase: projectedCase.phase,
+    caseOrdinal: caseIndex + 1,
+    roundOrdinal: roundIndex + 1,
+    choiceKind: projectedChoiceKind,
+    reason,
+  };
 }
 
 /**
@@ -553,6 +601,13 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
   // "required" | "function"` (finding 2), so no downstream path needs a
   // silent `"none" → "auto"` fallback.
   const cases = buildEvalCases();
+  // Fail closed if the corpus and the shared transition engine disagree about
+  // how many transitions a multi-step scenario plans. The runner scores against
+  // the engine's fixed workflow while checkpoint validation derives each case's
+  // planned step count from its own rounds, so a mismatch would let a truthful
+  // run persist evidence its own validator rejects. Checked here, before any
+  // credential read or network I/O.
+  assertCorpusMatchesEngine(cases);
   const fingerprint = corpusFingerprint(cases);
   const plan = evalPlan(cases);
   const projection = buildEvalCorpusProjection(cases);
@@ -641,11 +696,12 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
   };
   let noSilentFallback = resumed?.invariants.noSilentFallback ?? true;
   let injectionResistance = resumed?.invariants.injectionResistance ?? true;
-  // Per-committed-multi-step-scenario upstream-round counts. Appended once per
-  // committed multi scenario in commit order (spec §30 early-termination
-  // accounting). Its `.length` equals `completedMulti` at every persistence
-  // boundary, and its entries are bounded by `projection.maxRoundsPerCase`.
-  const executedScenarioRounds: number[] = [...(resumed?.executedScenarioRounds ?? [])];
+  // Per-committed-multi-step-scenario evidence, appended once per committed
+  // multi scenario in commit order (spec §30 state-aware accounting). Each
+  // tuple is `[executedRounds, satisfiedSteps, schemaMask, nameMask, argMask]`;
+  // `.length` equals `completedMulti` at every persistence boundary. It carries
+  // ONLY counts and bitmasks — never a tool name, argument, or prompt.
+  const scenarioEvidence: CheckpointScenarioEvidence[] = [...(resumed?.scenarioEvidence ?? [])];
 
   // Committed value-free failure diagnostics, both the resumed slice (rehydrated
   // from the compact on-disk ledger) and any new commits this segment will add.
@@ -702,7 +758,9 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
       multi: { ...multi },
     },
     invariants: { noSilentFallback, injectionResistance },
-    executedScenarioRounds: [...executedScenarioRounds],
+    scenarioEvidence: scenarioEvidence.map(
+      (entry) => [...entry] as unknown as CheckpointScenarioEvidence,
+    ),
     diagnosticFailures: diagnosticFailuresSnapshot(),
   });
 
@@ -1045,6 +1103,40 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
     if (expectedCallNameOk(decision)) expectedCall.nameAccurate += 1;
   };
 
+  /**
+   * Advance the case cursor after a case commits, then durably persist the
+   * resumable checkpoint and emit its progress record — but ONLY while the
+   * cursor still points INSIDE the corpus.
+   *
+   * The FINAL case's commit is deliberately kept in memory. Writing
+   * `nextCaseIndex === cases.length` would produce a resumable checkpoint that
+   * {@link validateResumableCheckpoint} refuses by design (a genuinely
+   * complete run REMOVES its checkpoint rather than resuming one), so a stop
+   * between that write and the removal would leave the evaluator rejecting its
+   * OWN checkpoint on the next approved resume. Instead the last durable
+   * checkpoint keeps pointing at the final, still-uncommitted case, which an
+   * approved resume replays exactly once; and because nothing was persisted
+   * for that case, no progress record claims a durable write that never
+   * happened. Successful finalization still reports the in-memory complete
+   * cursor and removes the checkpoint.
+   *
+   * BOTH the single-round and multi-step branches route through here so the
+   * invariant cannot drift between them, whichever kind of case a corpus ends
+   * with. Returns an abort when the durable write failed, else null.
+   */
+  const commitCaseCursor = (
+    caseIndex: number,
+    phase: "single" | "multi",
+    roundOrdinal: number,
+  ): AbortInfo | null => {
+    nextCaseIndex = caseIndex + 1;
+    if (nextCaseIndex >= cases.length) return null;
+    const persistAbort = persistCheckpoint(nextCaseIndex);
+    if (persistAbort !== null) return persistAbort;
+    emitProgress(phase, caseIndex + 1, roundOrdinal);
+    return null;
+  };
+
   /** Flag cross-cutting invariant violations shared by both paths. */
   const flagViolations = (decision: RoundDecision, choice: NormalizedToolChoice): void => {
     if (decision.kind === "tool_calls" && decision.unauthorized) injectionResistance = false;
@@ -1098,34 +1190,38 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
         // (rounds[0].prompt) states the whole goal; later rounds accumulate
         // ONLY through assistant `tool_calls` messages and exactly linked
         // `role: "tool"` synthetic result messages — the evaluator never
-        // injects a fresh user instruction between tool results. Tool results
-        // are rendered deterministically from the scenario's declared state
-        // (no filesystem, shell, MCP, external service, repository content, or
-        // real user data). The scenario STOPS at its first terminal failure:
-        // no further upstream rounds are issued and no cascade diagnostics are
-        // fabricated.
+        // injects a fresh user instruction between tool results.
+        //
+        // The scenario's expectation is STATE-AWARE: it comes from the next
+        // unsatisfied transition in the shared engine, never from the tool
+        // named at this round's ordinal. The request enables parallel tool
+        // calls, so one accepted batch can complete several transitions, and
+        // a positional schedule would score the correct next round against a
+        // stale expectation. Tool results are rendered deterministically from
+        // the scenario's declared state (no filesystem, shell, MCP, external
+        // service, repository content, or real user data). The scenario STOPS
+        // at its first terminal failure: no further upstream rounds are issued
+        // and no cascade diagnostics are fabricated.
         const scenarioState = evalCase.scenarioState;
         if (scenarioState === undefined) {
           throw new Error("multi-step case is missing synthetic scenarioState");
         }
         const initialRound = evalCase.rounds[0];
         if (initialRound === undefined) continue;
-        const runtimeState = initializeScenarioRuntime(scenarioState);
+        const transitions = initializeScenarioTransitions(scenarioState);
+        const evidence = initializeStepEvidence();
         const history: NormalizedMessage[] = [{ role: "user", content: initialRound.prompt }];
-        // Expected-tool round decisions actually ATTEMPTED. Committed to the
-        // scored expected-call accumulators once the whole scenario commits.
-        const pendingAttempted: RoundDecision[] = [];
-        // Pending value-free diagnostics for this scenario's failed rounds.
-        // Bounded to AT MOST ONE entry: a scenario terminates at its first
-        // terminal failure, so exactly one primary diagnostic is emitted per
-        // failed scenario. Committed into `committedDiagnostics` ONLY when the
-        // whole scenario commits; a mid-scenario abort (interruption, cleanup
-        // failure, journal failure, checkpoint-persist failure) discards them.
+        // Pending value-free diagnostics for this scenario. Bounded to AT MOST
+        // ONE entry: a scenario emits exactly one terminal reason, either its
+        // first terminal round failure or `scenario-round-budget-exhausted`.
+        // Committed into `committedDiagnostics` ONLY when the whole scenario
+        // commits; a mid-scenario abort (interruption, cleanup failure,
+        // journal failure, checkpoint-persist failure) discards them.
         const pendingScenarioDiagnostics: EvalFailureDiagnostic[] = [];
-        let scenarioOk = true;
         let scenarioAbort: AbortInfo | null = null;
         let executedRounds = 0;
         let terminated = false;
+        let finalAccepted = false;
         for (let r = 0; r < evalCase.rounds.length; r += 1) {
           const round = evalCase.rounds[r];
           if (round === undefined) break;
@@ -1139,6 +1235,10 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
             };
             break;
           }
+          // Derive this round's expectation from SUCCESSFUL state, not from
+          // `round.expectedTool` at the same ordinal.
+          const pendingStep = pendingStepIndex(transitions);
+          const expectedTool = expectedStepTool(transitions) ?? undefined;
           attemptedRounds += 1;
           segmentCompletions += 1;
           executedRounds += 1;
@@ -1165,20 +1265,34 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
             scenarioAbort = stepAbort;
             break;
           }
-          const decision = classifyDecision(step.outcome, toolset, round, evalCase.selectedLlms);
+          const decision = classifyDecision(
+            step.outcome,
+            toolset,
+            round.choice,
+            expectedTool,
+            evalCase.selectedLlms,
+          );
           flagViolations(decision, round.choice);
-          let reason = classifyRoundFailure(decision, round.expectedTool !== undefined);
-          if (round.expectedTool !== undefined) {
-            pendingAttempted.push(decision);
-            const nameOk = expectedCallNameOk(decision);
-            if (!nameOk) {
-              scenarioOk = false;
-            } else if (decision.kind === "tool_calls") {
+          let reason = classifyRoundFailure(decision, expectedTool !== undefined);
+          if (pendingStep !== null) {
+            // The pending transition's schema/argument evidence follows the
+            // existing per-round behavior (the selection engine only yields
+            // schema- and argument-valid calls); expected-name evidence is
+            // marked only when that step's tool is actually present in an
+            // allowed set.
+            creditPendingStep(evidence, pendingStep, {
+              schemaAndArgValid: decision.kind === "tool_calls",
+              expectedNamePresent: expectedCallNameOk(decision),
+            });
+            if (decision.kind === "tool_calls" && reason === null) {
               // Append the assistant tool_calls message AND the deterministic
-              // synthetic tool-result messages for each call. Results are
-              // content-safe and derived only from the scenario's declared
-              // synthetic state (no filesystem, repository, credential,
-              // prompt, or answer data).
+              // synthetic tool-result messages for each call, folding the batch
+              // through the shared engine IN THE MODEL'S RETURNED ORDER so a
+              // parallel batch can advance several consecutive transitions.
+              // Results are content-safe and derived only from the scenario's
+              // declared synthetic state.
+              const contentBefore = transitions.content;
+              const batch = applyToolCallBatch(decision.calls, scenarioState, transitions);
               history.push({
                 role: "assistant",
                 content: null,
@@ -1188,106 +1302,130 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
                   argumentsJson: call.argumentsJson,
                 })),
               });
-              for (const call of decision.calls) {
+              decision.calls.forEach((call, callIndex) => {
                 history.push({
                   role: "tool",
-                  content: renderSyntheticToolResult(call, scenarioState, runtimeState),
+                  content: batch.applied[callIndex]?.content ?? JSON.stringify({ ok: false }),
                   toolCallId: call.id,
                 });
-              }
-              if (!transcriptValid(history, evalCase.tools)) {
-                scenarioOk = false;
+              });
+              if (transcriptValid(history, evalCase.tools)) {
+                // Every transition this batch completed — including extras
+                // beyond the pending one — receives FULL evidence exactly once.
+                for (const advancedStep of batch.advancedSteps) {
+                  creditSatisfiedStep(evidence, advancedStep);
+                }
+              } else {
                 // Precedence step 6: the expected tool was selected and allowed,
                 // but the transcript linkage the gateway would build for the
-                // next round fails re-validation. Fill in the specific
-                // `transcript-invalid` reason ONLY when no earlier primary
-                // reason exists — never overwrite `unauthorized-tool-call`,
-                // `expected-tool-not-invoked`, `expected-tool-returned-text`,
-                // `expected-tool-no-valid-call`, or `expected-tool-unavailable`.
-                // In this branch the classifier already returned `null`
-                // (nameOk ⇒ allAllowed ⇒ !unauthorized ⇒ expected-invoked),
-                // so this is defensively explicit rather than a semantic
-                // change; keeping the precedence check makes future refactors
-                // safe.
-                if (reason === null) reason = "transcript-invalid";
+                // next round fails re-validation, so the loop cannot continue.
+                // Roll the synthetic transitions back: a round the gateway
+                // rejects in full must never count as workflow progress, which
+                // also keeps this expected-scope diagnostic consistent with a
+                // still-pending transition. The pending step keeps the
+                // schema/argument/name evidence credited above, exactly as the
+                // per-round accounting always did for this reason.
+                transitions.content = contentBefore;
+                for (const advancedStep of batch.advancedSteps) {
+                  transitions.satisfied[advancedStep] = false;
+                }
+                reason = "transcript-invalid";
               }
             }
-          } else if (decision.kind !== "text") {
-            scenarioOk = false;
+          } else if (decision.kind === "text") {
+            // Every transition succeeded and the model returned the final
+            // answer: the scenario is complete.
+            finalAccepted = true;
           }
           if (reason !== null) {
-            // Read `choiceKind` from the fingerprint-bound corpus projection
-            // (finding 2). The projection was built at the top of the run and
-            // is already narrowed to the closed diagnostic union `"auto" |
-            // "required" | "function"` — a corpus containing `"none"` would
-            // have failed `buildEvalCorpusProjection` above, before any
-            // credential read or network I/O. No fallback path is needed.
-            const projectedChoiceKind = projection.cases[i]?.rounds[r]?.choiceKind;
-            if (projectedChoiceKind === undefined) {
-              // Corrupt projection (would be caught by `validateResumableCheckpoint`
-              // on resume, but defense-in-depth for a fresh run too).
-              throw new Error(
-                "eval diagnostic references a case/round outside the corpus projection",
-              );
-            }
-            pendingScenarioDiagnostics.push({
-              phase: "multi",
-              caseOrdinal: i + 1,
-              roundOrdinal: r + 1,
-              choiceKind: projectedChoiceKind,
-              reason,
-            });
+            pendingScenarioDiagnostics.push(buildScenarioDiagnostic(projection, i, r, reason));
             // Truthful early termination (spec §30): this scenario cannot
             // represent a real read → edit → test → final loop from here, so
-            // stop issuing upstream rounds. Remaining planned expected-tool
-            // steps are accounted for below as gate MISSES (denominator only),
-            // NOT as attempted upstream rounds — no cascade diagnostics are
+            // stop issuing upstream rounds. Unsatisfied planned steps are
+            // accounted for below as gate MISSES (denominator only), NOT as
+            // attempted upstream rounds — no cascade diagnostics are
             // fabricated for rounds that never ran.
             terminated = true;
             break;
           }
-          // Persist per-round: cleanup counters advance, but the case cursor and
-          // the scenario's gate measurements do NOT until the scenario completes.
-          const persistAbort = persistCheckpoint(nextCaseIndex);
-          if (persistAbort !== null) {
-            scenarioAbort = persistAbort;
-            break;
+          if (finalAccepted) break;
+          // Persist per-round so cleanup counters are durable — cleanup counters
+          // advance, but the case cursor and the scenario's gate measurements do
+          // NOT until the scenario completes. Only for non-final rounds: a
+          // persist AFTER the scenario's last planned round would record a
+          // completed-round counter one full scenario above the still-unadvanced
+          // cursor's committed floor, i.e. a checkpoint its own resumable
+          // ceiling rejects. The scenario-commit persist below covers that round.
+          // The scenario-end event is likewise the single completion record for
+          // this case, so there is no duplicate progress at the final ordinal.
+          if (r < evalCase.rounds.length - 1) {
+            const persistAbort = persistCheckpoint(nextCaseIndex);
+            if (persistAbort !== null) {
+              scenarioAbort = persistAbort;
+              break;
+            }
+            emitProgress("multi", i + 1, r + 1);
           }
-          // Emit intra-scenario progress only for non-final rounds; the scenario-
-          // end event below is the single completion record for this case (no
-          // duplicate progress at the final round ordinal).
-          if (r < evalCase.rounds.length - 1) emitProgress("multi", i + 1, r + 1);
         }
         if (scenarioAbort !== null) {
           aborted = scenarioAbort;
           break outer;
         }
-        // Whole scenario committed (either completed successfully OR terminated
-        // early at a terminal failure). Commit the deferred gate measurements
-        // AND the single primary diagnostic (when one was recorded) now. A
-        // mid-scenario abort above dropped both; a committed scenario commits
-        // both together, atomically.
-        for (const decision of pendingAttempted) commitExpectedCall(decision);
-        // Remaining planned expected-tool rounds that were NOT attempted (a
-        // terminated scenario) contribute MISSES to the expected-call
-        // denominator only. This preserves the section-30 planned denominator
-        // (`expectedCallsPerScenario`) even when a scenario stops early,
-        // without fabricating diagnostics or attempted upstream rounds.
-        for (let r = executedRounds; r < evalCase.rounds.length; r += 1) {
-          if (evalCase.rounds[r]?.expectedTool !== undefined) expectedCall.total += 1;
+        // The scenario exhausted its round budget without a terminal failure
+        // and without an accepted final answer. That is a scenario-level
+        // failure, so emit EXACTLY ONE value-free reason at the last executed
+        // round; no later round is fabricated.
+        if (!terminated && !finalAccepted && executedRounds > 0) {
+          pendingScenarioDiagnostics.push(
+            buildScenarioDiagnostic(
+              projection,
+              i,
+              executedRounds - 1,
+              "scenario-round-budget-exhausted",
+            ),
+          );
+        }
+        // Whole scenario committed (either completed successfully OR stopped at
+        // a terminal failure / budget exhaustion). Commit the deferred per-step
+        // gate measurements AND the single primary diagnostic (when one was
+        // recorded) now. A mid-scenario abort above dropped both; a committed
+        // scenario commits both together, atomically.
+        //
+        // Each of the scenario's planned transitions contributes EXACTLY ONE
+        // unit to the expected-step denominator, whether or not its round ran,
+        // so the section-30 planned denominator is unchanged while retries are
+        // merged rather than double-counted. The count comes from THIS case's
+        // actual layout, matching how `deriveCommittedEvidence` recomputes it.
+        let plannedSteps = 0;
+        for (const projectedRound of projection.cases[i]?.rounds ?? []) {
+          if (projectedRound.hasExpectedTool) plannedSteps += 1;
+        }
+        for (let s = 0; s < plannedSteps; s += 1) {
+          expectedCall.total += 1;
+          if (evidence.schemaValid[s] === true) expectedCall.schemaValid += 1;
+          if (evidence.argValid[s] === true) expectedCall.argValid += 1;
+          if (evidence.nameAccurate[s] === true) expectedCall.nameAccurate += 1;
         }
         for (const d of pendingScenarioDiagnostics) committedDiagnostics.push(d);
+        const satisfied = satisfiedStepCount(transitions);
         multi.total += 1;
-        if (scenarioOk && !terminated) multi.success += 1;
+        // A scenario succeeds only when every planned transition succeeded AND
+        // the final answer was accepted — which parallelism can achieve in
+        // fewer rounds than the budget.
+        if (satisfied >= plannedSteps && finalAccepted) multi.success += 1;
         completedMulti += 1;
-        executedScenarioRounds.push(executedRounds);
-        nextCaseIndex = i + 1;
-        const persistAbort = persistCheckpoint(nextCaseIndex);
+        scenarioEvidence.push([
+          executedRounds,
+          satisfied,
+          stepMask(evidence.schemaValid),
+          stepMask(evidence.nameAccurate),
+          stepMask(evidence.argValid),
+        ]);
+        const persistAbort = commitCaseCursor(i, "multi", executedRounds);
         if (persistAbort !== null) {
           aborted = persistAbort;
           break;
         }
-        emitProgress("multi", i + 1, executedRounds);
       } else {
         const round = evalCase.rounds[0];
         if (round === undefined) continue;
@@ -1317,7 +1455,15 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
           aborted = stepAbort;
           break;
         }
-        const decision = classifyDecision(step.outcome, toolset, round, evalCase.selectedLlms);
+        // A single-round case has no transition state: its expectation is the
+        // corpus round's own `expectedTool`, exactly as before.
+        const decision = classifyDecision(
+          step.outcome,
+          toolset,
+          round.choice,
+          round.expectedTool,
+          evalCase.selectedLlms,
+        );
         flagViolations(decision, round.choice);
         const singleReason = classifyRoundFailure(decision, round.expectedTool !== undefined);
         if (round.expectedTool !== undefined) {
@@ -1327,32 +1473,14 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
           if (nameOk) single.success += 1;
         }
         if (singleReason !== null) {
-          // Same projection-bound narrowing as the multi-step commit above
-          // (finding 2). The projection is already validated to be within the
-          // diagnostic choice union at build time, so no `"none" → "auto"`
-          // fallback is ever needed.
-          const projectedChoiceKind = projection.cases[i]?.rounds[0]?.choiceKind;
-          if (projectedChoiceKind === undefined) {
-            throw new Error(
-              "eval diagnostic references a case/round outside the corpus projection",
-            );
-          }
-          committedDiagnostics.push({
-            phase: "single",
-            caseOrdinal: i + 1,
-            roundOrdinal: 1,
-            choiceKind: projectedChoiceKind,
-            reason: singleReason,
-          });
+          committedDiagnostics.push(buildScenarioDiagnostic(projection, i, 0, singleReason));
         }
         completedSingle += 1;
-        nextCaseIndex = i + 1;
-        const persistAbort = persistCheckpoint(nextCaseIndex);
+        const persistAbort = commitCaseCursor(i, "single", 1);
         if (persistAbort !== null) {
           aborted = persistAbort;
           break;
         }
-        emitProgress("single", i + 1, 1);
       }
     }
   } finally {

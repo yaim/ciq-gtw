@@ -21,8 +21,30 @@ import type { AuthObservation } from "../collectiviq/auth.js";
 /**
  * The output-model version. Bump on any breaking shape change.
  *
- * v4 (this release) captures two related semantic corrections without changing
- * any emitted field name:
+ * v5 (this release) makes multi-step scoring STATE-AWARE. A scenario's current
+ * expectation is derived from the transitions that have SUCCESSFULLY completed
+ * (`src/eval/scenario-engine.ts`), not from the tool named at the round's
+ * ordinal, because the request enables parallel tool calls and one accepted
+ * batch such as `[read, edit]` can complete several transitions at once. The
+ * previous positional schedule scored the following correct `test` round
+ * against a stale `edit` expectation. Consequently:
+ *
+ *   1. Multi-step gate evidence is measured PER PLANNED TRANSITION rather than
+ *      per upstream round: each of the three steps carries independent
+ *      schema-valid / argument-valid / expected-name / satisfied flags, merged
+ *      across retries so a step is never double-counted, and contributes
+ *      exactly one unit to the expected-step denominator at scenario commit.
+ *      The planned denominators, thresholds, corpus sizes, and the 280-round
+ *      upper bound are UNCHANGED, and single-round scoring is unchanged.
+ *   2. A scenario succeeds when all three transitions AND an accepted final
+ *      text complete within its round budget — including in three rounds when
+ *      parallelism completes two transitions at once.
+ *   3. {@link EvalFailureReason} gains the appended terminal reason
+ *      `scenario-round-budget-exhausted` for a scenario whose round budget ran
+ *      out before an accepted final answer.
+ *
+ * v4 captured two related semantic corrections without changing any emitted
+ * field name:
  *
  *   1. Multi-step scenarios model a genuine OpenCode-style agent loop over
  *      synthetic in-memory state: ONE initial user message states the whole
@@ -40,10 +62,10 @@ import type { AuthObservation } from "../collectiviq/auth.js";
  *      denominator, and 1 to the multi-step-success denominator, regardless
  *      of how many rounds it actually issued.
  *
- * v3 checkpoints and v3 reports are incompatible: an older checkpoint is
- * rejected outright with no migration path (see `src/eval/checkpoint.ts`).
+ * Older checkpoints and reports are incompatible: checkpoint formats 1, 2, and
+ * 3 are rejected outright with no migration path (see `src/eval/checkpoint.ts`).
  */
-export const EVAL_REPORT_VERSION = 4 as const;
+export const EVAL_REPORT_VERSION = 5 as const;
 
 /**
  * The closed set of value-free failure reasons a scored round can produce.
@@ -66,6 +88,12 @@ export const EVAL_REPORT_VERSION = 4 as const;
  * - `final-*` / `unexpected-tool-call-on-final` — a round with NO `expectedTool`
  *   (the final answer round of a three-step scenario) failed for the stated
  *   reason.
+ * - `scenario-round-budget-exhausted` — a multi-step scenario used its whole
+ *   round budget without reaching an accepted final answer. No individual
+ *   round failed terminally (each was accepted), so the reason belongs to the
+ *   scenario as a whole and applies to either round category (`any`). It is
+ *   emitted AT MOST ONCE per scenario, at its last executed round, and never
+ *   alongside another terminal reason.
  */
 export type EvalFailureReason =
   | "expected-tool-returned-text"
@@ -76,7 +104,8 @@ export type EvalFailureReason =
   | "transcript-invalid"
   | "unexpected-tool-call-on-final"
   | "final-no-valid-call"
-  | "final-unavailable";
+  | "final-unavailable"
+  | "scenario-round-budget-exhausted";
 
 /**
  * The fixed internal numeric mapping used ONLY by the compact on-disk
@@ -96,6 +125,8 @@ export const EVAL_FAILURE_REASON_CODES: Readonly<Record<EvalFailureReason, numbe
     "unexpected-tool-call-on-final": 7,
     "final-no-valid-call": 8,
     "final-unavailable": 9,
+    // APPENDED for report v5 — codes 1..9 keep their v4 meaning.
+    "scenario-round-budget-exhausted": 10,
   },
 );
 
@@ -106,7 +137,7 @@ export const EVAL_FAILURE_REASON_CODES: Readonly<Record<EvalFailureReason, numbe
  * (a `ReadonlyMap` type only hides mutation at compile time — the underlying
  * `Map` remains mutable, and `Object.freeze(new Map())` does not disable
  * `Map.prototype.set`). Returns the mapped reason for one of the fixed codes
- * 1–9 and `undefined` for anything else, including a non-number or NaN. Adding
+ * 1–10 and `undefined` for anything else, including a non-number or NaN. Adding
  * a new reason requires a new case here AND a new `EVAL_FAILURE_REASON_CODES`
  * entry AND a checkpoint-format-version bump.
  */
@@ -131,6 +162,8 @@ export function evalFailureReasonForCode(code: unknown): EvalFailureReason | und
       return "final-no-valid-call";
     case 9:
       return "final-unavailable";
+    case 10:
+      return "scenario-round-budget-exhausted";
     default:
       return undefined;
   }
@@ -140,10 +173,14 @@ export function evalFailureReasonForCode(code: unknown): EvalFailureReason | und
  * Which category of round a reason applies to. `expected-tool` reasons and
  * `transcript-invalid` are structurally compatible ONLY with rounds carrying an
  * `expectedTool`; `final-*` and `unexpected-tool-call-on-final` are compatible
- * ONLY with a final round (no `expectedTool`); `unauthorized-tool-call` is
- * compatible with either. Checkpoint validation uses this to reject a
- * `[caseOrdinal, roundOrdinal, reasonCode]` triple whose reason cannot match
- * the referenced round in the corpus.
+ * ONLY with a final round (no `expectedTool`); `unauthorized-tool-call` and
+ * `scenario-round-budget-exhausted` are compatible with either. Checkpoint
+ * validation uses this to reject a `[caseOrdinal, roundOrdinal, reasonCode]`
+ * triple whose reason cannot match the referenced round in the corpus.
+ *
+ * Under state-aware multi-step scoring a scenario's planned round positions no
+ * longer determine which tool a round expected, so a scope of `"any"` is the
+ * only honest classification for a whole-scenario reason.
  */
 export type EvalFailureReasonScope = "expected" | "final" | "any";
 
@@ -160,6 +197,7 @@ export const EVAL_FAILURE_REASON_SCOPE: Readonly<
   "unexpected-tool-call-on-final": "final",
   "final-no-valid-call": "final",
   "final-unavailable": "final",
+  "scenario-round-budget-exhausted": "any",
 });
 
 /**

@@ -9,6 +9,13 @@
  * is no account data, no live value, and no captured upstream content anywhere
  * in this file.
  *
+ * Report v3 makes the classifier STATE-AWARE: a scenario's expectation is the
+ * next UNSATISFIED transition, and the prior/future buckets are judged against
+ * transitions that SUCCEEDED rather than against a round's static position or
+ * against names that were merely invoked. The v2 member
+ * `expected-already-invoked` is therefore unreachable by construction and is
+ * gone from the union.
+ *
  * The value-freeness group is the point of the module: tool names go IN to the
  * classifier and only closed enums come OUT, so a diagnostic record can never
  * carry a name, path, or prompt fragment.
@@ -41,13 +48,14 @@ import {
   EVAL_REPORT_VERSION,
   type EvalFailureReason,
 } from "../../src/eval/report.js";
+import { SCENARIO_STEP_COUNT } from "../../src/eval/scenario-engine.js";
 import type { DiagnosticChoiceKind } from "../../src/eval/cases.js";
 
 // ---------------------------------------------------------------------------
 // Synthetic fixtures
 // ---------------------------------------------------------------------------
 
-/** The nine closed release failure reasons, enumerated by hand on purpose. */
+/** The ten closed release failure reasons, enumerated by hand on purpose. */
 const ALL_REASONS: readonly EvalFailureReason[] = [
   "expected-tool-returned-text",
   "expected-tool-no-valid-call",
@@ -58,6 +66,7 @@ const ALL_REASONS: readonly EvalFailureReason[] = [
   "unexpected-tool-call-on-final",
   "final-no-valid-call",
   "final-unavailable",
+  "scenario-round-budget-exhausted",
 ];
 
 /** The four reasons whose selection produced a tool-call set. */
@@ -75,7 +84,6 @@ const REASONS_REQUIRING_RELATION: readonly EvalFailureReason[] = [
 ];
 
 const ALL_RELATIONS: readonly AllowedCallRelation[] = [
-  "expected-already-invoked",
   "prior-only",
   "future-only",
   "prior-and-future",
@@ -100,49 +108,42 @@ const ALL_MULTIPLICITIES: readonly DiagnosticCallMultiplicity[] = [
 const CHOICE_KINDS: readonly DiagnosticChoiceKind[] = ["auto", "required", "function"];
 
 /**
- * A synthetic three-step scenario shape: three expected tool rounds followed by
- * a final-text round (`undefined`). It mirrors the production corpus layout
+ * A synthetic three-step workflow: the ordered transitions a scenario must
+ * complete before its final-text round. It mirrors the production corpus layout
  * without borrowing any of its content.
  */
-const EXPECTED_SEQUENCE: readonly (string | undefined)[] = ["read", "edit", "test", undefined];
+const WORKFLOW: readonly string[] = ["read", "edit", "test"];
 
-/** 0-based index of the `read` → `edit` transition the campaign failed at. */
-const TRANSITION_ROUND_INDEX = 1;
+/** Transitions satisfied at the `read` → `edit` round the campaign failed at. */
+const TRANSITION_SATISFIED = 1;
 
-/** 0-based index of the final-text round. */
-const FINAL_ROUND_INDEX = 3;
+/** Transitions satisfied at the final-text round (all of them). */
+const FINAL_SATISFIED = 3;
 
-/** A synthetic allowed tool that appears nowhere in {@link EXPECTED_SEQUENCE}. */
+/** A synthetic allowed tool that appears nowhere in {@link WORKFLOW}. */
 const UNRELATED_TOOL = "grep";
 
 /**
- * The invocation history a scenario would have if every earlier round invoked
- * EXACTLY its own expected tool (no parallel calls). This is the default for the
- * fixtures below, so the position-based expectations that predate history-aware
- * classification stay meaningful; the parallel-call cases override it explicitly.
+ * The scenario view for a run in which the first `satisfiedCount` transitions
+ * SUCCEEDED. `pendingTools[0]` is the tool the round was expected to invoke; an
+ * empty pending list means final text was expected.
  */
-function sequentialHistory(
-  expectedToolByRound: readonly (string | undefined)[],
-  roundIndex: number,
-): ReadonlySet<string> {
-  const invoked = new Set<string>();
-  for (let r = 0; r < roundIndex && r < expectedToolByRound.length; r += 1) {
-    const name = expectedToolByRound[r];
-    if (name !== undefined) invoked.add(name);
-  }
-  return invoked;
+function split(satisfiedCount: number): {
+  readonly satisfiedTools: readonly string[];
+  readonly pendingTools: readonly string[];
+} {
+  return {
+    satisfiedTools: WORKFLOW.slice(0, satisfiedCount),
+    pendingTools: WORKFLOW.slice(satisfiedCount),
+  };
 }
 
 function relationInput(over: Partial<AllowedCallRelationInput> = {}): AllowedCallRelationInput {
-  const expectedToolByRound = over.expectedToolByRound ?? EXPECTED_SEQUENCE;
-  const roundIndex = over.roundIndex ?? TRANSITION_ROUND_INDEX;
   return {
     reason: "expected-tool-not-invoked",
     selectedCallNames: ["read"],
     allAllowed: true,
-    expectedToolByRound,
-    roundIndex,
-    priorInvokedNames: sequentialHistory(expectedToolByRound, roundIndex),
+    ...split(TRANSITION_SATISFIED),
     ...over,
   };
 }
@@ -157,7 +158,7 @@ function finalRelationFor(selectedCallNames: readonly string[]): AllowedCallRela
   return classifyAllowedCallRelation(
     relationInput({
       reason: "unexpected-tool-call-on-final",
-      roundIndex: FINAL_ROUND_INDEX,
+      ...split(FINAL_SATISFIED),
       selectedCallNames,
     }),
   );
@@ -188,8 +189,8 @@ function consistentShape(reason: EvalFailureReason): DimensionShape {
 // ---------------------------------------------------------------------------
 
 describe("diagnostic report — version and profile", () => {
-  it("pins the diagnostic output-model version to 2", () => {
-    expect(DIAGNOSTIC_REPORT_VERSION).toBe(2);
+  it("pins the diagnostic output-model version to 3", () => {
+    expect(DIAGNOSTIC_REPORT_VERSION).toBe(3);
   });
 
   it("pins the fixed diagnostic profile name", () => {
@@ -211,6 +212,12 @@ describe("diagnostic report — version and profile", () => {
   it("caps persisted diagnostics at one per scenario in the 20-scenario corpus", () => {
     expect(MAX_TRANSITION_DIAGNOSTICS).toBe(20);
   });
+
+  it("matches the shared engine's fixed three-step workflow", () => {
+    // The classifier's fail-closed total is the engine's step count, so the
+    // fixture workflow must describe exactly one whole scenario.
+    expect(WORKFLOW).toHaveLength(SCENARIO_STEP_COUNT);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -224,32 +231,32 @@ describe("diagnostic report — allowed-call relation categories", () => {
     readonly expected: AllowedCallRelation;
   }[] = [
     {
-      label: "an earlier round's expected tool",
+      label: "a transition that already succeeded",
       selectedCallNames: ["read"],
       expected: "prior-only",
     },
     {
-      label: "a later round's expected tool",
+      label: "a later still-pending transition",
       selectedCallNames: ["test"],
       expected: "future-only",
     },
     {
-      label: "both an earlier and a later expected tool",
+      label: "both a satisfied and a later pending transition",
       selectedCallNames: ["read", "test"],
       expected: "prior-and-future",
     },
     {
-      label: "only an allowed tool outside the expected sequence",
+      label: "only an allowed tool outside the workflow",
       selectedCallNames: [UNRELATED_TOOL],
       expected: "other-allowed",
     },
     {
-      label: "an unrelated allowed tool beside a prior expected tool",
+      label: "an unrelated allowed tool beside a satisfied transition",
       selectedCallNames: ["read", UNRELATED_TOOL],
       expected: "mixed-other",
     },
     {
-      label: "an unrelated allowed tool beside a future expected tool",
+      label: "an unrelated allowed tool beside a later pending transition",
       selectedCallNames: ["test", UNRELATED_TOOL],
       expected: "mixed-other",
     },
@@ -261,20 +268,11 @@ describe("diagnostic report — allowed-call relation categories", () => {
     });
   }
 
-  it("produces all seven closed relation members across the fixture set", () => {
+  it("produces all six closed relation members across the fixture set", () => {
     const produced = new Set<AllowedCallRelation>(
       applicableCases.map((testCase) => relationFor(testCase.selectedCallNames)),
     );
     produced.add(classifyAllowedCallRelation(relationInput({ selectedCallNames: null })));
-    // The history-aware member: this round's expected tool already ran earlier.
-    produced.add(
-      classifyAllowedCallRelation(
-        relationInput({
-          priorInvokedNames: new Set(["read", "edit"]),
-          selectedCallNames: ["test"],
-        }),
-      ),
-    );
     expect([...produced].sort()).toEqual([...ALL_RELATIONS].sort());
   });
 
@@ -286,15 +284,15 @@ describe("diagnostic report — allowed-call relation categories", () => {
     { label: "the selected call set is empty", over: { selectedCallNames: [] } },
     { label: "a selected name fell outside the allowlist", over: { allAllowed: false } },
     {
-      label: "this round's expected tool was present after all",
+      label: "the currently expected transition was invoked after all",
       over: { selectedCallNames: ["edit"] },
     },
     {
-      label: "this round's expected tool was present beside an unrelated tool",
+      label: "the currently expected transition was invoked beside an unrelated tool",
       over: { selectedCallNames: ["edit", UNRELATED_TOOL] },
     },
     {
-      label: "this round's expected tool was present beside a prior expected tool",
+      label: "the currently expected transition was invoked beside a satisfied one",
       over: { selectedCallNames: ["read", "edit"] },
     },
   ];
@@ -319,142 +317,156 @@ describe("diagnostic report — allowed-call relation categories", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 2b. History-aware classification (parallel tool calls)
+// 2b. State-aware classification (parallel tool calls)
 // ---------------------------------------------------------------------------
 
-describe("diagnostic report — history-aware relation", () => {
-  // The round request enables parallel tool calls, so an accepted round can
-  // invoke several tools at once. Judging prior/future by STATIC round position
-  // then reports a correct continuation as a fabricated skip-ahead.
+describe("diagnostic report — state-aware relation", () => {
+  // The round request enables parallel tool calls, so one accepted round can
+  // complete several transitions at once. v3 derives the expectation from the
+  // transitions that SUCCEEDED, so a correct continuation is never reported as
+  // a fabricated skip-ahead and a call that ran but failed is never reported as
+  // finished work.
 
-  it("reports expected-already-invoked when the round's tool ran as a parallel call", () => {
-    // Round 1 returned [read, edit]; round 2 still statically expects `edit`,
-    // but `edit` already ran, so moving on to `test` is correct behavior.
-    expect(
-      classifyAllowedCallRelation(
-        relationInput({
-          priorInvokedNames: new Set(["read", "edit"]),
-          selectedCallNames: ["test"],
-        }),
-      ),
-    ).toBe("expected-already-invoked");
+  it("drops the v2 member that a stale expectation used to require", () => {
+    // Under v2 a round could statically expect a tool an earlier parallel batch
+    // had already invoked, and `expected-already-invoked` existed to avoid
+    // calling that correct continuation a skip-ahead. The member is gone.
+    const relationNames: readonly string[] = ALL_RELATIONS;
+    expect(relationNames).not.toContain("expected-already-invoked");
+    expect(relationNames).toHaveLength(6);
   });
 
-  it("prefers expected-already-invoked over any per-name bucket", () => {
-    // Whatever the selected names are, a stale expectation outranks them.
-    const history = new Set(["read", "edit"]);
-    for (const selectedCallNames of [
-      ["test"],
-      ["read"],
-      ["read", "test"],
-      [UNRELATED_TOOL],
-      ["read", UNRELATED_TOOL],
-      ["test", UNRELATED_TOOL],
-    ]) {
-      expect(
-        classifyAllowedCallRelation(
-          relationInput({ priorInvokedNames: history, selectedCallNames }),
-        ),
-      ).toBe("expected-already-invoked");
+  it("cannot expect a transition that already succeeded", () => {
+    // The situation the removed member described is unrepresentable: the
+    // expectation is `pendingTools[0]`, and satisfied/pending are disjoint at
+    // every point of the workflow.
+    for (let satisfiedCount = 0; satisfiedCount <= WORKFLOW.length; satisfiedCount += 1) {
+      const { satisfiedTools, pendingTools } = split(satisfiedCount);
+      expect(pendingTools.filter((name) => satisfiedTools.includes(name))).toEqual([]);
     }
+    // A hand-built view that claims otherwise fails closed rather than
+    // producing a confident wrong answer.
+    expect(() =>
+      classifyAllowedCallRelation(
+        relationInput({ satisfiedTools: ["read", "edit"], pendingTools: ["edit"] }),
+      ),
+    ).toThrow();
   });
 
-  it("treats a repeat of an early parallel call as prior, not future", () => {
-    // Round 1 returned [read, test]; round 2 repeats `test`. `test` is expected
-    // by a LATER round, but it already ran, so history wins over position.
+  it("moves the expectation on after a parallel batch completes two transitions", () => {
+    // The OBSERVED live shape: round 1 returns [read, edit] and BOTH
+    // transitions succeed, so the next round expects `test`. Calling `test` is
+    // correct behavior, and `not-applicable` is the classifier saying "the
+    // current expectation was present — this is no transition confusion".
+    const afterParallelBatch = {
+      satisfiedTools: ["read", "edit"],
+      pendingTools: ["test"],
+    };
     expect(
       classifyAllowedCallRelation(
-        relationInput({
-          priorInvokedNames: new Set(["read", "test"]),
-          selectedCallNames: ["test"],
-        }),
+        relationInput({ ...afterParallelBatch, selectedCallNames: ["test"] }),
+      ),
+    ).toBe("not-applicable");
+    // Repeating already-finished work from that same state is the real
+    // prior-only case.
+    expect(
+      classifyAllowedCallRelation(
+        relationInput({ ...afterParallelBatch, selectedCallNames: ["edit"] }),
       ),
     ).toBe("prior-only");
+    expect(
+      classifyAllowedCallRelation(
+        relationInput({ ...afterParallelBatch, selectedCallNames: ["read", "edit"] }),
+      ),
+    ).toBe("prior-only");
+  });
+
+  it("judges prior by SUCCESSFUL transitions, never by names that merely ran", () => {
+    // Round 1 returned [read, test]: `read` advanced the workflow, but `test`
+    // ran before its prerequisite and did NOT complete. Selecting `test` again
+    // is therefore still a genuine skip-ahead, not a repeat of finished work.
+    expect(
+      classifyAllowedCallRelation(relationInput({ ...split(1), selectedCallNames: ["test"] })),
+    ).toBe("future-only");
+  });
+
+  it("keeps a failed transition pending rather than promoting it to prior", () => {
+    // `edit` was invoked with the wrong text, so its transition did not
+    // complete: it remains the CURRENT expectation, which outranks every
+    // per-name bucket.
+    expect(relationFor(["edit"])).toBe("not-applicable");
+    expect(relationFor(["edit", "test"])).toBe("not-applicable");
+    expect(relationFor(["read", "edit", UNRELATED_TOOL])).toBe("not-applicable");
   });
 
   it("still reports a genuine skip-ahead as future-only", () => {
-    // Round 1 returned only [read]; `test` has not run and a later round expects
-    // it, so selecting `test` at round 2 IS a skip-ahead.
-    expect(
-      classifyAllowedCallRelation(
-        relationInput({ priorInvokedNames: new Set(["read"]), selectedCallNames: ["test"] }),
-      ),
-    ).toBe("future-only");
+    // Only `read` succeeded, `edit` is expected, and `test` has not run.
+    expect(relationFor(["test"])).toBe("future-only");
   });
 
-  it("still reports a repeat of the previous step as prior-only", () => {
-    expect(
-      classifyAllowedCallRelation(
-        relationInput({ priorInvokedNames: new Set(["read"]), selectedCallNames: ["read"] }),
-      ),
-    ).toBe("prior-only");
+  it("still reports a repeat of the completed step as prior-only", () => {
+    expect(relationFor(["read"])).toBe("prior-only");
   });
 
-  it("classifies an unrelated allowed tool as other regardless of history", () => {
-    expect(
-      classifyAllowedCallRelation(
-        relationInput({
-          priorInvokedNames: new Set(["read"]),
-          selectedCallNames: [UNRELATED_TOOL],
-        }),
-      ),
-    ).toBe("other-allowed");
-    expect(
-      classifyAllowedCallRelation(
-        relationInput({
-          priorInvokedNames: new Set(["read", "test"]),
-          selectedCallNames: ["test", UNRELATED_TOOL],
-        }),
-      ),
-    ).toBe("mixed-other");
+  it("classifies an unrelated allowed tool as other regardless of the state", () => {
+    for (let satisfiedCount = 0; satisfiedCount <= WORKFLOW.length; satisfiedCount += 1) {
+      expect(
+        classifyAllowedCallRelation(
+          relationInput({
+            ...split(satisfiedCount),
+            reason:
+              satisfiedCount === WORKFLOW.length
+                ? "unexpected-tool-call-on-final"
+                : "expected-tool-not-invoked",
+            selectedCallNames: [UNRELATED_TOOL],
+          }),
+        ),
+      ).toBe("other-allowed");
+    }
   });
 
-  it("treats an empty history as everything-still-ahead", () => {
-    // Nothing has run: a later-expected name is a skip-ahead, and a name that
-    // WOULD have been an earlier step is simply unrelated to what ran.
+  it("treats a fully unsatisfied workflow as everything-still-ahead", () => {
+    const fresh = split(0);
+    // `read` is the current expectation, so its presence is not a confusion;
+    // everything after it is a skip-ahead.
     expect(
-      classifyAllowedCallRelation(
-        relationInput({ priorInvokedNames: new Set(), selectedCallNames: ["test"] }),
-      ),
-    ).toBe("future-only");
-    expect(
-      classifyAllowedCallRelation(
-        relationInput({ priorInvokedNames: new Set(), selectedCallNames: ["read"] }),
-      ),
-    ).toBe("other-allowed");
-  });
-
-  it("keeps the current-tool-present rule ahead of the future bucket", () => {
-    // `edit` (the current expectation) is present and has NOT already run, so
-    // the round's failure is not a transition confusion.
-    expect(
-      classifyAllowedCallRelation(
-        relationInput({
-          priorInvokedNames: new Set(["read"]),
-          selectedCallNames: ["edit", "test"],
-        }),
-      ),
+      classifyAllowedCallRelation(relationInput({ ...fresh, selectedCallNames: ["read"] })),
     ).toBe("not-applicable");
+    expect(
+      classifyAllowedCallRelation(relationInput({ ...fresh, selectedCallNames: ["edit"] })),
+    ).toBe("future-only");
+    expect(
+      classifyAllowedCallRelation(relationInput({ ...fresh, selectedCallNames: ["edit", "test"] })),
+    ).toBe("future-only");
   });
 
-  it("does not mutate or retain the supplied history set", () => {
-    const history = new Set(["read"]);
+  it("treats a fully satisfied workflow as everything-prior", () => {
+    for (const name of WORKFLOW) {
+      expect(finalRelationFor([name])).toBe("prior-only");
+    }
+    expect(finalRelationFor([...WORKFLOW])).toBe("prior-only");
+  });
+
+  it("does not mutate or retain the supplied scenario view", () => {
+    const satisfiedTools = ["read"];
+    const pendingTools = ["edit", "test"];
     classifyAllowedCallRelation(
-      relationInput({ priorInvokedNames: history, selectedCallNames: ["test", UNRELATED_TOOL] }),
+      relationInput({ satisfiedTools, pendingTools, selectedCallNames: ["test", UNRELATED_TOOL] }),
     );
-    expect([...history]).toEqual(["read"]);
+    expect(satisfiedTools).toEqual(["read"]);
+    expect(pendingTools).toEqual(["edit", "test"]);
   });
 
-  it("emits only a closed enum even when the history holds sentinel names", () => {
-    const sentinel = "SYNTHETIC-HISTORY-TOOL-5d31";
+  it("emits only a closed enum even when the scenario view holds sentinel names", () => {
+    const sentinel = "SYNTHETIC-WORKFLOW-TOOL-5d31";
     const relation = classifyAllowedCallRelation(
       relationInput({
-        expectedToolByRound: [sentinel, "edit", "test", undefined],
-        priorInvokedNames: new Set([sentinel, "edit"]),
-        selectedCallNames: ["test"],
+        satisfiedTools: [sentinel],
+        pendingTools: ["edit", "test"],
+        selectedCallNames: [sentinel],
       }),
     );
-    expect(relation).toBe("expected-already-invoked");
+    expect(relation).toBe("prior-only");
     expect(JSON.stringify(relation)).not.toContain(sentinel);
     expect(JSON.stringify(relation)).not.toContain("SYNTHETIC");
   });
@@ -465,72 +477,73 @@ describe("diagnostic report — history-aware relation", () => {
 // ---------------------------------------------------------------------------
 
 describe("diagnostic report — classifier determinism and precedence", () => {
-  /** `read` is BOTH a prior (round 0) and a future (round 2) expected tool. */
-  const AMBIGUOUS_SEQUENCE: readonly (string | undefined)[] = ["read", "edit", "read", undefined];
+  const repeatedInput = relationInput({ selectedCallNames: ["read", UNRELATED_TOOL] });
 
-  const ambiguousInput = relationInput({
-    expectedToolByRound: AMBIGUOUS_SEQUENCE,
-    selectedCallNames: ["read"],
-  });
-
-  it("resolves a name occupying two expected positions identically on every call", () => {
+  it("resolves the same scenario view identically on every call", () => {
     const results = [
-      classifyAllowedCallRelation(ambiguousInput),
-      classifyAllowedCallRelation(ambiguousInput),
-      classifyAllowedCallRelation(ambiguousInput),
-      classifyAllowedCallRelation(ambiguousInput),
-      classifyAllowedCallRelation(ambiguousInput),
+      classifyAllowedCallRelation(repeatedInput),
+      classifyAllowedCallRelation(repeatedInput),
+      classifyAllowedCallRelation(repeatedInput),
+      classifyAllowedCallRelation(repeatedInput),
+      classifyAllowedCallRelation(repeatedInput),
     ];
     expect(new Set(results).size).toBe(1);
-    expect(results).toEqual(["prior-only", "prior-only", "prior-only", "prior-only", "prior-only"]);
+    expect(results).toEqual([
+      "mixed-other",
+      "mixed-other",
+      "mixed-other",
+      "mixed-other",
+      "mixed-other",
+    ]);
   });
 
   it("returns the same relation for freshly built, structurally equal inputs", () => {
-    const first = classifyAllowedCallRelation(
-      relationInput({ expectedToolByRound: AMBIGUOUS_SEQUENCE, selectedCallNames: ["read"] }),
-    );
-    const second = classifyAllowedCallRelation(
-      relationInput({ expectedToolByRound: AMBIGUOUS_SEQUENCE, selectedCallNames: ["read"] }),
-    );
+    const first = classifyAllowedCallRelation(relationInput({ selectedCallNames: ["read"] }));
+    const second = classifyAllowedCallRelation(relationInput({ selectedCallNames: ["read"] }));
     expect(first).toBe(second);
     expect(first).toBe("prior-only");
   });
 
   it("does not mutate its inputs", () => {
     const selectedCallNames: readonly string[] = ["read", UNRELATED_TOOL];
-    const expectedToolByRound: readonly (string | undefined)[] = [...AMBIGUOUS_SEQUENCE];
-    classifyAllowedCallRelation(relationInput({ selectedCallNames, expectedToolByRound }));
+    classifyAllowedCallRelation(relationInput({ selectedCallNames }));
     expect(selectedCallNames).toEqual(["read", UNRELATED_TOOL]);
-    expect(expectedToolByRound).toEqual(["read", "edit", "read", undefined]);
   });
 
-  it("reports a stale expectation when this round's tool already ran earlier", () => {
-    // `edit` is both this round's expected tool and round 0's expected tool, so
-    // the sequential history already contains it: the round's expectation is
-    // stale, which outranks per-name bucketing.
+  it("ranks the current expected transition above every other bucket", () => {
+    // `edit` is pending and current; whatever else the round selected, the
+    // failure is not a transition confusion.
+    for (const selectedCallNames of [
+      ["edit"],
+      ["read", "edit"],
+      ["edit", "test"],
+      ["edit", UNRELATED_TOOL],
+      ["read", "edit", "test", UNRELATED_TOOL],
+    ]) {
+      expect(relationFor(selectedCallNames)).toBe("not-applicable");
+    }
+  });
+
+  it("ranks the current expected transition above a later duplicate of the same name", () => {
+    // A pending list may legitimately repeat a name; the CURRENT slot wins, so
+    // the round is never reported as a skip-ahead onto itself.
     expect(
       classifyAllowedCallRelation(
         relationInput({
-          expectedToolByRound: ["edit", "edit", "test", undefined],
-          selectedCallNames: ["edit"],
-        }),
-      ),
-    ).toBe("expected-already-invoked");
-  });
-
-  it("ranks the current expected tool above a future occurrence of the same name", () => {
-    expect(
-      classifyAllowedCallRelation(
-        relationInput({
-          expectedToolByRound: ["read", "edit", "edit", undefined],
+          satisfiedTools: ["read"],
+          pendingTools: ["edit", "edit"],
           selectedCallNames: ["edit"],
         }),
       ),
     ).toBe("not-applicable");
   });
 
-  it("ranks a prior expected tool above a future occurrence of the same name", () => {
-    expect(classifyAllowedCallRelation(ambiguousInput)).toBe("prior-only");
+  it("keeps the prior and future buckets structurally disjoint", () => {
+    // Satisfied and pending may never overlap, so a single name can only ever
+    // land in ONE of the two buckets — the v2 ambiguity is gone.
+    expect(relationFor(["read"])).toBe("prior-only");
+    expect(relationFor(["test"])).toBe("future-only");
+    expect(relationFor(["read", "test"])).toBe("prior-and-future");
   });
 
   it("ranks a future expected tool above the unrelated-allowed bucket", () => {
@@ -540,54 +553,85 @@ describe("diagnostic report — classifier determinism and precedence", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 3b. The round-index range guard (fails closed rather than guessing)
+// 3b. The scenario-view guard (fails closed rather than guessing)
 // ---------------------------------------------------------------------------
 
-describe("diagnostic report — round-index range guard", () => {
-  // `roundIndex` and `expectedToolByRound` arrive as separate arguments, so an
-  // off-by-one or a scenario/round mispairing at the call site must be LOUD.
-  // Without the guard an index past the end silently buckets every named round
-  // as prior (a confident `prior-only`) and a negative index buckets them all as
-  // future (a confident `future-only`) — a plausible-looking but wrong answer.
-  const outOfRange: readonly number[] = [
-    EXPECTED_SEQUENCE.length,
-    EXPECTED_SEQUENCE.length + 1,
-    99,
-    -1,
-    -42,
+describe("diagnostic report — scenario-view guard", () => {
+  // `satisfiedTools` and `pendingTools` arrive as separate arguments, so a
+  // mispairing at the call site must be LOUD. Without the guard a short view
+  // silently shrinks the prior/future buckets, a duplicated view double-counts
+  // a transition, and an overlapping view lets one name occupy two buckets —
+  // each a plausible-looking but wrong answer in the one command whose entire
+  // purpose is diagnostic accuracy.
+
+  const mispairedViews: readonly {
+    readonly label: string;
+    readonly over: Partial<AllowedCallRelationInput>;
+  }[] = [
+    { label: "an empty view", over: { satisfiedTools: [], pendingTools: [] } },
+    {
+      label: "a short view",
+      over: { satisfiedTools: ["read"], pendingTools: ["edit"] },
+    },
+    {
+      label: "a long view",
+      over: { satisfiedTools: ["read"], pendingTools: ["edit", "test", UNRELATED_TOOL] },
+    },
+    {
+      label: "a satisfied-only long view",
+      over: { satisfiedTools: ["read", "edit", "test", UNRELATED_TOOL], pendingTools: [] },
+    },
+    {
+      label: "a duplicated satisfied transition",
+      over: { satisfiedTools: ["read", "read", "edit"], pendingTools: [] },
+    },
+    {
+      label: "a duplicated satisfied transition inside a whole-workflow view",
+      over: { satisfiedTools: ["read", "read"], pendingTools: ["edit"] },
+    },
+    {
+      label: "an overlapping view",
+      over: { satisfiedTools: ["read"], pendingTools: ["read", "edit"] },
+    },
+    {
+      label: "an overlapping view at the pending tail",
+      over: { satisfiedTools: ["read", "edit"], pendingTools: ["read"] },
+    },
   ];
 
-  for (const roundIndex of outOfRange) {
-    it(`throws for a round index of ${String(roundIndex)}`, () => {
-      expect(() => classifyAllowedCallRelation(relationInput({ roundIndex }))).toThrow();
-    });
-  }
-
-  for (const roundIndex of [1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
-    it(`throws for a non-integer round index of ${String(roundIndex)}`, () => {
-      expect(() => classifyAllowedCallRelation(relationInput({ roundIndex }))).toThrow();
+  for (const testCase of mispairedViews) {
+    it(`throws for ${testCase.label}`, () => {
+      expect(() => classifyAllowedCallRelation(relationInput(testCase.over))).toThrow();
     });
   }
 
   it("throws BEFORE any reason or call-set short-circuit could hide the mispairing", () => {
-    // A reason that would otherwise return `not-applicable` immediately, and a
-    // null call set, must still surface the bad index.
+    // A reason that would otherwise return `not-applicable` immediately, a null
+    // call set, and a disallowed call set must all still surface the bad view.
+    const short = { satisfiedTools: ["read"], pendingTools: ["edit"] };
+    expect(() =>
+      classifyAllowedCallRelation(relationInput({ reason: "expected-tool-unavailable", ...short })),
+    ).toThrow();
+    expect(() =>
+      classifyAllowedCallRelation(relationInput({ selectedCallNames: null, ...short })),
+    ).toThrow();
+    expect(() =>
+      classifyAllowedCallRelation(relationInput({ allAllowed: false, ...short })),
+    ).toThrow();
     expect(() =>
       classifyAllowedCallRelation(
-        relationInput({ reason: "expected-tool-unavailable", roundIndex: 99 }),
+        relationInput({
+          reason: "scenario-round-budget-exhausted",
+          satisfiedTools: ["read"],
+          pendingTools: ["read", "edit"],
+        }),
       ),
-    ).toThrow();
-    expect(() =>
-      classifyAllowedCallRelation(relationInput({ selectedCallNames: null, roundIndex: 99 })),
-    ).toThrow();
-    expect(() =>
-      classifyAllowedCallRelation(relationInput({ allAllowed: false, roundIndex: -1 })),
     ).toThrow();
   });
 
-  it("accepts every in-range index of the fixture sequence", () => {
-    for (let roundIndex = 0; roundIndex < EXPECTED_SEQUENCE.length; roundIndex += 1) {
-      expect(() => classifyAllowedCallRelation(relationInput({ roundIndex }))).not.toThrow();
+  it("accepts every satisfied-state split of the fixture workflow", () => {
+    for (let satisfiedCount = 0; satisfiedCount <= WORKFLOW.length; satisfiedCount += 1) {
+      expect(() => classifyAllowedCallRelation(relationInput(split(satisfiedCount)))).not.toThrow();
     }
   });
 
@@ -597,9 +641,9 @@ describe("diagnostic report — round-index range guard", () => {
     try {
       classifyAllowedCallRelation(
         relationInput({
-          expectedToolByRound: [sentinel, "edit", "test", undefined],
+          satisfiedTools: [sentinel],
+          pendingTools: [sentinel, "edit"],
           selectedCallNames: [sentinel],
-          roundIndex: 99,
         }),
       );
     } catch (error) {
@@ -608,7 +652,7 @@ describe("diagnostic report — round-index range guard", () => {
     expect(message).not.toBe("");
     expect(message).not.toContain(sentinel);
     expect(message).not.toContain("SYNTHETIC");
-    expect(message).not.toContain("99");
+    expect(message).not.toMatch(/\d/);
   });
 });
 
@@ -618,7 +662,8 @@ describe("diagnostic report — round-index range guard", () => {
 
 describe("diagnostic report — final-round relation", () => {
   it("confirms the fixture's final round expects text rather than a tool", () => {
-    expect(EXPECTED_SEQUENCE[FINAL_ROUND_INDEX]).toBeUndefined();
+    expect(split(FINAL_SATISFIED).pendingTools).toEqual([]);
+    expect(split(FINAL_SATISFIED).satisfiedTools).toEqual([...WORKFLOW]);
   });
 
   const finalCases: readonly {
@@ -626,10 +671,10 @@ describe("diagnostic report — final-round relation", () => {
     readonly selectedCallNames: readonly string[];
     readonly expected: AllowedCallRelation;
   }[] = [
-    { label: "the first expected tool", selectedCallNames: ["read"], expected: "prior-only" },
-    { label: "the middle expected tool", selectedCallNames: ["edit"], expected: "prior-only" },
+    { label: "the first transition", selectedCallNames: ["read"], expected: "prior-only" },
+    { label: "the middle transition", selectedCallNames: ["edit"], expected: "prior-only" },
     {
-      label: "every expected tool",
+      label: "every transition",
       selectedCallNames: ["read", "edit", "test"],
       expected: "prior-only",
     },
@@ -639,7 +684,7 @@ describe("diagnostic report — final-round relation", () => {
       expected: "other-allowed",
     },
     {
-      label: "an unrelated allowed tool beside an expected tool",
+      label: "an unrelated allowed tool beside a transition",
       selectedCallNames: ["read", UNRELATED_TOOL],
       expected: "mixed-other",
     },
@@ -666,7 +711,7 @@ describe("diagnostic report — final-round relation", () => {
       classifyAllowedCallRelation(
         relationInput({
           reason: "unexpected-tool-call-on-final",
-          roundIndex: FINAL_ROUND_INDEX,
+          ...split(FINAL_SATISFIED),
           selectedCallNames: null,
         }),
       ),
@@ -675,7 +720,7 @@ describe("diagnostic report — final-round relation", () => {
       classifyAllowedCallRelation(
         relationInput({
           reason: "unexpected-tool-call-on-final",
-          roundIndex: FINAL_ROUND_INDEX,
+          ...split(FINAL_SATISFIED),
           allAllowed: false,
         }),
       ),
@@ -692,8 +737,8 @@ describe("diagnostic report — reason ⇄ dimension contract", () => {
     // A future union member added to the release report fails HERE first, so
     // the diagnostic's predicates can never silently miss a reason.
     expect([...ALL_REASONS].sort()).toEqual(Object.keys(EVAL_FAILURE_REASON_CODES).sort());
-    expect(ALL_REASONS).toHaveLength(9);
-    expect(new Set(ALL_REASONS).size).toBe(9);
+    expect(ALL_REASONS).toHaveLength(10);
+    expect(new Set(ALL_REASONS).size).toBe(10);
   });
 
   for (const reason of ALL_REASONS) {
@@ -744,8 +789,8 @@ describe("diagnostic report — reason ⇄ dimension contract", () => {
     });
   }
 
-  it("covers all seven relation-free reasons in the loop above", () => {
-    expect(relationFreeReasons).toHaveLength(7);
+  it("covers all eight relation-free reasons in the loop above", () => {
+    expect(relationFreeReasons).toHaveLength(8);
   });
 
   it("forces not-applicable for transcript-invalid, whose expected tool WAS present", () => {
@@ -763,6 +808,48 @@ describe("diagnostic report — reason ⇄ dimension contract", () => {
     expect(classifyAllowedCallRelation(relationInput({ reason, allAllowed: true }))).toBe(
       "not-applicable",
     );
+  });
+
+  it("gives the whole-scenario budget reason all-not-applicable dimensions", () => {
+    // `scenario-round-budget-exhausted` belongs to the SCENARIO, not to one
+    // round's call set: no single round's selection describes it, so all three
+    // dimensions must be `not-applicable` and the reason ⇄ dimension contract
+    // must accept exactly that shape.
+    const reason: EvalFailureReason = "scenario-round-budget-exhausted";
+    expect(reasonHasSelectedCallSet(reason)).toBe(false);
+    expect(reasonRequiresAllowedCallRelation(reason)).toBe(false);
+    expect(classifyAllowedCallRelation(relationInput({ reason }))).toBe("not-applicable");
+    expect(
+      classifyAllowedCallRelation(
+        relationInput({ reason, selectedCallNames: ["read", "test", UNRELATED_TOOL] }),
+      ),
+    ).toBe("not-applicable");
+    expect(
+      transitionDiagnosticDimensionErrors({
+        reason,
+        allowedCallRelation: "not-applicable",
+        selectionSource: "not-applicable",
+        callMultiplicity: "not-applicable",
+      }),
+    ).toEqual([]);
+    for (const relation of ALL_RELATIONS.filter((r) => r !== "not-applicable")) {
+      expect(
+        transitionDiagnosticDimensionErrors({
+          reason,
+          allowedCallRelation: relation,
+          selectionSource: "not-applicable",
+          callMultiplicity: "not-applicable",
+        }),
+      ).toEqual(["relation-must-be-not-applicable"]);
+    }
+    expect(
+      transitionDiagnosticDimensionErrors({
+        reason,
+        allowedCallRelation: "not-applicable",
+        selectionSource: "desired-source",
+        callMultiplicity: "single",
+      }),
+    ).toEqual(["selection-source-must-be-not-applicable", "multiplicity-must-be-not-applicable"]);
   });
 });
 
@@ -871,6 +958,7 @@ describe("diagnostic report — dimension consistency validation", () => {
     "expected-tool-returned-text",
     "expected-tool-unavailable",
     "final-no-valid-call",
+    "scenario-round-budget-exhausted",
   ];
 
   for (const reason of noCallSetReasons) {
@@ -965,6 +1053,9 @@ const INVALID_CODES: readonly unknown[] = [
   0,
   -1,
   1.5,
+  // 7 was the v2 `expected-already-invoked` relation code; v3 removed it and no
+  // map assigns it, so every decoder must now reject it.
+  7,
   99,
   "1",
   "not-applicable",
@@ -1066,9 +1157,10 @@ describeCodeMap<DiagnosticCallMultiplicity>({
 });
 
 describe("diagnostic report — ledger code stability", () => {
-  it("pins the relation codes so a persisted ledger never renumbers", () => {
-    // Codes 1–6 are unchanged from format v1; the history-aware member was
-    // APPENDED as 7 rather than renumbering existing entries.
+  it("pins the six relation codes so a persisted ledger never renumbers", () => {
+    // Codes 1–6 are unchanged from formats v1 and v2. The v2 code 7
+    // (`expected-already-invoked`) was REMOVED rather than reused, so a stale
+    // ledger entry can never decode to a different member.
     expect({ ...ALLOWED_CALL_RELATION_CODES }).toEqual({
       "prior-only": 1,
       "future-only": 2,
@@ -1076,8 +1168,14 @@ describe("diagnostic report — ledger code stability", () => {
       "other-allowed": 4,
       "mixed-other": 5,
       "not-applicable": 6,
-      "expected-already-invoked": 7,
     });
+    expect(Object.keys(ALLOWED_CALL_RELATION_CODES)).toHaveLength(6);
+    expect(new Set(Object.values(ALLOWED_CALL_RELATION_CODES)).size).toBe(6);
+  });
+
+  it("no longer decodes the removed v2 relation code 7", () => {
+    expect(allowedCallRelationForCode(7)).toBeUndefined();
+    expect(Object.values(ALLOWED_CALL_RELATION_CODES)).not.toContain(7);
   });
 
   it("pins the selection-source codes", () => {
@@ -1195,31 +1293,34 @@ describe("diagnostic report — value-freeness", () => {
       expected: "other-allowed",
     },
     {
-      label: "a prior expected tool",
+      label: "a satisfied transition",
       input: relationInput({
-        expectedToolByRound: [TOOL_SENTINEL, "edit", "test", undefined],
+        satisfiedTools: [TOOL_SENTINEL],
+        pendingTools: ["edit", "test"],
         selectedCallNames: [TOOL_SENTINEL],
       }),
       expected: "prior-only",
     },
     {
-      label: "a future expected tool",
+      label: "a later pending transition",
       input: relationInput({
-        expectedToolByRound: ["read", "edit", TOOL_SENTINEL, undefined],
+        satisfiedTools: ["read"],
+        pendingTools: ["edit", TOOL_SENTINEL],
         selectedCallNames: [TOOL_SENTINEL],
       }),
       expected: "future-only",
     },
     {
-      label: "the current expected tool",
+      label: "the currently expected transition",
       input: relationInput({
-        expectedToolByRound: ["read", TOOL_SENTINEL, "test", undefined],
+        satisfiedTools: ["read"],
+        pendingTools: [TOOL_SENTINEL, "test"],
         selectedCallNames: [TOOL_SENTINEL],
       }),
       expected: "not-applicable",
     },
     {
-      label: "a path- and a prompt-like name beside a prior expected tool",
+      label: "a path- and a prompt-like name beside a satisfied transition",
       input: relationInput({ selectedCallNames: [PATH_SENTINEL, PROMPT_SENTINEL, "read"] }),
       expected: "mixed-other",
     },

@@ -92,21 +92,29 @@ import {
   type TransitionDiagnostic,
 } from "./diagnostic-report.js";
 import type { DiagnosticChoiceKind, EvalCase } from "./cases.js";
+import { MIN_SUCCESSFUL_SCENARIO_ROUNDS, SCENARIO_STEP_COUNT } from "./scenario-engine.js";
 import type { NormalizedToolChoice } from "../tools/types.js";
 
 /**
  * The only supported on-disk diagnostic checkpoint format version. There is no
  * migration path: any other version is rejected on read.
  *
- * Format 2 accompanies diagnostic report v2, whose {@link AllowedCallRelation}
- * gains the appended member `expected-already-invoked` (ledger code 7) and
- * judges the prior/future buckets against the scenario's actual invocation
- * history rather than static round position. A **format 1 checkpoint is
- * REJECTED** on read: its persisted relation codes were derived under the
- * position-based rules, so replaying them under v2 accounting would mix two
- * incompatible classifications. A resumed run must start from a fresh anchor.
+ * Format 3 accompanies diagnostic report v3, which adopts the shared
+ * STATE-AWARE transition engine: a scenario's expectation is the next
+ * UNSATISFIED transition, so the {@link AllowedCallRelation} buckets are judged
+ * against transitions that SUCCEEDED rather than names that were merely
+ * invoked, and the v2 member `expected-already-invoked` (ledger code 7) is
+ * removed as unreachable. Format 3 also replaces the plain executed-round
+ * ledger with the {@link DiagnosticScenarioEvidence} tuple so satisfied-state
+ * claims are durable and checkable.
+ *
+ * **Format 1 and format 2 checkpoints are REJECTED** on read with no migration
+ * path: their persisted relation codes and round counts were derived under
+ * position-based (v1) or invocation-history (v2) rules, so replaying them under
+ * v3 accounting would mix incompatible classifications. A resumed run must
+ * start from a fresh anchor.
  */
-export const DIAGNOSTIC_CHECKPOINT_FORMAT_VERSION = 2 as const;
+export const DIAGNOSTIC_CHECKPOINT_FORMAT_VERSION = 3 as const;
 
 /**
  * The fixed diagnostic checkpoint filename. It is intentionally distinct from
@@ -275,6 +283,26 @@ export type DiagnosticCheckpointEntry = readonly [
   multiplicityCode: number,
 ];
 
+/**
+ * One committed scenario's compact, content-free evidence tuple (format 3).
+ * Entries appear in COMMIT ORDER and map one-to-one onto the committed
+ * projected scenarios.
+ *
+ *  - `executedRounds` — upstream rounds the scenario actually issued, in
+ *    `[1, thatScenario.rounds.length]`. Under state-aware accounting a
+ *    SUCCESSFUL scenario may use fewer rounds than its budget when a parallel
+ *    batch completed several transitions at once.
+ *  - `satisfiedSteps` — how many workflow transitions SUCCEEDED, in
+ *    `[0, SCENARIO_STEP_COUNT]`. Success is prerequisite-gated, so the
+ *    satisfied transitions are always the leading prefix and a count fully
+ *    describes them.
+ *
+ * The tuple carries ONLY counts: no tool name, argument, schema, prompt,
+ * answer, model or source identifier, id, credential, title, body, URL,
+ * timestamp, or thrown value.
+ */
+export type DiagnosticScenarioEvidence = readonly [executedRounds: number, satisfiedSteps: number];
+
 /** Cumulative cleanup counters persisted across resume segments. */
 export interface DiagnosticCheckpointCleanup {
   readonly attempted: number;
@@ -318,13 +346,12 @@ export interface DiagnosticCheckpointData {
   readonly successfulScenarios: number;
   readonly cleanup: DiagnosticCheckpointCleanup;
   /**
-   * Per-committed-scenario upstream-round counts, in commit order. Each entry is
-   * mapped IN ORDER to its corresponding committed projected scenario and must
-   * be an integer in `[1, thatScenario.rounds.length]` — the per-SCENARIO round
-   * count, not the projection-wide maximum. `.length` MUST equal
-   * `completedScenarios`, and the sum is the committed upstream-round floor.
+   * Per-committed-scenario evidence, in commit order. See
+   * {@link DiagnosticScenarioEvidence}. `.length` MUST equal
+   * `completedScenarios`, and the sum of the tuples' executed-round elements is
+   * the committed upstream-round floor.
    */
-  readonly executedScenarioRounds: readonly number[];
+  readonly scenarioEvidence: readonly DiagnosticScenarioEvidence[];
   /** The compact, content-free terminal-diagnostic ledger (≤ one per scenario). */
   readonly diagnostics: readonly DiagnosticCheckpointEntry[];
 }
@@ -535,31 +562,46 @@ function asObject(value: unknown, label: string): Record<string, unknown> {
 }
 
 /**
- * Strictly parse the compact `executedScenarioRounds` array into positive
- * integers. Corpus-bound consistency (length, per-scenario bounds, the committed
- * floor) lives in {@link validateResumableDiagnosticCheckpoint}, which owns the
- * projection.
+ * Strictly parse the compact `scenarioEvidence` ledger into two-integer tuples.
+ * Corpus-bound consistency (length, per-scenario round bounds, satisfied-state
+ * agreement with the terminal diagnostic, the committed floor) lives in
+ * {@link validateResumableDiagnosticCheckpoint}, which owns the projection.
  */
-function parseExecutedScenarioRounds(value: unknown): number[] {
+function parseScenarioEvidence(value: unknown): DiagnosticScenarioEvidence[] {
   if (!Array.isArray(value)) {
-    throw new Error("diagnostic checkpoint executedScenarioRounds shape is invalid");
+    throw new Error("diagnostic checkpoint scenarioEvidence shape is invalid");
   }
   if (value.length > MAX_COUNT) {
-    throw new Error("diagnostic checkpoint executedScenarioRounds exceeds bound");
+    throw new Error("diagnostic checkpoint scenarioEvidence exceeds bound");
   }
-  const out: number[] = [];
-  for (const entry of value as unknown[]) {
-    if (
-      typeof entry !== "number" ||
-      !Number.isSafeInteger(entry) ||
-      entry < 1 ||
-      entry > MAX_COUNT
-    ) {
-      throw new Error("diagnostic checkpoint executedScenarioRounds entry is out of range");
-    }
-    out.push(entry);
-  }
+  const out: DiagnosticScenarioEvidence[] = [];
+  for (const entry of value as unknown[]) out.push(parseScenarioEvidenceEntry(entry));
   return out;
+}
+
+/** Strictly parse ONE `scenarioEvidence` tuple; throws value-free on any anomaly. */
+function parseScenarioEvidenceEntry(entry: unknown): DiagnosticScenarioEvidence {
+  if (!Array.isArray(entry) || entry.length !== 2) {
+    throw new Error("diagnostic checkpoint scenarioEvidence entry shape is invalid");
+  }
+  const [executedRounds, satisfiedSteps] = entry as unknown[];
+  if (
+    typeof executedRounds !== "number" ||
+    !Number.isSafeInteger(executedRounds) ||
+    executedRounds < 1 ||
+    executedRounds > MAX_COUNT
+  ) {
+    throw new Error("diagnostic checkpoint scenarioEvidence executed rounds are out of range");
+  }
+  if (
+    typeof satisfiedSteps !== "number" ||
+    !Number.isSafeInteger(satisfiedSteps) ||
+    satisfiedSteps < 0 ||
+    satisfiedSteps > SCENARIO_STEP_COUNT
+  ) {
+    throw new Error("diagnostic checkpoint scenarioEvidence satisfied steps are out of range");
+  }
+  return Object.freeze([executedRounds, satisfiedSteps]) as unknown as DiagnosticScenarioEvidence;
 }
 
 /**
@@ -664,7 +706,7 @@ function parseCheckpoint(
       "completedScenarios",
       "successfulScenarios",
       "cleanup",
-      "executedScenarioRounds",
+      "scenarioEvidence",
       "diagnostics",
     ],
     "root",
@@ -738,7 +780,7 @@ function parseCheckpoint(
       failed: assertCount(cleanupObj["failed"], "cleanup.failed"),
       journalFailures: assertCount(cleanupObj["journalFailures"], "cleanup.journalFailures"),
     },
-    executedScenarioRounds: parseExecutedScenarioRounds(obj["executedScenarioRounds"]),
+    scenarioEvidence: parseScenarioEvidence(obj["scenarioEvidence"]),
     diagnostics: parseDiagnostics(obj["diagnostics"]),
   };
 }
@@ -803,28 +845,19 @@ export function diagnosticCheckpointExists(loc: DiagnosticCheckpointLocation): b
 }
 
 /**
- * Shape-check the executed-round ledger before serialization. Takes `unknown` so
- * a hostile caller's non-array value is validated positionally rather than
- * trusted by its declared type.
+ * Shape-check the per-scenario evidence ledger before serialization. Takes
+ * `unknown` so a hostile caller's non-array value is validated positionally
+ * rather than trusted by its declared type.
  */
-function assertExecutedScenarioRoundsShape(entries: unknown): void {
+function assertScenarioEvidenceShape(entries: unknown): void {
   if (!Array.isArray(entries)) {
-    throw new Error("diagnostic checkpoint executedScenarioRounds shape is invalid");
+    throw new Error("diagnostic checkpoint scenarioEvidence shape is invalid");
   }
   const values = entries as readonly unknown[];
   if (values.length > MAX_COUNT) {
-    throw new Error("diagnostic checkpoint executedScenarioRounds exceeds bound");
+    throw new Error("diagnostic checkpoint scenarioEvidence exceeds bound");
   }
-  for (const entry of values) {
-    if (
-      typeof entry !== "number" ||
-      !Number.isSafeInteger(entry) ||
-      entry < 1 ||
-      entry > MAX_COUNT
-    ) {
-      throw new Error("diagnostic checkpoint executedScenarioRounds entry is invalid");
-    }
-  }
+  for (const entry of values) parseScenarioEvidenceEntry(entry);
 }
 
 /**
@@ -933,7 +966,7 @@ function serialize(data: DiagnosticCheckpointData): string {
   assertCount(data.completedScenarios, "completedScenarios");
   assertCount(data.successfulScenarios, "successfulScenarios");
   for (const [k, v] of Object.entries(data.cleanup)) assertCount(v, `cleanup.${k}`);
-  assertExecutedScenarioRoundsShape(data.executedScenarioRounds);
+  assertScenarioEvidenceShape(data.scenarioEvidence);
   assertDiagnosticsShape(data.diagnostics);
   return JSON.stringify(data) + "\n";
 }
@@ -1069,21 +1102,26 @@ interface DerivedDiagnosticEvidence {
  *  3. `nextScenarioIndex` STRICTLY within `0..scenarios.length` — a resumable
  *     checkpoint can never encode a complete corpus, because a genuinely
  *     complete run removes its checkpoint.
- *  4. `executedScenarioRounds.length === nextScenarioIndex === completedScenarios`
- *     and every entry within `[1, correspondingScenario.rounds.length]` — the
- *     per-SCENARIO round count, not the projection-wide maximum.
- *  5. Diagnostics: at most ONE per committed scenario (a scenario terminates at
- *     its first terminal failure); the case ordinal must be the GLOBAL ordinal of
- *     a committed projected scenario; the round must exist in THAT scenario; the
+ *  4. `scenarioEvidence.length === nextScenarioIndex === completedScenarios`,
+ *     every executed-round element within
+ *     `[1, correspondingScenario.rounds.length]` — the per-SCENARIO round
+ *     count, not the projection-wide maximum — and every satisfied-step count
+ *     within `[0, SCENARIO_STEP_COUNT]`.
+ *  5. Diagnostics: at most ONE per committed scenario (a scenario emits exactly
+ *     one terminal reason); the case ordinal must be the GLOBAL ordinal of a
+ *     committed projected scenario; the round must exist in THAT scenario; the
  *     round ordinal must equal that scenario's executed-round count (a scenario
- *     terminates AT its diagnostic round); the reason scope must match the
- *     round's ACTUAL `hasExpectedTool` disposition; the three dimensions must
- *     satisfy the reason ⇄ dimension contract; and an early-terminated scenario
- *     (`executed < rounds.length`) MUST carry a terminal diagnostic.
- *  6. `successfulScenarios` EXACTLY equals the derived count (ran to completion
- *     AND no terminal diagnostic), so a forged success claim is rejected.
+ *     stops AT its diagnostic round); the reason SCOPE must agree with the
+ *     scenario's SATISFIED STATE (an `expected` reason only while a transition
+ *     is pending, a `final` reason only once every transition succeeded); and
+ *     the three dimensions must satisfy the reason ⇄ dimension contract.
+ *  6. `successfulScenarios` EXACTLY equals the derived count (no terminal
+ *     diagnostic, which additionally requires every transition satisfied and
+ *     room for a final-answer round), so a forged success claim is rejected. A
+ *     successful scenario MAY use fewer rounds than its budget when a parallel
+ *     batch completed several transitions at once.
  *  7. Upstream-round counters bounded by the committed floor
- *     (`Σ executedScenarioRounds`) plus per-run-segment slack, with
+ *     (`Σ scenarioEvidence[k].executedRounds`) plus per-run-segment slack, with
  *     `completedRounds ≤ attemptedRounds`.
  *  8. Resumable cleanup accounting truthful (deleted + failed == attempted,
  *     failed == 0, journalFailures == 0, attempted == deleted == attemptedRounds)
@@ -1180,8 +1218,8 @@ function deriveDiagnosticEvidence(
   cursor: number,
 ): DerivedDiagnosticEvidence {
   const { scenarios } = projection;
-  if (data.executedScenarioRounds.length !== cursor) {
-    throw new Error("diagnostic checkpoint executedScenarioRounds length mismatch");
+  if (data.scenarioEvidence.length !== cursor) {
+    throw new Error("diagnostic checkpoint scenarioEvidence length mismatch");
   }
 
   // Index diagnostics by GLOBAL case ordinal, rejecting an uncommitted ordinal,
@@ -1214,18 +1252,13 @@ function deriveDiagnosticEvidence(
     if (reason === undefined) {
       throw new Error("diagnostic checkpoint diagnostics reason code is unknown");
     }
-    const scope = EVAL_FAILURE_REASON_SCOPE[reason];
-    if (scope === "expected" && !round.hasExpectedTool) {
-      throw new Error("diagnostic checkpoint diagnostics reason incompatible with final round");
-    }
-    if (scope === "final" && round.hasExpectedTool) {
-      throw new Error(
-        "diagnostic checkpoint diagnostics reason incompatible with expected-tool round",
-      );
-    }
     if (perScenario.has(co)) {
       throw new Error("diagnostic checkpoint diagnostics has multiple entries for one scenario");
     }
+    // The reason's scope is checked against the scenario's SATISFIED STATE
+    // below, not against the round's positional `hasExpectedTool`: under
+    // state-aware accounting a round's planned position no longer determines
+    // whether it expected a tool or the final answer.
     perScenario.set(co, { roundOrdinal: ro, reason });
   }
 
@@ -1236,19 +1269,29 @@ function deriveDiagnosticEvidence(
     if (scenario === undefined) {
       throw new Error("diagnostic checkpoint cursor references unknown scenario");
     }
-    const executed = data.executedScenarioRounds[k];
-    if (executed === undefined) {
-      throw new Error("diagnostic checkpoint executedScenarioRounds length mismatch");
+    const entry = data.scenarioEvidence[k];
+    if (entry === undefined) {
+      throw new Error("diagnostic checkpoint scenarioEvidence length mismatch");
     }
+    const [executed, satisfied] = entry;
     // Per-SCENARIO bound: `[1, thisScenario.rounds.length]`. A committed scenario
     // always issued at least its first round.
     if (!Number.isSafeInteger(executed) || executed < 1 || executed > scenario.rounds.length) {
       throw new Error(
-        "diagnostic checkpoint executedScenarioRounds entry out of range for its scenario",
+        "diagnostic checkpoint scenarioEvidence executed rounds out of range for its scenario",
+      );
+    }
+    if (!Number.isSafeInteger(satisfied) || satisfied < 0 || satisfied > SCENARIO_STEP_COUNT) {
+      throw new Error(
+        "diagnostic checkpoint scenarioEvidence satisfied steps out of range for its scenario",
       );
     }
     executedScenarioSum += executed;
 
+    // Once every transition succeeds the scenario expects FINAL TEXT; while one
+    // is pending it expects a tool. That state — not the round's positional
+    // `hasExpectedTool` — is what a terminal diagnostic's scope must agree with.
+    const expectsFinal = satisfied >= SCENARIO_STEP_COUNT;
     const diag = perScenario.get(scenario.caseOrdinal) ?? null;
     if (diag !== null) {
       if (diag.roundOrdinal !== executed) {
@@ -1256,11 +1299,32 @@ function deriveDiagnosticEvidence(
           "diagnostic checkpoint diagnostics is not at its scenario's terminal round",
         );
       }
-    } else if (executed < scenario.rounds.length) {
-      throw new Error(
-        "diagnostic checkpoint claims a scenario stopped early without a terminal diagnostic",
-      );
+      const scope = EVAL_FAILURE_REASON_SCOPE[diag.reason];
+      if (scope === "expected" && expectsFinal) {
+        throw new Error(
+          "diagnostic checkpoint diagnostics expected-tool reason disagrees with satisfied state",
+        );
+      }
+      if (scope === "final" && !expectsFinal) {
+        throw new Error(
+          "diagnostic checkpoint diagnostics final reason disagrees with satisfied state",
+        );
+      }
     } else {
+      // No diagnostic ⇒ the scenario SUCCEEDED: every transition completed and
+      // the final answer was accepted. That requires at least one tool-call
+      // round plus one final-answer round — but NOT the whole budget, because a
+      // parallel batch can complete several transitions at once.
+      if (!expectsFinal) {
+        throw new Error(
+          "diagnostic checkpoint claims a scenario succeeded without every transition",
+        );
+      }
+      if (executed < MIN_SUCCESSFUL_SCENARIO_ROUNDS) {
+        throw new Error(
+          "diagnostic checkpoint claims a scenario succeeded without a final-answer round",
+        );
+      }
       successfulScenarios += 1;
     }
   }

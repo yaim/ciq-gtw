@@ -78,20 +78,29 @@ import { compileToolset, type CompiledToolset } from "../tools/schema.js";
 import { createToolCallIdGenerator } from "../tools/ids.js";
 import { normalizeToolRequest, type ProbedField } from "../tools/request.js";
 import type { NormalizedMessage } from "../openai/chat-types.js";
-import type { NormalizedTool, ParsedToolCall, ToolParseSource } from "../tools/types.js";
+import type {
+  NormalizedTool,
+  NormalizedToolChoice,
+  ParsedToolCall,
+  ToolParseSource,
+} from "../tools/types.js";
 import {
   buildRoundRequest,
   runLiveRound,
   type BoundDeleter,
   type LiveRoundResult,
 } from "./live-round.js";
+import { buildEvalCases, corpusFingerprint } from "./cases.js";
 import {
-  buildEvalCases,
-  corpusFingerprint,
-  initializeScenarioRuntime,
-  renderSyntheticToolResult,
-  type EvalRound,
-} from "./cases.js";
+  applyToolCallBatch,
+  assertCorpusMatchesEngine,
+  expectedStepTool,
+  initializeScenarioTransitions,
+  pendingStepIndex,
+  satisfiedStepCount,
+  SCENARIO_STEP_COUNT,
+  SCENARIO_STEP_TOOLS,
+} from "./scenario-engine.js";
 import {
   classifyRoundFailure,
   defaultToolsEvalDeps,
@@ -110,6 +119,7 @@ import {
   DIAGNOSTIC_CHECKPOINT_FORMAT_VERSION,
   type DiagnosticCheckpointData,
   type DiagnosticCheckpointEntry,
+  type DiagnosticScenarioEvidence,
 } from "./diagnostic-checkpoint.js";
 import {
   classifyAllowedCallRelation,
@@ -320,11 +330,16 @@ type DiagnosticDecision = RoundDecision & {
  * Classify a poll outcome by running the REAL selection engine, capturing the
  * trusted selection path alongside the release evaluator's decision shape.
  * Never throws.
+ *
+ * `expectedTool` is supplied by the CALLER, derived from the scenario's
+ * successfully completed transitions (`src/eval/scenario-engine.ts`), never
+ * from the tool named at the round's ordinal.
  */
 function classifyDiagnosticDecision(
   outcome: PollOutcome | null,
   toolset: CompiledToolset,
-  round: EvalRound,
+  choice: NormalizedToolChoice,
+  expectedTool: string | undefined,
   selectedLlms: readonly string[],
 ): DiagnosticDecision {
   if (outcome === null || outcome.kind === "timeout") {
@@ -339,7 +354,7 @@ function classifyDiagnosticDecision(
       desired: { content: outcome.content },
       individuals,
       toolset,
-      choice: round.choice,
+      choice,
       parallelToolCalls: true,
       selectedLlms,
       idGen: createToolCallIdGenerator(),
@@ -362,9 +377,7 @@ function classifyDiagnosticDecision(
   if (calls.length === 0) return { kind: "no_valid_call", selectionSource: null };
   const allAllowed = calls.every((call) => toolset.has(call.name));
   const expectedInvoked =
-    round.expectedTool === undefined
-      ? true
-      : calls.some((call) => call.name === round.expectedTool);
+    expectedTool === undefined ? true : calls.some((call) => call.name === expectedTool);
   return {
     kind: "tool_calls",
     calls,
@@ -373,11 +386,6 @@ function classifyDiagnosticDecision(
     unauthorized: !allAllowed,
     selectionSource: selection.generation.source,
   };
-}
-
-/** Whether an expected-tool-call round produced the correct allowed call (pure). */
-function expectedCallNameOk(decision: DiagnosticDecision): boolean {
-  return decision.kind === "tool_calls" && decision.allAllowed && decision.expectedInvoked;
 }
 
 /**
@@ -409,23 +417,28 @@ function transcriptValid(
 }
 
 /**
- * Build one value-free {@link TransitionDiagnostic}. The scenario's expected-tool
- * sequence and the selected call names are read here (in-process, synthetic
- * corpus values) but only closed enums are returned. Fails closed if the derived
+ * Build one value-free {@link TransitionDiagnostic}. The scenario's transition
+ * state and the selected call names are read here (in-process, synthetic corpus
+ * values) but only closed enums are returned. Fails closed if the derived
  * dimensions would violate the reason ⇄ dimension contract, so an inconsistent
  * diagnostic can never be emitted or persisted.
+ *
+ * `satisfiedSteps` is the count of transitions that SUCCESSFULLY completed
+ * before this round; it partitions the fixed workflow into the `prior` bucket
+ * and the still-pending ones, whose head is the tool this round was expected to
+ * invoke.
  */
 function buildTransitionDiagnostic(
   caseOrdinal: number,
   roundOrdinal: number,
   choiceKind: TransitionDiagnostic["choiceKind"],
   reason: TransitionDiagnostic["reason"],
-  decision: DiagnosticDecision,
-  expectedToolByRound: readonly (string | undefined)[],
-  priorInvokedNames: ReadonlySet<string>,
+  /** `null` for a whole-scenario reason that no single round's decision describes. */
+  decision: DiagnosticDecision | null,
+  satisfiedSteps: number,
 ): TransitionDiagnostic {
   const calls: readonly ParsedToolCall[] | null =
-    decision.kind === "tool_calls" ? decision.calls : null;
+    decision !== null && decision.kind === "tool_calls" ? decision.calls : null;
   const diagnostic: TransitionDiagnostic = {
     caseOrdinal,
     roundOrdinal,
@@ -434,12 +447,11 @@ function buildTransitionDiagnostic(
     allowedCallRelation: classifyAllowedCallRelation({
       reason,
       selectedCallNames: calls === null ? null : calls.map((call) => call.name),
-      allAllowed: decision.kind === "tool_calls" ? decision.allAllowed : false,
-      expectedToolByRound,
-      roundIndex: roundOrdinal - 1,
-      priorInvokedNames,
+      allAllowed: decision !== null && decision.kind === "tool_calls" && decision.allAllowed,
+      satisfiedTools: SCENARIO_STEP_TOOLS.slice(0, satisfiedSteps),
+      pendingTools: SCENARIO_STEP_TOOLS.slice(satisfiedSteps),
     }),
-    selectionSource: diagnosticSelectionSourceFor(decision.selectionSource),
+    selectionSource: diagnosticSelectionSourceFor(decision?.selectionSource ?? null),
     callMultiplicity: diagnosticCallMultiplicityFor(calls === null ? null : calls.length),
   };
   if (transitionDiagnosticDimensionErrors(diagnostic).length > 0) {
@@ -502,6 +514,11 @@ export async function runToolsDiagnostic(deps: ToolsDiagnosticDeps): Promise<num
   // executed path. Projection build also fails closed on a `choiceKind` outside
   // the diagnostic union, before any credential read or network I/O.
   const cases = buildEvalCases();
+  // Fail closed if the corpus and the shared transition engine disagree about
+  // how many transitions a multi-step scenario plans (see the release
+  // evaluator's identical guard). Checked before any credential read or
+  // network I/O.
+  assertCorpusMatchesEngine(cases);
   const fingerprint = corpusFingerprint(cases);
   const scenarios = selectDiagnosticScenarios(cases);
   const projection = buildDiagnosticCorpusProjection(scenarios);
@@ -568,7 +585,9 @@ export async function runToolsDiagnostic(deps: ToolsDiagnosticDeps): Promise<num
     failed: resumed?.cleanup.failed ?? 0,
     journalFailures: resumed?.cleanup.journalFailures ?? 0,
   };
-  const executedScenarioRounds: number[] = [...(resumed?.executedScenarioRounds ?? [])];
+  // Per-committed-scenario evidence `[executedRounds, satisfiedSteps]`, in
+  // commit order. It carries ONLY counts — never a tool name or argument.
+  const scenarioEvidence: DiagnosticScenarioEvidence[] = [...(resumed?.scenarioEvidence ?? [])];
 
   // Committed value-free diagnostics: the resumed slice (rehydrated from the
   // compact ledger against the SAME projection the validator used) plus any new
@@ -619,7 +638,9 @@ export async function runToolsDiagnostic(deps: ToolsDiagnosticDeps): Promise<num
       failed: cleanupState.failed,
       journalFailures: cleanupState.journalFailures,
     },
-    executedScenarioRounds: [...executedScenarioRounds],
+    scenarioEvidence: scenarioEvidence.map(
+      (entry) => [...entry] as unknown as DiagnosticScenarioEvidence,
+    ),
     diagnostics: diagnosticsSnapshot(),
   });
 
@@ -999,29 +1020,24 @@ export async function runToolsDiagnostic(deps: ToolsDiagnosticDeps): Promise<num
       }
       const initialRound = evalCase.rounds[0];
       if (initialRound === undefined) continue;
-      const expectedToolByRound = evalCase.rounds.map((round) => round.expectedTool);
-      const runtimeState = initializeScenarioRuntime(scenarioState);
+      // The SHARED state-aware transition engine — the same one the release
+      // evaluator uses — owns the scenario's expectation. A round expects the
+      // next UNSATISFIED transition, so an accepted parallel batch such as
+      // `[read, edit]` correctly leaves `test` as the next expectation instead
+      // of re-expecting the `edit` that already succeeded.
+      const transitions = initializeScenarioTransitions(scenarioState);
       // ONE initial user message states the whole goal; later rounds accumulate
       // ONLY through the accepted assistant `tool_calls` message and exactly
       // linked `role: "tool"` synthetic result messages. No fresh user
       // instruction is ever injected between tool results.
       const history: NormalizedMessage[] = [{ role: "user", content: initialRound.prompt }];
-      // AT MOST ONE pending diagnostic: a scenario terminates at its first
-      // terminal failure. Committed only when the whole scenario commits.
+      // AT MOST ONE pending diagnostic: a scenario emits exactly one terminal
+      // reason. Committed only when the whole scenario commits.
       const pendingScenarioDiagnostics: TransitionDiagnostic[] = [];
-      // The tool names this scenario has ACTUALLY invoked in accepted rounds —
-      // the execution history the diagnostic's prior/future buckets are judged
-      // against. The round request enables parallel tool calls, so an accepted
-      // round can invoke several tools and static round position does not
-      // describe what has run. It is scenario-local (discarded when the scenario
-      // ends), affects ONLY diagnostic classification, and its names never leave
-      // the process. A round's own calls are added only AFTER that round is
-      // accepted and its transcript re-validates.
-      const priorInvokedNames = new Set<string>();
-      let scenarioOk = true;
       let scenarioAbort: AbortInfo | null = null;
       let executedRounds = 0;
       let terminated = false;
+      let finalAccepted = false;
 
       for (let r = 0; r < evalCase.rounds.length; r += 1) {
         const round = evalCase.rounds[r];
@@ -1036,6 +1052,11 @@ export async function runToolsDiagnostic(deps: ToolsDiagnosticDeps): Promise<num
           };
           break;
         }
+        // The transition state BEFORE this round runs, so the failing round is
+        // always classified against the progress that existed before it.
+        const pendingStep = pendingStepIndex(transitions);
+        const satisfiedBefore = satisfiedStepCount(transitions);
+        const expectedTool = expectedStepTool(transitions) ?? undefined;
         attemptedRounds += 1;
         segmentCompletions += 1;
         executedRounds += 1;
@@ -1065,23 +1086,21 @@ export async function runToolsDiagnostic(deps: ToolsDiagnosticDeps): Promise<num
         const decision = classifyDiagnosticDecision(
           step.outcome,
           toolset,
-          round,
+          round.choice,
+          expectedTool,
           evalCase.selectedLlms,
         );
         // The RELEASE evaluator's own classifier, reused verbatim, so the
         // diagnostic's terminal-failure precedence can never drift from the
         // behavior it is explaining.
-        let reason = classifyRoundFailure(decision, round.expectedTool !== undefined);
-        // This round's selected names, held back until the round is fully
-        // accepted. They join `priorInvokedNames` only after the terminal-failure
-        // check below, so the failing round is always classified against the
-        // history that existed BEFORE it ran.
-        let acceptedCallNames: readonly string[] | null = null;
-        if (round.expectedTool !== undefined) {
-          const nameOk = expectedCallNameOk(decision);
-          if (!nameOk) {
-            scenarioOk = false;
-          } else if (decision.kind === "tool_calls") {
+        let reason = classifyRoundFailure(decision, expectedTool !== undefined);
+        if (pendingStep !== null) {
+          if (decision.kind === "tool_calls" && reason === null) {
+            // Fold the batch through the shared engine IN THE MODEL'S RETURNED
+            // ORDER so a parallel batch advances every transition its
+            // prerequisites allow. Results are deterministic and content-safe.
+            const contentBefore = transitions.content;
+            const batch = applyToolCallBatch(decision.calls, scenarioState, transitions);
             history.push({
               role: "assistant",
               content: null,
@@ -1091,22 +1110,29 @@ export async function runToolsDiagnostic(deps: ToolsDiagnosticDeps): Promise<num
                 argumentsJson: call.argumentsJson,
               })),
             });
-            for (const call of decision.calls) {
+            decision.calls.forEach((call, callIndex) => {
               history.push({
                 role: "tool",
-                content: renderSyntheticToolResult(call, scenarioState, runtimeState),
+                content: batch.applied[callIndex]?.content ?? JSON.stringify({ ok: false }),
                 toolCallId: call.id,
               });
-            }
+            });
             if (!transcriptValid(history, evalCase.tools)) {
-              scenarioOk = false;
-              if (reason === null) reason = "transcript-invalid";
-            } else {
-              acceptedCallNames = decision.calls.map((call) => call.name);
+              // The gateway could not build the next round's request, so the
+              // round is rejected in full. Roll the synthetic transitions back
+              // — a rejected round is not workflow progress — which also keeps
+              // the persisted satisfied count consistent with this
+              // expected-scope diagnostic.
+              transitions.content = contentBefore;
+              for (const advancedStep of batch.advancedSteps) {
+                transitions.satisfied[advancedStep] = false;
+              }
+              reason = "transcript-invalid";
             }
           }
-        } else if (decision.kind !== "text") {
-          scenarioOk = false;
+        } else if (decision.kind === "text") {
+          // Every transition succeeded and the model returned the final answer.
+          finalAccepted = true;
         }
         if (reason !== null) {
           const projectedChoiceKind = projection.scenarios[i]?.rounds[r]?.choiceKind;
@@ -1120,8 +1146,7 @@ export async function runToolsDiagnostic(deps: ToolsDiagnosticDeps): Promise<num
               projectedChoiceKind,
               reason,
               decision,
-              expectedToolByRound,
-              priorInvokedNames,
+              satisfiedBefore,
             ),
           );
           // Truthful early termination: this scenario cannot represent a real
@@ -1131,11 +1156,7 @@ export async function runToolsDiagnostic(deps: ToolsDiagnosticDeps): Promise<num
           terminated = true;
           break;
         }
-        // The round was ACCEPTED: its calls become part of the scenario's
-        // invocation history for every later round's classification.
-        if (acceptedCallNames !== null) {
-          for (const name of acceptedCallNames) priorInvokedNames.add(name);
-        }
+        if (finalAccepted) break;
         // Persist per-round so cleanup counters are durable, but ONLY for
         // non-final rounds: the scenario cursor and its commit measurements do
         // not advance until the scenario completes, so a persist AFTER the final
@@ -1159,12 +1180,36 @@ export async function runToolsDiagnostic(deps: ToolsDiagnosticDeps): Promise<num
         aborted = scenarioAbort;
         break;
       }
-      // Whole scenario committed (completed OR terminated early at a terminal
-      // failure). Commit its diagnostic and counters together, atomically.
+      // The scenario used its whole round budget without a terminal failure and
+      // without an accepted final answer. Emit EXACTLY ONE value-free reason at
+      // the last executed round; no later round is fabricated.
+      if (!terminated && !finalAccepted && executedRounds > 0) {
+        const projectedChoiceKind = projection.scenarios[i]?.rounds[executedRounds - 1]?.choiceKind;
+        if (projectedChoiceKind === undefined) {
+          throw new Error("diagnostic references a scenario/round outside the corpus projection");
+        }
+        pendingScenarioDiagnostics.push(
+          buildTransitionDiagnostic(
+            caseOrdinal,
+            executedRounds,
+            projectedChoiceKind,
+            "scenario-round-budget-exhausted",
+            null,
+            satisfiedStepCount(transitions),
+          ),
+        );
+      }
+      // Whole scenario committed (completed OR stopped at a terminal failure /
+      // budget exhaustion). Commit its diagnostic and counters together,
+      // atomically.
       for (const d of pendingScenarioDiagnostics) committedDiagnostics.push(d);
       completedScenarios += 1;
-      if (scenarioOk && !terminated) successfulScenarios += 1;
-      executedScenarioRounds.push(executedRounds);
+      const satisfied = satisfiedStepCount(transitions);
+      // A scenario succeeds only when every transition succeeded AND the final
+      // answer was accepted — which parallelism can achieve in fewer rounds
+      // than the budget.
+      if (satisfied >= SCENARIO_STEP_COUNT && finalAccepted) successfulScenarios += 1;
+      scenarioEvidence.push([executedRounds, satisfied]);
       nextScenarioIndex = i + 1;
       // The FINAL scenario's commit stays in memory. Persisting it would write
       // `nextScenarioIndex === scenarios.length`, a cursor the resumable

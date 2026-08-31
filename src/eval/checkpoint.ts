@@ -59,17 +59,27 @@ import {
   type EvalFailureReason,
 } from "./report.js";
 import type { DiagnosticChoiceKind, EvalCorpusProjection } from "./cases.js";
+import {
+  MIN_SUCCESSFUL_SCENARIO_ROUNDS,
+  popcount,
+  prefixMask,
+  SCENARIO_STEP_COUNT,
+} from "./scenario-engine.js";
 
 /**
- * The only supported on-disk checkpoint format version. Format 3 adds the
- * per-committed-multi-step-scenario `executedScenarioRounds` ledger so an
- * early-terminated scenario's ACTUAL upstream-round count is proved on disk
- * (no more inference from `committedMulti * maxRoundsPerCase`). Format 2 is
- * REJECTED on read (no migration): a resumed run started from a v2 checkpoint
- * must start from a fresh anchor and cannot be replayed under v3 accounting.
- * Format 1 (predating the diagnostic ledger) remains rejected as well.
+ * The only supported on-disk checkpoint format version. Format 4 replaces
+ * format 3's `executedScenarioRounds` integer ledger with the richer
+ * per-committed-scenario {@link CheckpointScenarioEvidence} tuple, because
+ * multi-step scoring is now STATE-AWARE: gate evidence is measured per planned
+ * TRANSITION rather than per upstream round, so an executed-round count alone
+ * can no longer prove what a committed scenario earned.
+ *
+ * Formats 1, 2, and 3 are REJECTED on read with NO migration path: their
+ * accounting was positional (one expected tool per round ordinal) and cannot
+ * be replayed under transition-based accounting. A resumed run started from an
+ * older checkpoint must start from a fresh anchor.
  */
-export const CHECKPOINT_FORMAT_VERSION = 3 as const;
+export const CHECKPOINT_FORMAT_VERSION = 4 as const;
 /** Fixed checkpoint filename. */
 export const CHECKPOINT_FILENAME = "tools-eval-checkpoint.json";
 
@@ -149,6 +159,38 @@ export type CheckpointDiagnosticFailure = readonly [
   reasonCode: number,
 ];
 
+/**
+ * One committed multi-step scenario's compact, content-free evidence tuple
+ * (format 4). Entries appear in COMMIT ORDER and map one-to-one, in projection
+ * order, onto the committed multi-step cases.
+ *
+ *  - `executedRounds` — upstream rounds the scenario actually issued, in
+ *    `[1, correspondingCase.rounds.length]`. Under state-aware accounting a
+ *    SUCCESSFUL scenario may use fewer rounds than its budget when a parallel
+ *    batch completed several transitions at once.
+ *  - `satisfiedSteps` — how many of the planned transitions SUCCEEDED, in
+ *    `[0, plannedSteps]`. Success is prerequisite-gated, so the satisfied
+ *    steps are always the leading PREFIX of the workflow and a count fully
+ *    describes them.
+ *  - `schemaMask` / `nameMask` / `argMask` — per-step bitmasks (bit `i` is the
+ *    i-th planned transition) recording schema-validity, expected-name
+ *    accuracy, and argument-validity evidence. Each step contributes exactly
+ *    one unit to its gate denominator at commit, so a retried step merges its
+ *    evidence instead of being counted twice.
+ *
+ * The tuple carries ONLY counts and bitmasks: no tool name, argument, schema,
+ * prompt, answer, model name, id, credential, title, body, URL, timestamp, or
+ * thrown value. Storage is deliberately compact so the worst valid ledger stays
+ * well below {@link MAX_CHECKPOINT_BYTES}.
+ */
+export type CheckpointScenarioEvidence = readonly [
+  executedRounds: number,
+  satisfiedSteps: number,
+  schemaMask: number,
+  nameMask: number,
+  argMask: number,
+];
+
 /** Cumulative cleanup counters persisted across resume segments. */
 export interface CheckpointCleanup {
   readonly attempted: number;
@@ -214,24 +256,13 @@ export interface CheckpointData {
   readonly gates: CheckpointGates;
   readonly invariants: CheckpointInvariants;
   /**
-   * Per-committed-multi-step-scenario upstream-round counts, in commit order.
-   * Format 3 adds this ledger so an early-terminated scenario's ACTUAL count
-   * is durable and cursor-consistent — no more inference from
-   * `committedMulti * maxRoundsPerCase`. Each entry is mapped IN ORDER to
-   * its corresponding committed multi-step projected case, and every entry
-   * MUST be an integer in `[1, correspondingCase.rounds.length]` — the
-   * per-CASE round count, NOT the projection-wide `maxRoundsPerCase`, so a
-   * non-uniform corpus is validated round-by-round rather than reduced to
-   * the projection maximum. A scenario that has been committed always
-   * issued at least one upstream round (the very first `read`). The
-   * projection-wide `maxRoundsPerCase` remains relevant elsewhere in
-   * checkpoint validation ONLY as the operational counter ceiling for
-   * `attemptedRounds`/`completedRounds` and per-run-segment slack.
-   * `executedScenarioRounds.length` MUST equal `completedMultiStepScenarios`,
-   * and its sum PLUS `completedSingleRoundCases` is the committed
-   * upstream-round floor used by resumable-counter validation.
+   * Per-committed-multi-step-scenario evidence, in commit order. See
+   * {@link CheckpointScenarioEvidence}. `.length` MUST equal
+   * `completedMultiStepScenarios`, and the sum of the tuples' executed-round
+   * elements PLUS `completedSingleRoundCases` is the committed upstream-round
+   * floor used by resumable-counter validation.
    */
-  readonly executedScenarioRounds: readonly number[];
+  readonly scenarioEvidence: readonly CheckpointScenarioEvidence[];
   /**
    * The compact, content-free ledger of scored-round failure diagnostics
    * committed by the run. Bounded to {@link MAX_DIAGNOSTIC_FAILURES} entries,
@@ -341,16 +372,17 @@ function parseCheckpoint(
       "cleanup",
       "gates",
       "invariants",
-      "executedScenarioRounds",
+      "scenarioEvidence",
       "diagnosticFailures",
     ],
     "root",
   );
 
-  // Versions 1 and 2 predate the `executedScenarioRounds` ledger; there is
+  // Versions 1, 2, and 3 predate the per-scenario evidence ledger and recorded
+  // positional (one-expected-tool-per-round-ordinal) accounting; there is
   // deliberately NO migration path — a resumed run started from an older
   // checkpoint must start from a fresh anchor and cannot be replayed under
-  // v3 accounting.
+  // v4 transition-based accounting.
   if (obj["formatVersion"] !== CHECKPOINT_FORMAT_VERSION) {
     throw new Error("checkpoint version is unsupported");
   }
@@ -405,7 +437,7 @@ function parseCheckpoint(
   const invariantsObj = asObject(obj["invariants"], "invariants");
   assertExactKeys(invariantsObj, ["noSilentFallback", "injectionResistance"], "invariants");
 
-  const executedScenarioRounds = parseExecutedScenarioRounds(obj["executedScenarioRounds"]);
+  const scenarioEvidence = parseScenarioEvidence(obj["scenarioEvidence"]);
   const diagnosticFailures = parseDiagnosticFailures(obj["diagnosticFailures"]);
 
   return {
@@ -462,48 +494,79 @@ function parseCheckpoint(
         "invariants.injectionResistance",
       ),
     },
-    executedScenarioRounds,
+    scenarioEvidence,
     diagnosticFailures,
   };
 }
 
 /**
- * Strictly parse the compact `executedScenarioRounds` array (format 3) into a
- * frozen array of positive integers. Bounds checked at the SHAPE level only:
- * every entry is a safe integer in `[1, MAX_COUNT]` and the array length stays
- * within {@link MAX_COUNT}. Corpus-bound consistency — that
- * `.length === completedMultiStepScenarios`, that each entry (mapped IN
- * COMMIT ORDER to its corresponding committed multi-step projected case) is
- * within `[1, correspondingCase.rounds.length]` — the corresponding case's
- * actual round count, NOT the projection-wide `maxRoundsPerCase` — and that
- * the ledger sum plus `completedSingleRoundCases` equals the committed
- * upstream-round floor lives in {@link validateResumableCheckpoint}, which
- * owns the corpus projection. The projection-wide `maxRoundsPerCase` is
- * only used later in that same validator as the operational counter ceiling
- * for `attemptedRounds`/`completedRounds` and per-run-segment slack, never
- * as a per-entry bound on this ledger.
+ * Strictly parse the compact `scenarioEvidence` ledger (format 4) into frozen
+ * five-element tuples. Bounds are checked at the SHAPE level only: each tuple
+ * has exactly five safe-integer elements, `executedRounds` is in
+ * `[1, MAX_COUNT]`, `satisfiedSteps` is in `[0, SCENARIO_STEP_COUNT]`, and each
+ * mask is a non-negative integer below `2 ** SCENARIO_STEP_COUNT`, so no
+ * oversized value can reach the semantic validator.
+ *
+ * Corpus-bound consistency — `.length === completedMultiStepScenarios`, each
+ * `executedRounds` within its CORRESPONDING committed case's actual
+ * `rounds.length` (never the projection-wide `maxRoundsPerCase`, which is only
+ * used later as the operational counter ceiling and per-run-segment slack),
+ * masks confined to that case's planned step count, the satisfied prefix
+ * present in every mask, aggregate numerators equal to the mask popcounts, and
+ * the diagnostic ↔ satisfied-state agreement — lives in
+ * {@link validateResumableCheckpoint}, which owns the corpus projection.
  */
-function parseExecutedScenarioRounds(value: unknown): number[] {
+function parseScenarioEvidence(value: unknown): CheckpointScenarioEvidence[] {
   if (!Array.isArray(value)) {
-    throw new Error("checkpoint executedScenarioRounds shape is invalid");
+    throw new Error("checkpoint scenarioEvidence shape is invalid");
   }
   if (value.length > MAX_COUNT) {
-    throw new Error("checkpoint executedScenarioRounds exceeds bound");
+    throw new Error("checkpoint scenarioEvidence exceeds bound");
   }
-  const out: number[] = [];
-  for (let i = 0; i < value.length; i += 1) {
-    const entry: unknown = value[i];
-    if (
-      typeof entry !== "number" ||
-      !Number.isSafeInteger(entry) ||
-      entry < 1 ||
-      entry > MAX_COUNT
-    ) {
-      throw new Error("checkpoint executedScenarioRounds entry is out of range");
-    }
-    out.push(entry);
-  }
+  const out: CheckpointScenarioEvidence[] = [];
+  for (const entry of value as unknown[]) out.push(parseScenarioEvidenceEntry(entry));
   return out;
+}
+
+/** Strictly parse ONE `scenarioEvidence` tuple; throws value-free on any anomaly. */
+function parseScenarioEvidenceEntry(entry: unknown): CheckpointScenarioEvidence {
+  if (!Array.isArray(entry) || entry.length !== 5) {
+    throw new Error("checkpoint scenarioEvidence entry shape is invalid");
+  }
+  const [executedRounds, satisfiedSteps, schemaMask, nameMask, argMask] = entry as unknown[];
+  if (
+    typeof executedRounds !== "number" ||
+    !Number.isSafeInteger(executedRounds) ||
+    executedRounds < 1 ||
+    executedRounds > MAX_COUNT
+  ) {
+    throw new Error("checkpoint scenarioEvidence executed-round count is out of range");
+  }
+  if (
+    typeof satisfiedSteps !== "number" ||
+    !Number.isSafeInteger(satisfiedSteps) ||
+    satisfiedSteps < 0 ||
+    satisfiedSteps > SCENARIO_STEP_COUNT
+  ) {
+    throw new Error("checkpoint scenarioEvidence satisfied-step count is out of range");
+  }
+  for (const mask of [schemaMask, nameMask, argMask]) {
+    if (
+      typeof mask !== "number" ||
+      !Number.isSafeInteger(mask) ||
+      mask < 0 ||
+      mask >= 1 << SCENARIO_STEP_COUNT
+    ) {
+      throw new Error("checkpoint scenarioEvidence mask is out of range");
+    }
+  }
+  return Object.freeze([
+    executedRounds,
+    satisfiedSteps,
+    schemaMask as number,
+    nameMask as number,
+    argMask as number,
+  ]) as unknown as CheckpointScenarioEvidence;
 }
 
 /**
@@ -751,34 +814,26 @@ function serialize(data: CheckpointData): string {
   assertCount(data.gates.multi.success, "gates.multi.success");
   assertBoolean(data.invariants.noSilentFallback, "invariants.noSilentFallback");
   assertBoolean(data.invariants.injectionResistance, "invariants.injectionResistance");
-  assertExecutedScenarioRoundsShape(data.executedScenarioRounds);
+  assertScenarioEvidenceShape(data.scenarioEvidence);
   assertDiagnosticFailuresShape(data.diagnosticFailures);
   return JSON.stringify(data) + "\n";
 }
 
 /**
- * Shape-check the `executedScenarioRounds` ledger before serialization. This
- * mirrors the post-parse checks in {@link parseExecutedScenarioRounds} so a
- * hostile caller cannot slip a malformed ledger onto disk via
- * {@link writeCheckpoint}.
+ * Shape-check the `scenarioEvidence` ledger before serialization. This mirrors
+ * the post-parse checks in {@link parseScenarioEvidence} so a hostile caller
+ * cannot slip a malformed ledger onto disk via {@link writeCheckpoint}.
  */
-function assertExecutedScenarioRoundsShape(entries: readonly number[] | undefined): void {
+function assertScenarioEvidenceShape(
+  entries: readonly CheckpointScenarioEvidence[] | undefined,
+): void {
   if (!Array.isArray(entries)) {
-    throw new Error("checkpoint executedScenarioRounds shape is invalid");
+    throw new Error("checkpoint scenarioEvidence shape is invalid");
   }
   if (entries.length > MAX_COUNT) {
-    throw new Error("checkpoint executedScenarioRounds exceeds bound");
+    throw new Error("checkpoint scenarioEvidence exceeds bound");
   }
-  for (const entry of entries) {
-    if (
-      typeof entry !== "number" ||
-      !Number.isSafeInteger(entry) ||
-      entry < 1 ||
-      entry > MAX_COUNT
-    ) {
-      throw new Error("checkpoint executedScenarioRounds entry is invalid");
-    }
-  }
+  for (const entry of entries) parseScenarioEvidenceEntry(entry);
 }
 
 /**
@@ -999,6 +1054,13 @@ function accumulateExpectedRound(
     case "final-no-valid-call":
     case "final-unavailable":
       throw new Error("checkpoint diagnosticFailures reason incompatible with expected-tool round");
+    case "scenario-round-budget-exhausted":
+      // A whole-scenario reason; multi-step evidence is accumulated from the
+      // per-step masks, and a single-round case is rejected before it reaches
+      // this table.
+      throw new Error(
+        "checkpoint diagnosticFailures scenario reason has no per-round contribution",
+      );
     default: {
       const _exhaustive: never = diagReason;
       void _exhaustive;
@@ -1017,25 +1079,35 @@ function accumulateExpectedRound(
  *
  * Structural / relational rejects (throws value-free):
  *
- *  1. Any `executedScenarioRounds[k]` outside `[1, correspondingCase.rounds.length]`
- *     — the per-CASE round count, NOT the global `maxRoundsPerCase` (finding 2).
- *  2. `executedScenarioRounds.length !== committedMultiStepScenarios` derived
- *     from `cursor`.
- *  3. A diagnostic referencing an uncommitted case, an unknown round of a
- *     committed case, or a reason whose scope disagrees with that round's
- *     `hasExpectedTool` disposition.
- *  4. Two or more diagnostics for the same committed case — the runner
+ *  1. A `scenarioEvidence[k]` executed-round count outside
+ *     `[1, correspondingCase.rounds.length]` — the per-CASE round count, NOT
+ *     the global `maxRoundsPerCase`.
+ *  2. `scenarioEvidence.length !== committedMultiStepScenarios` derived from
+ *     `cursor`.
+ *  3. A `satisfiedSteps` count outside `[0, thatCase's plannedSteps]`, a mask
+ *     carrying a bit outside that case's planned steps, or a mask omitting a
+ *     bit of the satisfied PREFIX (a successful transition necessarily proves
+ *     schema, name, and argument evidence for its step).
+ *  4. A diagnostic referencing an uncommitted case or an unknown round of a
+ *     committed case.
+ *  5. Two or more diagnostics for the same committed case — the runner
  *     terminates each case at its FIRST failure, so a case has AT MOST ONE
  *     diagnostic.
- *  5. A diagnostic referencing an unexecuted round for a committed multi-step
- *     scenario (`roundOrdinal > executedScenarioRounds[k]`).
- *  6. A multi-step diagnostic whose round ordinal disagrees with the
- *     scenario's executed-round count (a scenario terminates AT its
- *     diagnostic round, so `diagRound == executedScenarioRounds[k]`).
- *  7. A committed multi-step scenario with `executedScenarioRounds[k] <
- *     rounds.length` and NO terminal diagnostic (an early-terminated scenario
- *     always produces exactly one primary diagnostic per spec §30).
- *  8. A single-round case whose diagnostic references a round other than 1.
+ *  6. A diagnostic referencing an unexecuted round for a committed multi-step
+ *     scenario, or one whose round ordinal disagrees with the scenario's
+ *     executed-round count (a scenario stops AT its diagnostic round).
+ *  7. A terminal diagnostic whose SCOPE disagrees with the scenario's
+ *     satisfied state — an `expected`-scope reason once every transition
+ *     succeeded, or a `final`-scope reason while one is still pending. For a
+ *     single-round case the scope is checked against the round's own
+ *     `hasExpectedTool` disposition instead, and a whole-scenario reason is
+ *     rejected outright.
+ *  8. A diagnostic-FREE committed multi-step scenario that did not satisfy
+ *     every transition, that carries incomplete step evidence, or that could
+ *     not have reached a final-answer round. A successful scenario MAY use
+ *     fewer rounds than its budget when a parallel batch completed several
+ *     transitions at once, so the bound is a floor, not the full budget.
+ *  9. A single-round case whose diagnostic references a round other than 1.
  */
 function deriveCommittedEvidence(
   data: CheckpointData,
@@ -1066,12 +1138,29 @@ function deriveCommittedEvidence(
     if (reason === undefined) {
       throw new Error("checkpoint diagnosticFailures reason code is unknown");
     }
-    const scope = EVAL_FAILURE_REASON_SCOPE[reason];
-    if (scope === "expected" && !projectedRound.hasExpectedTool) {
-      throw new Error("checkpoint diagnosticFailures reason incompatible with final round");
-    }
-    if (scope === "final" && projectedRound.hasExpectedTool) {
-      throw new Error("checkpoint diagnosticFailures reason incompatible with expected-tool round");
+    // Scope is judged POSITIONALLY only for a single-round case, whose sole
+    // round has no transition state and whose `hasExpectedTool` disposition is
+    // therefore exactly what that round expected.
+    //
+    // A MULTI-STEP case gets NO positional scope check here. Under state-aware
+    // accounting a round's corpus slot no longer describes what that round
+    // expected: a parallel batch can satisfy several transitions early (so an
+    // expected-tool slot can legitimately carry a `final-*` reason), and a
+    // semantically failed retry can leave a transition pending past its
+    // planned slot (so the final slot can legitimately carry an
+    // `expected-tool-*` reason). Applying the old rule here rejected truthful
+    // checkpoints BEFORE the correct check could run. Multi-step scope is
+    // validated below against the scenario's persisted SATISFIED STATE.
+    if (projectedCase.phase === "single") {
+      const scope = EVAL_FAILURE_REASON_SCOPE[reason];
+      if (scope === "expected" && !projectedRound.hasExpectedTool) {
+        throw new Error("checkpoint diagnosticFailures reason incompatible with final round");
+      }
+      if (scope === "final" && projectedRound.hasExpectedTool) {
+        throw new Error(
+          "checkpoint diagnosticFailures reason incompatible with expected-tool round",
+        );
+      }
     }
     if (perCaseDiagnostic.has(co)) {
       throw new Error("checkpoint diagnosticFailures has multiple diagnostics for one case");
@@ -1153,6 +1242,12 @@ function deriveCommittedEvidence(
           "checkpoint diagnosticFailures references a non-existent round in a single-round case",
         );
       }
+      if (diag !== null && diag.reason === "scenario-round-budget-exhausted") {
+        // A whole-scenario reason cannot describe a one-round case.
+        throw new Error(
+          "checkpoint diagnosticFailures scenario reason is invalid for a single-round case",
+        );
+      }
       // A single-round case's sole round is always executed on commit;
       // update the invariants using the projection + this round's
       // diagnostic reason (or null when the round scored acceptably).
@@ -1168,28 +1263,59 @@ function deriveCommittedEvidence(
     } else {
       committedMulti += 1;
       multiTotal += 1;
-      const executed = data.executedScenarioRounds[ledgerIdx];
-      if (executed === undefined) {
-        throw new Error("checkpoint executedScenarioRounds length mismatch");
+      const entry = data.scenarioEvidence[ledgerIdx];
+      if (entry === undefined) {
+        throw new Error("checkpoint scenarioEvidence length mismatch");
       }
       ledgerIdx += 1;
-      // Per-CASE bound (finding 2): `[1, correspondingCase.rounds.length]`,
-      // NOT the corpus-wide `maxRoundsPerCase`. A committed scenario
-      // always issued at least one upstream round (the very first `read`).
+      const [executed, satisfied, schemaMask, nameMask, argMask] = entry;
+
+      // Per-CASE bound: `[1, correspondingCase.rounds.length]`, NOT the
+      // corpus-wide `maxRoundsPerCase`. A committed scenario always issued at
+      // least one upstream round.
       if (
         !Number.isSafeInteger(executed) ||
         executed < 1 ||
         executed > projectedCase.rounds.length
       ) {
-        throw new Error("checkpoint executedScenarioRounds entry out of range for its case");
+        throw new Error("checkpoint scenarioEvidence executed rounds out of range for its case");
       }
       executedScenarioSum += executed;
 
-      // A committed multi-step scenario has AT MOST one diagnostic (indexed
-      // in `perCaseDiagnostic`); if present, its round ordinal is the
-      // scenario's terminal round — i.e. exactly equal to `executed`. An
-      // early-terminated scenario (`executed < rounds.length`) MUST carry
-      // one terminal diagnostic.
+      // The scenario's PLANNED transitions come from the corpus, never from
+      // the checkpoint. Every planned transition contributes exactly one unit
+      // to the expected-step denominator, whether or not its round ran.
+      let plannedSteps = 0;
+      for (const round of projectedCase.rounds) {
+        if (round.hasExpectedTool) plannedSteps += 1;
+      }
+      const fullMask = plannedSteps <= 0 ? 0 : (1 << plannedSteps) - 1;
+
+      if (!Number.isSafeInteger(satisfied) || satisfied < 0 || satisfied > plannedSteps) {
+        throw new Error("checkpoint scenarioEvidence satisfied steps out of range for its case");
+      }
+      // A mask may only carry bits for transitions this case actually plans.
+      for (const mask of [schemaMask, nameMask, argMask]) {
+        if ((mask & ~fullMask) !== 0) {
+          throw new Error("checkpoint scenarioEvidence mask exceeds the case's planned steps");
+        }
+      }
+      // Transition success is prerequisite-gated, so the satisfied steps are
+      // the leading PREFIX of the workflow, and a successful transition
+      // necessarily proves schema, name, and argument evidence for its step.
+      // Uses the engine's own helper so the two can never drift.
+      const satisfiedPrefix = prefixMask(satisfied);
+      for (const mask of [schemaMask, nameMask, argMask]) {
+        if ((mask & satisfiedPrefix) !== satisfiedPrefix) {
+          throw new Error("checkpoint scenarioEvidence mask omits a satisfied transition");
+        }
+      }
+
+      // Once every transition succeeds the scenario expects FINAL TEXT; while
+      // one is pending it expects a tool. That is the state-aware disposition
+      // a terminal diagnostic's scope must agree with — the round's positional
+      // `hasExpectedTool` no longer describes what the round expected.
+      const expectsFinal = satisfied >= plannedSteps;
       if (diag !== null) {
         if (diag.roundOrdinal > executed) {
           throw new Error(
@@ -1201,57 +1327,78 @@ function deriveCommittedEvidence(
             "checkpoint diagnosticFailures for a multi-step scenario is not at its terminal round",
           );
         }
-      } else if (executed < projectedCase.rounds.length) {
-        throw new Error(
-          "checkpoint claims a multi-step scenario stopped early without a terminal diagnostic",
-        );
+        const scope = EVAL_FAILURE_REASON_SCOPE[diag.reason];
+        if (scope === "expected" && expectsFinal) {
+          throw new Error(
+            "checkpoint diagnosticFailures expected-tool reason disagrees with satisfied state",
+          );
+        }
+        if (scope === "final" && !expectsFinal) {
+          throw new Error(
+            "checkpoint diagnosticFailures final reason disagrees with satisfied state",
+          );
+        }
+      } else {
+        // No diagnostic ⇒ the scenario SUCCEEDED: every transition completed
+        // and the final answer was accepted. That requires full evidence and
+        // at least one tool-call round plus one final-answer round — but NOT
+        // the whole budget, because a parallel batch can complete several
+        // transitions at once.
+        if (satisfied !== plannedSteps) {
+          throw new Error(
+            "checkpoint claims a multi-step scenario succeeded without every transition",
+          );
+        }
+        if (schemaMask !== fullMask || nameMask !== fullMask || argMask !== fullMask) {
+          throw new Error(
+            "checkpoint claims a multi-step scenario succeeded with incomplete step evidence",
+          );
+        }
+        const minSuccessRounds = plannedSteps > 0 ? MIN_SUCCESSFUL_SCENARIO_ROUNDS : 1;
+        if (executed < minSuccessRounds) {
+          throw new Error(
+            "checkpoint claims a multi-step scenario succeeded without a final-answer round",
+          );
+        }
       }
 
-      // Per-round expected-call accumulation. Rounds 1..executed contributed
-      // to the runner's `expectedCall.*` accumulators; rounds beyond
-      // `executed` count in the DENOMINATOR only (as gate MISSES), never as
-      // attempted upstream rounds. Prior-round diagnostics were rejected
-      // above by the "diag.roundOrdinal !== executed" check, so the diag (if
-      // any) only affects the terminal round. The invariant derivation runs
-      // for EVERY executed round (both expected-tool and final), so an
-      // executed final round under `required`/`function` with no diagnostic
-      // (an accepted text outcome) correctly derives
-      // `noSilentFallback = false`.
-      for (let r = 0; r < projectedCase.rounds.length; r += 1) {
-        const round = projectedCase.rounds[r];
-        if (round === undefined) throw new Error("checkpoint cursor references unknown round");
-        if (r + 1 > executed) {
-          if (round.hasExpectedTool) {
-            // Unexecuted expected-tool round: denominator only.
-            expectedCall.total += 1;
-          }
-          // Unexecuted rounds contribute nothing to the invariants.
-          continue;
-        }
-        const roundDiagReason = diag !== null && diag.roundOrdinal === r + 1 ? diag.reason : null;
-        updateInvariants(round, roundDiagReason);
-        if (round.hasExpectedTool) {
-          accumulateExpectedRound(expectedCall, roundDiagReason);
-        }
+      // Per-STEP expected-call accumulation (state-aware). Each planned
+      // transition contributes one denominator unit and its recorded evidence
+      // bit; retries were merged into the mask by the runner, so no step is
+      // double-counted and an unsatisfied step is a truthful miss.
+      expectedCall.total += plannedSteps;
+      expectedCall.schemaValid += popcount(schemaMask);
+      expectedCall.nameAccurate += popcount(nameMask);
+      expectedCall.argValid += popcount(argMask);
+
+      // Invariants. Every round BEFORE the terminal one was accepted with a
+      // valid allowed tool-call set (a scenario stops at its first terminal
+      // failure and at its accepted final answer), so ordinary text and an
+      // unauthorized call can only occur at the terminal round.
+      const terminalRound = projectedCase.rounds[executed - 1];
+      if (terminalRound === undefined) {
+        throw new Error("checkpoint cursor references unknown round");
+      }
+      if (diag?.reason === "unauthorized-tool-call") injectionResistance = false;
+      const constrained =
+        terminalRound.choiceKind === "required" || terminalRound.choiceKind === "function";
+      if (constrained && (diag === null || diag.reason === "expected-tool-returned-text")) {
+        // Either an accepted final-text round or a text answer while a
+        // transition was still pending, both under a constrained choice.
+        noSilentFallback = false;
       }
 
-      // Multi-step success: scenario ran to completion (`executed ==
-      // rounds.length`) AND no terminal diagnostic (`diag === null`). An
-      // early-terminated scenario or a full-length scenario with a
-      // terminal-round diagnostic contributes 0 to `multi.success`.
-      if (diag === null) {
-        // `executed === projectedCase.rounds.length` is already guaranteed
-        // above (no diag ⇒ full length).
-        multiSuccess += 1;
-      }
+      // Multi-step success: every transition satisfied AND the final answer
+      // accepted — exactly the diagnostic-free case validated above.
+      if (diag === null) multiSuccess += 1;
     }
   }
 
   // The ledger length must exactly match the committed multi count. This
-  // catches a length mismatch even when the runtime executed count would
-  // pass the per-entry bound.
-  if (ledgerIdx !== data.executedScenarioRounds.length) {
-    throw new Error("checkpoint executedScenarioRounds length mismatch");
+  // catches a length mismatch even when the runtime entries would pass the
+  // per-entry bounds.
+  if (ledgerIdx !== data.scenarioEvidence.length) {
+    throw new Error("checkpoint scenarioEvidence length mismatch");
   }
 
   return {
@@ -1277,8 +1424,8 @@ function deriveCommittedEvidence(
  * ACTUAL fingerprint-bound corpus projection (findings 1 + 2). Enforces that
  * a persisted resumable checkpoint's cursor, committed case counts, gate
  * denominators/numerators, upstream-round counters, and cleanup accounting
- * are consistent with the projection AND the per-scenario executed-round
- * ledger AND the per-round diagnostic ledger, so a forged or internally
+ * are consistent with the projection AND the per-scenario evidence ledger AND
+ * the per-round diagnostic ledger, so a forged or internally
  * inconsistent checkpoint (e.g. a "complete + passing, zero-attempt" file, a
  * scenario that skipped its final-answer round without a terminal diagnostic,
  * a numerator that exceeds the diagnostic-provable evidence, or an
@@ -1287,31 +1434,30 @@ function deriveCommittedEvidence(
  * per-round layout come from the supplied projection — never from
  * checkpoint-claimed sizes.
  *
- * Per-case ledger mapping (finding 2). Every `executedScenarioRounds[k]`
- * entry is mapped in projection order to its CORRESPONDING committed
- * multi-step case; the per-entry bound is `[1, correspondingCase.rounds.length]`
- * — the per-CASE round count, NOT the corpus-wide `maxRoundsPerCase`. A
- * non-uniform corpus (a case with more/fewer rounds than its peers, or an
- * expected/final round in an unusual position) is honored round-by-round.
+ * Per-case ledger mapping. Every `scenarioEvidence[k]` tuple is mapped in
+ * projection order to its CORRESPONDING committed multi-step case; the
+ * executed-round bound is `[1, correspondingCase.rounds.length]` — the per-CASE
+ * round count, NOT the corpus-wide `maxRoundsPerCase` — and the satisfied count
+ * and masks are bounded by that case's own planned step count. A non-uniform
+ * corpus (a case with more/fewer rounds than its peers, or an expected/final
+ * round in an unusual position) is honored case-by-case.
  *
- * Diagnostic ↔ evidence correlation (finding 1). Every gate numerator is
- * required to equal the value derivable from the executed-round ledger and
- * the diagnostic ledger — a loose upper bound is not enough. The mapping
- * from a round's diagnostic reason to its committed
- * schema/arg/nameAccurate contribution is the SAME table the runner's
- * `commitExpectedCall`/selection engine uses (see
- * {@link accumulateExpectedRound}), so a checkpoint claiming success for an
- * unexecuted expected-tool round is rejected as impossible: the derived
- * numerator disagrees with the claim.
+ * Numerator ↔ evidence correlation. Every gate numerator must EXACTLY equal the
+ * derivable value — a loose upper bound is not enough. A single-round case's
+ * contribution is derived from its diagnostic reason through the same table the
+ * runner's `commitExpectedCall` uses ({@link accumulateExpectedRound}); a
+ * multi-step scenario's contribution is the POPCOUNT of its persisted per-step
+ * masks. A checkpoint claiming credit for a transition its masks do not record
+ * is therefore rejected as impossible.
  *
- * Multi-step success semantics. A committed multi-step scenario is credited
- * to `multi.success` iff it ran to completion (`executedScenarioRounds[k] ==
- * projectedCase.rounds.length`) AND it has NO terminal diagnostic. An
- * early-terminated scenario (executed < length) or a full-length scenario
- * with a terminal-round diagnostic contributes 0 to `multi.success`. The
- * corresponding invariants also require exactly one primary diagnostic per
- * terminated scenario at its terminal round, so no diagnostic can reference
- * an unexecuted round of a committed case.
+ * Multi-step success semantics (state-aware). A committed multi-step scenario is
+ * credited to `multi.success` iff it has NO terminal diagnostic, which the
+ * derivation additionally requires to mean every planned transition succeeded,
+ * every mask is full, and the scenario had room for a final-answer round.
+ * A successful scenario MAY use fewer rounds than its budget — a parallel batch
+ * such as `[read, edit]` completes two transitions at once — so a short
+ * diagnostic-free scenario is valid, while a short scenario WITHOUT full
+ * evidence is not.
  *
  * A resumable checkpoint MUST have `nextCaseIndex` STRICTLY less than the
  * corpus length: a genuinely complete run removes its checkpoint during
@@ -1321,7 +1467,8 @@ function deriveCommittedEvidence(
  * report `passed` without executing the remaining cases live.
  *
  * Round-counter bounds. The committed upstream floor is `committedSingle +
- * Σ executedScenarioRounds` (NOT `committedMulti * maxRoundsPerCase`). The
+ * Σ scenarioEvidence[k].executedRounds` (NOT `committedMulti *
+ * maxRoundsPerCase`). The
  * operational counters (`attemptedRounds`/`completedRounds`) accumulate
  * across resume segments, but a segment aborts at its FIRST non-committing
  * case, so a segment can leave at most ONE in-flight case's worth of

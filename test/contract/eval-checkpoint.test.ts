@@ -33,7 +33,9 @@ import {
   type CheckpointDiagnosticFailure,
   type CheckpointFsOps,
   type CheckpointLocation,
+  type CheckpointScenarioEvidence,
 } from "../../src/eval/checkpoint.js";
+import { SCENARIO_STEP_COUNT } from "../../src/eval/scenario-engine.js";
 import { EVAL_FAILURE_REASON_CODES, MAX_DIAGNOSTIC_FAILURES } from "../../src/eval/report.js";
 import {
   buildEvalCases,
@@ -93,7 +95,7 @@ function data(over: Partial<CheckpointData> = {}): CheckpointData {
       multi: { total: 0, success: 0 },
     },
     invariants: { noSilentFallback: true, injectionResistance: true },
-    executedScenarioRounds: [],
+    scenarioEvidence: [],
     diagnosticFailures: [],
     ...over,
   };
@@ -163,11 +165,13 @@ describe("eval checkpoint — fail-closed validation", () => {
       // Format v1 predates the compact diagnostic ledger; the reader MUST refuse
       // it with no migration path (see `parseCheckpoint` version rejection).
       JSON.stringify({ ...data(), formatVersion: 1 }),
-      // Format v2 predates the `executedScenarioRounds` ledger and cannot be
-      // replayed under v3 accounting; also rejected outright.
+      // Format v2 predates any per-scenario ledger, and v3's ledger was a
+      // POSITIONAL executed-round count that cannot be replayed under v4
+      // transition-based accounting; both are rejected outright.
       JSON.stringify({ ...data(), formatVersion: 2 }),
-      // Format v4+ is also unsupported: only the current version is accepted.
-      JSON.stringify({ ...data(), formatVersion: 4 }),
+      JSON.stringify({ ...data(), formatVersion: 3 }),
+      // Format v5+ is also unsupported: only the current version is accepted.
+      JSON.stringify({ ...data(), formatVersion: 5 }),
       JSON.stringify({ ...data(), corpusFingerprint: "ZZZ" }),
     ]) {
       writeFileSync(file(dir), bad, { mode: 0o600 });
@@ -511,28 +515,65 @@ function deriveInvariantsForTests(
     if (projectedCase === undefined) continue;
     const co = i + 1;
     const diag = perCase.get(co) ?? null;
-    const executed =
-      projectedCase.phase === "single"
-        ? projectedCase.rounds.length
-        : (cp.executedScenarioRounds[ledgerIdx] ?? projectedCase.rounds.length);
-    if (projectedCase.phase !== "single") ledgerIdx += 1;
-    for (let r = 0; r < projectedCase.rounds.length; r += 1) {
-      if (r + 1 > executed) continue;
-      const round = projectedCase.rounds[r];
+    if (projectedCase.phase === "single") {
+      const round = projectedCase.rounds[0];
       if (round === undefined) continue;
-      const roundDiagReason = diag !== null && diag.ro === r + 1 ? diag.reason : null;
       const constrained = round.choiceKind === "required" || round.choiceKind === "function";
-      if (roundDiagReason === "unauthorized-tool-call") injectionResistance = false;
+      if (diag?.reason === "unauthorized-tool-call") injectionResistance = false;
       if (round.hasExpectedTool) {
-        if (constrained && roundDiagReason === "expected-tool-returned-text") {
+        if (constrained && diag?.reason === "expected-tool-returned-text") {
           noSilentFallback = false;
         }
-      } else if (constrained && roundDiagReason === null) {
+      } else if (constrained && diag === null) {
         noSilentFallback = false;
       }
+      continue;
+    }
+    // State-aware multi-step derivation: every round before the terminal one
+    // was an accepted tool-call round, so only the terminal round can witness
+    // ordinary text or an unauthorized call.
+    const executed = cp.scenarioEvidence[ledgerIdx]?.[0] ?? projectedCase.rounds.length;
+    ledgerIdx += 1;
+    const terminalRound = projectedCase.rounds[executed - 1];
+    if (terminalRound === undefined) continue;
+    const constrained =
+      terminalRound.choiceKind === "required" || terminalRound.choiceKind === "function";
+    if (diag?.reason === "unauthorized-tool-call") injectionResistance = false;
+    if (constrained && (diag === null || diag.reason === "expected-tool-returned-text")) {
+      noSilentFallback = false;
     }
   }
   return { noSilentFallback, injectionResistance };
+}
+
+/** All-steps-set mask for the fixed three-step workflow. */
+const FULL_STEP_MASK = (1 << SCENARIO_STEP_COUNT) - 1;
+
+/**
+ * Build a truthful {@link CheckpointScenarioEvidence} tuple for a committed
+ * multi-step scenario, mirroring exactly what the runner would persist.
+ *
+ * `satisfied` defaults to "every planned transition succeeded"; the masks
+ * default to the satisfied prefix plus, when `pendingEvidence` is supplied, the
+ * schema/argument/name bits the terminal round earned for the still-pending
+ * step (the same contributions `accumulateExpectedRound` derives from a
+ * diagnostic reason).
+ */
+function evidence(
+  executed: number,
+  satisfied: number = SCENARIO_STEP_COUNT,
+  pendingEvidence: { schemaAndArg?: boolean; name?: boolean } = {},
+): CheckpointScenarioEvidence {
+  const prefix = satisfied <= 0 ? 0 : (1 << satisfied) - 1;
+  const pendingBit = satisfied < SCENARIO_STEP_COUNT ? 1 << satisfied : 0;
+  const schemaArgBit = pendingEvidence.schemaAndArg === true ? pendingBit : 0;
+  const nameBit = pendingEvidence.name === true ? pendingBit : 0;
+  return [executed, satisfied, prefix | schemaArgBit, prefix | nameBit, prefix | schemaArgBit];
+}
+
+/** Convenience: a fully successful scenario that used `executed` upstream rounds. */
+function successEvidence(executed: number): CheckpointScenarioEvidence {
+  return [executed, SCENARIO_STEP_COUNT, FULL_STEP_MASK, FULL_STEP_MASK, FULL_STEP_MASK];
 }
 
 /**
@@ -554,22 +595,29 @@ function withDerivedInvariants(
  * A semantically-VALID resumable seed for `cursor` with EXACTLY the committed
  * counts a genuine (fully-successful) run would persist: a committed scenario
  * contributes `expectedCallsPerScenario` (3) to the gate denominators and, by
- * default, `maxRoundsPerCase` (4) upstream rounds — the executed-round ledger
- * is uniformly `[4, 4, ..., 4]` (length = committedMulti). Callers may override
- * `executedScenarioRounds` and the round counters to model an early-terminated
- * scenario (an entry in `[1, maxRoundsPerCase]`; `attemptedRounds ==
- * committedSingle + Σ executedScenarioRounds` for a resumable-anchor seed).
- * `runSegments` defaults to `data()`'s value (2). `invariants` is auto-derived
- * from the resulting diagnostic + executed-round ledgers so tests that model
- * a specific diagnostic stay consistent with the runner's live invariant
- * state; pass `over.invariants` to override for a forgery-probing test.
+ * default, `maxRoundsPerCase` (4) upstream rounds with every transition
+ * satisfied — the per-scenario evidence ledger is uniformly
+ * `[[4, 3, 7, 7, 7], ...]` (length = committedMulti). Callers may override
+ * `scenarioEvidence` and the round counters to model an early-terminated or
+ * parallel-shortened scenario (see {@link evidence} / {@link successEvidence};
+ * `attemptedRounds == committedSingle + Σ executedRounds` for a
+ * resumable-anchor seed). `runSegments` defaults to `data()`'s value (2).
+ * `invariants` is auto-derived from the resulting diagnostic + evidence ledgers
+ * so tests that model a specific diagnostic stay consistent with the runner's
+ * live invariant state; pass `over.invariants` to override for a
+ * forgery-probing test.
+ *
+ * Gate numerators default to the fully-successful values, so a seed that models
+ * a diagnostic must pass matching `gates` overrides — exactly as before.
  */
 function validSeed(cursor: number, over: Partial<CheckpointData> = {}): CheckpointData {
   const committedSingle = Math.min(cursor, PLAN.plannedSingle);
   const committedMulti = Math.max(0, cursor - PLAN.plannedSingle);
   const expDenom = committedSingle + committedMulti * PLAN.expectedCallsPerScenario;
-  const executed = new Array<number>(committedMulti).fill(PLAN.maxRoundsPerCase);
-  const rounds = committedSingle + executed.reduce((sum, n) => sum + n, 0); // committed upstream rounds
+  const scenarioEvidence =
+    over.scenarioEvidence ??
+    Array.from({ length: committedMulti }, () => successEvidence(PLAN.maxRoundsPerCase));
+  const rounds = committedSingle + scenarioEvidence.reduce((sum, [executed]) => sum + executed, 0);
   const invariantsOverride = over.invariants;
   const built = data({
     nextCaseIndex: cursor,
@@ -588,7 +636,7 @@ function validSeed(cursor: number, over: Partial<CheckpointData> = {}): Checkpoi
       single: { total: committedSingle, success: committedSingle },
       multi: { total: committedMulti, success: committedMulti },
     },
-    executedScenarioRounds: executed,
+    scenarioEvidence,
     ...over,
   });
   return withDerivedInvariants(built, PLAN, invariantsOverride);
@@ -726,10 +774,11 @@ describe("eval checkpoint — semantic corpus-bound validation (finding 1)", () 
 
   it("counts a committed scenario using its executed-round ledger, not maxRoundsPerCase (finding 1)", () => {
     // A committed multi-step scenario contributes BETWEEN 1 and maxRoundsPerCase
-    // (4) upstream rounds; the `executedScenarioRounds` ledger is the SOLE
-    // source of truth. `validSeed` defaults to `[4]` for one committed scenario
-    // (= 200 + 4 = 204 upstream rounds); a claim of 203 with a still-uniform
-    // `[4]` ledger is now internally inconsistent and rejected.
+    // (4) upstream rounds; the `scenarioEvidence` ledger's executed-round
+    // element is the SOLE source of truth. `validSeed` defaults to a uniform
+    // `successEvidence(4)` for one committed scenario (= 200 + 4 = 204 upstream
+    // rounds); a claim of 203 against that ledger is internally inconsistent
+    // and rejected.
     const short = { attemptedRounds: 203, completedRounds: 203 };
     bad(
       validSeed(201, {
@@ -740,32 +789,27 @@ describe("eval checkpoint — semantic corpus-bound validation (finding 1)", () 
     ok(validSeed(201)); // 204 upstream rounds is correct for [4]
   });
 
-  it("accepts a committed early-terminated scenario with a truthful executed-round entry (spec §30)", () => {
-    // A scenario that legitimately terminated at round 3 (`test`) commits
-    // with `executedScenarioRounds = [3]` AND exactly ONE primary diagnostic
-    // AT that terminal round — the runner writes both together at scenario
+  it("accepts a committed early-terminated scenario with a truthful evidence entry (spec §30)", () => {
+    // A scenario that legitimately terminated at its third upstream round
+    // commits with ONE evidence tuple AND exactly ONE primary diagnostic AT
+    // that terminal round — the runner writes both together at scenario
     // commit. `multi.success` cannot count an early-terminated scenario, so
-    // it is 0 here. Numerator accounting:
+    // it is 0 here. Transition accounting:
     //
     //   200 single expected rounds (all passed) → 200 schema/arg/name.
-    //   Case 201 rounds 1-2 executed with no diag (nameOk) → +2 each.
-    //   Case 201 round 3 executed, diagnosed `expected-tool-returned-text`
-    //     (decision.kind = "text") → +0 each.
-    //   Case 201 round 4 (final) unexecuted, no expectedTool → +0 (denom
-    //     unaffected: the corpus expected-call denominator counts only
-    //     expected-tool rounds).
+    //   Case 201 satisfied its first two transitions (read, edit) → the
+    //     satisfied prefix 0b011 is set in all three masks.
+    //   Its terminal round is diagnosed `expected-tool-returned-text`
+    //     (decision.kind = "text"), so the still-pending third transition
+    //     earned no schema/argument/name evidence → its bit stays clear.
     //
-    // So: expectedCall.total = 200 + 3 = 203; schema/arg/name = 202; the
-    // missed-final round IS NOT counted in the expected-call denominator
-    // (it has no expectedTool), while the missed expected round WOULD be if
-    // the terminal failure had been earlier. Its upstream floor is
-    // 200 + 3 = 203.
+    // So: expectedCall.total = 200 + 3 (every PLANNED transition counts) and
+    // schema/arg/name = 200 + popcount(0b011) = 202. The unsatisfied
+    // transition is a truthful miss, not an attempted upstream round. The
+    // scenario's upstream floor is 200 + 3 = 203.
     ok(
       validSeed(201, {
-        executedScenarioRounds: [3],
-        attemptedRounds: 203,
-        completedRounds: 203,
-        cleanup: { attempted: 203, deleted: 203, failed: 0, journalFailures: 0 },
+        scenarioEvidence: [evidence(3, 2)],
         diagnosticFailures: [[201, 3, EVAL_FAILURE_REASON_CODES["expected-tool-returned-text"]]],
         gates: {
           expectedCall: {
@@ -781,45 +825,26 @@ describe("eval checkpoint — semantic corpus-bound validation (finding 1)", () 
     );
   });
 
-  it("rejects an executedScenarioRounds ledger whose length disagrees with the committed multi count", () => {
+  it("rejects a scenarioEvidence ledger whose length disagrees with the committed multi count", () => {
     // committed multi = 1, but the ledger claims 2 entries.
     bad(
       validSeed(201, {
-        executedScenarioRounds: [4, 4],
+        scenarioEvidence: [successEvidence(4), successEvidence(4)],
       }),
     );
     // committed multi = 2, but the ledger claims 1 entry.
     bad(
       validSeed(202, {
-        executedScenarioRounds: [4],
-        // attemptedRounds/cleanup would be 208 for two full scenarios; override
-        // so shape and length are the only inconsistencies.
-        attemptedRounds: 204,
-        completedRounds: 204,
-        cleanup: { attempted: 204, deleted: 204, failed: 0, journalFailures: 0 },
+        scenarioEvidence: [successEvidence(4)],
       }),
     );
   });
 
-  it("rejects an executedScenarioRounds entry below 1 or above maxRoundsPerCase", () => {
+  it("rejects a scenarioEvidence executed-round count below 1 or above its case's round count", () => {
     // Zero → below the minimum (a committed scenario always ran round 1).
-    bad(
-      validSeed(201, {
-        executedScenarioRounds: [0],
-        attemptedRounds: 200,
-        completedRounds: 200,
-        cleanup: { attempted: 200, deleted: 200, failed: 0, journalFailures: 0 },
-      }),
-    );
-    // Five → above maxRoundsPerCase (4).
-    bad(
-      validSeed(201, {
-        executedScenarioRounds: [5],
-        attemptedRounds: 205,
-        completedRounds: 205,
-        cleanup: { attempted: 205, deleted: 205, failed: 0, journalFailures: 0 },
-      }),
-    );
+    bad(validSeed(201, { scenarioEvidence: [successEvidence(0)] }));
+    // Five → above case 201's actual round count (4).
+    bad(validSeed(201, { scenarioEvidence: [successEvidence(5)] }));
   });
 
   it("rejects a committed upstream floor that disagrees with the executed-round ledger", () => {
@@ -905,16 +930,16 @@ function diag(
   return [co, ro, EVAL_FAILURE_REASON_CODES[reasonKey]];
 }
 
-describe("eval checkpoint — v3 format version enforcement", () => {
-  it("the current on-disk format version is exactly 3", () => {
-    expect(CHECKPOINT_FORMAT_VERSION).toBe(3);
+describe("eval checkpoint — v4 format version enforcement", () => {
+  it("the current on-disk format version is exactly 4", () => {
+    expect(CHECKPOINT_FORMAT_VERSION).toBe(4);
   });
 
   it("REJECTS a v1 checkpoint (no migration path)", () => {
     const dir = tempDir();
     // A shape-legal v1 payload: everything except formatVersion=1, the missing
-    // diagnosticFailures field, and the missing executedScenarioRounds ledger
-    // is otherwise valid.
+    // diagnosticFailures field, and the missing per-scenario ledger is
+    // otherwise valid.
     const v1 = {
       formatVersion: 1,
       origin: ORIGIN,
@@ -943,8 +968,8 @@ describe("eval checkpoint — v3 format version enforcement", () => {
   it("REJECTS a v2 checkpoint (no migration path)", () => {
     const dir = tempDir();
     // A shape-legal v2 payload: everything except formatVersion=2 and the
-    // absent executedScenarioRounds ledger (v2 predates it) is otherwise
-    // valid. A v2 checkpoint cannot be safely replayed under v3 accounting.
+    // absent per-scenario ledger (v2 predates it) is otherwise valid. A v2
+    // checkpoint cannot be safely replayed under v4 accounting.
     const v2 = {
       formatVersion: 2,
       origin: ORIGIN,
@@ -968,6 +993,44 @@ describe("eval checkpoint — v3 format version enforcement", () => {
       diagnosticFailures: [],
     };
     writeFileSync(file(dir), JSON.stringify(v2), { mode: 0o600 });
+    expect(() => readCheckpoint(loc(dir), EXPECTED)).toThrow();
+  });
+
+  it("REJECTS a v3 checkpoint (no migration path)", () => {
+    const dir = tempDir();
+    // A shape-legal v3 payload: it carries the POSITIONAL
+    // `executedScenarioRounds` integer ledger instead of v4's per-transition
+    // `scenarioEvidence` tuples. v3's one-expected-tool-per-round-ordinal
+    // accounting cannot be replayed under transition-based accounting, so the
+    // reader refuses it outright rather than inventing missing step evidence.
+    const v3 = {
+      formatVersion: 3,
+      origin: ORIGIN,
+      authMode: "password",
+      corpusFingerprint: FP,
+      resumeState: "resumable",
+      abort: null,
+      nextCaseIndex: 42,
+      runSegments: 2,
+      attemptedRounds: 42,
+      completedRounds: 42,
+      completedSingleRoundCases: 42,
+      completedMultiStepScenarios: 0,
+      cleanup: { attempted: 42, deleted: 42, failed: 0, journalFailures: 0 },
+      gates: {
+        expectedCall: { total: 42, schemaValid: 42, nameAccurate: 42, argValid: 42 },
+        single: { total: 42, success: 42 },
+        multi: { total: 0, success: 0 },
+      },
+      invariants: { noSilentFallback: true, injectionResistance: true },
+      executedScenarioRounds: [],
+      diagnosticFailures: [],
+    };
+    writeFileSync(file(dir), JSON.stringify(v3), { mode: 0o600 });
+    expect(() => readCheckpoint(loc(dir), EXPECTED)).toThrow();
+    // The same payload with a v4 version stamp is still refused: the v3 ledger
+    // field is unknown to v4 and the v4 ledger field is absent.
+    writeFileSync(file(dir), JSON.stringify({ ...v3, formatVersion: 4 }), { mode: 0o600 });
     expect(() => readCheckpoint(loc(dir), EXPECTED)).toThrow();
   });
 
@@ -1064,6 +1127,84 @@ describe("eval checkpoint — v2 diagnostic ledger round-trip and shape validati
   });
 });
 
+describe("eval checkpoint — v4 scenarioEvidence ledger round-trip and shape validation", () => {
+  it("round-trips an empty ledger", () => {
+    const dir = tempDir();
+    writeCheckpoint(loc(dir), data({ scenarioEvidence: [] }));
+    expect(readCheckpoint(loc(dir), EXPECTED)?.scenarioEvidence).toEqual([]);
+  });
+
+  it("round-trips per-scenario evidence tuples unchanged", () => {
+    const dir = tempDir();
+    const entries: CheckpointScenarioEvidence[] = [
+      successEvidence(4), // full budget, every transition satisfied
+      successEvidence(3), // a parallel batch finished a round early
+      successEvidence(2), // one batch completed all three transitions
+      evidence(3, 2, { schemaAndArg: true, name: true }), // pending step fully evidenced
+      evidence(2, 1, { schemaAndArg: true }), // pending step named wrongly
+      evidence(1, 0), // nothing satisfied, nothing earned
+    ];
+    writeCheckpoint(loc(dir), data({ nextCaseIndex: 220, scenarioEvidence: entries }));
+    expect(readCheckpoint(loc(dir), EXPECTED)?.scenarioEvidence).toEqual(entries);
+  });
+
+  it("REJECTS a non-array ledger and a non-quintuple entry", () => {
+    const dir = tempDir();
+    for (const badLedger of [
+      null,
+      { 0: [4, 3, 7, 7, 7] },
+      [[4, 3, 7, 7]], // arity 4
+      [[4, 3, 7, 7, 7, 7]], // arity 6
+      [[4, 3, 7, 7, "7"]], // non-numeric element
+      [4, 3, 7, 7, 7], // a bare tuple instead of a ledger of tuples
+    ]) {
+      writeFileSync(file(dir), JSON.stringify({ ...data(), scenarioEvidence: badLedger }), {
+        mode: 0o600,
+      });
+      expect(() => readCheckpoint(loc(dir), EXPECTED)).toThrow();
+    }
+  });
+
+  it("REJECTS out-of-range executed-round, satisfied-step, and mask elements on disk", () => {
+    const dir = tempDir();
+    for (const badLedger of [
+      [[0, 3, 7, 7, 7]], // a committed scenario always ran at least one round
+      [[1.5, 3, 7, 7, 7]], // non-integer executed-round count
+      [[4, -1, 0, 0, 0]], // negative satisfied-step count
+      [[4, SCENARIO_STEP_COUNT + 1, 7, 7, 7]], // more satisfied steps than the workflow has
+      [[4, 3, -1, 7, 7]], // negative mask
+      [[4, 3, 1 << SCENARIO_STEP_COUNT, 7, 7]], // schema mask beyond the step space
+      [[4, 3, 7, 1 << SCENARIO_STEP_COUNT, 7]], // name mask beyond the step space
+      [[4, 3, 7, 7, 1 << SCENARIO_STEP_COUNT]], // argument mask beyond the step space
+    ]) {
+      writeFileSync(file(dir), JSON.stringify({ ...data(), scenarioEvidence: badLedger }), {
+        mode: 0o600,
+      });
+      expect(() => readCheckpoint(loc(dir), EXPECTED)).toThrow();
+    }
+  });
+
+  it("REJECTS the same malformed ledgers on the WRITE path (no bypass via writeCheckpoint)", () => {
+    const dir = tempDir();
+    for (const badLedger of [
+      [[4, 3, 7, 7]],
+      [[0, 3, 7, 7, 7]],
+      [[4, SCENARIO_STEP_COUNT + 1, 7, 7, 7]],
+      [[4, 3, 1 << SCENARIO_STEP_COUNT, 7, 7]],
+    ]) {
+      expect(() =>
+        writeCheckpoint(
+          loc(dir),
+          data({ scenarioEvidence: badLedger as unknown as CheckpointScenarioEvidence[] }),
+        ),
+      ).toThrow();
+    }
+    // A refused payload never lands, and never leaves a temp file behind.
+    expect(readCheckpoint(loc(dir), EXPECTED)).toBeNull();
+    expect(readdirSync(dir).filter((n) => n.includes(".tmp"))).toEqual([]);
+  });
+});
+
 describe("eval checkpoint — v2 semantic (corpus-bound) diagnostic validation", () => {
   const ok = (d: CheckpointData): void => validateResumableCheckpoint(d, PLAN);
   const bad = (d: CheckpointData): void =>
@@ -1072,52 +1213,47 @@ describe("eval checkpoint — v2 semantic (corpus-bound) diagnostic validation",
   it("accepts a valid ledger that references only committed cases + real rounds", () => {
     // A truthful ledger under spec §30: each committed case has AT MOST ONE
     // primary diagnostic; a multi-step scenario's diagnostic is AT its
-    // terminal round (`roundOrdinal == executedScenarioRounds[k]`), and a
+    // terminal round (`roundOrdinal == scenarioEvidence[k][0]`), and a
     // full-length scenario with a diagnostic terminated at its FINAL round.
     // cursor 219: 200 singles + 19 multi committed. Layout:
     //   - Single case 1   diagnosed `expected-tool-returned-text`.
     //   - Single case 200 diagnosed `expected-tool-no-valid-call`.
-    //   - Multi case 201  ran full-length; final round `final-unavailable`.
-    //   - Multi case 219  terminated at round 2 (edit) `unauthorized-tool-call`
-    //                     (any-scope on an expected-tool round).
-    //   - Multi case 210  terminated at round 3 (test) `transcript-invalid`
-    //                     (expected-scope on the terminal expected round).
+    //   - Multi case 201  ran full-length with every transition satisfied;
+    //                     its FINAL round failed `final-unavailable`
+    //                     (final-scope, so satisfiedSteps must be 3).
+    //   - Multi case 219  terminated at round 2 with `unauthorized-tool-call`
+    //                     (any-scope): one transition satisfied, and the
+    //                     pending transition earned schema/argument evidence
+    //                     but not expected-name evidence.
+    //   - Multi case 210  terminated at round 3 with `transcript-invalid`
+    //                     (expected-scope, so satisfiedSteps must be < 3): two
+    //                     transitions satisfied, and the pending transition
+    //                     earned schema, argument AND name evidence.
     //   - All 16 other multi scenarios ran full-length without a diagnostic.
     //
-    // Numerator derivation (finding 1):
+    // Numerator derivation (finding 1): singles contribute through the
+    // per-round reason table, multi scenarios through their per-step masks.
     //   Singles: 198 pass (+1 schema/arg/name each), 2 fail with 0-contribution
     //     reasons → schema/arg/name = 198; single.success = 198.
-    //   Multi:
-    //     Case 201: rounds 1-3 pass (+3 each), round 4 final-diag has no
-    //       expected contribution → +3 schema/arg/name. multi.success = 0.
-    //     Case 219: round 1 passes (+1), round 2 diag `unauthorized-tool-call`
-    //       (+1 schema, +1 arg, +0 name), round 3 unexecuted (+0 in denom;
-    //       hasExpectedTool) → +2 schema/arg, +1 name. multi.success = 0.
-    //     Case 210: rounds 1-2 pass (+2), round 3 diag `transcript-invalid`
-    //       (+1 schema/arg/name) → +3 schema/arg/name. multi.success = 0.
+    //   Multi (denominator is always the 3 PLANNED transitions per scenario):
+    //     Case 201: masks 0b111 → +3 schema/arg/name. multi.success = 0.
+    //     Case 219: masks 0b011 / 0b001 / 0b011 → +2 schema, +1 name, +2 arg.
+    //     Case 210: masks 0b111 → +3 schema/arg/name. multi.success = 0.
     //     Other 16 cases: full success → +3 each. multi.success += 16.
     //   Total: 200 + 19*3 = 257 denom; schema/arg = 198 + 3 + 2 + 3 + 48 = 254;
     //     name = 198 + 3 + 1 + 3 + 48 = 253; multi.success = 16.
     //
-    // Upstream-round floor: 200 singles + 18*4 full + 3 (case 210) + 2 (case
-    // 219) = 200 + 72 + 5 = 277.
-    const executed = [
-      ...Array<number>(9).fill(4), // cases 201..209 full-length
-      3, // case 210 terminated at round 3
-      ...Array<number>(8).fill(4), // cases 211..218 full-length
-      2, // case 219 terminated at round 2
+    // Upstream-round floor: 200 singles + 17*4 full + 3 (case 210) + 2 (case
+    // 219) = 200 + 68 + 5 = 273, derived by `validSeed` from the tuples.
+    const scenarioEvidence: CheckpointScenarioEvidence[] = [
+      ...Array.from({ length: 9 }, () => successEvidence(4)), // cases 201..209
+      evidence(3, 2, { schemaAndArg: true, name: true }), // case 210
+      ...Array.from({ length: 8 }, () => successEvidence(4)), // cases 211..218
+      evidence(2, 1, { schemaAndArg: true }), // case 219
     ];
     ok(
       validSeed(220 - 1, {
-        executedScenarioRounds: executed,
-        attemptedRounds: 200 + executed.reduce((a, b) => a + b, 0),
-        completedRounds: 200 + executed.reduce((a, b) => a + b, 0),
-        cleanup: {
-          attempted: 200 + executed.reduce((a, b) => a + b, 0),
-          deleted: 200 + executed.reduce((a, b) => a + b, 0),
-          failed: 0,
-          journalFailures: 0,
-        },
+        scenarioEvidence,
         diagnosticFailures: [
           diag(1, 1, "expected-tool-returned-text"),
           diag(200, 1, "expected-tool-no-valid-call"),
@@ -1212,24 +1348,23 @@ describe("eval checkpoint — v2 semantic (corpus-bound) diagnostic validation",
       }),
     );
     // Multi expected-tool round terminated with unauthorized-tool-call at
-    // round 1 (case 201). Rounds 2, 3 unexecuted (denom only); round 4
-    // unexecuted (no expectedTool → no denom).
+    // round 1 (case 201): NO transition succeeded, and the pending first
+    // transition earned schema/argument evidence but not expected-name
+    // evidence. The two unsatisfied transitions stay truthful misses.
     ok(
       validSeed(205, {
-        executedScenarioRounds: [1, 4, 4, 4, 4],
-        attemptedRounds: 200 + 1 + 4 * 4,
-        completedRounds: 200 + 1 + 4 * 4,
-        cleanup: {
-          attempted: 200 + 1 + 4 * 4,
-          deleted: 200 + 1 + 4 * 4,
-          failed: 0,
-          journalFailures: 0,
-        },
+        scenarioEvidence: [
+          evidence(1, 0, { schemaAndArg: true }),
+          successEvidence(4),
+          successEvidence(4),
+          successEvidence(4),
+          successEvidence(4),
+        ],
         diagnosticFailures: [diag(201, 1, "unauthorized-tool-call")],
         gates: {
           expectedCall: {
             total: 200 + 5 * 3, // 215
-            // Singles: +200 each. Case 201 round 1 diag (+1 schema/arg, +0 name).
+            // Singles: +200 each. Case 201 masks 0b001 / 0b000 / 0b001.
             // Cases 202-205: full success (+3 each, +12 each).
             schemaValid: 200 + 1 + 12, // 213
             nameAccurate: 200 + 0 + 12, // 212
@@ -1296,6 +1431,42 @@ describe("eval checkpoint — v2 worst-case ledger fits within the 8 KiB bound",
     expect(raw).toBeLessThanOrEqual(8192);
     expect(raw).toBeGreaterThan(0);
   });
+
+  it("the MAXIMUM-valid-shape checkpoint (full cursor + full diagnostic + full evidence ledgers) fits the 8 KiB cap", () => {
+    const dir = tempDir();
+    // The largest legal on-disk shape for the production corpus:
+    //   - the largest cursor (220 = the whole corpus);
+    //   - a full 280-entry diagnostic ledger at the widest ordinals, every
+    //     entry carrying the widest (two-digit) reason code;
+    //   - a full 20-entry scenarioEvidence ledger at the widest tuple values
+    //     (4 executed rounds, 3 satisfied steps, all three masks full).
+    // Adding the v4 evidence ledger must not push the payload past the cap,
+    // so this measures the REAL serialized length rather than eyeballing it.
+    const widestCode = EVAL_FAILURE_REASON_CODES["scenario-round-budget-exhausted"];
+    const worstEntries: CheckpointDiagnosticFailure[] = [];
+    for (let co = 1; co <= 200; co += 1) worstEntries.push([co, 1, widestCode]);
+    for (let co = 201; co <= 220; co += 1) {
+      for (let ro = 1; ro <= 4; ro += 1) worstEntries.push([co, ro, widestCode]);
+    }
+    expect(worstEntries).toHaveLength(MAX_DIAGNOSTIC_FAILURES);
+    const worstEvidence = Array.from({ length: 20 }, () => successEvidence(4));
+    const worst = data({
+      nextCaseIndex: 220,
+      runSegments: 1,
+      scenarioEvidence: worstEvidence,
+      diagnosticFailures: worstEntries,
+    });
+    writeCheckpoint(loc(dir), worst);
+    const readBack = readCheckpoint(loc(dir), EXPECTED);
+    expect(readBack?.diagnosticFailures).toHaveLength(MAX_DIAGNOSTIC_FAILURES);
+    expect(readBack?.scenarioEvidence).toEqual(worstEvidence);
+    // Measured on-disk size of that maximum shape. It is asserted exactly so
+    // any future field growth has to re-justify the 8 KiB budget rather than
+    // silently consuming the remaining headroom.
+    const raw = statSync(file(dir)).size;
+    expect(raw).toBe(3899);
+    expect(raw).toBeLessThanOrEqual(8192);
+  });
 });
 
 describe("eval checkpoint — v2 rehydrate to report shape uses corpus, not checkpoint claims", () => {
@@ -1343,6 +1514,79 @@ describe("eval checkpoint — v2 rehydrate to report shape uses corpus, not chec
         roundOrdinal: 4,
         choiceKind: "auto",
         reason: "unexpected-tool-call-on-final",
+      },
+    ]);
+  });
+
+  it("a resumed segment reproduces every persisted diagnostic exactly once", () => {
+    // The full resume path: validate → persist → read back → rehydrate. A
+    // resumed final report re-emits each prior segment's diagnostics once, so
+    // the rehydrated collection must match the persisted ledger entry-for-entry
+    // with no duplicate (caseOrdinal, roundOrdinal) identity.
+    const dir = tempDir();
+    const entries: CheckpointDiagnosticFailure[] = [
+      diag(1, 1, "expected-tool-returned-text"),
+      diag(200, 1, "expected-tool-no-valid-call"),
+      diag(201, 3, "transcript-invalid"),
+      diag(202, 4, "final-unavailable"),
+    ];
+    const cp = validSeed(203, {
+      scenarioEvidence: [
+        evidence(3, 2, { schemaAndArg: true, name: true }), // 201 terminal transcript-invalid
+        successEvidence(4), // 202 satisfied every transition, failed its final round
+        successEvidence(4), // 203 fully successful
+      ],
+      diagnosticFailures: entries,
+      gates: {
+        expectedCall: {
+          total: 200 + 3 * 3,
+          // 198 passing singles + three fully-evidenced scenarios.
+          schemaValid: 198 + 9,
+          nameAccurate: 198 + 9,
+          argValid: 198 + 9,
+        },
+        single: { total: 200, success: 198 },
+        multi: { total: 3, success: 1 },
+      },
+    });
+    validateResumableCheckpoint(cp, PROJECTION);
+    writeCheckpoint(loc(dir), cp);
+    const readBack = readCheckpoint(loc(dir), EXPECTED);
+    expect(readBack?.diagnosticFailures).toEqual(entries);
+    if (readBack === null) throw new Error("checkpoint missing");
+    validateResumableCheckpoint(readBack, PROJECTION);
+    const rehydrated = rehydrateDiagnosticFailures(readBack.diagnosticFailures, PROJECTION);
+    expect(new Set(rehydrated.map((d) => `${d.caseOrdinal}:${d.roundOrdinal}`)).size).toBe(
+      entries.length,
+    );
+    expect(rehydrated).toEqual([
+      {
+        phase: "single",
+        caseOrdinal: 1,
+        roundOrdinal: 1,
+        choiceKind: "auto",
+        reason: "expected-tool-returned-text",
+      },
+      {
+        phase: "single",
+        caseOrdinal: 200,
+        roundOrdinal: 1,
+        choiceKind: "required",
+        reason: "expected-tool-no-valid-call",
+      },
+      {
+        phase: "multi",
+        caseOrdinal: 201,
+        roundOrdinal: 3,
+        choiceKind: "auto",
+        reason: "transcript-invalid",
+      },
+      {
+        phase: "multi",
+        caseOrdinal: 202,
+        roundOrdinal: 4,
+        choiceKind: "auto",
+        reason: "final-unavailable",
       },
     ]);
   });
@@ -1396,7 +1640,7 @@ describe("eval checkpoint — v2 serialized payload carries no content", () => {
  * mutation attempts are impossible.
  */
 describe("eval failure reason lookup — Finding 1 immutability regression", () => {
-  it("returns the fixed reason for every code in 1..9 (unchanged mapping)", async () => {
+  it("returns the fixed reason for every code in 1..10 (1..9 unchanged)", async () => {
     const { evalFailureReasonForCode } = await import("../../src/eval/report.js");
     expect(evalFailureReasonForCode(1)).toBe("expected-tool-returned-text");
     expect(evalFailureReasonForCode(2)).toBe("expected-tool-no-valid-call");
@@ -1407,12 +1651,37 @@ describe("eval failure reason lookup — Finding 1 immutability regression", () 
     expect(evalFailureReasonForCode(7)).toBe("unexpected-tool-call-on-final");
     expect(evalFailureReasonForCode(8)).toBe("final-no-valid-call");
     expect(evalFailureReasonForCode(9)).toBe("final-unavailable");
+    // APPENDED for report v5; the nine codes above keep their exact meaning.
+    expect(evalFailureReasonForCode(10)).toBe("scenario-round-budget-exhausted");
+  });
+
+  it("maps exactly ten reasons onto the unique codes 1..10, appending the scenario reason", () => {
+    // The union is closed and the codes are stable: a new reason must be
+    // APPENDED, never renumbered, because the on-disk ledger persists the
+    // integers. Renumbering would silently reinterpret a recorded checkpoint.
+    const entries = Object.entries(EVAL_FAILURE_REASON_CODES);
+    expect(entries).toHaveLength(10);
+    const codes = entries.map(([, code]) => code);
+    expect(new Set(codes).size).toBe(10);
+    expect([...codes].sort((a, b) => a - b)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+    // Codes 1..9 keep their exact pre-v5 values.
+    expect(EVAL_FAILURE_REASON_CODES["expected-tool-returned-text"]).toBe(1);
+    expect(EVAL_FAILURE_REASON_CODES["expected-tool-no-valid-call"]).toBe(2);
+    expect(EVAL_FAILURE_REASON_CODES["expected-tool-unavailable"]).toBe(3);
+    expect(EVAL_FAILURE_REASON_CODES["expected-tool-not-invoked"]).toBe(4);
+    expect(EVAL_FAILURE_REASON_CODES["unauthorized-tool-call"]).toBe(5);
+    expect(EVAL_FAILURE_REASON_CODES["transcript-invalid"]).toBe(6);
+    expect(EVAL_FAILURE_REASON_CODES["unexpected-tool-call-on-final"]).toBe(7);
+    expect(EVAL_FAILURE_REASON_CODES["final-no-valid-call"]).toBe(8);
+    expect(EVAL_FAILURE_REASON_CODES["final-unavailable"]).toBe(9);
+    // The appended tenth member.
+    expect(EVAL_FAILURE_REASON_CODES["scenario-round-budget-exhausted"]).toBe(10);
   });
 
   it("rejects code 42 and every other out-of-range or non-integer value", async () => {
     const { evalFailureReasonForCode } = await import("../../src/eval/report.js");
     expect(evalFailureReasonForCode(0)).toBeUndefined();
-    expect(evalFailureReasonForCode(10)).toBeUndefined();
+    expect(evalFailureReasonForCode(11)).toBeUndefined();
     expect(evalFailureReasonForCode(42)).toBeUndefined();
     expect(evalFailureReasonForCode(-1)).toBeUndefined();
     expect(evalFailureReasonForCode(1.5)).toBeUndefined();
@@ -1560,29 +1829,53 @@ const NONUNIFORM_PROJECTION: EvalCorpusProjection = Object.freeze({
   ]),
 });
 
+/** Every multi-step case in {@link NONUNIFORM_PROJECTION} plans exactly two transitions. */
+const NONUNIFORM_PLANNED_STEPS = 2;
+
+/**
+ * Build a truthful evidence tuple for a {@link NONUNIFORM_PROJECTION} scenario.
+ * Mirrors {@link evidence}, but against that projection's TWO planned
+ * transitions rather than the production corpus's three, so a mask never
+ * carries a bit outside the case's own planned step count.
+ */
+function nonUniformEvidence(
+  executed: number,
+  satisfied: number = NONUNIFORM_PLANNED_STEPS,
+  pendingEvidence: { schemaAndArg?: boolean; name?: boolean } = {},
+): CheckpointScenarioEvidence {
+  const prefix = satisfied <= 0 ? 0 : (1 << satisfied) - 1;
+  const pendingBit = satisfied < NONUNIFORM_PLANNED_STEPS ? 1 << satisfied : 0;
+  const schemaArgBit = pendingEvidence.schemaAndArg === true ? pendingBit : 0;
+  const nameBit = pendingEvidence.name === true ? pendingBit : 0;
+  return [executed, satisfied, prefix | schemaArgBit, prefix | nameBit, prefix | schemaArgBit];
+}
+
 /**
  * Build a semantically-VALID resumable seed for a NON-UNIFORM projection at
  * `cursor` (0-based case index). Committed upstream rounds sum the ACTUAL
- * per-case round counts (never `single + multi * maxRoundsPerCase`); gate
- * denominators sum the ACTUAL per-case `hasExpectedTool` counts.
+ * per-case executed-round evidence (never `single + multi * maxRoundsPerCase`);
+ * gate denominators sum the ACTUAL per-case `hasExpectedTool` counts, which is
+ * also each scenario's planned transition count.
  */
 function nonUniformSeed(cursor: number, over: Partial<CheckpointData> = {}): CheckpointData {
   let committedSingle = 0;
   let committedMulti = 0;
-  let upstreamRounds = 0;
   let expectedRounds = 0;
-  const executed: number[] = [];
+  const fullyExecuted: CheckpointScenarioEvidence[] = [];
   for (let i = 0; i < cursor; i += 1) {
     const c = NONUNIFORM_PROJECTION.cases[i];
     if (c === undefined) break;
     if (c.phase === "single") committedSingle += 1;
     else {
       committedMulti += 1;
-      executed.push(c.rounds.length); // the full scenario ran to completion
+      // The full scenario ran to completion with every transition satisfied.
+      fullyExecuted.push(nonUniformEvidence(c.rounds.length));
     }
-    upstreamRounds += c.rounds.length;
     for (const r of c.rounds) if (r.hasExpectedTool) expectedRounds += 1;
   }
+  const scenarioEvidence = over.scenarioEvidence ?? fullyExecuted;
+  const upstreamRounds =
+    committedSingle + scenarioEvidence.reduce((sum, [executed]) => sum + executed, 0);
   const invariantsOverride = over.invariants;
   const built = data({
     nextCaseIndex: cursor,
@@ -1606,7 +1899,7 @@ function nonUniformSeed(cursor: number, over: Partial<CheckpointData> = {}): Che
       single: { total: committedSingle, success: committedSingle },
       multi: { total: committedMulti, success: committedMulti },
     },
-    executedScenarioRounds: executed,
+    scenarioEvidence,
     runSegments: 1,
     ...over,
   });
@@ -1624,25 +1917,18 @@ describe("eval checkpoint — Finding 2: non-uniform corpus projection", () => {
     // reason. A scenario terminates at its FIRST failure, so this test
     // exercises two independent ok() cases with a SINGLE terminal diagnostic
     // each, placed at the real expected round the reason targets.
-    // Terminated at case 2 round 1 with `expected-tool-returned-text`.
+    // Terminated at case 2 round 1 with `expected-tool-returned-text`: no
+    // transition satisfied and the pending one earned nothing.
     ok(
       nonUniformSeed(3, {
-        executedScenarioRounds: [1, 3],
-        attemptedRounds: 1 + 1 + 3,
-        completedRounds: 1 + 1 + 3,
-        cleanup: {
-          attempted: 1 + 1 + 3,
-          deleted: 1 + 1 + 3,
-          failed: 0,
-          journalFailures: 0,
-        },
+        scenarioEvidence: [nonUniformEvidence(1, 0), nonUniformEvidence(3)],
         diagnosticFailures: [[2, 1, EVAL_FAILURE_REASON_CODES["expected-tool-returned-text"]]],
         gates: {
           expectedCall: {
-            // Denom: single (1) + case 2 (2 planned expected) + case 3 (2) = 5.
+            // Denom: single (1) + case 2 (2 planned transitions) + case 3 (2) = 5.
             total: 5,
-            // Case 1 (single) +1 each. Case 2 round 1 diag `text` +0 each,
-            // round 3 unexecuted +0. Case 3 rounds 1, 3 no diag +2 each.
+            // Case 1 (single) +1 each. Case 2 masks 0b00 → +0 each. Case 3
+            // fully satisfied → +2 each.
             schemaValid: 1 + 0 + 2,
             nameAccurate: 1 + 0 + 2,
             argValid: 1 + 0 + 2,
@@ -1653,24 +1939,16 @@ describe("eval checkpoint — Finding 2: non-uniform corpus projection", () => {
       }),
     );
     // Terminated at case 2 round 3 with `expected-tool-no-valid-call` — round
-    // 3 is an EXPECTED round, not a "third round is final" position.
+    // 3 is an EXPECTED round, not a "third round is final" position. Its first
+    // transition succeeded; the pending second one earned nothing.
     ok(
       nonUniformSeed(3, {
-        executedScenarioRounds: [3, 3],
-        attemptedRounds: 1 + 3 + 3,
-        completedRounds: 1 + 3 + 3,
-        cleanup: {
-          attempted: 1 + 3 + 3,
-          deleted: 1 + 3 + 3,
-          failed: 0,
-          journalFailures: 0,
-        },
+        scenarioEvidence: [nonUniformEvidence(3, 1), nonUniformEvidence(3)],
         diagnosticFailures: [[2, 3, EVAL_FAILURE_REASON_CODES["expected-tool-no-valid-call"]]],
         gates: {
           expectedCall: {
             total: 5,
-            // Case 1 +1 each. Case 2 round 1 no diag +1 each; round 3 diag
-            // `no_valid_call` +0 each. Case 3 rounds 1, 3 +2 each.
+            // Case 1 +1 each. Case 2 masks 0b01 → +1 each. Case 3 +2 each.
             schemaValid: 1 + 1 + 2,
             nameAccurate: 1 + 1 + 2,
             argValid: 1 + 1 + 2,
@@ -1699,19 +1977,22 @@ describe("eval checkpoint — Finding 2: non-uniform corpus projection", () => {
       }),
     );
     // But the ACTUAL expected round (3, 3) accepts an expected-tool reason.
-    // Round 3 is case 3's LAST round, so an "executed at the terminal round"
-    // diagnostic uses executedScenarioRounds=[5, 3] with a full-length case 3.
+    // Round 3 is case 3's LAST round, so the scenario ran all three of its
+    // rounds; an `expected`-scope reason additionally requires a still-pending
+    // transition, so case 3 satisfied only its first and its pending second
+    // transition earned schema/argument evidence but no expected-name credit.
     ok(
       nonUniformSeed(3, {
+        scenarioEvidence: [nonUniformEvidence(5), nonUniformEvidence(3, 1, { schemaAndArg: true })],
         diagnosticFailures: [[3, 3, EVAL_FAILURE_REASON_CODES["expected-tool-not-invoked"]]],
         gates: {
           expectedCall: {
             total: 5,
-            // Case 1 +1 each. Case 2 full +2 each. Case 3 round 1 no diag +1
-            // each; round 3 diag `not-invoked` (+1 schema/arg, +0 name).
-            schemaValid: 1 + 2 + (1 + 1),
-            nameAccurate: 1 + 2 + (1 + 0),
-            argValid: 1 + 2 + (1 + 1),
+            // Case 1 +1 each. Case 2 full +2 each. Case 3 masks 0b11 / 0b01 /
+            // 0b11 → +2 schema, +1 name, +2 arg.
+            schemaValid: 1 + 2 + 2,
+            nameAccurate: 1 + 2 + 1,
+            argValid: 1 + 2 + 2,
           },
           single: { total: 1, success: 1 },
           multi: { total: 2, success: 1 },
@@ -1728,25 +2009,17 @@ describe("eval checkpoint — Finding 2: non-uniform corpus projection", () => {
       }),
     );
     // Round 4 of multi case 2 is FINAL — `final-*` reasons are compatible.
-    // A scenario terminates at its diagnostic round, so executed=4 here.
+    // A scenario terminates at its diagnostic round, so executed=4 here, and a
+    // `final`-scope reason additionally requires EVERY transition satisfied.
     ok(
       nonUniformSeed(3, {
-        executedScenarioRounds: [4, 3],
-        attemptedRounds: 1 + 4 + 3,
-        completedRounds: 1 + 4 + 3,
-        cleanup: {
-          attempted: 1 + 4 + 3,
-          deleted: 1 + 4 + 3,
-          failed: 0,
-          journalFailures: 0,
-        },
+        scenarioEvidence: [nonUniformEvidence(4), nonUniformEvidence(3)],
         diagnosticFailures: [[2, 4, EVAL_FAILURE_REASON_CODES["final-unavailable"]]],
         gates: {
           expectedCall: {
             total: 5,
-            // Case 1 +1 each. Case 2 rounds 1, 3 no diag +2 each; round 4 is
-            // final (no expectedTool → no expectedCall contribution); round 5
-            // unexecuted and NOT expected (no denom contribution). Case 3
+            // Case 1 +1 each. Case 2 satisfied both transitions → +2 each; the
+            // failed FINAL round contributes no transition evidence. Case 3
             // full +2 each.
             schemaValid: 1 + 2 + 2,
             nameAccurate: 1 + 2 + 2,
@@ -1981,7 +2254,7 @@ describe("eval corpus — Finding 1: one exact fingerprint-bound corpus drives e
         multi: { total: 0, success: 0 },
       },
       invariants: { noSilentFallback: true, injectionResistance: true },
-      executedScenarioRounds: [],
+      scenarioEvidence: [],
       diagnosticFailures: [],
     };
     expect(() => validateResumableCheckpoint(fresh, projection)).not.toThrow();
@@ -2148,25 +2421,18 @@ describe("eval checkpoint — Finding 1 remediation: forged gate metrics are rej
 
   it("REJECTS a forged '19 one-round multi ledgers + all-success + perfect numerators' checkpoint (reproduced forgery)", () => {
     // The exact forgery reproduced by the review: 200 committed single-round
-    // cases + 19 committed multi-step scenarios; `executedScenarioRounds`
-    // contains only 1 for every multi scenario (scenarios stopped after their
-    // first upstream round); NO diagnostics; perfect expected-call numerators
-    // as though every planned expected-tool round ran; and all 19 multi
-    // scenarios marked successful. The pre-fix validator accepted it because
-    // it checked numerators only against denominators and did not correlate
-    // the ledger with the diagnostic ledger.
-    const executed = Array<number>(19).fill(1);
-    const upstreamRounds = 200 + executed.reduce((a, b) => a + b, 0); // 219
+    // cases + 19 committed multi-step scenarios; every scenario claims a
+    // one-round full success (scenarios stopped after their first upstream
+    // round); NO diagnostics; perfect expected-call numerators as though every
+    // planned transition succeeded; and all 19 multi scenarios marked
+    // successful. The pre-fix validator accepted it because it checked
+    // numerators only against denominators and did not correlate the ledger
+    // with the diagnostic ledger. Under state-aware accounting a
+    // diagnostic-free scenario must also have had room for its final-answer
+    // round (MIN_SUCCESSFUL_SCENARIO_ROUNDS = 2), so one round can never
+    // encode a success.
     const forged = validSeed(219, {
-      executedScenarioRounds: executed,
-      attemptedRounds: upstreamRounds,
-      completedRounds: upstreamRounds,
-      cleanup: {
-        attempted: upstreamRounds,
-        deleted: upstreamRounds,
-        failed: 0,
-        journalFailures: 0,
-      },
+      scenarioEvidence: Array.from({ length: 19 }, () => successEvidence(1)),
       diagnosticFailures: [],
       gates: {
         expectedCall: {
@@ -2187,21 +2453,14 @@ describe("eval checkpoint — Finding 1 remediation: forged gate metrics are rej
     // cannot count this scenario — the derived multi.success is 0, so a
     // claimed 1 is rejected as impossible.
     const forged = validSeed(201, {
-      executedScenarioRounds: [2],
-      attemptedRounds: 200 + 2,
-      completedRounds: 200 + 2,
-      cleanup: {
-        attempted: 200 + 2,
-        deleted: 200 + 2,
-        failed: 0,
-        journalFailures: 0,
-      },
+      scenarioEvidence: [evidence(2, 1, { schemaAndArg: true })],
       diagnosticFailures: [[201, 2, EVAL_FAILURE_REASON_CODES["expected-tool-not-invoked"]]],
       gates: {
         expectedCall: {
           total: 200 + 3,
-          // Case 201 round 1 no diag (+1 each), round 2 diag `not-invoked`
-          // (+1 schema/arg, +0 name), round 3 unexecuted (+0).
+          // Case 201 satisfied its first transition; the pending one earned
+          // schema/argument evidence but no expected-name credit, and the
+          // third transition never ran → masks 0b011 / 0b001 / 0b011.
           schemaValid: 200 + 2,
           nameAccurate: 200 + 1,
           argValid: 200 + 2,
@@ -2213,21 +2472,25 @@ describe("eval checkpoint — Finding 1 remediation: forged gate metrics are rej
     bad(forged);
   });
 
+  it("REJECTS counting a diagnosed full-length scenario in multi.success", () => {
+    // Case 201 ran its whole budget and satisfied every transition, but its
+    // FINAL round failed. A terminal diagnostic — at any round, for any
+    // reason — disqualifies the scenario from `multi.success`, so the
+    // `validSeed` default of 1 is a forgery here.
+    bad(
+      validSeed(201, {
+        diagnosticFailures: [diag(201, 4, "final-unavailable")],
+      }),
+    );
+  });
+
   it("REJECTS a diagnostic that references an UNEXECUTED round of a committed scenario", () => {
     // Case 201 terminated at round 2 (executed=2), but the ledger claims a
     // diagnostic at round 3 — a round that was never executed. The runner
     // never emits a diagnostic for a round it did not run; this pattern is
     // structurally impossible.
     const forged = validSeed(201, {
-      executedScenarioRounds: [2],
-      attemptedRounds: 200 + 2,
-      completedRounds: 200 + 2,
-      cleanup: {
-        attempted: 200 + 2,
-        deleted: 200 + 2,
-        failed: 0,
-        journalFailures: 0,
-      },
+      scenarioEvidence: [evidence(2, 1)],
       diagnosticFailures: [[201, 3, EVAL_FAILURE_REASON_CODES["expected-tool-returned-text"]]],
     });
     bad(forged);
@@ -2235,20 +2498,12 @@ describe("eval checkpoint — Finding 1 remediation: forged gate metrics are rej
 
   it("REJECTS expected-call numerators exceeding evidence from executed expected-tool rounds", () => {
     // Case 201 terminated at round 1 with `expected-tool-returned-text`
-    // (decision.kind = "text") — that round contributes 0 to schema/arg/name.
-    // Rounds 2 and 3 were never executed and contribute 0 as well. The only
-    // truthful multi contribution is 0 across the board. Any positive multi
-    // contribution to schema/arg/name is a forgery.
+    // (decision.kind = "text") — no transition succeeded and the pending one
+    // earned no evidence, so every mask is empty and the only truthful multi
+    // contribution is 0 across the board. Any positive multi contribution to
+    // schema/arg/name is a forgery.
     const forged = validSeed(201, {
-      executedScenarioRounds: [1],
-      attemptedRounds: 200 + 1,
-      completedRounds: 200 + 1,
-      cleanup: {
-        attempted: 200 + 1,
-        deleted: 200 + 1,
-        failed: 0,
-        journalFailures: 0,
-      },
+      scenarioEvidence: [evidence(1, 0)],
       diagnosticFailures: [[201, 1, EVAL_FAILURE_REASON_CODES["expected-tool-returned-text"]]],
       gates: {
         expectedCall: {
@@ -2291,20 +2546,15 @@ describe("eval checkpoint — Finding 1 remediation: forged gate metrics are rej
   });
 
   it("REJECTS an early-terminated scenario with no terminal diagnostic", () => {
-    // Case 201 committed with `executedScenarioRounds=[2]` (early terminated
-    // before its final answer round) but NO diagnostic ledger entry — an
-    // early-terminated scenario always emits one primary diagnostic per
-    // spec §30 lifecycle, so the absence of a diagnostic here is a forgery.
+    // Case 201 committed with only two executed rounds and an INCOMPLETE
+    // transition prefix (it stopped before its final answer round) but NO
+    // diagnostic ledger entry — an early-terminated scenario always emits one
+    // primary diagnostic per spec §30 lifecycle, so the absence of a
+    // diagnostic here is a forgery. Under state-aware accounting the
+    // structural tell is the unsatisfied transition: a diagnostic-free
+    // scenario must have satisfied EVERY planned transition.
     const forged = validSeed(201, {
-      executedScenarioRounds: [2],
-      attemptedRounds: 200 + 2,
-      completedRounds: 200 + 2,
-      cleanup: {
-        attempted: 200 + 2,
-        deleted: 200 + 2,
-        failed: 0,
-        journalFailures: 0,
-      },
+      scenarioEvidence: [evidence(2, 2)],
       diagnosticFailures: [],
       gates: {
         expectedCall: {
@@ -2336,26 +2586,18 @@ describe("eval checkpoint — Finding 1 remediation: forged gate metrics are rej
 
   it("accepts a truthful early-terminal checkpoint (Finding 1 acceptance case)", () => {
     // A committed multi-step scenario that terminated at round 3 with
-    // `expected-tool-returned-text` (the model returned final text instead
-    // of the expected tool call). Every accumulator, ledger entry, and
+    // `expected-tool-returned-text` (the model returned final text while a
+    // transition was still pending). Every accumulator, ledger entry, and
     // diagnostic is internally consistent.
     ok(
       validSeed(201, {
-        executedScenarioRounds: [3],
-        attemptedRounds: 200 + 3,
-        completedRounds: 200 + 3,
-        cleanup: {
-          attempted: 200 + 3,
-          deleted: 200 + 3,
-          failed: 0,
-          journalFailures: 0,
-        },
+        scenarioEvidence: [evidence(3, 2)],
         diagnosticFailures: [[201, 3, EVAL_FAILURE_REASON_CODES["expected-tool-returned-text"]]],
         gates: {
           expectedCall: {
             total: 200 + 3,
-            // Case 201 rounds 1-2 no diag (+2 each), round 3 diag `text` (+0),
-            // round 4 (final) unexecuted / no expectedTool (+0).
+            // Case 201 satisfied its first two transitions (masks 0b011); the
+            // pending third earned nothing from a text answer.
             schemaValid: 200 + 2,
             nameAccurate: 200 + 2,
             argValid: 200 + 2,
@@ -2386,28 +2628,39 @@ describe("eval checkpoint — Finding 2 remediation: per-case round-count bound"
   const bad = (d: CheckpointData): void =>
     expect(() => validateResumableCheckpoint(d, NONUNIFORM_PROJECTION)).toThrow();
 
-  it("REJECTS an executedScenarioRounds entry that fits maxRoundsPerCase but exceeds its per-case length", () => {
+  it("REJECTS a scenarioEvidence entry that fits maxRoundsPerCase but exceeds its per-case length", () => {
     // NONUNIFORM_PROJECTION: multi case 2 has 5 rounds, multi case 3 has 3
-    // rounds, and `maxRoundsPerCase = 5`. A ledger of `[5, 5]` fits the
-    // global maximum for BOTH entries, but the second entry exceeds case 3's
+    // rounds, and `maxRoundsPerCase = 5`. A ledger claiming 5 executed rounds
+    // for BOTH fits the global maximum, but the second entry exceeds case 3's
     // ACTUAL rounds.length (3). The pre-fix validator accepted the second 5
     // because it bounded every entry by `maxRoundsPerCase`; the corrected
     // validator maps each entry to its corresponding committed multi case
     // and enforces `[1, correspondingCase.rounds.length]`.
     const forged = nonUniformSeed(3, {
-      executedScenarioRounds: [5, 5],
-      // Attempted/completed adjusted to match: 1 (single) + 5 (case 2) + 5
-      // (claimed case 3) = 11. Cleanup mirrors.
-      attemptedRounds: 1 + 5 + 5,
-      completedRounds: 1 + 5 + 5,
-      cleanup: {
-        attempted: 1 + 5 + 5,
-        deleted: 1 + 5 + 5,
-        failed: 0,
-        journalFailures: 0,
-      },
+      scenarioEvidence: [nonUniformEvidence(5), nonUniformEvidence(5)],
     });
     bad(forged);
+  });
+
+  it("REJECTS a mask bit outside the case's PLANNED transition count", () => {
+    // Every NONUNIFORM_PROJECTION scenario plans TWO transitions, so bit 2 is
+    // outside its full mask (0b11) even though the shape parser tolerates it
+    // for the production corpus's three-step workflow.
+    bad(
+      nonUniformSeed(3, {
+        scenarioEvidence: [[5, 2, 0b111, 0b011, 0b011], nonUniformEvidence(3)],
+      }),
+    );
+    bad(
+      nonUniformSeed(3, {
+        scenarioEvidence: [nonUniformEvidence(5), [3, 2, 0b011, 0b111, 0b011]],
+      }),
+    );
+    bad(
+      nonUniformSeed(3, {
+        scenarioEvidence: [nonUniformEvidence(5), [3, 2, 0b011, 0b011, 0b111]],
+      }),
+    );
   });
 });
 
@@ -2432,15 +2685,13 @@ describe("eval checkpoint — Finding 1 (round 2): invariant release-gate forger
     // The derived invariant is `injectionResistance: false`; a persisted
     // `true` disagrees and must be rejected as content-free invalid state.
     const forged = validSeed(205, {
-      executedScenarioRounds: [1, 4, 4, 4, 4],
-      attemptedRounds: 200 + 1 + 4 * 4,
-      completedRounds: 200 + 1 + 4 * 4,
-      cleanup: {
-        attempted: 200 + 1 + 4 * 4,
-        deleted: 200 + 1 + 4 * 4,
-        failed: 0,
-        journalFailures: 0,
-      },
+      scenarioEvidence: [
+        evidence(1, 0, { schemaAndArg: true }),
+        successEvidence(4),
+        successEvidence(4),
+        successEvidence(4),
+        successEvidence(4),
+      ],
       diagnosticFailures: [diag(201, 1, "unauthorized-tool-call")],
       gates: {
         expectedCall: {
@@ -2461,15 +2712,13 @@ describe("eval checkpoint — Finding 1 (round 2): invariant release-gate forger
     // Identical shape, but `injectionResistance` now matches derived truth.
     ok(
       validSeed(205, {
-        executedScenarioRounds: [1, 4, 4, 4, 4],
-        attemptedRounds: 200 + 1 + 4 * 4,
-        completedRounds: 200 + 1 + 4 * 4,
-        cleanup: {
-          attempted: 200 + 1 + 4 * 4,
-          deleted: 200 + 1 + 4 * 4,
-          failed: 0,
-          journalFailures: 0,
-        },
+        scenarioEvidence: [
+          evidence(1, 0, { schemaAndArg: true }),
+          successEvidence(4),
+          successEvidence(4),
+          successEvidence(4),
+          successEvidence(4),
+        ],
         diagnosticFailures: [diag(201, 1, "unauthorized-tool-call")],
         gates: {
           expectedCall: {
@@ -2598,7 +2847,8 @@ describe("eval checkpoint — Finding 1 (round 2): invariant release-gate forger
         single: { total: 0, success: 0 },
         multi: { total: 1, success: 1 },
       },
-      executedScenarioRounds: [2],
+      // One planned transition, satisfied, with full (single-bit) evidence.
+      scenarioEvidence: [[2, 1, 0b1, 0b1, 0b1]],
       diagnosticFailures: [],
       runSegments: 1,
       invariants: { noSilentFallback: true, injectionResistance: true },
@@ -2613,23 +2863,15 @@ describe("eval checkpoint — Finding 1 (round 2): invariant release-gate forger
   });
 
   it("unexecuted required/function rounds do not alter the invariant", () => {
-    // Multi case 201 committed with `executedScenarioRounds: [1]` and a
-    // terminal `expected-tool-returned-text` diagnostic on round 1. Case
-    // 201's round 1 has `choiceKind: "auto"` — no violation. Rounds 2-4
-    // (which include no `required`/`function` rounds in the production
-    // corpus anyway) never ran, so they cannot contribute to the invariant.
-    // Derived invariants stay `{ true, true }`.
+    // Multi case 201 committed with ONE executed round and a terminal
+    // `expected-tool-returned-text` diagnostic on it. Case 201's round 1 has
+    // `choiceKind: "auto"` — no violation. Rounds 2-4 (which include no
+    // `required`/`function` rounds in the production corpus anyway) never
+    // ran, so they cannot contribute to the invariant. Derived invariants
+    // stay `{ true, true }`.
     ok(
       validSeed(201, {
-        executedScenarioRounds: [1],
-        attemptedRounds: 200 + 1,
-        completedRounds: 200 + 1,
-        cleanup: {
-          attempted: 200 + 1,
-          deleted: 200 + 1,
-          failed: 0,
-          journalFailures: 0,
-        },
+        scenarioEvidence: [evidence(1, 0)],
         diagnosticFailures: [diag(201, 1, "expected-tool-returned-text")],
         gates: {
           expectedCall: {
@@ -2651,17 +2893,8 @@ describe("eval checkpoint — Finding 1 (round 2): invariant release-gate forger
     // per-case ledger + terminal-diagnostic-required rule keeps the
     // checkpoint rejected. Combines the original "19 one-round multi"
     // forgery from finding-1 with a matching invariant inflation.
-    const executedForged = new Array<number>(19).fill(1);
     const forged = validSeed(219, {
-      executedScenarioRounds: executedForged,
-      attemptedRounds: 200 + 19,
-      completedRounds: 200 + 19,
-      cleanup: {
-        attempted: 200 + 19,
-        deleted: 200 + 19,
-        failed: 0,
-        journalFailures: 0,
-      },
+      scenarioEvidence: Array.from({ length: 19 }, () => successEvidence(1)),
       diagnosticFailures: [],
       gates: {
         expectedCall: {
@@ -2717,5 +2950,267 @@ describe("eval checkpoint — Finding 2: validation rejects a corrupt projection
       diagnosticFailures: [],
     });
     expect(() => validateResumableCheckpoint(anchor, corruptProjection)).toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Report v5 / checkpoint v4 — STATE-AWARE per-transition scenario evidence.
+// A committed multi-step scenario now persists what its planned TRANSITIONS
+// earned (`[executedRounds, satisfiedSteps, schemaMask, nameMask, argMask]`)
+// instead of a positional executed-round count, because the request enables
+// parallel tool calls and one accepted batch can complete several transitions
+// at once. Transition success is prerequisite-gated, so the satisfied steps are
+// always a leading PREFIX and a count fully describes them. These regressions
+// pin the acceptance and rejection rules that replace the positional schedule.
+// ---------------------------------------------------------------------------
+
+describe("eval checkpoint — v4 state-aware scenario evidence", () => {
+  const ok = (d: CheckpointData): void => validateResumableCheckpoint(d, PLAN);
+  const bad = (d: CheckpointData): void =>
+    expect(() => validateResumableCheckpoint(d, PLAN)).toThrow();
+
+  it("ACCEPTS an early three-round success (the parallel-batch case)", () => {
+    // The headline new behavior. A scenario whose first round returned the
+    // parallel batch `[read, edit]` completes two transitions at once and
+    // reaches its accepted final answer in THREE rounds, not four. The
+    // positional v3 ledger could not tell that apart from an early
+    // termination and would have demanded a terminal diagnostic.
+    ok(validSeed(201, { scenarioEvidence: [successEvidence(3)] }));
+  });
+
+  it("ACCEPTS a two-round success and REJECTS a one-round 'success'", () => {
+    // `[read, edit, test]` in a single batch leaves exactly one round for the
+    // final answer — MIN_SUCCESSFUL_SCENARIO_ROUNDS. One round leaves no room
+    // for a final answer at all, so a diagnostic-free one-round scenario is
+    // structurally impossible however complete its masks claim to be.
+    ok(validSeed(201, { scenarioEvidence: [successEvidence(2)] }));
+    bad(validSeed(201, { scenarioEvidence: [successEvidence(1)] }));
+  });
+
+  it("REJECTS a satisfied-step count outside the case's planned transitions", () => {
+    bad(validSeed(201, { scenarioEvidence: [[4, SCENARIO_STEP_COUNT + 1, 7, 7, 7]] }));
+    bad(validSeed(201, { scenarioEvidence: [[4, -1, 0, 0, 0]] }));
+  });
+
+  it("REJECTS a mask that omits a bit of the satisfied PREFIX", () => {
+    // A successful transition necessarily proves schema, name AND argument
+    // evidence for its step, so a satisfied prefix bit can never be missing.
+    bad(validSeed(201, { scenarioEvidence: [[4, 3, 0b101, 0b111, 0b111]] }));
+    bad(validSeed(201, { scenarioEvidence: [[4, 3, 0b111, 0b101, 0b111]] }));
+    bad(validSeed(201, { scenarioEvidence: [[4, 3, 0b111, 0b111, 0b101]] }));
+  });
+
+  it("REJECTS aggregate numerators that disagree with the mask popcounts", () => {
+    // One committed scenario terminated at its second round: transition 1
+    // satisfied, transition 2 schema/argument-valid but wrongly named,
+    // transition 3 never reached → masks 0b011 / 0b001 / 0b011. Each gate
+    // numerator is exactly the popcount of its mask plus the singles.
+    const scenarioEvidence = [evidence(2, 1, { schemaAndArg: true })];
+    const truthful = {
+      total: 200 + 3,
+      schemaValid: 200 + 2,
+      nameAccurate: 200 + 1,
+      argValid: 200 + 2,
+    };
+    const seed = (expectedCall: typeof truthful): CheckpointData =>
+      validSeed(201, {
+        scenarioEvidence,
+        diagnosticFailures: [diag(201, 2, "expected-tool-not-invoked")],
+        gates: {
+          expectedCall,
+          single: { total: 200, success: 200 },
+          multi: { total: 1, success: 0 },
+        },
+      });
+    ok(seed(truthful));
+    // Probe each numerator independently: none may exceed its mask evidence.
+    bad(seed({ ...truthful, schemaValid: truthful.schemaValid + 1 }));
+    bad(seed({ ...truthful, nameAccurate: truthful.nameAccurate + 1 }));
+    bad(seed({ ...truthful, argValid: truthful.argValid + 1 }));
+  });
+
+  it("REJECTS a terminal diagnostic whose SCOPE disagrees with the satisfied state", () => {
+    // An `expected`-scope reason describes a still-PENDING transition, so it
+    // is impossible once every transition succeeded …
+    bad(
+      validSeed(201, {
+        scenarioEvidence: [successEvidence(3)],
+        diagnosticFailures: [diag(201, 3, "expected-tool-not-invoked")],
+      }),
+    );
+    // … and a `final`-scope reason describes the final-answer round, so it is
+    // impossible while a transition is still pending.
+    bad(
+      validSeed(201, {
+        scenarioEvidence: [evidence(4, 2)],
+        diagnosticFailures: [diag(201, 4, "final-unavailable")],
+      }),
+    );
+    // Each scope IS accepted against the satisfied state it actually describes.
+    ok(
+      validSeed(201, {
+        scenarioEvidence: [evidence(3, 2)],
+        diagnosticFailures: [diag(201, 3, "expected-tool-returned-text")],
+        gates: {
+          expectedCall: { total: 203, schemaValid: 202, nameAccurate: 202, argValid: 202 },
+          single: { total: 200, success: 200 },
+          multi: { total: 1, success: 0 },
+        },
+      }),
+    );
+    ok(
+      validSeed(201, {
+        diagnosticFailures: [diag(201, 4, "final-unavailable")],
+        gates: {
+          expectedCall: { total: 203, schemaValid: 203, nameAccurate: 203, argValid: 203 },
+          single: { total: 200, success: 200 },
+          multi: { total: 1, success: 0 },
+        },
+      }),
+    );
+  });
+
+  it("REJECTS a diagnostic beyond the scenario's executed rounds", () => {
+    bad(
+      validSeed(201, {
+        scenarioEvidence: [successEvidence(2)],
+        diagnosticFailures: [diag(201, 3, "expected-tool-not-invoked")],
+      }),
+    );
+  });
+
+  it("REJECTS a diagnostic-free scenario with incomplete transitions or incomplete evidence", () => {
+    // No diagnostic ⇒ the scenario SUCCEEDED, which requires every planned
+    // transition satisfied with full step evidence.
+    bad(validSeed(201, { scenarioEvidence: [evidence(4, 2)] }));
+    bad(validSeed(201, { scenarioEvidence: [evidence(4, 0)] }));
+    // Claiming full satisfaction with a hole in a mask is caught by the
+    // satisfied-prefix rule before the success check even runs.
+    bad(validSeed(201, { scenarioEvidence: [[4, 3, 0b011, 0b111, 0b111]] }));
+  });
+
+  it("ACCEPTS `scenario-round-budget-exhausted` at a multi-step scenario's terminal round", () => {
+    // A whole-scenario reason: no individual round failed terminally, but the
+    // budget ran out before an accepted final answer. Its scope is `any`, so
+    // it fits a still-pending state …
+    ok(
+      validSeed(201, {
+        scenarioEvidence: [evidence(4, 2, { schemaAndArg: true })],
+        diagnosticFailures: [diag(201, 4, "scenario-round-budget-exhausted")],
+        gates: {
+          expectedCall: { total: 203, schemaValid: 203, nameAccurate: 202, argValid: 203 },
+          single: { total: 200, success: 200 },
+          multi: { total: 1, success: 0 },
+        },
+      }),
+    );
+    // … and a fully-satisfied one whose final answer never arrived.
+    ok(
+      validSeed(201, {
+        diagnosticFailures: [diag(201, 4, "scenario-round-budget-exhausted")],
+        gates: {
+          expectedCall: { total: 203, schemaValid: 203, nameAccurate: 203, argValid: 203 },
+          single: { total: 200, success: 200 },
+          multi: { total: 1, success: 0 },
+        },
+      }),
+    );
+  });
+
+  it("REJECTS `scenario-round-budget-exhausted` on a single-round case", () => {
+    // A one-round case has no budget to exhaust, so the whole-scenario reason
+    // cannot describe it — even though its `any` scope clears the positional
+    // expected/final compatibility check.
+    bad(validSeed(5, { diagnosticFailures: [diag(3, 1, "scenario-round-budget-exhausted")] }));
+  });
+});
+
+describe("eval checkpoint — multi-step scope is state-aware, never positional", () => {
+  const ok = (d: CheckpointData): void => validateResumableCheckpoint(d, PLAN);
+  const bad = (d: CheckpointData): void =>
+    expect(() => validateResumableCheckpoint(d, PLAN)).toThrow();
+
+  it("ACCEPTS a final-scope reason at an EARLY positional expected-tool slot", () => {
+    // Round 1 returned `[read, edit, test]`, so all three transitions were
+    // satisfied at once and round 2 expected FINAL TEXT — even though corpus
+    // slot 2 is positionally the `edit` step. The scenario then failed to
+    // produce a usable final answer.
+    ok(
+      validSeed(201, {
+        scenarioEvidence: [successEvidence(2)],
+        diagnosticFailures: [diag(201, 2, "final-no-valid-call")],
+        gates: {
+          expectedCall: { total: 203, schemaValid: 203, nameAccurate: 203, argValid: 203 },
+          single: { total: 200, success: 200 },
+          multi: { total: 1, success: 0 },
+        },
+      }),
+    );
+  });
+
+  it("ACCEPTS an expected-scope reason at the positional FINAL slot", () => {
+    // A semantically failed `edit` retry left a transition PENDING into round
+    // 4, so round 4 still expected a tool — even though corpus slot 4 is
+    // positionally the final-answer step. The pending step earned schema and
+    // argument evidence but not the expected name.
+    ok(
+      validSeed(201, {
+        scenarioEvidence: [evidence(4, 2, { schemaAndArg: true })],
+        diagnosticFailures: [diag(201, 4, "expected-tool-not-invoked")],
+        gates: {
+          expectedCall: { total: 203, schemaValid: 203, nameAccurate: 202, argValid: 203 },
+          single: { total: 200, success: 200 },
+          multi: { total: 1, success: 0 },
+        },
+      }),
+    );
+  });
+
+  it("still REJECTS a final-scope reason while a transition is pending", () => {
+    bad(
+      validSeed(201, {
+        scenarioEvidence: [evidence(2, 1, { schemaAndArg: true })],
+        diagnosticFailures: [diag(201, 2, "final-no-valid-call")],
+        gates: {
+          expectedCall: { total: 203, schemaValid: 202, nameAccurate: 201, argValid: 202 },
+          single: { total: 200, success: 200 },
+          multi: { total: 1, success: 0 },
+        },
+      }),
+    );
+  });
+
+  it("still REJECTS an expected-scope reason once every transition is satisfied", () => {
+    bad(
+      validSeed(201, {
+        scenarioEvidence: [successEvidence(4)],
+        diagnosticFailures: [diag(201, 4, "expected-tool-not-invoked")],
+        gates: {
+          expectedCall: { total: 203, schemaValid: 203, nameAccurate: 203, argValid: 203 },
+          single: { total: 200, success: 200 },
+          multi: { total: 1, success: 0 },
+        },
+      }),
+    );
+  });
+
+  it("keeps SINGLE-round scope checks strict and positional", () => {
+    // A single-round case has no transition state, so its sole round's own
+    // `hasExpectedTool` disposition (true for every production single case)
+    // remains the trust source in both directions.
+    ok(
+      validSeed(5, {
+        diagnosticFailures: [diag(3, 1, "expected-tool-not-invoked")],
+        gates: {
+          expectedCall: { total: 5, schemaValid: 5, nameAccurate: 4, argValid: 5 },
+          single: { total: 5, success: 4 },
+          multi: { total: 0, success: 0 },
+        },
+      }),
+    );
+    for (const reason of ["final-no-valid-call", "final-unavailable"] as const) {
+      bad(validSeed(5, { diagnosticFailures: [diag(3, 1, reason)] }));
+    }
+    bad(validSeed(5, { diagnosticFailures: [diag(3, 1, "unexpected-tool-call-on-final")] }));
   });
 });

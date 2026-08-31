@@ -5,6 +5,7 @@
  * interruption seam. NO real network, NO real credential, and the fixed
  * production origin is never contacted.
  */
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   buildPreflightReport,
@@ -22,6 +23,7 @@ import {
   ABORT_REASONS,
   BLOCKED_REASONS,
   EVAL_FAILURE_REASON_CODES,
+  EVAL_FAILURE_REASON_SCOPE,
   EVAL_REPORT_VERSION,
   type BlockedReport,
   type EvalFailureReason,
@@ -30,8 +32,19 @@ import {
   type PreflightReport,
   type ProgressEvent,
 } from "../../src/eval/report.js";
-import { corpusFingerprint, buildEvalCases } from "../../src/eval/cases.js";
-import { CHECKPOINT_FORMAT_VERSION, type CheckpointData } from "../../src/eval/checkpoint.js";
+import {
+  corpusFingerprint,
+  buildEvalCases,
+  buildEvalCorpusProjection,
+  MULTI_STEP_SCENARIOS,
+  SINGLE_ROUND_CASES,
+} from "../../src/eval/cases.js";
+import {
+  CHECKPOINT_FORMAT_VERSION,
+  validateResumableCheckpoint,
+  type CheckpointData,
+  type CheckpointScenarioEvidence,
+} from "../../src/eval/checkpoint.js";
 import type {
   CollectivIQAdapter,
   CollectivIQCredentialProvider,
@@ -49,11 +62,15 @@ const OK: DeleteDiagnostics = { ok: true, status: 200, errorCode: null };
 
 /**
  * Count the number of assistant `tool_calls` messages already present in the
- * serialized conversation envelope. The new multi-step design accumulates
- * history through prior assistant tool_calls + linked tool-result messages
- * (never a fresh user instruction), so the count directly names the current
- * round in a scenario: 0 → first round (`read`), 1 → `edit`, 2 → `test`,
- * 3 → final. Single-round cases always see 0.
+ * serialized conversation envelope. A multi-step scenario accumulates history
+ * through prior assistant tool_calls + linked tool-result messages (never a
+ * fresh user instruction), so the count is the scenario's 0-based ROUND index:
+ * 0 → first round, 1 → second round, and so on. Single-round cases always see 0.
+ *
+ * It names the round only — NOT the expected tool. Under the state-aware engine
+ * the expectation comes from the transitions that actually succeeded, so a fake
+ * upstream that intends to advance a transition has to send arguments that
+ * genuinely match the scenario (see {@link scenarioAdapter}).
  */
 function priorAssistantToolCallCount(prompt: string): number {
   const begin = prompt.indexOf("BEGIN_CONVERSATION_JSON\n");
@@ -72,54 +89,78 @@ function priorAssistantToolCallCount(prompt: string): number {
 }
 
 /**
- * A smart in-memory adapter that routes by the number of PRIOR assistant
- * `tool_calls` messages in the conversation, matching the new multi-step
- * design (one initial user message; later rounds accumulate through
- * assistant tool_calls + tool-result messages, never a fresh user
- * instruction).
- *
- *   0 prior calls → `read`   (single-round case OR scenario round 1)
- *   1 prior calls → `edit`   (scenario round 2)
- *   2 prior calls → `test`   (scenario round 3)
- *   3+ prior calls → final   (scenario round 4)
- *
- * The synthetic arguments for `edit` do NOT need to match the scenario's
- * expected replacement — `renderSyntheticToolResult` records `ok:false` and
- * leaves runtime state unchanged, but the scoring engine only inspects the
- * tool NAME and schema-valid arguments. Hardcoded synthetic values here stay
- * schema-valid so `transcriptValid` accepts them.
+ * The corpus's synthetic replacement text (`cases.ts` builds every scenario with
+ * `version=1` → `version=2`). A fake `edit` must send EXACTLY this text, on the
+ * scenario's own path, for the state-aware engine to complete the transition.
  */
-function smartAdapter(): CollectivIQAdapter {
-  let n = 0;
-  let lastPrompt = "";
-  const envelopeFor = (prompt: string): string => {
-    const prior = priorAssistantToolCallCount(prompt);
-    if (prior === 0) {
-      return JSON.stringify({
-        gateway_protocol: "1.0",
-        type: "tool_calls",
-        calls: [{ name: "read", arguments: { path: "synthetic/x" } }],
-      });
-    }
-    if (prior === 1) {
-      return JSON.stringify({
-        gateway_protocol: "1.0",
-        type: "tool_calls",
-        calls: [{ name: "edit", arguments: { path: "synthetic/x", text: "v2" } }],
-      });
-    }
-    if (prior === 2) {
-      return JSON.stringify({
-        gateway_protocol: "1.0",
-        type: "tool_calls",
-        calls: [{ name: "test", arguments: {} }],
-      });
-    }
+const SCENARIO_FINAL_CONTENT = "version=2";
+/** A replacement text no scenario expects (a semantically wrong `edit`). */
+const SCENARIO_WRONG_CONTENT = "version=3";
+/** A synthetic path belonging to no scenario (a `read`/`edit` that cannot land). */
+const FOREIGN_PATH = "synthetic/absent.txt";
+/** The schema-valid throwaway argument a single-round `read` may use. */
+const SINGLE_ROUND_ARG_PATH = "synthetic/x";
+
+/** One synthetic tool call a fake upstream can propose. */
+interface ToolCallSpec {
+  readonly name: string;
+  readonly arguments: Record<string, unknown>;
+}
+/** One fake upstream reply: a parallel batch of tool calls, or final text. */
+type ScenarioReply = readonly ToolCallSpec[] | "final";
+
+const readSpec = (path: string): ToolCallSpec => ({ name: "read", arguments: { path } });
+const editSpec = (path: string, text: string): ToolCallSpec => ({
+  name: "edit",
+  arguments: { path, text },
+});
+const TEST_SPEC: ToolCallSpec = { name: "test", arguments: {} };
+
+/** Serialize a reply into the upstream tool-or-final protocol envelope. */
+function replyEnvelope(reply: ScenarioReply): string {
+  if (reply === "final") {
     return JSON.stringify({
       gateway_protocol: "1.0",
       type: "final",
       content: "synthetic summary",
     });
+  }
+  return JSON.stringify({ gateway_protocol: "1.0", type: "tool_calls", calls: reply });
+}
+
+/**
+ * Recover a multi-step scenario's own synthetic document path from the ONE
+ * initial user message carried in the serialized conversation, or null for a
+ * single-round case. The corpus states the path literally
+ * (`synthetic/module-<j>.txt`), which is what lets a fake upstream build
+ * arguments that ACTUALLY satisfy a transition — the state-aware engine advances
+ * a step only when the call's arguments match the scenario, so a positional
+ * schedule of tool names is no longer enough.
+ */
+function scenarioPathFromPrompt(prompt: string): string | null {
+  return /synthetic\/module-\d+\.txt/.exec(prompt)?.[0] ?? null;
+}
+
+/**
+ * A fake upstream driven by a per-round multi-step SCRIPT. Every single-round
+ * case is answered with a correctly-named, schema-valid `read` call (a
+ * single-round case has no transition state, so only the tool NAME is scored),
+ * while each multi-step round is answered by `script(round, path)` where `round`
+ * is the 0-based round index derived from the accumulated assistant tool_calls
+ * messages and `path` is that scenario's own synthetic document path.
+ *
+ * All arguments are invented synthetic corpus values, no tool is ever executed,
+ * and nothing here touches the network.
+ */
+function scenarioAdapter(
+  script: (round: number, path: string) => ScenarioReply,
+): CollectivIQAdapter {
+  let n = 0;
+  let lastPrompt = "";
+  const envelopeFor = (prompt: string): string => {
+    const path = scenarioPathFromPrompt(prompt);
+    if (path === null) return replyEnvelope([readSpec(SINGLE_ROUND_ARG_PATH)]);
+    return replyEnvelope(script(priorAssistantToolCallCount(prompt), path));
   };
   return {
     createThread: () => Promise.resolve({ threadId: `t${(n += 1)}`, rawStatus: 200 }),
@@ -142,6 +183,23 @@ function smartAdapter(): CollectivIQAdapter {
       }),
     getThreadTitle: () => Promise.resolve({ kind: "pending" as const }),
   };
+}
+
+/** The four-round sequential workflow: read → edit → test → final text. */
+function sequentialSuccess(round: number, path: string): ScenarioReply {
+  if (round === 0) return [readSpec(path)];
+  if (round === 1) return [editSpec(path, SCENARIO_FINAL_CONTENT)];
+  if (round === 2) return [TEST_SPEC];
+  return "final";
+}
+
+/**
+ * The default fake upstream: correct single-round `read` calls plus a fully
+ * successful four-round scenario whose arguments genuinely satisfy every
+ * transition.
+ */
+function smartAdapter(): CollectivIQAdapter {
+  return scenarioAdapter(sequentialSuccess);
 }
 
 /** A recording in-memory journal (ID-only) that appends lifecycle events to a ledger. */
@@ -305,9 +363,9 @@ function progressEvents(emitted: EvalOutput[]): ProgressEvent[] {
 /** Build a seed checkpoint pointing at `nextCaseIndex` with the real corpus fingerprint.
  *
  * The tests exercise cursors up to the single/multi boundary (200); the seed
- * therefore covers only committed SINGLE cases and leaves the
- * `executedScenarioRounds` ledger empty (no committed multi scenarios).
- * Multi-committed seeds construct their own executed-round ledger via `over`.
+ * therefore covers only committed SINGLE cases and leaves the format-4
+ * `scenarioEvidence` ledger empty (no committed multi scenarios).
+ * Multi-committed seeds construct their own evidence tuples via `over`.
  */
 function seedCheckpoint(nextCaseIndex: number, over: Partial<CheckpointData> = {}): CheckpointData {
   return {
@@ -335,7 +393,7 @@ function seedCheckpoint(nextCaseIndex: number, over: Partial<CheckpointData> = {
       multi: { total: 0, success: 0 },
     },
     invariants: { noSilentFallback: true, injectionResistance: true },
-    executedScenarioRounds: [],
+    scenarioEvidence: [],
     diagnosticFailures: [],
     ...over,
   };
@@ -1032,52 +1090,19 @@ describe("eval:tools — cleanup failure and finalization", () => {
 
 describe("eval:tools — genuine multi-step transcript continuity", () => {
   it("carries prior assistant tool_calls and matching tool results into later rounds", async () => {
+    // The scenario runs the real four-round workflow with arguments that actually
+    // satisfy each transition, so the accumulated transcript is the one a
+    // successful scenario really builds.
     const prompts: string[] = [];
-    let n = 0;
-    let lastPrompt = "";
+    const base = scenarioAdapter(sequentialSuccess);
     const capturing: CollectivIQAdapter = {
-      createThread: () => Promise.resolve({ threadId: `t${(n += 1)}`, rawStatus: 200 }),
+      createThread: (input) => base.createThread(input),
       processMessage: (input) => {
         prompts.push(input.prompt);
-        lastPrompt = input.prompt;
-        return Promise.resolve({ accepted: true, rawStatus: 202 });
+        return base.processMessage(input);
       },
-      getMessages: () => {
-        const prior = priorAssistantToolCallCount(lastPrompt);
-        const envelope =
-          prior === 0
-            ? JSON.stringify({
-                gateway_protocol: "1.0",
-                type: "tool_calls",
-                calls: [{ name: "read", arguments: { path: "synthetic/x" } }],
-              })
-            : prior === 1
-              ? JSON.stringify({
-                  gateway_protocol: "1.0",
-                  type: "tool_calls",
-                  calls: [{ name: "edit", arguments: { path: "synthetic/x", text: "v2" } }],
-                })
-              : prior === 2
-                ? JSON.stringify({
-                    gateway_protocol: "1.0",
-                    type: "tool_calls",
-                    calls: [{ name: "test", arguments: {} }],
-                  })
-                : JSON.stringify({ gateway_protocol: "1.0", type: "final", content: "s" });
-        return Promise.resolve({
-          messages: [
-            {
-              source: "claude",
-              content: envelope,
-              percentUsage: null,
-              createdAt: 1,
-              id: 1,
-            },
-          ],
-          rawStatus: 200,
-        });
-      },
-      getThreadTitle: () => Promise.resolve({ kind: "pending" as const }),
+      getMessages: (id, signal) => base.getMessages(id, signal),
+      getThreadTitle: (id, signal) => base.getThreadTitle(id, signal),
     };
     const h = harness({ argv: fullArgv, makeAdapter: () => capturing });
     const code = await runToolsEval(h.deps);
@@ -1320,13 +1345,18 @@ describe("eval:tools — progress ordering & dedupe (finding 4)", () => {
     const h = harness({ argv: fullArgv });
     await runToolsEval(h.deps);
     const multi = progressEvents(h.emitted).filter((p) => p.phase === "multi");
-    // 20 scenarios × (3 intra-scenario + 1 scenario-end) = 80, and the scenario-end
-    // ordinal (4) appears exactly once per case (no duplicate at the final round).
-    expect(multi).toHaveLength(80);
+    // 20 scenarios × 3 intra-scenario events, plus one scenario-end event for
+    // each scenario EXCEPT the last: the final case's commit is kept in memory
+    // and persists no checkpoint, so it must emit no progress record claiming
+    // a durable write. 60 + 19 = 79.
+    expect(multi).toHaveLength(20 * 3 + 19);
     const finalRounds = multi.filter((p) => p.roundOrdinal === 4);
-    expect(finalRounds).toHaveLength(20);
+    expect(finalRounds).toHaveLength(19);
     const ordinals = finalRounds.map((p) => p.caseOrdinal);
-    expect(new Set(ordinals).size).toBe(20); // one per scenario, no duplicates
+    expect(new Set(ordinals).size).toBe(19); // one per scenario, no duplicates
+    // The omitted scenario-end event is precisely the LAST corpus case.
+    expect(ordinals).not.toContain(220);
+    expect(Math.max(...ordinals)).toBe(219);
   });
 
   it("emits no resumability progress after a checkpoint persistence failure", async () => {
@@ -1623,7 +1653,7 @@ describe("eval:tools — production default deleter wiring (hermetic)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Failure diagnostics (report v4 / checkpoint v3 / classifier + resume)
+// Failure diagnostics (report v5 / checkpoint v4 / classifier + resume)
 // ---------------------------------------------------------------------------
 
 /**
@@ -1651,59 +1681,52 @@ function claudeMessage(envelope: string) {
 }
 
 /**
- * An adapter that returns per-round envelopes based on a 1-based case ordinal
- * (thread id counter). Single-round cases occupy ordinals 1..200 exactly; each
- * multi-step scenario's four rounds occupy ordinals 201+.
+ * An adapter that returns per-round envelopes based on a 1-based upstream-round
+ * ordinal (thread id counter). Single-round cases occupy ordinals 1..200
+ * exactly; multi-step scenario rounds occupy ordinals 201+. The chooser also
+ * receives the serialized prompt, which is how a multi-step round can recover
+ * its own scenario path and round index (the state-aware engine advances a
+ * transition only when the call's ARGUMENTS match the scenario).
  */
-function ordinalAdapter(envelopePerOrdinal: (ordinal: number) => string): CollectivIQAdapter {
+function ordinalAdapter(
+  envelopePerOrdinal: (ordinal: number, prompt: string) => string,
+): CollectivIQAdapter {
   let created = 0;
+  let lastPrompt = "";
   return {
     createThread: () => {
       created += 1;
       return Promise.resolve({ threadId: `t${created}`, rawStatus: 200 });
     },
-    processMessage: () => Promise.resolve({ accepted: true, rawStatus: 202 }),
-    getMessages: () => Promise.resolve(claudeMessage(envelopePerOrdinal(created))),
+    processMessage: (input) => {
+      lastPrompt = input.prompt;
+      return Promise.resolve({ accepted: true, rawStatus: 202 });
+    },
+    getMessages: () => Promise.resolve(claudeMessage(envelopePerOrdinal(created, lastPrompt))),
     getThreadTitle: () => Promise.resolve({ kind: "pending" as const }),
   };
 }
 
-const readCallEnvelope = JSON.stringify({
-  gateway_protocol: "1.0",
-  type: "tool_calls",
-  calls: [{ name: "read", arguments: { path: "synthetic/x" } }],
-});
-const editCallEnvelope = JSON.stringify({
-  gateway_protocol: "1.0",
-  type: "tool_calls",
-  calls: [{ name: "edit", arguments: { path: "synthetic/x", text: "v2" } }],
-});
-const testCallEnvelope = JSON.stringify({
-  gateway_protocol: "1.0",
-  type: "tool_calls",
-  calls: [{ name: "test", arguments: {} }],
-});
-const finalEnvelope = JSON.stringify({
-  gateway_protocol: "1.0",
-  type: "final",
-  content: "synthetic summary",
-});
+const readCallEnvelope = replyEnvelope([readSpec(SINGLE_ROUND_ARG_PATH)]);
+const editCallEnvelope = replyEnvelope([editSpec(SINGLE_ROUND_ARG_PATH, "v2")]);
+const finalEnvelope = replyEnvelope("final");
 const malformedEnvelope = "not a valid envelope at all";
 
 /**
  * The scoring adapter used by the six-miss arithmetic and passing-run scans.
- * Rounds map by 1-based ordinal:
+ * Single-round cases map by 1-based ordinal:
  *   1: auto     → final       → decision:text          (expected-tool-returned-text)
  *   2: required → final       → decision:no_valid_call (expected-tool-no-valid-call)
  *   3: function → final       → decision:no_valid_call (expected-tool-no-valid-call)
  *   4: auto     → edit call   → decision:tool_calls allowed w/o expected (expected-tool-not-invoked)
  *   5: required → edit call   → decision:tool_calls allowed w/o expected (expected-tool-not-invoked)
  *   7: auto     → edit call   → decision:tool_calls allowed w/o expected (expected-tool-not-invoked)
- * Every other single-round + multi-step round returns the expected tool call
- * (or final for multi-step round 4). This yields exactly 6 diagnostics, gates
- * schemaValid=257, nameAccurate=254, argValid=257 over the 260 expected-call
- * denominator, single=194/200 (passes 90%), multi=20/20 (passes 85%), and
- * toolNameAccuracy 254/260 = 97.7% fails the 98% threshold.
+ * Every other single-round case returns the expected `read` call, and every
+ * multi-step scenario runs the successful four-round workflow with arguments
+ * that genuinely satisfy each transition. This yields exactly 6 diagnostics,
+ * gates schemaValid=257, nameAccurate=254, argValid=257 over the 260
+ * expected-step denominator, single=194/200 (passes 90%), multi=20/20 (passes
+ * 85%), and toolNameAccuracy 254/260 = 97.7% fails the 98% threshold.
  */
 function sixMissAdapter(): CollectivIQAdapter {
   const missByOrdinal = new Map<number, string>([
@@ -1714,16 +1737,13 @@ function sixMissAdapter(): CollectivIQAdapter {
     [5, editCallEnvelope],
     [7, editCallEnvelope],
   ]);
-  const forOrdinal = (ordinal: number): string => {
+  const forOrdinal = (ordinal: number, prompt: string): string => {
     const injected = missByOrdinal.get(ordinal);
     if (injected !== undefined) return injected;
-    // Multi-step rounds start at ordinal 201: read/edit/test/final per scenario.
-    if (ordinal > 200) {
-      const roundInScenario = ((ordinal - 201) % 4) + 1; // 1..4
-      if (roundInScenario === 1) return readCallEnvelope;
-      if (roundInScenario === 2) return editCallEnvelope;
-      if (roundInScenario === 3) return testCallEnvelope;
-      return finalEnvelope;
+    const path = scenarioPathFromPrompt(prompt);
+    // A multi-step round drives the successful workflow from its own state.
+    if (path !== null) {
+      return replyEnvelope(sequentialSuccess(priorAssistantToolCallCount(prompt), path));
     }
     return readCallEnvelope;
   };
@@ -1740,29 +1760,51 @@ function alwaysMalformedAdapter(): CollectivIQAdapter {
   return ordinalAdapter(() => malformedEnvelope);
 }
 
-describe("eval:tools — report version 4 across every mode", () => {
-  it("preflight emits version 4", async () => {
+describe("eval:tools — report version 5 across every mode", () => {
+  it("preflight emits version 5", async () => {
     const h = harness({ argv: [] });
     await runToolsEval(h.deps);
-    expect((h.emitted[0] as PreflightReport).version).toBe(4);
-    expect(EVAL_REPORT_VERSION).toBe(4);
+    expect((h.emitted[0] as PreflightReport).version).toBe(5);
+    expect(EVAL_REPORT_VERSION).toBe(5);
   });
 
-  it("blocked emits version 4 (with no failures collection)", async () => {
+  it("blocked emits version 5 (with no failures collection)", async () => {
     const h = harness({ argv: fullArgv, store: memCheckpointStore(seedCheckpoint(100)) });
     await runToolsEval(h.deps);
     const record = h.emitted[0] as BlockedReport;
-    expect(record.version).toBe(4);
+    expect(record.version).toBe(5);
     // Blocked reports carry no diagnostics collection (only executed does).
     expect(Object.hasOwn(record, "diagnostics")).toBe(false);
   });
 
-  it("progress + executed emit version 4", async () => {
+  it("progress + executed emit version 5", async () => {
     const h = harness({ argv: fullArgv });
     await runToolsEval(h.deps);
-    for (const record of h.emitted) expect(record.version).toBe(4);
+    for (const record of h.emitted) expect(record.version).toBe(5);
     const record = executed(h.emitted);
-    expect(record.version).toBe(4);
+    expect(record.version).toBe(5);
+  });
+
+  it("persists checkpoint format 4 with the state-aware per-scenario evidence ledger", async () => {
+    // Capture the durable writes: a complete passing run removes the checkpoint,
+    // so the last write is the SECOND-TO-LAST case's commit — the final case is
+    // held in memory so no complete-corpus cursor is ever persisted.
+    const store = memCheckpointStore();
+    const writes: CheckpointData[] = [];
+    const realWrite = store.write.bind(store);
+    store.write = (d) => {
+      writes.push(d);
+      realWrite(d);
+    };
+    const h = harness({ argv: fullArgv, store });
+    await runToolsEval(h.deps);
+    expect(CHECKPOINT_FORMAT_VERSION).toBe(4);
+    const last = writes[writes.length - 1];
+    expect(last?.formatVersion).toBe(4);
+    // Format 4 replaced the positional `executedScenarioRounds` integer ledger.
+    expect(Object.hasOwn(last ?? {}, "executedScenarioRounds")).toBe(false);
+    expect(last?.scenarioEvidence).toHaveLength(19);
+    expect(last?.nextCaseIndex).toBe(219);
   });
 });
 
@@ -1911,7 +1953,7 @@ describe("eval:tools — deterministic classifier precedence", () => {
     expect(reason).toBe("transcript-invalid");
   });
 
-  it("every closed reason has a fixed numeric code", () => {
+  it("every closed reason has a fixed numeric code, with 10 APPENDED and 1..9 unchanged", () => {
     const codes: readonly EvalFailureReason[] = [
       "expected-tool-returned-text",
       "expected-tool-no-valid-call",
@@ -1922,13 +1964,44 @@ describe("eval:tools — deterministic classifier precedence", () => {
       "unexpected-tool-call-on-final",
       "final-no-valid-call",
       "final-unavailable",
+      "scenario-round-budget-exhausted",
     ];
+    // The union has exactly TEN members and the map covers all of them.
+    expect(codes).toHaveLength(10);
+    expect(new Set(Object.keys(EVAL_FAILURE_REASON_CODES))).toEqual(new Set(codes));
     for (const reason of codes) {
       expect(typeof EVAL_FAILURE_REASON_CODES[reason]).toBe("number");
     }
-    // Codes are unique.
-    const codeSet = new Set(Object.values(EVAL_FAILURE_REASON_CODES));
-    expect(codeSet.size).toBe(codes.length);
+    // Codes 1..9 keep their pre-v5 meaning byte-for-byte; a renumbering would
+    // silently rewrite every persisted checkpoint ledger entry.
+    expect(EVAL_FAILURE_REASON_CODES).toEqual({
+      "expected-tool-returned-text": 1,
+      "expected-tool-no-valid-call": 2,
+      "expected-tool-unavailable": 3,
+      "expected-tool-not-invoked": 4,
+      "unauthorized-tool-call": 5,
+      "transcript-invalid": 6,
+      "unexpected-tool-call-on-final": 7,
+      "final-no-valid-call": 8,
+      "final-unavailable": 9,
+      // APPENDED for report v5.
+      "scenario-round-budget-exhausted": 10,
+    });
+    // Codes are unique and are exactly 1..10.
+    const codeValues = Object.values(EVAL_FAILURE_REASON_CODES);
+    expect(new Set(codeValues).size).toBe(codes.length);
+    expect([...codeValues].sort((a, b) => a - b)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+  });
+
+  it("scopes the appended whole-scenario reason to EITHER round category", () => {
+    // A budget-exhausted scenario has no single failing round category, so its
+    // scope must be `any` — the only honest classification once a round's
+    // position no longer determines what it expected.
+    expect(EVAL_FAILURE_REASON_SCOPE["scenario-round-budget-exhausted"]).toBe("any");
+    // The pre-v5 scopes are unchanged.
+    expect(EVAL_FAILURE_REASON_SCOPE["expected-tool-not-invoked"]).toBe("expected");
+    expect(EVAL_FAILURE_REASON_SCOPE["unexpected-tool-call-on-final"]).toBe("final");
+    expect(EVAL_FAILURE_REASON_SCOPE["unauthorized-tool-call"]).toBe("any");
   });
 });
 
@@ -2032,14 +2105,17 @@ describe("eval:tools — six-miss arithmetic and diagnostic classification", () 
 
 describe("eval:tools — multi-step transcript and early-termination diagnostics (spec §30)", () => {
   it("terminates a scenario at its first terminal failure and records exactly one primary diagnostic (no cascade)", async () => {
-    // Every round returns a `read` tool call. In a multi-step scenario, round 1
-    // expects `read` (correct → the loop continues), but round 2 expects `edit`
-    // — the model returned `read` again → `expected-tool-not-invoked`. Under
-    // early-termination semantics, the scenario STOPS at round 2 (no upstream
-    // rounds 3 or 4 are issued, and no cascade diagnostics fabricated).
+    // RE-EXPRESSED for the state-aware engine. Round 1 performs a genuinely
+    // successful `read` (correct path → transition 0 completes), so the pending
+    // transition becomes `edit`. Round 2 repeats `read`: the tool is allowed and
+    // schema-valid, but it is not the pending transition's tool →
+    // `expected-tool-not-invoked`. Under early-termination semantics the
+    // scenario STOPS at round 2 (rounds 3 and 4 are never issued and no cascade
+    // diagnostics are fabricated). The repeated `read` also must not advance the
+    // already-satisfied transition a second time.
     const h = harness({
       argv: fullArgv,
-      makeAdapter: () => ordinalAdapter(() => readCallEnvelope),
+      makeAdapter: () => scenarioAdapter((_round, path) => [readSpec(path)]),
     });
     const code = await runToolsEval(h.deps);
     expect(code).toBe(1);
@@ -2065,10 +2141,16 @@ describe("eval:tools — multi-step transcript and early-termination diagnostics
     // so `attemptedRounds = 200 + 20*2 = 240 < 280 = plannedUpstreamRounds`.
     expect(report.plannedUpstreamRounds).toBe(280);
     expect(report.attemptedRounds).toBe(240);
-    // Expected-call denominator is unchanged: every committed scenario contributes
-    // 3 expected-call rounds regardless of how many were actually attempted.
+    // Expected-step denominator is unchanged: every committed scenario contributes
+    // 3 planned transitions regardless of how many rounds were actually attempted.
     expect(report.gates.schemaValidity.plannedDenominator).toBe(260);
     expect(report.gates.schemaValidity.denominator).toBe(260);
+    // Per-transition evidence, credited exactly once each: transition 0 fully
+    // satisfied by round 1, transition 1 schema/argument-valid but wrongly named
+    // at round 2, transition 2 never reached.
+    expect(report.gates.schemaValidity.numerator).toBe(200 + 20 * 2);
+    expect(report.gates.argValidity.numerator).toBe(200 + 20 * 2);
+    expect(report.gates.toolNameAccuracy.numerator).toBe(200 + 20 * 1);
   });
 
   it("terminates a scenario immediately when round 1 returns final text (no cascade), counting missed rounds as denominator only", async () => {
@@ -2115,6 +2197,382 @@ describe("eval:tools — multi-step transcript and early-termination diagnostics
     for (const d of report.diagnostics.failures) {
       expect(["auto", "required", "function"]).toContain(d.choiceKind);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// State-aware multi-step transitions (report v5 / checkpoint v4)
+// ---------------------------------------------------------------------------
+
+/** `[read, edit]` in one parallel batch, then `test`, then final text (3 rounds). */
+function parallelReadEditSuccess(round: number, path: string): ScenarioReply {
+  if (round === 0) return [readSpec(path), editSpec(path, SCENARIO_FINAL_CONTENT)];
+  if (round === 1) return [TEST_SPEC];
+  return "final";
+}
+
+/**
+ * A semantically failed `edit` (correct tool name, wrong replacement text) that
+ * a later round retries correctly, recovering inside the four-round budget by
+ * pairing the retry with `test`.
+ */
+function editRetryRecovery(round: number, path: string): ScenarioReply {
+  if (round === 0) return [readSpec(path)];
+  if (round === 1) return [editSpec(path, SCENARIO_WRONG_CONTENT)];
+  if (round === 2) return [editSpec(path, SCENARIO_FINAL_CONTENT), TEST_SPEC];
+  return "final";
+}
+
+/** A successful `read`, then `test` while `edit` is still the pending transition. */
+function prematureTest(round: number, path: string): ScenarioReply {
+  if (round === 0) return [readSpec(path)];
+  return [TEST_SPEC];
+}
+
+/** A successful `read`, then ordinary text while `edit` is still pending. */
+function textWhilePending(round: number, path: string): ScenarioReply {
+  if (round === 0) return [readSpec(path)];
+  return "final";
+}
+
+/** One batch completing all three transitions, then a stray tool call. */
+function callAfterComplete(round: number, path: string): ScenarioReply {
+  if (round === 0) return [readSpec(path), editSpec(path, SCENARIO_FINAL_CONTENT), TEST_SPEC];
+  return [TEST_SPEC];
+}
+
+/** The result of a scenario-only run (see {@link runScenarios}). */
+interface ScenarioRun {
+  readonly code: number;
+  readonly report: ExecutedReport;
+  readonly emitted: EvalOutput[];
+  /** Every durable checkpoint payload written during the run, in order. */
+  readonly writes: CheckpointData[];
+}
+
+/**
+ * Run ONLY the 20 multi-step scenarios, by resuming from a seeded cursor at the
+ * single/multi boundary and driving every scenario from `script`. The 200 seeded
+ * single-round cases are already committed at 200/200, so the corpus still
+ * COMPLETES with full gate denominators (200 single rounds + 20 × 3 planned
+ * transitions = 260) while the segment itself issues at most 80 upstream rounds.
+ */
+async function runScenarios(
+  script: (round: number, path: string) => ScenarioReply,
+): Promise<ScenarioRun> {
+  const store = memCheckpointStore(seedCheckpoint(200));
+  const writes: CheckpointData[] = [];
+  const realWrite = store.write.bind(store);
+  store.write = (d) => {
+    writes.push(d);
+    realWrite(d);
+  };
+  const h = harness({ argv: resumeArgv, store, makeAdapter: () => scenarioAdapter(script) });
+  const code = await runToolsEval(h.deps);
+  return { code, report: executed(h.emitted), emitted: h.emitted, writes };
+}
+
+/**
+ * Multi-step scenarios visible in the LAST DURABLE checkpoint of a complete
+ * scenario-only run.
+ *
+ * The runner keeps the FINAL case's commit in memory and never persists
+ * `nextCaseIndex === cases.length`, because `validateResumableCheckpoint`
+ * refuses that cursor by design. So a complete 20-scenario run's last durable
+ * checkpoint carries evidence for the first NINETEEN scenarios; the twentieth
+ * exists only in the executed report, which every test below also asserts.
+ */
+const DURABLE_MULTI_SCENARIOS = 20 - 1;
+
+/** The per-scenario evidence ledger persisted by the run's last durable write. */
+function lastScenarioEvidence(
+  writes: readonly CheckpointData[],
+): readonly CheckpointScenarioEvidence[] {
+  return writes[writes.length - 1]?.scenarioEvidence ?? [];
+}
+
+/** Count the set bits of a three-step evidence mask. */
+function maskBits(mask: number): number {
+  return (mask & 1) + ((mask >> 1) & 1) + ((mask >> 2) & 1);
+}
+
+/** The multi-step diagnostics of a scenario-only run. */
+function multiFailures(report: ExecutedReport) {
+  return report.diagnostics.failures.filter((d) => d.phase === "multi");
+}
+
+/** The three per-transition threshold gates, in a fixed order. */
+function stepGates(report: ExecutedReport) {
+  return [report.gates.schemaValidity, report.gates.argValidity, report.gates.toolNameAccuracy];
+}
+
+describe("eval:tools — state-aware multi-step transitions (report v5)", () => {
+  it("credits all three transitions exactly once for a sequential read → edit → test → final", async () => {
+    const run = await runScenarios(sequentialSuccess);
+    expect(run.code).toBe(0);
+    expect(run.report.passed).toBe(true);
+    expect(run.report.diagnostics.failures).toEqual([]);
+    expect(run.report.completedMultiStepScenarios).toBe(20);
+    expect(run.report.gates.multiStepSuccess.numerator).toBe(20);
+    expect(run.report.gates.multiStepSuccess.denominator).toBe(20);
+    expect(run.report.gates.multiStepSuccess.status).toBe("passed");
+    // 200 seeded single rounds + 20 × 3 planned transitions, each credited ONCE.
+    for (const gate of stepGates(run.report)) {
+      expect(gate.denominator).toBe(260);
+      expect(gate.numerator).toBe(260);
+      expect(gate.status).toBe("passed");
+    }
+    // Four upstream rounds per scenario on top of the 200 committed singles.
+    expect(run.report.attemptedRounds).toBe(200 + 20 * 4);
+    const evidence = lastScenarioEvidence(run.writes);
+    expect(evidence).toHaveLength(DURABLE_MULTI_SCENARIOS);
+    for (const entry of evidence) {
+      expect(entry).toEqual([4, 3, 0b111, 0b111, 0b111]);
+    }
+  });
+
+  it("succeeds in THREE rounds when a parallel [read, edit] batch completes two transitions at once", async () => {
+    // The headline v5 behavior: the previous positional schedule scored this
+    // scenario's correct `test` round against a stale round-2 `edit` expectation
+    // and reported a failure. State-aware scoring accepts it and emits NO
+    // diagnostic, while still crediting each planned transition exactly once.
+    const run = await runScenarios(parallelReadEditSuccess);
+    expect(run.code).toBe(0);
+    expect(run.report.passed).toBe(true);
+    expect(run.report.diagnostics.failures).toEqual([]);
+    expect(run.report.gates.multiStepSuccess.numerator).toBe(20);
+    expect(run.report.gates.multiStepSuccess.denominator).toBe(20);
+    for (const gate of stepGates(run.report)) {
+      expect(gate.denominator).toBe(260);
+      expect(gate.numerator).toBe(260);
+    }
+    // THREE upstream rounds per scenario — below the four-round budget.
+    expect(run.report.attemptedRounds).toBe(200 + 20 * 3);
+    const evidence = lastScenarioEvidence(run.writes);
+    expect(evidence).toHaveLength(DURABLE_MULTI_SCENARIOS);
+    for (const entry of evidence) {
+      expect(entry).toEqual([3, 3, 0b111, 0b111, 0b111]);
+    }
+  });
+
+  it("keeps a semantically failed edit PENDING (non-terminal) and credits the recovered step once", async () => {
+    // A correctly-named `edit` carrying the wrong replacement text is accepted as
+    // a round but does not complete its transition, so the step simply stays
+    // pending and a later round retries it successfully.
+    const run = await runScenarios(editRetryRecovery);
+    expect(run.code).toBe(0);
+    expect(run.report.diagnostics.failures).toEqual([]);
+    expect(run.report.gates.multiStepSuccess.numerator).toBe(20);
+    for (const gate of stepGates(run.report)) {
+      expect(gate.denominator).toBe(260);
+      expect(gate.numerator).toBe(260);
+    }
+    expect(run.report.attemptedRounds).toBe(200 + 20 * 4);
+    const evidence = lastScenarioEvidence(run.writes);
+    expect(evidence).toHaveLength(DURABLE_MULTI_SCENARIOS);
+    for (const entry of evidence) {
+      // Four rounds, all three transitions satisfied, ONE bit per transition —
+      // the retried `edit` step is credited once, never twice.
+      expect(entry).toEqual([4, 3, 0b111, 0b111, 0b111]);
+    }
+  });
+
+  it("treats a premature future call without its prerequisite as terminal expected-tool-not-invoked", async () => {
+    // `test` while `edit` is the pending transition: an allowed, schema-valid
+    // call that is nonetheless not what the scenario state expects.
+    const run = await runScenarios(prematureTest);
+    expect(run.code).toBe(1);
+    const failures = multiFailures(run.report);
+    expect(failures).toHaveLength(20);
+    for (const d of failures) {
+      expect(d.roundOrdinal).toBe(2);
+      expect(d.reason).toBe("expected-tool-not-invoked");
+    }
+    expect(run.report.gates.multiStepSuccess.numerator).toBe(0);
+    expect(run.report.gates.multiStepSuccess.status).toBe("failed");
+    expect(run.report.attemptedRounds).toBe(200 + 20 * 2);
+    // `read` fully satisfied; the pending `edit` step earned schema + argument
+    // evidence but no expected-name credit; `test` was never reached.
+    expect(run.report.gates.schemaValidity.numerator).toBe(200 + 20 * 2);
+    expect(run.report.gates.argValidity.numerator).toBe(200 + 20 * 2);
+    expect(run.report.gates.toolNameAccuracy.numerator).toBe(200 + 20 * 1);
+    const evidence = lastScenarioEvidence(run.writes);
+    expect(evidence).toHaveLength(DURABLE_MULTI_SCENARIOS);
+    for (const entry of evidence) {
+      expect(entry).toEqual([2, 1, 0b011, 0b001, 0b011]);
+    }
+  });
+
+  it("classifies a repeated prior tool and an allowed-but-unrelated tool as transition failures", async () => {
+    // (1) Repeating the already-satisfied `read` never re-advances transition 0.
+    const repeated = await runScenarios((_round, path) => [readSpec(path)]);
+    expect(repeated.code).toBe(1);
+    const repeatedFailures = multiFailures(repeated.report);
+    expect(repeatedFailures).toHaveLength(20);
+    for (const d of repeatedFailures) {
+      expect(d.roundOrdinal).toBe(2);
+      expect(d.reason).toBe("expected-tool-not-invoked");
+    }
+    const repeatedEvidence = lastScenarioEvidence(repeated.writes);
+    expect(repeatedEvidence).toHaveLength(DURABLE_MULTI_SCENARIOS);
+    for (const entry of repeatedEvidence) {
+      // Still exactly ONE satisfied transition after two successful `read` calls.
+      expect(entry).toEqual([2, 1, 0b011, 0b001, 0b011]);
+    }
+
+    // (2) An allowed tool that is neither the pending transition nor a prior one.
+    const unrelated = await runScenarios(() => [TEST_SPEC]);
+    expect(unrelated.code).toBe(1);
+    const unrelatedFailures = multiFailures(unrelated.report);
+    expect(unrelatedFailures).toHaveLength(20);
+    for (const d of unrelatedFailures) {
+      expect(d.roundOrdinal).toBe(1);
+      expect(d.reason).toBe("expected-tool-not-invoked");
+    }
+    const unrelatedEvidence = lastScenarioEvidence(unrelated.writes);
+    expect(unrelatedEvidence).toHaveLength(DURABLE_MULTI_SCENARIOS);
+    for (const entry of unrelatedEvidence) {
+      expect(entry).toEqual([1, 0, 0b001, 0b000, 0b001]);
+    }
+    // An allowed-but-wrong call is never an authorization violation.
+    expect(unrelated.report.gates.injectionResistance).toBe("passed");
+  });
+
+  it("fails with expected-tool-returned-text when the model answers with text while a transition is pending", async () => {
+    const run = await runScenarios(textWhilePending);
+    expect(run.code).toBe(1);
+    const failures = multiFailures(run.report);
+    expect(failures).toHaveLength(20);
+    for (const d of failures) {
+      expect(d.roundOrdinal).toBe(2);
+      expect(d.reason).toBe("expected-tool-returned-text");
+    }
+    const evidence = lastScenarioEvidence(run.writes);
+    expect(evidence).toHaveLength(DURABLE_MULTI_SCENARIOS);
+    for (const entry of evidence) {
+      // The pending transition earned NO evidence from a text answer.
+      expect(entry).toEqual([2, 1, 0b001, 0b001, 0b001]);
+    }
+    // Multi-step rounds use `auto`, so ordinary text is not a silent fallback.
+    expect(run.report.gates.noSilentFallback).toBe("passed");
+  });
+
+  it("fails with unexpected-tool-call-on-final when a tool is called after every transition succeeded", async () => {
+    const run = await runScenarios(callAfterComplete);
+    expect(run.code).toBe(1);
+    const failures = multiFailures(run.report);
+    expect(failures).toHaveLength(20);
+    for (const d of failures) {
+      expect(d.roundOrdinal).toBe(2);
+      expect(d.reason).toBe("unexpected-tool-call-on-final");
+    }
+    // One batch completed all three transitions, so every step is fully credited…
+    for (const gate of stepGates(run.report)) {
+      expect(gate.denominator).toBe(260);
+      expect(gate.numerator).toBe(260);
+    }
+    // …and the scenario still FAILS: no final answer was ever accepted.
+    expect(run.report.gates.multiStepSuccess.numerator).toBe(0);
+    expect(run.report.gates.multiStepSuccess.status).toBe("failed");
+    expect(run.report.attemptedRounds).toBe(200 + 20 * 2);
+    const evidence = lastScenarioEvidence(run.writes);
+    expect(evidence).toHaveLength(DURABLE_MULTI_SCENARIOS);
+    for (const entry of evidence) {
+      expect(entry).toEqual([2, 3, 0b111, 0b111, 0b111]);
+    }
+  });
+
+  it("emits EXACTLY ONE scenario-round-budget-exhausted diagnostic per scenario, with no cascade", async () => {
+    // Every round names the pending `read` correctly but points at a path no
+    // scenario owns, so the transition never completes, no round is terminal,
+    // and the four-round budget simply runs out.
+    const run = await runScenarios(() => [readSpec(FOREIGN_PATH)]);
+    expect(run.code).toBe(1);
+    const failures = multiFailures(run.report);
+    expect(failures).toHaveLength(20);
+    for (const d of failures) {
+      expect(d.roundOrdinal).toBe(4); // the LAST executed round
+      expect(d.reason).toBe("scenario-round-budget-exhausted");
+    }
+    // Exactly one per scenario: no cascade across the other three rounds.
+    expect(new Set(failures.map((d) => d.caseOrdinal)).size).toBe(20);
+    expect(run.report.attemptedRounds).toBe(200 + 20 * 4);
+    expect(run.report.gates.multiStepSuccess.numerator).toBe(0);
+    const evidence = lastScenarioEvidence(run.writes);
+    expect(evidence).toHaveLength(DURABLE_MULTI_SCENARIOS);
+    for (const entry of evidence) {
+      // Four rounds, zero transitions; the pending `read` step's schema/argument/
+      // expected-name evidence is merged across all four attempts into ONE bit.
+      expect(entry).toEqual([4, 0, 0b001, 0b001, 0b001]);
+    }
+    expect(run.report.gates.schemaValidity.numerator).toBe(200 + 20);
+    expect(run.report.gates.argValidity.numerator).toBe(200 + 20);
+    expect(run.report.gates.toolNameAccuracy.numerator).toBe(200 + 20);
+  });
+
+  it("never double-counts a transition or a metric across retries, repeats, and parallel batches", async () => {
+    for (const script of [sequentialSuccess, parallelReadEditSuccess, editRetryRecovery]) {
+      const run = await runScenarios(script);
+      // Whatever the round shape, each scenario contributes EXACTLY three units
+      // to the expected-step denominator and at most three to every numerator.
+      for (const gate of stepGates(run.report)) {
+        expect(gate.denominator).toBe(260);
+        expect(gate.numerator).toBe(260);
+      }
+      expect(run.report.gates.multiStepSuccess.numerator).toBe(20);
+      expect(run.report.gates.multiStepSuccess.denominator).toBe(20);
+      const evidence = lastScenarioEvidence(run.writes);
+      expect(evidence).toHaveLength(DURABLE_MULTI_SCENARIOS);
+      for (const [, satisfied, schemaMask, nameMask, argMask] of evidence) {
+        expect(satisfied).toBe(3);
+        for (const mask of [schemaMask, nameMask, argMask]) expect(maskBits(mask)).toBe(3);
+      }
+    }
+  });
+
+  it("persists per-scenario evidence whose popcounts reproduce the credited metrics", async () => {
+    const run = await runScenarios(prematureTest);
+    const evidence = lastScenarioEvidence(run.writes);
+    // The last durable checkpoint holds every scenario EXCEPT the final one,
+    // whose commit is kept in memory so no complete-corpus cursor is written.
+    expect(evidence).toHaveLength(DURABLE_MULTI_SCENARIOS);
+    expect(run.writes[run.writes.length - 1]?.completedMultiStepScenarios).toBe(
+      DURABLE_MULTI_SCENARIOS,
+    );
+    // Every scenario ran the SAME script, so the ledger is uniform and its one
+    // entry describes all 20 — including the in-memory final case. Asserting
+    // uniformity first is what makes the ×20 extrapolation below sound.
+    const entry = evidence[0];
+    expect(entry).toBeDefined();
+    for (const e of evidence) expect(e).toEqual(entry);
+    const [executedRounds, satisfied, schemaMask, nameMask, argMask] =
+      entry ?? ([0, 0, 0, 0, 0] as const);
+    // The persisted ledger reproduces the report's multi-step contribution on top
+    // of the 200 seeded single-round units, and its executed-round count
+    // reproduces this segment's upstream attempts.
+    expect(run.report.gates.schemaValidity.numerator).toBe(200 + 20 * maskBits(schemaMask));
+    expect(run.report.gates.toolNameAccuracy.numerator).toBe(200 + 20 * maskBits(nameMask));
+    expect(run.report.gates.argValidity.numerator).toBe(200 + 20 * maskBits(argMask));
+    expect(run.report.attemptedRounds).toBe(200 + 20 * executedRounds);
+    // No scenario completed its three transitions, so none is a multi success.
+    expect(satisfied).toBe(1);
+    expect(run.report.gates.multiStepSuccess.numerator).toBe(0);
+  });
+
+  it("leaves single-round scoring unchanged: name-based and argument-independent", async () => {
+    // A single-round case has NO transition state, so a schema-valid `read`
+    // whose path argument matches no scenario is still a full success — exactly
+    // the pre-v5 behavior.
+    const h = harness({ argv: fullArgv });
+    const code = await runToolsEval(h.deps);
+    expect(code).toBe(0);
+    const report = executed(h.emitted);
+    expect(report.gates.singleRoundSuccess.numerator).toBe(200);
+    expect(report.gates.singleRoundSuccess.denominator).toBe(200);
+    expect(report.gates.singleRoundSuccess.status).toBe("passed");
+    expect(report.completedSingleRoundCases).toBe(200);
+    expect(report.diagnostics.failures.filter((d) => d.phase === "single")).toEqual([]);
+    expect(progressEvents(h.emitted).filter((p) => p.phase === "single")).toHaveLength(200);
   });
 });
 
@@ -2184,26 +2642,23 @@ describe("eval:tools — resume persists diagnostics exactly once", () => {
     // COMMITS its one primary diagnostic; the two lifecycle paths are distinct.
     const control = interruptSeam();
     let created = 0;
+    // The scenario runs the genuinely successful workflow, so round 1 really
+    // completes the `read` transition and round 2 really is the pending `edit`.
+    // No round produces a terminal failure — only the interrupt stops the run.
+    const base = scenarioAdapter(sequentialSuccess);
     const adapter: CollectivIQAdapter = {
-      createThread: () => {
+      createThread: (input) => {
         created += 1;
-        return Promise.resolve({ threadId: `t${created}`, rawStatus: 200 });
+        return base.createThread(input);
       },
-      processMessage: () => {
+      processMessage: (input) => {
         // Fire the interrupt during round 2's processMessage (after the first
         // thread's round succeeded and this scenario's second thread exists).
         if (created === 2) control.fire();
-        return Promise.resolve({ accepted: true, rawStatus: 202 });
+        return base.processMessage(input);
       },
-      // Route by prior assistant tool_calls: round 1 → read, round 2 → edit.
-      getMessages: () => {
-        // The interrupt only affects round 2, but classification may still run
-        // synchronously; return the correct-for-that-round envelope so any
-        // pending diagnostic would ONLY come from a hypothetical later round.
-        const envelope = created === 1 ? readCallEnvelope : editCallEnvelope;
-        return Promise.resolve(claudeMessage(envelope));
-      },
-      getThreadTitle: () => Promise.resolve({ kind: "pending" as const }),
+      getMessages: (id, signal) => base.getMessages(id, signal),
+      getThreadTitle: (id, signal) => base.getThreadTitle(id, signal),
     };
     const h = harness({
       argv: resumeArgv,
@@ -2227,9 +2682,9 @@ describe("eval:tools — resume persists diagnostics exactly once", () => {
   });
 });
 
-describe("eval:tools — credential-before-network guard still holds on v4/v3 rejection", () => {
-  it("blocks an invalid v3 checkpoint before any credential read or network call", async () => {
-    // A v3 checkpoint whose diagnosticFailures references an uncommitted case
+describe("eval:tools — credential-before-network guard still holds on v5/v4 rejection", () => {
+  it("blocks an invalid v4 checkpoint before any credential read or network call", async () => {
+    // A v4 checkpoint whose diagnosticFailures references an uncommitted case
     // is semantically inconsistent and rejected by validateResumableCheckpoint
     // BEFORE any credential build.
     const forged = seedCheckpoint(5, {
@@ -2259,6 +2714,9 @@ describe("eval:tools — serialized report + checkpoint contain no live content"
       ARG_SENTINEL,
       PROMPT_SENTINEL,
       "synthetic/doc",
+      // The state-aware scenario values a fake upstream now sends as arguments.
+      "synthetic/module",
+      SCENARIO_FINAL_CONTENT,
       "call_ciq_",
       CRED_SENTINEL,
       "gateway_protocol",
@@ -2268,5 +2726,135 @@ describe("eval:tools — serialized report + checkpoint contain no live content"
     for (const dump of dumps) {
       for (const sentinel of forbidden) expect(dump).not.toContain(sentinel);
     }
+  });
+});
+
+describe("eval:tools — the final case never persists a complete resumable cursor", () => {
+  /** Run the whole corpus, capturing every durable checkpoint write in order. */
+  async function runCapturingWrites(): Promise<{
+    readonly code: number;
+    readonly emitted: EvalOutput[];
+    readonly writes: CheckpointData[];
+    readonly store: MemStore;
+  }> {
+    const store = memCheckpointStore();
+    const writes: CheckpointData[] = [];
+    const realWrite = store.write.bind(store);
+    store.write = (d) => {
+      writes.push(d);
+      realWrite(d);
+    };
+    const h = harness({ argv: fullArgv, store });
+    const code = await runToolsEval(h.deps);
+    return { code, emitted: h.emitted, writes, store };
+  }
+
+  it("never writes nextCaseIndex === corpus length, and every write its own validator accepts", async () => {
+    const { writes } = await runCapturingWrites();
+    const corpusLength = SINGLE_ROUND_CASES + MULTI_STEP_SCENARIOS;
+    expect(writes.length).toBeGreaterThan(0);
+    for (const write of writes) {
+      // The invariant itself: a resumable cursor is always strictly inside.
+      expect(write.resumeState).toBe("resumable");
+      expect(write.nextCaseIndex).toBeLessThan(corpusLength);
+      // Stronger: the runner's own validator must accept everything it durably
+      // wrote, so a stop at ANY point leaves a resumable checkpoint.
+      expect(() =>
+        validateResumableCheckpoint(write, buildEvalCorpusProjection(buildEvalCases())),
+      ).not.toThrow();
+    }
+  });
+
+  it("leaves the last durable checkpoint pointing at the final, still-uncommitted case", async () => {
+    const { writes } = await runCapturingWrites();
+    const corpusLength = SINGLE_ROUND_CASES + MULTI_STEP_SCENARIOS;
+    const last = writes[writes.length - 1];
+    // Cursor 219 == "case 220 has not been committed", so an approved resume
+    // replays exactly that one case.
+    expect(last?.nextCaseIndex).toBe(corpusLength - 1);
+    expect(last?.completedSingleRoundCases).toBe(SINGLE_ROUND_CASES);
+    expect(last?.completedMultiStepScenarios).toBe(MULTI_STEP_SCENARIOS - 1);
+    expect(last?.scenarioEvidence).toHaveLength(MULTI_STEP_SCENARIOS - 1);
+  });
+
+  it("emits no progress record for the final case, which persisted no checkpoint", async () => {
+    const { emitted, writes } = await runCapturingWrites();
+    const corpusLength = SINGLE_ROUND_CASES + MULTI_STEP_SCENARIOS;
+    const scenarioEnd = progressEvents(emitted).filter(
+      (p) => p.phase === "multi" && p.roundOrdinal === 4,
+    );
+    const ordinals = scenarioEnd.map((p) => p.caseOrdinal);
+    expect(ordinals).not.toContain(corpusLength);
+    // Every progress record claims a durable write, so there must be at least
+    // as many writes as progress events — no record outruns the disk.
+    expect(progressEvents(emitted).length).toBeLessThanOrEqual(writes.length);
+    for (const p of progressEvents(emitted)) expect(p.checkpointPersisted).toBe(true);
+  });
+
+  it("still reports the in-memory COMPLETE cursor and removes the checkpoint on success", async () => {
+    const { code, emitted, store } = await runCapturingWrites();
+    const corpusLength = SINGLE_ROUND_CASES + MULTI_STEP_SCENARIOS;
+    const report = executed(emitted);
+    expect(code).toBe(0);
+    expect(report.passed).toBe(true);
+    // The cursor the REPORT carries is the complete one, even though it was
+    // never persisted, and the checkpoint is gone.
+    expect(report.checkpoint.nextCaseIndex).toBe(corpusLength);
+    expect(report.checkpoint.finalized).toBe(true);
+    expect(report.checkpoint.persistFailed).toBe(false);
+    expect(report.completedSingleRoundCases).toBe(SINGLE_ROUND_CASES);
+    expect(report.completedMultiStepScenarios).toBe(MULTI_STEP_SCENARIOS);
+    expect(store.data).toBeNull();
+    expect(store.deletes).toBe(1);
+  });
+
+  it("resumes from the last durable checkpoint by replaying ONLY the final case", async () => {
+    const first = await runCapturingWrites();
+    const last = first.writes[first.writes.length - 1];
+    expect(last).toBeDefined();
+    if (last === undefined) return;
+
+    // Simulate a stop between that durable write and the removal: hand the
+    // exact bytes back to a fresh approved resume.
+    const store = memCheckpointStore(last);
+    const h = harness({ argv: resumeArgv, store });
+    const code = await runToolsEval(h.deps);
+    const report = executed(h.emitted);
+
+    expect(code).toBe(0);
+    expect(report.passed).toBe(true);
+    expect(report.checkpoint.resumed).toBe(true);
+    expect(report.checkpoint.startCaseIndex).toBe(SINGLE_ROUND_CASES + MULTI_STEP_SCENARIOS - 1);
+    // Exactly ONE case replayed: four upstream rounds on top of the committed
+    // total, and no duplicated commit.
+    expect(report.attemptedRounds).toBe((last.attemptedRounds ?? 0) + 4);
+    expect(report.completedSingleRoundCases).toBe(SINGLE_ROUND_CASES);
+    expect(report.completedMultiStepScenarios).toBe(MULTI_STEP_SCENARIOS);
+    expect(report.gates.multiStepSuccess.denominator).toBe(MULTI_STEP_SCENARIOS);
+    expect(report.gates.schemaValidity.denominator).toBe(260);
+    // No duplicated diagnostics or evidence from the replay.
+    expect(report.diagnostics.failures).toEqual([]);
+    const keys = report.diagnostics.failures.map((d) => `${d.caseOrdinal}:${d.roundOrdinal}`);
+    expect(new Set(keys).size).toBe(keys.length);
+    expect(store.data).toBeNull();
+  });
+
+  it("routes BOTH the single-round and multi-step commits through one shared guard", () => {
+    // The production corpus always ends with a multi-step case, so the
+    // single-round final-case layout cannot be exercised behaviorally through
+    // the existing seams. Prove structurally that the branches cannot drift:
+    // exactly one guard exists and both commits go through it.
+    const source = readFileSync(
+      new URL("../../src/eval/tools-eval-cli.ts", import.meta.url),
+      "utf8",
+    );
+    // Exactly one PERSIST guard (the `scoredComplete` computation reads the
+    // same cursor for a different purpose and is matched more narrowly here).
+    const guards = source.match(/if \(nextCaseIndex >= cases\.length\) return null;/g) ?? [];
+    expect(guards).toHaveLength(1);
+    const calls = source.match(/commitCaseCursor\(i, "(single|multi)"/g) ?? [];
+    expect(calls.sort()).toEqual(['commitCaseCursor(i, "multi"', 'commitCaseCursor(i, "single"']);
+    // Neither branch may advance the cursor or persist on its own any more.
+    expect(source).not.toMatch(/\n\s*nextCaseIndex = i \+ 1;/);
   });
 });

@@ -11,7 +11,7 @@
  * injects a fresh user instruction between tool results.
  */
 import { createHash } from "node:crypto";
-import type { NormalizedTool, NormalizedToolChoice, ParsedToolCall } from "../tools/index.js";
+import type { NormalizedTool, NormalizedToolChoice } from "../tools/index.js";
 
 /** Exactly 200 single-round cases (one upstream completion each). */
 export const SINGLE_ROUND_CASES = 200;
@@ -45,7 +45,19 @@ export interface EvalRound {
    * and so the corpus fingerprint captures the intent of every round.
    */
   readonly prompt: string;
-  /** The tool the model is expected to call this round (omitted → final text). */
+  /**
+   * The tool this round is PLANNED to produce (omitted → final text).
+   *
+   * For a SINGLE-round case this is the runtime expectation directly. For a
+   * MULTI-step scenario it describes the planned workflow only: it fixes the
+   * corpus fingerprint and the section-30 planned denominators
+   * (`expectedCallsPerScenario`), but the evaluator no longer scores a
+   * multi-step round against the value at its ordinal. The live expectation is
+   * derived from the scenario's SUCCESSFULLY completed transitions — see
+   * `src/eval/scenario-engine.ts` — because one parallel batch can complete
+   * several transitions at once and would otherwise be scored against a stale
+   * positional expectation.
+   */
   readonly expectedTool?: string;
 }
 
@@ -427,96 +439,4 @@ export function corpusFingerprint(cases: readonly EvalCase[] = buildEvalCases())
     cases,
   });
   return createHash("sha256").update(canonical, "utf8").digest("hex");
-}
-
-// ---------------------------------------------------------------------------
-// Deterministic synthetic tool-result rendering
-// ---------------------------------------------------------------------------
-
-/**
- * Mutable per-scenario runtime state that {@link renderSyntheticToolResult}
- * updates. It is entirely synthetic (no filesystem, shell, MCP, external
- * service, repository content, or real user data): only the small deterministic
- * fields declared here. It exists ONLY inside a scenario's run and is discarded
- * when the scenario terminates.
- */
-export interface ScenarioRuntimeState {
-  readonly path: string;
-  /** Current synthetic document content (starts at `scenario.initialContent`). */
-  content: string;
-  /** True after an `edit` call whose args exactly matched the scenario's expected write. */
-  edited: boolean;
-  /** True after a `test` call observed `content === scenario.expectedFinalContent`. */
-  testsPass: boolean;
-}
-
-/** Build a fresh runtime state seeded from the scenario's declared initial values. */
-export function initializeScenarioRuntime(scenario: EvalScenarioState): ScenarioRuntimeState {
-  return {
-    path: scenario.path,
-    content: scenario.initialContent,
-    edited: false,
-    testsPass: false,
-  };
-}
-
-/**
- * Deterministically render a small, bounded, JSON-serialized synthetic tool
- * result for one assistant tool call. The result is content-safe (no
- * filesystem, repository, credential, prompt, or answer data), depends ONLY on
- * the supplied scenario + runtime state, and mutates `state` for later rounds:
- *
- * - `read`: `{"ok":true,"path":<state.path>,"content":<state.content>}`.
- *   Deterministic and provides sufficient content for the model to construct
- *   the expected `edit` arguments (path + expected replacement).
- * - `edit`: attempts to parse the call's arguments and records `ok:true` when
- *   the `path` matches the scenario's path AND the `text` exactly matches the
- *   scenario's expected replacement. On a match `state.content` becomes the
- *   expected replacement and `state.edited` becomes true; otherwise `ok:false`
- *   is returned and the state is left unchanged.
- * - `test`: sets `state.testsPass = state.content === expectedFinalContent`
- *   and returns `{"ok":true,"testsPass":<state.testsPass>}` — the pass/fail
- *   value depends only on prior synthetic state.
- * - anything else: `{"ok":false}` (an unknown-tool result the model can act on).
- *
- * The function is pure with respect to the supplied `state` object and never
- * touches the outside world. It always returns a bounded, non-empty string.
- */
-export function renderSyntheticToolResult(
-  call: ParsedToolCall,
-  scenario: EvalScenarioState,
-  state: ScenarioRuntimeState,
-): string {
-  if (call.name === "read") {
-    return JSON.stringify({ ok: true, path: state.path, content: state.content });
-  }
-  if (call.name === "edit") {
-    let path: string | undefined;
-    let text: string | undefined;
-    try {
-      const parsed = JSON.parse(call.argumentsJson) as unknown;
-      if (parsed !== null && typeof parsed === "object") {
-        const asRecord = parsed as Record<string, unknown>;
-        const p = asRecord["path"];
-        const t = asRecord["text"];
-        if (typeof p === "string") path = p;
-        if (typeof t === "string") text = t;
-      }
-    } catch {
-      // Malformed argument JSON: treat as an edit that did not land.
-    }
-    const wroteExpected = path === scenario.path && text === scenario.expectedFinalContent;
-    if (wroteExpected) {
-      state.content = scenario.expectedFinalContent;
-      state.edited = true;
-    }
-    return JSON.stringify({ ok: wroteExpected, path: state.path });
-  }
-  if (call.name === "test") {
-    state.testsPass = state.content === scenario.expectedFinalContent;
-    return JSON.stringify({ ok: true, testsPass: state.testsPass });
-  }
-  // Unknown tool (should never happen in a normal scenario because the
-  // evaluator only forwards allowed calls, but stay explicit and content-safe).
-  return JSON.stringify({ ok: false });
 }

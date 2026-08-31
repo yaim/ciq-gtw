@@ -13,6 +13,7 @@
  * checkpoint contracts are unchanged.
  */
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 import {
   buildDiagnosticPreflightReport,
   defaultToolsDiagnosticDeps,
@@ -42,7 +43,12 @@ import {
   DIAGNOSTIC_CHECKPOINT_FILENAME,
   DIAGNOSTIC_CHECKPOINT_FORMAT_VERSION,
   type DiagnosticCheckpointData,
+  type DiagnosticScenarioEvidence,
 } from "../../src/eval/diagnostic-checkpoint.js";
+import {
+  MIN_SUCCESSFUL_SCENARIO_ROUNDS,
+  SCENARIO_STEP_COUNT,
+} from "../../src/eval/scenario-engine.js";
 import { runLiveRound, buildRoundRequest } from "../../src/eval/live-round.js";
 import { buildEvalCases, corpusFingerprint } from "../../src/eval/cases.js";
 import { EVAL_REPORT_VERSION } from "../../src/eval/report.js";
@@ -93,35 +99,75 @@ function priorAssistantToolCallCount(prompt: string): number {
   }
 }
 
+/**
+ * The synthetic replacement text the corpus's `edit` step must write. The
+ * shared transition engine only ADVANCES a step when the call's arguments match
+ * the scenario's own synthetic state, so the fake model has to use the real
+ * path and text rather than a placeholder.
+ */
+const EXPECTED_FINAL_CONTENT = "version=2";
+
+/** Recover a scenario's synthetic document path from its initial user message. */
+function scenarioPath(prompt: string): string {
+  return /synthetic\/module-\d+\.txt/.exec(prompt)?.[0] ?? "synthetic/unknown.txt";
+}
+
 function toolCallsEnvelope(calls: { name: string; arguments: unknown }[]): string {
   return JSON.stringify({ gateway_protocol: "1.0", type: "tool_calls", calls });
 }
 function finalEnvelope(content: string): string {
   return JSON.stringify({ gateway_protocol: "1.0", type: "final", content });
 }
-function argsFor(name: string): unknown {
-  if (name === READ) return { path: "synthetic/x" };
-  if (name === EDIT) return { path: "synthetic/x", text: "version=2" };
+function argsFor(name: string, path: string): unknown {
+  if (name === READ) return { path };
+  if (name === EDIT) return { path, text: EXPECTED_FINAL_CONTENT };
   return {};
 }
 
-/** The successful loop envelope for a round, keyed by prior tool-call count. */
-function successEnvelope(prior: number): string {
-  if (prior === 0) return toolCallsEnvelope([{ name: READ, arguments: argsFor(READ) }]);
-  if (prior === 1) return toolCallsEnvelope([{ name: EDIT, arguments: argsFor(EDIT) }]);
-  if (prior === 2) return toolCallsEnvelope([{ name: TEST, arguments: argsFor(TEST) }]);
+/** One round's upstream answer, built from the scenario's synthetic path. */
+type RoundAnswer = (path: string) => string;
+
+/** Propose the named tools with arguments the transition engine accepts. */
+function callsFor(...names: readonly string[]): RoundAnswer {
+  return (path) =>
+    toolCallsEnvelope(names.map((name) => ({ name, arguments: argsFor(name, path) })));
+}
+
+/** Return one fixed upstream answer regardless of the scenario. */
+function raw(content: string): RoundAnswer {
+  return () => content;
+}
+
+/**
+ * A schema-valid `edit` whose arguments do NOT match the scenario's synthetic
+ * state. The expected tool IS invoked, so the round is accepted, but the
+ * transition never completes and the workflow does not advance.
+ */
+const UNPRODUCTIVE_EDIT: RoundAnswer = raw(
+  toolCallsEnvelope([{ name: EDIT, arguments: { path: "synthetic/other.txt", text: "x" } }]),
+);
+
+/** The successful sequential loop answer for a round, keyed by prior tool-call count. */
+function successEnvelope(prior: number, path: string): string {
+  if (prior === 0) return toolCallsEnvelope([{ name: READ, arguments: argsFor(READ, path) }]);
+  if (prior === 1) return toolCallsEnvelope([{ name: EDIT, arguments: argsFor(EDIT, path) }]);
+  if (prior === 2) return toolCallsEnvelope([{ name: TEST, arguments: argsFor(TEST, path) }]);
   return finalEnvelope("synthetic summary");
 }
 
 interface AdapterOptions {
   /**
-   * Envelope override for round 1. Used to model PARALLEL tool calls, which the
-   * round request enables: one accepted round can invoke several tools, so the
-   * scenario's actual invocation history diverges from the static plan.
+   * Answer override for round 1. Used to model PARALLEL tool calls, which the
+   * round request enables: one accepted round can COMPLETE several transitions,
+   * so the scenario's satisfied state diverges from the static plan.
    */
-  readonly round1?: string;
-  /** Envelope override for round 2 (the read → edit transition). */
-  readonly round2?: string;
+  readonly round1?: RoundAnswer;
+  /** Answer override for round 2 (the read → edit transition). */
+  readonly round2?: RoundAnswer;
+  /** Answer override for round 3 (the final answer after a parallel batch). */
+  readonly round3?: RoundAnswer;
+  /** Answer override for round 4 (the last round of the scenario's budget). */
+  readonly round4?: RoundAnswer;
   /**
    * When set, round 2's messages place the valid envelope on NON-desired
    * individual sources (the desired `claude` message is unparsable prose), so the
@@ -162,9 +208,10 @@ function smartAdapter(opts: AdapterOptions = {}): CountingAdapter {
     getMessages: () => {
       counts.polls += 1;
       const prior = priorAssistantToolCallCount(lastPrompt);
+      const path = scenarioPath(lastPrompt);
       const isRound2 = prior === 1;
-      const override = prior === 0 ? opts.round1 : isRound2 ? opts.round2 : undefined;
-      const envelope = override ?? successEnvelope(prior);
+      const override = [opts.round1, opts.round2, opts.round3, opts.round4][prior];
+      const envelope = override?.(path) ?? successEnvelope(prior, path);
       const messages: UpstreamMessage[] = [];
       if (isRound2 && opts.round2Individuals !== undefined) {
         // The desired (`claude`) candidate is unparsable prose, so selection must
@@ -360,7 +407,11 @@ function progressEvents(emitted: DiagnosticOutput[]): DiagnosticProgressEvent[] 
   return emitted.filter((r): r is DiagnosticProgressEvent => r.mode === "progress");
 }
 
-/** A truthful all-successful resumable diagnostic checkpoint at scenario cursor `k`. */
+/**
+ * A truthful all-successful resumable diagnostic checkpoint at scenario cursor
+ * `k`: every committed scenario ran its whole round budget and completed all
+ * three transitions (format 3's `[executedRounds, satisfiedSteps]` evidence).
+ */
 function seed(k: number, over: Partial<DiagnosticCheckpointData> = {}): DiagnosticCheckpointData {
   const rounds = ROUNDS_PER_SCENARIO * k;
   return {
@@ -378,7 +429,10 @@ function seed(k: number, over: Partial<DiagnosticCheckpointData> = {}): Diagnost
     completedScenarios: k,
     successfulScenarios: k,
     cleanup: { attempted: rounds, deleted: rounds, failed: 0, journalFailures: 0 },
-    executedScenarioRounds: Array.from({ length: k }, () => ROUNDS_PER_SCENARIO),
+    scenarioEvidence: Array.from(
+      { length: k },
+      () => [ROUNDS_PER_SCENARIO, SCENARIO_STEP_COUNT] as DiagnosticScenarioEvidence,
+    ),
     diagnostics: [],
     ...over,
   };
@@ -591,11 +645,13 @@ describe("eval:tools:diagnose — bounded multi-step-only execution", () => {
       return { rejected, completeCursorWrites, resumableWrites, store };
     }
 
-    // A fully successful corpus (executed-round entries of 4) and one where
-    // every scenario terminates early at round 2 (entries of 2).
+    // A fully successful corpus (evidence entries of `[4, 3]`), one where every
+    // scenario terminates early at round 2 (`[2, 1]`), and one where a parallel
+    // `[read, edit]` batch finishes each scenario in three rounds (`[3, 3]`).
     for (const over of [
       {},
-      { round2: toolCallsEnvelope([{ name: READ, arguments: argsFor(READ) }]) },
+      { round2: callsFor(READ) },
+      { round1: callsFor(READ, EDIT), round2: callsFor(TEST), round3: raw(finalEnvelope("ok")) },
     ]) {
       const audit = await auditWrites(over);
       expect(audit.rejected).toEqual([]);
@@ -657,8 +713,7 @@ describe("eval:tools:diagnose — bounded multi-step-only execution", () => {
     const first = harness({
       argv: fullArgv,
       store,
-      makeAdapter: () =>
-        smartAdapter({ round2: toolCallsEnvelope([{ name: READ, arguments: argsFor(READ) }]) }),
+      makeAdapter: () => smartAdapter({ round2: callsFor(READ) }),
     });
     expect(await runToolsDiagnostic(first.deps)).toBe(0);
     const firstReport = executed(first.emitted);
@@ -674,7 +729,7 @@ describe("eval:tools:diagnose — bounded multi-step-only execution", () => {
 
     // Resume from exactly that file, as an interrupted run would.
     const adapter = smartAdapter({
-      round2: toolCallsEnvelope([{ name: READ, arguments: argsFor(READ) }]),
+      round2: callsFor(READ),
     });
     const resumeStore = memStore(durable);
     const second = harness({ argv: resumeArgv, store: resumeStore, makeAdapter: () => adapter });
@@ -730,7 +785,7 @@ describe("eval:tools:diagnose — transition classification", () => {
 
   it("classifies a repeated prior tool as prior-only, single, desired-source", async () => {
     const report = await diagnoseRound2({
-      round2: toolCallsEnvelope([{ name: READ, arguments: argsFor(READ) }]),
+      round2: callsFor(READ),
     });
     expect(report.diagnostics.failures).toHaveLength(SCENARIO_COUNT);
     for (const d of report.diagnostics.failures) {
@@ -763,7 +818,7 @@ describe("eval:tools:diagnose — transition classification", () => {
 
   it("classifies a skipped-ahead tool as future-only", async () => {
     const report = await diagnoseRound2({
-      round2: toolCallsEnvelope([{ name: TEST, arguments: argsFor(TEST) }]),
+      round2: callsFor(TEST),
     });
     expect(report.diagnostics.failures[0]).toMatchObject({
       reason: "expected-tool-not-invoked",
@@ -773,12 +828,7 @@ describe("eval:tools:diagnose — transition classification", () => {
   });
 
   it("classifies a prior+future mixture as prior-and-future with multiple calls", async () => {
-    const report = await diagnoseRound2({
-      round2: toolCallsEnvelope([
-        { name: READ, arguments: argsFor(READ) },
-        { name: TEST, arguments: argsFor(TEST) },
-      ]),
-    });
+    const report = await diagnoseRound2({ round2: callsFor(READ, TEST) });
     expect(report.diagnostics.failures[0]).toMatchObject({
       reason: "expected-tool-not-invoked",
       allowedCallRelation: "prior-and-future",
@@ -788,7 +838,7 @@ describe("eval:tools:diagnose — transition classification", () => {
 
   it("carries individual-single from the trusted selector", async () => {
     const report = await diagnoseRound2({
-      round2: toolCallsEnvelope([{ name: READ, arguments: argsFor(READ) }]),
+      round2: callsFor(READ),
       round2Individuals: ["alt-a"],
     });
     expect(report.diagnostics.failures[0]).toMatchObject({
@@ -799,7 +849,7 @@ describe("eval:tools:diagnose — transition classification", () => {
 
   it("carries individual-consensus from the trusted selector", async () => {
     const report = await diagnoseRound2({
-      round2: toolCallsEnvelope([{ name: READ, arguments: argsFor(READ) }]),
+      round2: callsFor(READ),
       round2Individuals: ["alt-a", "alt-b"],
     });
     expect(report.diagnostics.failures[0]).toMatchObject({
@@ -809,7 +859,7 @@ describe("eval:tools:diagnose — transition classification", () => {
   });
 
   it("uses not-applicable dimensions when the round returned ordinary text", async () => {
-    const report = await diagnoseRound2({ round2: finalEnvelope("I will stop here.") });
+    const report = await diagnoseRound2({ round2: raw(finalEnvelope("I will stop here.")) });
     expect(report.diagnostics.failures[0]).toMatchObject({
       reason: "expected-tool-returned-text",
       allowedCallRelation: "not-applicable",
@@ -821,56 +871,135 @@ describe("eval:tools:diagnose — transition classification", () => {
   it("uses not-applicable dimensions when no valid call could be selected", async () => {
     // Neither the desired candidate nor any individual parses, and the round's
     // choice is `auto`, so selection falls back to ordinary text.
-    const report = await diagnoseRound2({ round2: "not an envelope at all" });
+    const report = await diagnoseRound2({ round2: raw("not an envelope at all") });
     expect(report.diagnostics.failures[0]?.allowedCallRelation).toBe("not-applicable");
     expect(report.diagnostics.failures[0]?.selectionSource).toBe("not-applicable");
     expect(report.diagnostics.failures[0]?.callMultiplicity).toBe("not-applicable");
   });
 
-  it("reports expected-already-invoked when a parallel round 1 already ran the edit step", async () => {
-    // The regression this whole version bump exists for. Round 1 returns
-    // [read, edit] in ONE accepted assistant message; both calls execute. Round 2
-    // still statically expects `edit`, so the release classifier records
-    // `expected-tool-not-invoked` when the model correctly moves on to `test` —
-    // but that is NOT a skip-ahead, and the diagnostic must not imply one.
+  it("completes a [read, edit] parallel batch, then test, then final text with NO diagnostic", async () => {
+    // THE HEADLINE FIX, and the exact shape 13 of 20 live scenarios took.
+    // Round 1 returns [read, edit] in ONE accepted assistant message and BOTH
+    // transitions complete, so round 2 correctly runs `test` and round 3
+    // returns the final answer. The old positional schedule scored round 2
+    // against a stale `edit` expectation and recorded
+    // `expected-tool-not-invoked` (relation `expected-already-invoked`) for a
+    // scenario that had in fact done everything right. State-aware scoring
+    // records NOTHING: the scenario simply succeeded, in three rounds.
     const report = await diagnoseRound2({
-      round1: toolCallsEnvelope([
-        { name: READ, arguments: argsFor(READ) },
-        { name: EDIT, arguments: argsFor(EDIT) },
-      ]),
-      round2: toolCallsEnvelope([{ name: TEST, arguments: argsFor(TEST) }]),
+      round1: callsFor(READ, EDIT),
+      round2: callsFor(TEST),
+      round3: raw(finalEnvelope("synthetic summary")),
+    });
+    expect(report.diagnostics.failures).toEqual([]);
+    expect(report.successfulScenarios).toBe(SCENARIO_COUNT);
+    expect(report.completedScenarios).toBe(SCENARIO_COUNT);
+    // Three rounds per scenario — fewer than the four-round budget, which is
+    // only possible because a parallel batch completed two transitions at once.
+    expect(report.attemptedRounds).toBe(SCENARIO_COUNT * 3);
+    expect(report.attemptedRounds).toBeLessThan(MAX_DIAGNOSTIC_UPSTREAM_ROUNDS);
+    expect(report.attemptedRounds / SCENARIO_COUNT).toBeGreaterThanOrEqual(
+      MIN_SUCCESSFUL_SCENARIO_ROUNDS,
+    );
+    expect(report.completed).toBe(true);
+    expect(report.aborted).toBeNull();
+    expect(report.cleanup).toEqual({
+      attempted: SCENARIO_COUNT * 3,
+      deleted: SCENARIO_COUNT * 3,
+      failed: 0,
+      remaining: 0,
+      journalFailures: 0,
+    });
+  });
+
+  it("never expects a transition an accepted parallel batch already completed", async () => {
+    // The complement of the case above: after [read, edit] the expectation is
+    // `test`, so a round that REPEATS `edit` is judged against the state the
+    // batch produced — finished work — rather than being excused as a stale
+    // expectation. The removed v2 member has no successor here.
+    const report = await diagnoseRound2({
+      round1: callsFor(READ, EDIT),
+      round2: callsFor(EDIT),
     });
     expect(report.diagnostics.failures).toHaveLength(SCENARIO_COUNT);
     for (const d of report.diagnostics.failures) {
       expect(d.roundOrdinal).toBe(2);
       // The reason is whatever the RELEASE classifier produces — unchanged.
       expect(d.reason).toBe("expected-tool-not-invoked");
-      expect(d.allowedCallRelation).toBe("expected-already-invoked");
-      expect(d.allowedCallRelation).not.toBe("future-only");
-    }
-  });
-
-  it("reports a repeated early parallel call as prior, never future-only", async () => {
-    // Round 1 returns [read, test]; round 2 repeats `test`. `test` is expected by
-    // a LATER round, but it already ran, so history outranks static position.
-    const report = await diagnoseRound2({
-      round1: toolCallsEnvelope([
-        { name: READ, arguments: argsFor(READ) },
-        { name: TEST, arguments: argsFor(TEST) },
-      ]),
-      round2: toolCallsEnvelope([{ name: TEST, arguments: argsFor(TEST) }]),
-    });
-    for (const d of report.diagnostics.failures) {
-      expect(d.reason).toBe("expected-tool-not-invoked");
       expect(d.allowedCallRelation).toBe("prior-only");
       expect(d.allowedCallRelation).not.toBe("future-only");
     }
   });
 
+  it("judges prior by SUCCESSFUL transitions, not by names that merely ran", async () => {
+    // Round 1 returns [read, test]: `read` completes, but `test` runs before its
+    // `edit` prerequisite, so its transition FAILS and the workflow does not
+    // advance past `read`. Round 2 repeating `test` is therefore still a genuine
+    // skip-ahead — v2, which bucketed by invocation history, called it
+    // `prior-only` and hid the real behavior.
+    const report = await diagnoseRound2({
+      round1: callsFor(READ, TEST),
+      round2: callsFor(TEST),
+    });
+    expect(report.diagnostics.failures).toHaveLength(SCENARIO_COUNT);
+    for (const d of report.diagnostics.failures) {
+      expect(d.reason).toBe("expected-tool-not-invoked");
+      expect(d.allowedCallRelation).toBe("future-only");
+      expect(d.allowedCallRelation).not.toBe("prior-only");
+    }
+  });
+
+  it("keeps a failed edit pending instead of promoting it to prior", async () => {
+    // Round 1 completes `read`; round 2 calls `edit` with the WRONG text, so the
+    // call is accepted (the expected tool WAS invoked) but the transition does
+    // not advance. Round 3 then skips to `test` while `edit` is still the
+    // pending expectation.
+    const report = await diagnoseRound2({
+      round2: UNPRODUCTIVE_EDIT,
+      round3: callsFor(TEST),
+    });
+    expect(report.diagnostics.failures).toHaveLength(SCENARIO_COUNT);
+    for (const d of report.diagnostics.failures) {
+      // The scenario ran a third round: round 2 was accepted, just unproductive.
+      expect(d.roundOrdinal).toBe(3);
+      expect(d.reason).toBe("expected-tool-not-invoked");
+      expect(d.allowedCallRelation).toBe("future-only");
+    }
+    expect(report.attemptedRounds).toBe(SCENARIO_COUNT * 3);
+    expect(report.successfulScenarios).toBe(0);
+  });
+
+  it("emits exactly one budget-exhausted diagnostic when the loop never finishes", async () => {
+    // Every round after the first repeats an accepted-but-unproductive `edit`:
+    // the expected tool IS invoked, so no round fails terminally, yet the
+    // workflow never advances and the scenario burns its whole four-round budget
+    // without a final answer. That is a WHOLE-SCENARIO failure, recorded once,
+    // at the last executed round, with all three dimensions not-applicable.
+    const report = await diagnoseRound2({
+      round2: UNPRODUCTIVE_EDIT,
+      round3: UNPRODUCTIVE_EDIT,
+      round4: UNPRODUCTIVE_EDIT,
+    });
+    expect(report.diagnostics.failures).toHaveLength(SCENARIO_COUNT);
+    for (const d of report.diagnostics.failures) {
+      expect(d).toMatchObject({
+        roundOrdinal: ROUNDS_PER_SCENARIO,
+        reason: "scenario-round-budget-exhausted",
+        allowedCallRelation: "not-applicable",
+        selectionSource: "not-applicable",
+        callMultiplicity: "not-applicable",
+      });
+      expect(transitionDiagnosticDimensionErrors(d)).toEqual([]);
+    }
+    expect(report.attemptedRounds).toBe(MAX_DIAGNOSTIC_UPSTREAM_ROUNDS);
+    expect(report.successfulScenarios).toBe(0);
+    expect(report.completed).toBe(true);
+  });
+
   it("still reports a GENUINE skip-ahead as future-only after an ordinary round 1", async () => {
     // Round 1 returns only [read], so `test` has genuinely not run yet.
     const report = await diagnoseRound2({
-      round2: toolCallsEnvelope([{ name: TEST, arguments: argsFor(TEST) }]),
+      round2: callsFor(TEST),
     });
     for (const d of report.diagnostics.failures) {
       expect(d.reason).toBe("expected-tool-not-invoked");
@@ -880,7 +1009,7 @@ describe("eval:tools:diagnose — transition classification", () => {
 
   it("still reports a repeat of the previous step as prior-only after an ordinary round 1", async () => {
     const report = await diagnoseRound2({
-      round2: toolCallsEnvelope([{ name: READ, arguments: argsFor(READ) }]),
+      round2: callsFor(READ),
     });
     for (const d of report.diagnostics.failures) {
       expect(d.reason).toBe("expected-tool-not-invoked");
@@ -888,30 +1017,27 @@ describe("eval:tools:diagnose — transition classification", () => {
     }
   });
 
-  it("classifies the failing round against the history that existed BEFORE it ran", async () => {
-    // Round 2 returns [test, read]: `read` ran earlier so it is prior, `test` has
-    // not, so the set is mixed — and crucially the round's OWN calls must not be
-    // folded into the history before it is classified (which would make `test`
-    // look prior too and mask the skip-ahead half of the mixture).
-    const report = await diagnoseRound2({
-      round2: toolCallsEnvelope([
-        { name: TEST, arguments: argsFor(TEST) },
-        { name: READ, arguments: argsFor(READ) },
-      ]),
-    });
+  it("classifies the failing round against the state that existed BEFORE it ran", async () => {
+    // Round 2 returns [test, read]: `read`'s transition already succeeded so it
+    // is prior, `test`'s has not, so the set is mixed — and crucially the
+    // round's OWN calls must not be folded into the state before it is
+    // classified (which would make `test` look prior too and mask the
+    // skip-ahead half of the mixture).
+    const report = await diagnoseRound2({ round2: callsFor(TEST, READ) });
     for (const d of report.diagnostics.failures) {
       expect(d.allowedCallRelation).toBe("prior-and-future");
       expect(d.callMultiplicity).toBe("multiple");
     }
   });
 
-  it("keeps history scenario-local: one scenario's parallel calls never leak into the next", async () => {
-    // Every scenario terminates at round 2, so each one is classified from an
-    // EMPTY starting history plus only its own round 1. If the set leaked across
-    // scenarios, later scenarios would see `edit` as already invoked and report
-    // `expected-already-invoked` instead of `future-only`.
+  it("keeps transition state scenario-local: one scenario never carries into the next", async () => {
+    // Every scenario terminates at round 2, so each one is classified from a
+    // FRESH, fully unsatisfied state plus only its own round 1. If the state
+    // leaked across scenarios, later scenarios would see `edit` as already
+    // satisfied and report `test` as the current expectation instead of a
+    // skip-ahead.
     const report = await diagnoseRound2({
-      round2: toolCallsEnvelope([{ name: TEST, arguments: argsFor(TEST) }]),
+      round2: callsFor(TEST),
     });
     expect(report.diagnostics.failures).toHaveLength(SCENARIO_COUNT);
     expect(new Set(report.diagnostics.failures.map((d) => d.allowedCallRelation))).toEqual(
@@ -922,17 +1048,14 @@ describe("eval:tools:diagnose — transition classification", () => {
   it("marks an unauthorized tool name not-applicable for the relation but keeps the call dimensions", async () => {
     // An out-of-allowlist name is rejected by the parser itself, so selection
     // yields no valid call and the round is classified without a relation.
-    const report = await diagnoseRound2({
-      round2: toolCallsEnvelope([{ name: "rm-rf", arguments: {} }]),
-    });
+    const report = await diagnoseRound2({ round2: callsFor("rm-rf") });
     expect(report.diagnostics.failures[0]?.allowedCallRelation).toBe("not-applicable");
   });
 
   it("never emits a tool name, prompt, argument, path, id, or credential", async () => {
     const h = harness({
       argv: fullArgv,
-      makeAdapter: () =>
-        smartAdapter({ round2: toolCallsEnvelope([{ name: READ, arguments: argsFor(READ) }]) }),
+      makeAdapter: () => smartAdapter({ round2: callsFor(READ) }),
     });
     await runToolsDiagnostic(h.deps);
     const serialized = JSON.stringify(h.emitted);
@@ -962,28 +1085,34 @@ describe("eval:tools:diagnose — transition classification", () => {
   });
 
   it("emits no gate collection and no `passed` field", async () => {
-    const h = harness({ argv: fullArgv });
-    await runToolsDiagnostic(h.deps);
-    const report = executed(h.emitted) as unknown as Record<string, unknown>;
-    expect(report["gates"]).toBeUndefined();
-    expect(report["passed"]).toBeUndefined();
-    expect(Object.hasOwn(report, "completed")).toBe(true);
+    // True for a clean corpus AND for one where every scenario failed the
+    // transition: this command gathers evidence and establishes no gate.
+    for (const over of [{}, { round2: callsFor(READ) }]) {
+      const h = harness({ argv: fullArgv, makeAdapter: () => smartAdapter(over) });
+      await runToolsDiagnostic(h.deps);
+      const report = executed(h.emitted) as unknown as Record<string, unknown>;
+      expect(report["gates"]).toBeUndefined();
+      expect(report["passed"]).toBeUndefined();
+      expect(Object.hasOwn(report, "gates")).toBe(false);
+      expect(Object.hasOwn(report, "passed")).toBe(false);
+      expect(Object.hasOwn(report, "completed")).toBe(true);
+    }
   });
 });
 
 describe("eval:tools:diagnose — relation classifier categories the production corpus cannot produce", () => {
-  // The synthetic toolset is exactly {read, edit, test} and all three appear in
-  // the expected sequence, so `other-allowed` and `mixed-other` are unreachable
-  // through the live loop. The classifier is pure, so they are proven directly.
-  const expectedSequence = [READ, EDIT, TEST, undefined];
+  // The synthetic toolset is exactly {read, edit, test} and all three belong to
+  // the workflow, so `other-allowed` and `mixed-other` are unreachable through
+  // the live loop. The classifier is pure, so they are proven directly.
+  //
+  // The scenario view is the one a sequential (non-parallel) round 1 leaves
+  // behind: `read`'s transition succeeded, `edit` is the live expectation, and
+  // `test` is still ahead.
   const base = {
     reason: "expected-tool-not-invoked" as const,
     allAllowed: true,
-    expectedToolByRound: expectedSequence,
-    roundIndex: 1,
-    // The history a sequential (non-parallel) round 1 leaves behind: `read` ran,
-    // `edit` has not, so the round-2 expectation is still live.
-    priorInvokedNames: new Set([READ]),
+    satisfiedTools: [READ],
+    pendingTools: [EDIT, TEST],
   };
 
   it("classifies an unrelated allowed tool as other-allowed", () => {
@@ -1009,16 +1138,9 @@ describe("eval:tools:diagnose — relation classifier categories the production 
       classifyAllowedCallRelation({ ...base, selectedCallNames: ["grep"] }),
       classifyAllowedCallRelation({ ...base, selectedCallNames: [READ, "grep"] }),
       classifyAllowedCallRelation({ ...base, selectedCallNames: null }),
-      // The history-aware member: `edit` already ran as a parallel call.
-      classifyAllowedCallRelation({
-        ...base,
-        priorInvokedNames: new Set([READ, EDIT]),
-        selectedCallNames: [TEST],
-      }),
     ];
     expect(new Set(viaClassifier)).toEqual(
       new Set([
-        "expected-already-invoked",
         "prior-only",
         "future-only",
         "prior-and-future",
@@ -1027,6 +1149,33 @@ describe("eval:tools:diagnose — relation classifier categories the production 
         "not-applicable",
       ]),
     );
+    // Exactly six members: the v2 `expected-already-invoked` bucket is gone.
+    expect(new Set(viaClassifier).size).toBe(6);
+  });
+
+  it("fails closed on a mispaired scenario view rather than guessing", () => {
+    // The two views must describe the whole workflow exactly once. A wrong
+    // total, a duplicate, or an overlap would otherwise yield a confident wrong
+    // relation in the one command whose purpose is diagnostic accuracy.
+    expect(base.satisfiedTools.length + base.pendingTools.length).toBe(SCENARIO_STEP_COUNT);
+    expect(() =>
+      classifyAllowedCallRelation({ ...base, pendingTools: [EDIT], selectedCallNames: [READ] }),
+    ).toThrow();
+    expect(() =>
+      classifyAllowedCallRelation({
+        ...base,
+        satisfiedTools: [READ, READ],
+        pendingTools: [EDIT],
+        selectedCallNames: [READ],
+      }),
+    ).toThrow();
+    expect(() =>
+      classifyAllowedCallRelation({
+        ...base,
+        pendingTools: [READ, EDIT],
+        selectedCallNames: [READ],
+      }),
+    ).toThrow();
   });
 
   it("refuses not-applicable for expected-tool-not-invoked and requires it for transcript-invalid", () => {
@@ -1105,7 +1254,26 @@ describe("eval:tools:diagnose — checkpoint preconditions before credentials or
     const forgeries: Partial<DiagnosticCheckpointData>[] = [
       { successfulScenarios: 20 }, // impossible at cursor 3
       { completedScenarios: 9 }, // disagrees with the cursor
-      { executedScenarioRounds: [4, 4] }, // ledger length mismatch
+      {
+        scenarioEvidence: [
+          [4, 3],
+          [4, 3],
+        ],
+      }, // ledger length mismatch
+      {
+        scenarioEvidence: [
+          [4, 3],
+          [4, 3],
+          [4, 2],
+        ],
+      }, // a success with a pending transition
+      {
+        scenarioEvidence: [
+          [1, 3],
+          [4, 3],
+          [4, 3],
+        ],
+      }, // a success with no final-answer round
       { attemptedRounds: 999, completedRounds: 999 }, // inflated counters
       { cleanup: { attempted: 12, deleted: 11, failed: 1, journalFailures: 0 } },
       { nextScenarioIndex: 20 }, // a complete corpus can never be resumable
@@ -1186,6 +1354,55 @@ describe("eval:tools:diagnose — resume", () => {
     expect(new Set(ordinals)).toEqual(new Set([219, 220]));
   });
 
+  it("resumes a v3 checkpoint whose committed scenarios finished in three rounds", async () => {
+    // The state-aware success shape ON DISK: each committed scenario recorded
+    // `[3, 3]` — three upstream rounds with all three transitions satisfied —
+    // which format 2's plain executed-round ledger could not express and the
+    // old four-round success floor would have rejected outright.
+    const committed = 18;
+    const rounds = 3 * committed;
+    const store = memStore(
+      seed(committed, {
+        attemptedRounds: rounds,
+        completedRounds: rounds,
+        cleanup: { attempted: rounds, deleted: rounds, failed: 0, journalFailures: 0 },
+        scenarioEvidence: Array.from(
+          { length: committed },
+          () => [3, SCENARIO_STEP_COUNT] as DiagnosticScenarioEvidence,
+        ),
+      }),
+    );
+    const adapter = smartAdapter({
+      round1: callsFor(READ, EDIT),
+      round2: callsFor(TEST),
+      round3: raw(finalEnvelope("synthetic summary")),
+    });
+    const h = harness({ argv: resumeArgv, store, makeAdapter: () => adapter });
+    expect(await runToolsDiagnostic(h.deps)).toBe(0);
+    const report = executed(h.emitted);
+    expect(report.checkpoint.resumed).toBe(true);
+    expect(report.checkpoint.startScenarioIndex).toBe(committed);
+    expect(report.checkpoint.runSegments).toBe(2);
+    // Only the last two scenarios ran, three rounds each.
+    expect(adapter.counts.creates).toBe(2 * 3);
+    expect(report.attemptedRounds).toBe(rounds + 6);
+    expect(report.completedScenarios).toBe(SCENARIO_COUNT);
+    expect(report.successfulScenarios).toBe(SCENARIO_COUNT);
+    expect(report.diagnostics.failures).toEqual([]);
+    expect(report.cleanup).toEqual({
+      attempted: rounds + 6,
+      deleted: rounds + 6,
+      failed: 0,
+      remaining: 0,
+      journalFailures: 0,
+    });
+    // Finalization removes ONLY the diagnostic checkpoint.
+    expect(report.completed).toBe(true);
+    expect(report.checkpoint.finalized).toBe(true);
+    expect(store.deletes).toBe(1);
+    expect(store.data).toBeNull();
+  });
+
   it("restarts an uncommitted scenario without duplicating its diagnostic", async () => {
     // Segment 1: scenario 202 (index 1) fails operationally mid-scenario at its
     // round 2, so the scenario does NOT commit and the cursor stays at 1.
@@ -1218,8 +1435,7 @@ describe("eval:tools:diagnose — resume", () => {
     const second = harness({
       argv: resumeArgv,
       store,
-      makeAdapter: () =>
-        smartAdapter({ round2: toolCallsEnvelope([{ name: READ, arguments: argsFor(READ) }]) }),
+      makeAdapter: () => smartAdapter({ round2: callsFor(READ) }),
     });
     expect(await runToolsDiagnostic(second.deps)).toBe(0);
     const report = executed(second.emitted);
@@ -1239,7 +1455,7 @@ describe("eval:tools:diagnose — resume", () => {
     const store = memStore();
     let created = 0;
     const base = smartAdapter({
-      round2: toolCallsEnvelope([{ name: READ, arguments: argsFor(READ) }]),
+      round2: callsFor(READ),
     });
     const adapter: CollectivIQAdapter = {
       ...base,
@@ -1590,8 +1806,7 @@ describe("eval:tools:diagnose — exit semantics", () => {
   it("exits ZERO on a complete diagnostic even when every scenario failed at the transition", async () => {
     const h = harness({
       argv: fullArgv,
-      makeAdapter: () =>
-        smartAdapter({ round2: toolCallsEnvelope([{ name: READ, arguments: argsFor(READ) }]) }),
+      makeAdapter: () => smartAdapter({ round2: callsFor(READ) }),
     });
     const code = await runToolsDiagnostic(h.deps);
     expect(code).toBe(0);
@@ -1614,19 +1829,49 @@ describe("eval:tools:diagnose — exit semantics", () => {
 });
 
 describe("eval:tools:diagnose — release evaluator compatibility", () => {
-  it("leaves the release report and checkpoint versions untouched", () => {
-    expect(EVAL_REPORT_VERSION).toBe(4);
-    expect(CHECKPOINT_FORMAT_VERSION).toBe(3);
-    // The diagnostic contract versions independently: v2 adds the history-aware
-    // relation member. A release bump must not follow from a diagnostic bump.
-    expect(DIAGNOSTIC_REPORT_VERSION).toBe(2);
-    expect(DIAGNOSTIC_CHECKPOINT_FORMAT_VERSION).toBe(2);
+  it("keeps the diagnostic versions independent of the release evaluator's", () => {
+    // The release constants are owned by `src/eval/report.ts` and
+    // `src/eval/checkpoint.ts`; they are pinned here purely as a canary, so a
+    // silent release-side bump surfaces in the diagnostic suite too.
+    expect(EVAL_REPORT_VERSION).toBe(5);
+    expect(CHECKPOINT_FORMAT_VERSION).toBe(4);
+    // The diagnostic contract versions INDEPENDENTLY: v3 removes the v2
+    // `expected-already-invoked` relation and replaces the executed-round
+    // ledger with per-scenario `[executedRounds, satisfiedSteps]` evidence.
+    // Neither number may be derived from the release side.
+    expect(DIAGNOSTIC_REPORT_VERSION).toBe(3);
+    expect(DIAGNOSTIC_CHECKPOINT_FORMAT_VERSION).toBe(3);
+    // Widened to `number` so the comparison is about the runtime values rather
+    // than the literal types.
+    const diagnosticReport: number = DIAGNOSTIC_REPORT_VERSION;
+    const diagnosticCheckpoint: number = DIAGNOSTIC_CHECKPOINT_FORMAT_VERSION;
+    const releaseReport: number = EVAL_REPORT_VERSION;
+    const releaseCheckpoint: number = CHECKPOINT_FORMAT_VERSION;
+    expect(diagnosticReport).not.toBe(releaseReport);
+    expect(diagnosticCheckpoint).not.toBe(releaseCheckpoint);
   });
 
   it("uses the same fixed origin but a distinct checkpoint filename and profile", () => {
     expect(DIAGNOSTIC_ORIGIN).toBe(EVAL_ORIGIN);
     expect(DIAGNOSTIC_CHECKPOINT_FILENAME).not.toBe(CHECKPOINT_FILENAME);
     expect(DIAGNOSTIC_PROFILE).toBe("multi-step-transition");
+  });
+
+  it("cannot name the release checkpoint module or filename from the command itself", () => {
+    // The command's own module resolves ONLY the diagnostic checkpoint store, so
+    // no code path here can read, overwrite, finalize, or remove the release
+    // evaluator's checkpoint. Comments are stripped first: the docstring
+    // legitimately explains the separation, and the property under test is that
+    // no CODE position can reach it. A hermetic file read; no network,
+    // credential, or upstream call.
+    const source = readFileSync(
+      new URL("../../src/eval/tools-diagnostic-cli.ts", import.meta.url),
+      "utf8",
+    );
+    const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+    expect(code).not.toMatch(/from\s+["']\.\/checkpoint\.js["']/);
+    expect(code).not.toContain(CHECKPOINT_FILENAME);
+    expect(code).toContain("./diagnostic-checkpoint.js");
   });
 
   it("wires production deps to the DIAGNOSTIC checkpoint store, never the release one", () => {

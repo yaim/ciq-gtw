@@ -18,8 +18,8 @@
  * finalization. Interpretation of the evidence, and any production remediation,
  * is a separate approval-gated decision.
  *
- * VERSIONING. {@link DIAGNOSTIC_REPORT_VERSION} is `2` and is INDEPENDENT of the
- * release evaluator's `EVAL_REPORT_VERSION` (4). The two outputs are separate
+ * VERSIONING. {@link DIAGNOSTIC_REPORT_VERSION} is `3` and is INDEPENDENT of the
+ * release evaluator's `EVAL_REPORT_VERSION` (5). The two outputs are separate
  * contracts; neither version implies anything about the other.
  *
  * SHARED VOCABULARY. The closed value-free abort/cleanup/failure-reason unions
@@ -37,6 +37,7 @@
  */
 import type { AuthObservation } from "../collectiviq/auth.js";
 import type { DiagnosticChoiceKind } from "./cases.js";
+import { SCENARIO_STEP_COUNT } from "./scenario-engine.js";
 import type {
   AbortInfo,
   AbortStage,
@@ -49,16 +50,24 @@ import type {
  * The diagnostic output-model version. Independent of `EVAL_REPORT_VERSION`;
  * bump on any breaking shape change (there is no migration path).
  *
- * v2 adds the {@link AllowedCallRelation} member `expected-already-invoked` and
- * makes the prior/future buckets HISTORY-aware rather than position-aware. The
- * round request enables parallel tool calls, so an accepted round can invoke
- * several tools at once (e.g. round 1 returning both `read` and `edit`). Under
- * v1 the classifier compared each selected name against the STATIC planned
- * sequence, so a model that correctly moved on to the next step after a parallel
- * round was reported as `future-only` — a fabricated "skip-ahead". v2 evaluates
- * against the set of names actually invoked in accepted prior rounds.
+ * v3 adopts the shared STATE-AWARE transition engine
+ * (`src/eval/scenario-engine.ts`) that both live evaluators now use. A
+ * scenario's expectation is the next UNSATISFIED transition, so the prior /
+ * future buckets are judged against transitions that SUCCESSFULLY completed
+ * rather than against names that were merely invoked.
+ *
+ * Consequently v3 REMOVES the v2 member `expected-already-invoked`. Under v2 a
+ * round could statically expect a tool that an earlier parallel batch had
+ * already invoked, and that member existed to avoid reporting a correct
+ * continuation as a fabricated skip-ahead. A state-aware expectation can never
+ * name an already-satisfied transition, so the category is unreachable by
+ * construction. It survives only as documented historical v2 live evidence.
+ *
+ * v2 made the buckets history-aware (invoked names) and added
+ * `expected-already-invoked`; v1 compared each selected name against the static
+ * planned sequence.
  */
-export const DIAGNOSTIC_REPORT_VERSION = 2 as const;
+export const DIAGNOSTIC_REPORT_VERSION = 3 as const;
 
 /**
  * The fixed diagnostic profile name. It appears in every emitted record and in
@@ -68,37 +77,37 @@ export const DIAGNOSTIC_REPORT_VERSION = 2 as const;
 export const DIAGNOSTIC_PROFILE = "multi-step-transition" as const;
 
 /**
- * How the selected allowed tool-call set relates to the scenario's execution
- * HISTORY and remaining planned steps, relative to the round that failed. This
- * is the dimension the release report cannot express.
+ * How the selected allowed tool-call set relates to the scenario's SUCCESSFULLY
+ * COMPLETED transitions and its remaining ones, relative to the round that
+ * failed. This is the dimension the release report cannot express.
  *
- * "Prior" and "future" are judged against what the scenario ACTUALLY invoked in
- * accepted earlier rounds — not against the static planned position — because
- * the round request enables parallel tool calls, so one accepted round can
- * invoke several tools.
+ * "Prior" and "future" are judged against transitions that actually SUCCEEDED —
+ * not against the static planned position, and not against names that were
+ * merely invoked. The round request enables parallel tool calls, so one accepted
+ * round can complete several transitions, and a failed call does not advance the
+ * workflow even though its name was invoked.
  *
- * - `expected-already-invoked`: this round's expected tool was ALREADY invoked in
- *   an accepted earlier round (typically as a parallel call), so the round's
- *   static expectation is stale and the model was not skipping work. This is the
- *   category that keeps a correct post-parallel continuation from being reported
- *   as a skip-ahead.
- * - `prior-only`: every selected call is a tool the scenario already invoked in
- *   an accepted earlier round (the loop repeated finished work).
- * - `future-only`: every selected call is a tool the scenario has NOT invoked yet
- *   and that a LATER planned round expects (a genuine skip-ahead).
- * - `prior-and-future`: the calls span both already-invoked and not-yet-invoked
- *   later-expected tools, with no unrelated allowed tool.
- * - `other-allowed`: the calls contain only allowed tools that are neither
- *   already invoked, the current expected tool, nor expected by a later round.
- * - `mixed-other`: at least one unrelated allowed tool appears together with an
- *   already-invoked or later-expected tool.
+ * - `prior-only`: every selected call is a tool whose transition already
+ *   SUCCEEDED (the loop repeated finished work).
+ * - `future-only`: every selected call is a tool whose transition has not
+ *   succeeded and comes AFTER the currently pending one (a genuine skip-ahead).
+ * - `prior-and-future`: the calls span both completed and later-pending
+ *   transitions, with no unrelated allowed tool.
+ * - `other-allowed`: the calls contain only allowed tools that are neither a
+ *   completed transition, the currently expected tool, nor a later one.
+ * - `mixed-other`: at least one unrelated allowed tool appears together with a
+ *   completed or later-pending one.
  * - `not-applicable`: there is no selected allowed tool-call set, the expected
  *   tool WAS present, or the failure class cannot usefully be categorized this
- *   way (an unauthorized name, ordinary text, an unavailable round, or no valid
- *   call).
+ *   way (an unauthorized name, ordinary text, an unavailable round, no valid
+ *   call, or an exhausted round budget).
+ *
+ * The v2 member `expected-already-invoked` is REMOVED in v3: a state-aware
+ * expectation is always the next UNSATISFIED transition, so a round can never
+ * expect a tool whose transition already succeeded. See the historical v2 live
+ * evidence in specification section 30.1.
  */
 export type AllowedCallRelation =
-  | "expected-already-invoked"
   | "prior-only"
   | "future-only"
   | "prior-and-future"
@@ -157,9 +166,10 @@ export interface TransitionDiagnostic {
 
 /**
  * Fixed integer codes for {@link AllowedCallRelation} (ledger use only). Codes
- * 1–6 are unchanged from v1; `expected-already-invoked` was APPENDED as 7 rather
- * than renumbering, so the ledger encoding of every pre-existing member is
- * stable.
+ * 1–6 keep their v1/v2 meaning. Code `7` (`expected-already-invoked`) is
+ * REMOVED in v3 and is no longer accepted: the state-aware engine cannot
+ * produce it, and a v2 checkpoint that persisted it is rejected outright
+ * (there is no migration path).
  */
 export const ALLOWED_CALL_RELATION_CODES: Readonly<Record<AllowedCallRelation, number>> =
   Object.freeze({
@@ -169,7 +179,6 @@ export const ALLOWED_CALL_RELATION_CODES: Readonly<Record<AllowedCallRelation, n
     "other-allowed": 4,
     "mixed-other": 5,
     "not-applicable": 6,
-    "expected-already-invoked": 7,
   });
 
 /** Decode a persisted relation code; `undefined` for anything unrecognized. */
@@ -188,8 +197,6 @@ export function allowedCallRelationForCode(code: unknown): AllowedCallRelation |
       return "mixed-other";
     case 6:
       return "not-applicable";
-    case 7:
-      return "expected-already-invoked";
     default:
       return undefined;
   }
@@ -272,6 +279,9 @@ export function reasonHasSelectedCallSet(reason: EvalFailureReason): boolean {
     case "expected-tool-unavailable":
     case "final-no-valid-call":
     case "final-unavailable":
+    case "scenario-round-budget-exhausted":
+      // The last is a whole-scenario reason: no single round's call set
+      // describes it, so it carries no selected calls either.
       return false;
     default: {
       const exhaustive: never = reason;
@@ -371,109 +381,91 @@ export interface AllowedCallRelationInput {
   /** True when every selected call named a tool inside the request allowlist. */
   readonly allAllowed: boolean;
   /**
-   * The scenario's expected tool per round, in round order. `undefined` marks a
-   * round that expects final text (the scenario's last round).
-   */
-  readonly expectedToolByRound: readonly (string | undefined)[];
-  /**
-   * 0-based index of the FAILING round within `expectedToolByRound`. It MUST
-   * index the same scenario the sequence came from; see the range check in
-   * {@link classifyAllowedCallRelation}.
-   */
-  readonly roundIndex: number;
-  /**
-   * The names the scenario ACTUALLY invoked in accepted earlier rounds — the
-   * execution history the prior/future buckets are judged against. It must NOT
-   * yet include the failing round's own calls.
+   * The workflow tools whose transitions SUCCESSFULLY completed before this
+   * round, in workflow order. This — not the set of names that were merely
+   * invoked — is what the `prior` bucket is judged against: a call that ran but
+   * failed (a wrong `edit` path, a `test` before its prerequisite) did not
+   * advance the workflow and must not read as finished work.
    *
-   * This exists because the round request enables parallel tool calls: an
-   * accepted round can invoke several tools at once, so static round position
-   * does not describe what has run. Names are in-process synthetic corpus values
-   * and never leave this function.
-   *
-   * Every earlier round of a still-running scenario was necessarily ACCEPTED
-   * (a scenario terminates at its first terminal failure), and acceptance
-   * requires the round's expected tool to be among its selected calls, so each
-   * earlier round's expected tool is always present in this set — the
-   * history-aware `prior` bucket is therefore a superset of the old
-   * position-based one and never loses a correct classification.
+   * Names are in-process synthetic corpus values and never leave this function.
    */
-  readonly priorInvokedNames: ReadonlySet<string>;
+  readonly satisfiedTools: readonly string[];
+  /**
+   * The workflow tools whose transitions have NOT succeeded, in workflow order.
+   * `pendingTools[0]` is the tool this round was expected to invoke; the rest
+   * are the later transitions a skip-ahead would target. An empty array means
+   * every transition succeeded and the round was expected to return final text.
+   *
+   * Together with {@link satisfiedTools} this must describe the WHOLE workflow
+   * exactly once; {@link classifyAllowedCallRelation} fails closed otherwise
+   * rather than returning a confident wrong answer.
+   */
+  readonly pendingTools: readonly string[];
 }
 
 /**
  * Derive the {@link AllowedCallRelation} for one failing round, purely and
- * deterministically, from the scenario's execution HISTORY plus its remaining
- * planned steps.
+ * deterministically, from the scenario's SUCCESSFULLY COMPLETED transitions
+ * plus the transitions still outstanding.
  *
  * Precedence:
  *
  *  1. Reason applicability: a reason that cannot carry a relation is
  *     `not-applicable` (see {@link reasonRequiresAllowedCallRelation}), as is a
  *     missing/empty call set or a set containing a name outside the allowlist.
- *  2. `expected-already-invoked`: this round's expected tool was ALREADY invoked
- *     in an accepted earlier round. The round's static expectation is stale, so
- *     the model was not skipping work — this outranks per-name bucketing, which
- *     would otherwise report a correct continuation as `future-only`.
- *  3. Per-name bucketing, in fixed order so a name occupying several roles
+ *  2. Per-name bucketing, in fixed order so a name occupying several roles
  *     always resolves the same way:
- *       - the CURRENT expected tool being present ⇒ `not-applicable` (the
- *         round's failure is not a transition confusion);
- *       - a name in the invoked history ⇒ `prior`;
- *       - a name NOT yet invoked but expected by a LATER planned round ⇒
- *         `future`;
+ *       - the CURRENT expected tool (`pendingTools[0]`) being present ⇒
+ *         `not-applicable` (the round's failure is not a transition confusion);
+ *       - a tool whose transition already SUCCEEDED ⇒ `prior`;
+ *       - a tool whose transition has not succeeded and comes AFTER the pending
+ *         one ⇒ `future`;
  *       - anything else allowed ⇒ `other`.
- *  4. Combine: `other` with `prior`/`future` ⇒ `mixed-other`; `other` alone ⇒
+ *  3. Combine: `other` with `prior`/`future` ⇒ `mixed-other`; `other` alone ⇒
  *     `other-allowed`; both ⇒ `prior-and-future`; else `prior-only` /
  *     `future-only`.
  *
- * FAILS CLOSED on an out-of-range `roundIndex`. The index is otherwise used only
- * to read the current expected tool and to bound the later-round scan, so an
- * index past the end would silently treat every planned round as already past
- * and a negative index would treat every round as still ahead — a
- * plausible-looking but wrong answer in a command whose entire purpose is
- * diagnostic accuracy. Because `roundIndex` and `expectedToolByRound` arrive as
- * separate arguments, an off-by-one or a scenario/round mispairing at the call
- * site must be loud rather than silent.
+ * There is no `expected-already-invoked` step any more. The expectation is the
+ * next UNSATISFIED transition, so it can never name a transition that already
+ * succeeded, and the v2 member that existed to catch that stale-expectation
+ * case is unreachable by construction (see {@link DIAGNOSTIC_REPORT_VERSION}).
+ *
+ * FAILS CLOSED when the two supplied views do not describe the whole workflow
+ * exactly once (a wrong total, or a tool appearing in both). The views are
+ * otherwise used only to read the current expectation and bound the future
+ * scan, so a mispaired scenario view would produce a plausible-looking but
+ * wrong answer in the one command whose entire purpose is diagnostic accuracy.
  */
 export function classifyAllowedCallRelation(input: AllowedCallRelationInput): AllowedCallRelation {
-  const {
-    reason,
-    selectedCallNames,
-    allAllowed,
-    expectedToolByRound,
-    roundIndex,
-    priorInvokedNames,
-  } = input;
-  if (!Number.isInteger(roundIndex) || roundIndex < 0 || roundIndex >= expectedToolByRound.length) {
-    throw new Error("diagnostic relation classifier received a round index outside the scenario");
+  const { reason, selectedCallNames, allAllowed, satisfiedTools, pendingTools } = input;
+  if (satisfiedTools.length + pendingTools.length !== SCENARIO_STEP_COUNT) {
+    throw new Error("diagnostic relation classifier received an incomplete scenario view");
+  }
+  const satisfied = new Set(satisfiedTools);
+  if (satisfied.size !== satisfiedTools.length) {
+    throw new Error("diagnostic relation classifier received a duplicated scenario view");
+  }
+  for (const name of pendingTools) {
+    if (satisfied.has(name)) {
+      throw new Error("diagnostic relation classifier received an overlapping scenario view");
+    }
   }
   if (!reasonRequiresAllowedCallRelation(reason)) return "not-applicable";
   if (selectedCallNames === null || selectedCallNames.length === 0) return "not-applicable";
   if (!allAllowed) return "not-applicable";
 
-  const current = expectedToolByRound[roundIndex];
-
-  // Step 2: the round's expectation is stale because its tool already ran.
-  if (current !== undefined && priorInvokedNames.has(current)) {
-    return "expected-already-invoked";
-  }
-
-  // Tools a LATER planned round expects. A name already invoked is history, not
-  // a skip-ahead, so the invoked set takes precedence over this set below.
-  const laterExpected = new Set<string>();
-  for (let r = roundIndex + 1; r < expectedToolByRound.length; r += 1) {
-    const name = expectedToolByRound[r];
-    if (name !== undefined) laterExpected.add(name);
-  }
+  // The tool this round was expected to invoke, and the transitions a genuine
+  // skip-ahead would target.
+  const current = pendingTools[0];
+  const later = new Set(pendingTools.slice(1));
 
   let sawPrior = false;
   let sawFuture = false;
   let sawOther = false;
   for (const name of selectedCallNames) {
     if (current !== undefined && name === current) return "not-applicable";
-    if (priorInvokedNames.has(name)) sawPrior = true;
-    else if (laterExpected.has(name)) sawFuture = true;
+    if (satisfied.has(name)) sawPrior = true;
+    else if (later.has(name)) sawFuture = true;
     else sawOther = true;
   }
 
