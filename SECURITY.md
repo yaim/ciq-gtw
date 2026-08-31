@@ -252,7 +252,52 @@ reasonCode]` ledger with fixed integer reason codes AND a compact per-committed-
   accepted only at an exact `0600` mode with symlink-safe ancestry. That
   corrected evaluator was first exercised live in the completed 2026-08-31
   campaign summarized above; section-30 stays unmet and no production security
-  boundary changed. `native` tool mode
+  boundary changed.
+- A separate approval-gated **multi-step transition diagnostic**
+  (`npm run eval:tools:diagnose`) exists to explain those value-free
+  `expected-tool-not-invoked` failures without weakening any privacy property.
+  Its output, logs, and persisted checkpoint remain **value-free by
+  construction**: the three new dimensions are CLOSED enums
+  (`allowedCallRelation`, `selectionSource`, `callMultiplicity`) emitted
+  alongside ordinals and the existing closed reason union, so no prompt, answer,
+  tool name, argument, schema, model or source identifier, thread/run/message/
+  session id, credential, title, body, timestamp, or exception text can appear;
+  the only URL any record carries is the fixed public origin. The relation
+  classifier reads synthetic tool names in-process and returns only an enum, and
+  a reason ⇄ dimension contract is enforced on both construction and persistence
+  so an inconsistent diagnostic can neither be emitted nor stored. The relation is
+  HISTORY-aware (output v2): because the round request enables parallel tool
+  calls, it is judged against the names the scenario ACTUALLY invoked in accepted
+  earlier rounds, and a round whose expected tool already ran reports
+  `expected-already-invoked` rather than a fabricated skip-ahead. That
+  invoked-name set is scenario-local and in-process, is never emitted, logged, or
+  persisted, and affects ONLY diagnostic classification — never
+  release-evaluator scoring, tool execution, or upstream behavior; the persisted
+  ledger stores the relation as an integer code, never a name. It runs ONLY
+  the 20 multi-step scenarios (max 80 upstream completions), reuses the shared
+  round lifecycle so each attempted round creates at most one thread and deletes
+  it immediately under the ID-only recovery journal, and keeps the same cleanup
+  truth: a cleanup-delete failure, a journal-persistence failure, a journal
+  finalization failure, or a checkpoint persistence/finalization failure is
+  non-resumable, prevents `completed`, and exits non-zero. Its resume state lives
+  in a SEPARATE format-v2 checkpoint
+  (`.agent/sessions/eval/tools-multi-step-diagnostic-checkpoint.json`) owned by a
+  self-contained module that hard-codes its own filename and imports nothing from
+  the release checkpoint, so the command structurally cannot read, overwrite,
+  finalize, or remove the release evaluator's checkpoint; it keeps the exact
+  `0600` mode, symlink-safe top-down ancestry validation, `O_NOFOLLOW`, atomic
+  temp+rename, bounded size, and blocked-tombstone discipline, and validates
+  every persisted tuple against the fingerprint-bound corpus before any
+  credential read or network I/O. A **format-v1 checkpoint is rejected** before
+  any credential access (no migration path), and a resumable checkpoint NEVER
+  encodes a complete-corpus cursor — the final scenario's commit is kept in memory
+  so the last durable file always stays one an approved resume accepts, and an
+  interruption before finalization replays exactly that scenario. Diagnostic
+  versions move independently of the release evaluator's report v4 / checkpoint
+  v3, which are unchanged. The default invocation is a credential-free,
+  network-free preflight. It **establishes no release gate**, and **the live
+  diagnostic has not been run** — every live invocation is separately
+  approval-gated. `native` tool mode
   remains unimplemented.
   `stream` is normalized to a boolean: absent or exactly `false` selects
   the non-streamed JSON path, exactly `true` selects the synthetic-SSE path

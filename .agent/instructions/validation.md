@@ -17,6 +17,7 @@
 | `npm run test:compatibility` | SDK compatibility | Standalone hermetic suite (`test/compatibility`, own `vitest.compatibility.config.ts`); pinned `ai`/`@ai-sdk/openai-compatible` SDK vs an ephemeral loopback gateway with a **fake** completion — no network/credentials/CollectivIQ. **Excluded from `validate`/CI** |
 | `npm run test:adversarial` | Tool release gate | Standalone hermetic suite (`test/adversarial`, own `vitest.adversarial.config.ts`); ≥200 deterministic tool-protocol cases against the pure engine — no network/credentials/CollectivIQ. **Excluded from `validate`/CI** |
 | `npm run eval:tools` | Live tool gate | Approval-gated LIVE evaluator (`src/eval/`). Default is a credential-free/network-free preflight; the fully-approved path probes the fixed CollectivIQ origin. Network-only; **must NEVER be added to `validate`/CI**. Four authorized campaigns have run. The operative evidence is the **completed 2026-08-31 report-v4 campaign** (the first completed campaign on the corrected report-v4 / checkpoint-v3 evaluator): it finished the full corpus across two resumable execution segments with cleanup and checkpoint finalization succeeding, and **six of eight gates passed** while **tool-name accuracy (248/260, 95.4% vs 98%) and multi-step success (14/20, 70% vs 85%) failed**, so section 30 remains **unmet**. Remediation was deliberately **deferred**; no production prompt, parser, selector, evaluator, threshold, model default, or configuration changed in response, and any future live run is separately approval-gated. See specification section 30 for the complete record. |
+| `npm run eval:tools:diagnose` | Live tool diagnostic | Approval-gated LIVE **multi-step transition diagnostic** (`src/eval/tools-diagnostic-cli.ts`). Default is a credential-free/network-free preflight; the fully-approved path runs ONLY the 20 multi-step scenarios (global corpus ordinals 201–220, max 80 upstream rounds) against the fixed CollectivIQ origin in password mode. It **establishes no release gate** — its output has no gates and no `passed` field, only `completed` — and it uses a SEPARATE diagnostic checkpoint so it can never touch the release evaluator's. Network-only; **must NEVER be added to `validate`/CI**. **The live diagnostic has NOT been run**; every live invocation is separately approval-gated. See specification section 30.1. |
 | `npm run test:coverage` | Coverage | Vitest with V8 coverage |
 | `npm run build` | Build | `tsc -p tsconfig.json`, emits `dist/` |
 | `npm run test:build` | Build smoke | Imports compiled `dist/*.js`; asserts no listening socket |
@@ -33,11 +34,64 @@ must **never** be added to `validate` or CI. `test:compatibility` is hermetic bu
 is likewise kept **out** of `validate`/CI and run only on its own. The
 **adversarial tool-protocol release-gate suite** `test:adversarial`
 (`vitest.adversarial.config.ts`) is now implemented and is likewise hermetic but
-kept **out** of `validate`/CI. The network-only `eval:tools` live evaluator and
-the `contract:*` commands must **never** be added to `validate` or CI. Load,
+kept **out** of `validate`/CI. The network-only `eval:tools` live evaluator, the
+network-only `eval:tools:diagnose` live diagnostic, and the `contract:*`
+commands must **never** be added to `validate` or CI. Load,
 live-upstream, end-to-end OpenCode, and Docker/live checks remain **not
 implemented** and must not be added to `validate`. Keep fast hermetic validation
 separate from those.
+
+**Multi-step transition diagnostic (`npm run eval:tools:diagnose`).** A separate,
+approval-gated, multi-step-only command that collects the evidence the release
+report deliberately cannot express: for a valid-but-wrong allowed call it records
+three closed value-free dimensions (`allowedCallRelation`, `selectionSource`,
+`callMultiplicity`) alongside the existing `caseOrdinal`/`roundOrdinal`/
+`choiceKind`/`reason`. Specification section 30.1 owns the normative contract —
+do not restate it here. Operationally:
+
+- The DEFAULT invocation is a credential-free, network-free **preflight**: it
+  reads no credential, initializes no journal, inspects or creates no checkpoint,
+  and opens no socket. Running it without approval flags is the only safe way to
+  verify wiring.
+- Live execution requires ALL of `--execute-approved`, `--cost-approved`,
+  `--cleanup-approved`, `--recovery-journal-approved`; an existing diagnostic
+  checkpoint additionally requires `--resume-approved`. Every unknown argument is
+  rejected.
+- Bounds: exactly the 20 multi-step scenarios at global ordinals **201–220**, max
+  **80** upstream rounds (an upper bound — early termination reduces it), fixed
+  origin, password auth only. The 200 single-round cases never execute.
+- It **establishes no release gate**: the output has no gate collection and no
+  `passed` field, only `completed`. A complete diagnostic exits **zero even when
+  model transition failures were observed**; non-zero means the diagnostic itself
+  could not be trusted (blocked precondition, operational abort, cleanup/journal
+  failure, or checkpoint persistence/finalization failure).
+- Resume uses the SEPARATE version-2 checkpoint
+  `.agent/sessions/eval/tools-multi-step-diagnostic-checkpoint.json` (a
+  **version-1 checkpoint is rejected** before any credential access, with no
+  migration path). It can
+  never read, overwrite, finalize, or remove the release evaluator's checkpoint,
+  and validates every persisted tuple against the fingerprint-bound corpus before
+  any credential read or network I/O.
+- A resumable diagnostic checkpoint NEVER encodes a complete-corpus cursor: the
+  final scenario's commit is kept in memory and disposed of by finalization, so
+  the last durable file always stays one an approved resume accepts. An
+  interruption before finalization replays exactly that final scenario. A
+  non-resumable failure may still write a `blocked` tombstone, which is exempt
+  from that cursor rule.
+- Diagnostic output is version 2 (`allowedCallRelation` gained the history-aware
+  member `expected-already-invoked`). Diagnostic versions move INDEPENDENTLY of
+  the release evaluator's report v4 / checkpoint v3 — never bump one because the
+  other changed.
+- **The live diagnostic has NOT been run.** Do not record a campaign for it.
+
+Expected OFFLINE validation for changes in this area: the narrow suites
+`test/contract/tools-diagnostic-cli.test.ts`,
+`test/contract/eval-diagnostic-checkpoint.test.ts`,
+`test/contract/eval-diagnostic-report.test.ts`, plus the release evaluator's
+unchanged `test/contract/tools-eval-cli.test.ts` and
+`test/contract/eval-checkpoint.test.ts`; then `npm run test:adversarial`,
+`npm run test:compatibility`, and `npm run validate`. All are hermetic: no
+network, no credential, no CollectivIQ call, no tool execution.
 
 **Phase 3 emulated-tool evidence (offline).** Tool calling is covered end to end
 by hermetic suites and only these claims are asserted: unit

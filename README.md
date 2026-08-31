@@ -684,6 +684,76 @@ OpenCode-style tool loop, which is an evaluator-corpus correction and
 does NOT change the production tool corpus, allowlists, thresholds, or
 protocol.
 
+### Multi-step transition diagnostic
+
+`npm run eval:tools:diagnose` is a **separate, approval-gated, multi-step-only
+diagnostic**. Every failure in the 2026-08-31 campaign was the same shape — a
+multi-step scenario, at round 2 (the `edit` step after a successful `read`),
+under `tool_choice: auto`, producing a valid, _allowed_ tool call that omitted
+the expected tool — and the value-free release report cannot say whether the
+model repeated a finished tool, skipped ahead, mixed both, chose another allowed
+tool, or emitted several calls. This command collects exactly that evidence.
+
+For each terminal failure it adds three closed, value-free dimensions beside the
+existing `caseOrdinal` / `roundOrdinal` / `choiceKind` / `reason`:
+
+```ts
+type AllowedCallRelation =
+  | "expected-already-invoked"
+  | "prior-only"
+  | "future-only"
+  | "prior-and-future"
+  | "other-allowed"
+  | "mixed-other"
+  | "not-applicable";
+type DiagnosticSelectionSource =
+  "desired-source" | "individual-single" | "individual-consensus" | "not-applicable";
+type DiagnosticCallMultiplicity = "single" | "multiple" | "not-applicable";
+```
+
+Operator summary:
+
+| Property        | Value                                                                                                             |
+| --------------- | ----------------------------------------------------------------------------------------------------------------- |
+| Default run     | Credential-free, network-free **preflight** (no journal, no checkpoint, no socket)                                |
+| Live approvals  | `--execute-approved --cost-approved --cleanup-approved --recovery-journal-approved`                               |
+| Resume approval | `--resume-approved` (required whenever a diagnostic checkpoint exists)                                            |
+| Scope           | Only the 20 multi-step scenarios, global corpus ordinals **201–220**; the 200 single-round cases never run        |
+| Upstream bound  | Max **80** completions (upper bound — early termination reduces it)                                               |
+| Origin / auth   | Fixed `https://api.prod.collectiviq.ai`, password mode only                                                       |
+| Output          | Independent version-**2** union (`preflight`/`progress`/`blocked`/`executed`), `profile: "multi-step-transition"` |
+| Checkpoint      | Separate `.agent/sessions/eval/tools-multi-step-diagnostic-checkpoint.json` (format v2, ignored)                  |
+| Exit code       | **0** when `completed` — even with observed model failures; non-zero only when the diagnostic itself failed       |
+
+`allowedCallRelation` is judged against what the scenario ACTUALLY invoked, not
+against planned round position. The round request enables parallel tool calls, so
+one accepted round can run several tools: a round 1 returning `[read, edit]`
+executes both while round 2 still statically expects `edit`. Position-based
+classification would report a model that correctly moves on to `test` as
+`future-only` — a fabricated skip-ahead — so that case reports
+`expected-already-invoked` instead. A genuine skip-ahead after an ordinary round 1
+still reports `future-only`. The invoked-name set is scenario-local, in-process,
+and never emitted or persisted.
+
+A resumable diagnostic checkpoint never encodes a complete corpus: the final
+scenario's commit is kept in memory, so the last durable checkpoint always stays
+one an approved resume accepts. If the process stops before finalization, a resume
+replays exactly that final scenario with no duplicate diagnostics.
+
+Diagnostic output/checkpoint versions are **independent** of the release
+evaluator's report v4 / checkpoint v3, which are unchanged. Format-1 diagnostic
+checkpoints are rejected with no migration path.
+
+It **establishes no release gate**: the output carries no gate collection and no
+`passed` field, and it changes no threshold, denominator, corpus, prompt, parser,
+selector, model default, or OpenCode configuration. The separate checkpoint means
+it can never read, overwrite, finalize, or remove the release evaluator's
+checkpoint. Like `eval:tools`, it is network-only and must **never** be added to
+`validate`/CI. **The live diagnostic has not been run**; every live invocation is
+separately approval-gated. See
+[`.agent/docs/tech-software-spec.md`](.agent/docs/tech-software-spec.md) section
+30.1.
+
 ## CollectivIQ contract tooling
 
 The upstream contract is grounded in the published OpenAPI document and captured

@@ -38,6 +38,48 @@ here. What matters for tool-policy decisions:
   model configuration is being changed in response**, and any future live rerun
   or remediation is a separate approval-gated decision.
 
+**Multi-step transition diagnostic (`npm run eval:tools:diagnose`).** Because the
+release report is value-free, it cannot say WHY those round-2 calls were valid,
+allowed, and yet wrong. A separate approval-gated, multi-step-only command
+collects that evidence: for each terminal failure it adds three closed value-free
+dimensions — `allowedCallRelation` (`expected-already-invoked` / `prior-only` /
+`future-only` / `prior-and-future` / `other-allowed` / `mixed-other` /
+`not-applicable`),
+`selectionSource` (carried from the trusted selector), and `callMultiplicity`
+(`single` / `multiple` / `not-applicable`) — alongside the existing
+`caseOrdinal` / `roundOrdinal` / `choiceKind` / `reason`. **Specification section
+30.1 owns the normative contract; `.agent/instructions/validation.md` owns the
+operational detail. Do not restate either here.**
+
+`allowedCallRelation` is HISTORY-aware: the round request enables parallel tool
+calls, so one accepted round can invoke several tools and static round position
+does not describe what ran. A round whose expected tool ALREADY ran in an accepted
+earlier round reports `expected-already-invoked` rather than a fabricated
+`future-only`. The invoked-name set is scenario-local and in-process; it affects
+ONLY diagnostic classification and never release-evaluator scoring or tool
+execution. Diagnostic output is version 2 and its checkpoint format is version 2
+(format 1 rejected, no migration); both are independent of the release
+evaluator's report v4 / checkpoint v3, which are unchanged.
+
+Interpretation boundaries, which matter for every tool-policy decision:
+
+- The diagnostic **establishes no release gate**. Its output has no gate
+  collection and no `passed` field, only `completed`, and it changes no
+  threshold, denominator, corpus, or gate accounting. A complete diagnostic exits
+  zero even when transition failures were observed.
+- A relation value **localizes** a failure; it does not identify a root cause. It
+  still names no tool, model, source, prompt, or argument, so it cannot by itself
+  attribute the behavior to the provider, the model, the prompt protocol, the
+  parser, or the selector.
+- It reuses the release evaluator's own failure classifier and the shared
+  `src/eval/live-round.ts` lifecycle, so its terminal-failure precedence and
+  upstream behavior are identical to the behavior it is explaining. Do not fork
+  either.
+- **The live diagnostic has NOT been run.** Do not treat the classification
+  categories as observed findings, and do not change a production prompt, parser,
+  selector, threshold, model default, or model configuration on the strength of
+  this command existing.
+
 Baseline evaluator hardening landed offline before the 2026-08-26 campaign; the
 report-v4 / checkpoint-v3 corrections were added afterwards and were first
 exercised live on 2026-08-31. The baseline hardening emits a versioned value-free

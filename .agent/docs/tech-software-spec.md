@@ -3597,6 +3597,206 @@ with the case's score and cursor before progress is emitted. On a completed
 run, the final `executed` report re-emits every prior segment's committed
 diagnostics exactly once.
 
+### 30.1 Multi-step transition diagnostic (`npm run eval:tools:diagnose`)
+
+The completed 2026-08-31 report-v4 campaign localized every multi-step failure
+to one shape: a multi-step scenario, at round 2 (the `edit` step that follows a
+successful `read`), under `tool_choice: auto`, producing a VALID, ALLOWED tool
+call that omitted the expected tool — reason `expected-tool-not-invoked`. The
+release report is value-free by construction, so it **cannot** distinguish
+whether the model repeated an already-completed tool, skipped ahead to a later
+tool, returned a mixture of both, selected some other allowed tool, or produced
+multiple calls. This section defines a SEPARATE, approval-gated, multi-step-only
+diagnostic that collects exactly that missing evidence.
+
+**It establishes NO release gate.** Its output carries no threshold, no gate
+collection, and no `passed` field. It does not alter any section-30 threshold,
+denominator, corpus, or gate accounting, and no production prompt, tool parser,
+candidate selector, request normalization, model default, model configuration,
+OpenCode configuration, or public HTTP route may be changed by adding it. A
+diagnostic result is evidence for a later, separately approved decision — never
+a release claim. **The live diagnostic has NOT been run**; every live invocation
+is separately approval-gated.
+
+**Scope and bounds (normative).**
+
+- Runs ONLY the multi-step scenarios, at their GLOBAL corpus ordinals **201–220**
+  (20 scenarios). The 200 single-round cases are never executed.
+- MAXIMUM **80** upstream completions (20 × 4) per segment. This is an UPPER
+  BOUND: truthful early termination at the first terminal failure means an actual
+  run attempts strictly fewer.
+- Fixed origin `https://api.prod.collectiviq.ai` (a module constant, never
+  injectable) and **password auth only**.
+- Preserves the report-v4 agent-loop semantics exactly: ONE initial user message,
+  history accumulated only through the accepted assistant `tool_calls` message
+  and exactly linked `role: "tool"` synthetic result messages, deterministic
+  content-safe synthetic results, and termination at the first terminal failure
+  with no fabricated cascade diagnostics.
+- Creates at most ONE thread per attempted round and deletes it immediately,
+  reusing the ID-only recovery journal and the shared create → journal → submit →
+  poll → delete lifecycle (`src/eval/live-round.ts`) that the release evaluator
+  also uses, so the two cannot drift.
+- Reuses the release evaluator's own failure classifier, so terminal-failure
+  precedence is identical to the behavior being explained.
+
+**Approvals.** The DEFAULT invocation is a credential-free, network-free
+preflight that reads no credential, initializes no journal, inspects or creates
+no checkpoint, and opens no socket. Live execution requires ALL of
+`--execute-approved`, `--cost-approved`, `--cleanup-approved`, and
+`--recovery-journal-approved`; an existing diagnostic checkpoint additionally
+requires `--resume-approved`. Every unknown argument is rejected. The command is
+network-only and must **never** be added to `validate` or CI.
+
+**Classification contract.** Each terminal failure emits the release report's
+safe structural identity (`caseOrdinal` — the GLOBAL 201–220 ordinal —
+`roundOrdinal`, `choiceKind`, and the closed `EvalFailureReason`) plus three
+CLOSED, value-free dimensions:
+
+```ts
+type AllowedCallRelation =
+  | "expected-already-invoked" // this round's tool ALREADY ran in an accepted round
+  | "prior-only"        // every selected call already ran in an accepted round
+  | "future-only"       // every selected call has NOT run and a LATER round expects it
+  | "prior-and-future"  // both, with no unrelated allowed tool
+  | "other-allowed"     // only allowed tools outside history and remaining plan
+  | "mixed-other"       // an unrelated allowed tool plus a prior/future one
+  | "not-applicable";
+
+type DiagnosticSelectionSource =
+  | "desired-source" | "individual-single" | "individual-consensus" | "not-applicable";
+
+type DiagnosticCallMultiplicity = "single" | "multiple" | "not-applicable";
+```
+
+**`allowedCallRelation` is HISTORY-aware, not position-aware.** The round request
+enables parallel tool calls, so ONE accepted round can invoke several tools: a
+round 1 that returns `[read, edit]` executes both, yet round 2 still statically
+expects `edit`. Judging the relation by planned round position would then report a
+model that correctly proceeds to `test` as `future-only` — a fabricated
+skip-ahead in the one command whose purpose is diagnostic accuracy. The relation
+is therefore derived from the set of names the scenario ACTUALLY invoked in
+accepted earlier rounds, tracked per scenario in memory (names never emitted,
+logged, or persisted), together with the tools later planned rounds still expect.
+
+Required precedence:
+
+1. Reason applicability: a reason that cannot carry a relation is
+   `not-applicable`, as is a missing/empty call set or a set containing a name
+   outside the allowlist.
+2. `expected-already-invoked` when this round's expected tool is already in the
+   invoked set. The round's static expectation is stale, so the model was not
+   skipping work; this outranks per-name bucketing.
+3. Per-name bucketing: the CURRENT expected tool being present ⇒
+   `not-applicable`; a name in the invoked set ⇒ `prior`; a name NOT yet invoked
+   but expected by a LATER planned round ⇒ `future`; anything else allowed ⇒
+   `other`.
+4. Combine as the member list above describes.
+
+A round's OWN calls join the invoked set only AFTER that round is accepted and
+its transcript re-validates, so the failing round is always classified against
+the history that existed before it ran. The set is scenario-local and discarded
+when the scenario ends. Because a scenario terminates at its first terminal
+failure, every earlier round was accepted and acceptance requires its expected
+tool among the selected calls — so the history-aware `prior` bucket is a superset
+of the old position-based one and never loses a correct classification. Prior-call
+history affects ONLY diagnostic classification: it changes no release-evaluator
+scoring, no tool execution, and no upstream behavior.
+
+An out-of-range round index fails closed rather than returning a confident wrong
+answer. A diagnostic whose reason is `expected-tool-not-invoked` MUST carry a
+non-`not-applicable` relation; an expected-tool-present failure such as
+`transcript-invalid`, and an `unauthorized-tool-call`, MUST use
+`not-applicable`. `selectionSource` is carried from the trusted selector result
+and never names an upstream model or answer source. `callMultiplicity` buckets the
+selected call count; exact counts beyond the bucket are never emitted. The reason
+⇄ dimension contract is enforced on both construction and persistence, so an
+inconsistent diagnostic can neither be emitted nor stored.
+
+**Output contract.** An INDEPENDENT version-`2` union (`preflight | progress |
+blocked | executed`), unrelated to `EVAL_REPORT_VERSION` — a diagnostic bump must
+never imply a release bump. Version 2 adds the `expected-already-invoked` relation
+member (ledger code `7`, APPENDED so codes 1–6 keep their v1 meaning) and the
+history-aware prior/future rules above. Every record carries
+`version: 2`, `profile: "multi-step-transition"`, the fixed origin, and
+`authMode: "password"`. Preflight reports the planned scenarios, the global
+ordinal range, the upstream-round upper bound, the required and supplied
+approvals, and the resume-approved state. Progress is emitted ONLY after a
+durable diagnostic-checkpoint write and carries only bounded counters, global
+case/round ordinals, cleanup totals, the run segment, and
+`checkpointPersisted: true`. The `executed` report carries the planned scenarios
+and upper-bound rounds, attempted/completed rounds, completed/successful scenario
+counts, the bounded failure diagnostics, cleanup totals, the value-free
+password-auth observation, the separate diagnostic checkpoint state, closed abort
+metadata, and `completed: boolean`.
+
+`completed` is true ONLY when all 20 scenarios were observed, no operational
+abort remains, every created thread was confirmed deleted, no recovery-journal
+failure remains, journal finalization succeeded, and the diagnostic checkpoint
+was removed successfully. **Exit zero when `completed` is true, even when model
+transition failures were observed** — those failures are the evidence the command
+exists to gather. Exit non-zero for blocking conditions, operational aborts,
+cleanup/journal failures, and checkpoint persistence/finalization failures.
+
+**Separate checkpoint.** Resume uses a DISTINCT format-version-`2` checkpoint at
+the ignored `.agent/sessions/eval/tools-multi-step-diagnostic-checkpoint.json`,
+owned by a self-contained module that hard-codes its own filename and references
+nothing from the release checkpoint, so the command structurally CANNOT read,
+overwrite, finalize, or remove the release evaluator's checkpoint. There is no
+migration path, and a **format-1 checkpoint is REJECTED** before any credential
+access or network I/O: its persisted relation codes were derived under the
+position-based rules, so replaying them under v2's history-aware accounting would
+mix two incompatible classifications. A resumed run must start from a fresh
+anchor. It is bound to the fixed origin, auth mode, and profile plus the
+fingerprint of the corpus, which is built EXACTLY ONCE per run — the multi-step
+slice, its fingerprint, its projection, and the execution loop all derive from
+that one value. It stores only bounded counters, cleanup truth, closed abort
+state, a per-committed-scenario executed-round ledger, and diagnostics persisted
+as a fixed integer tuple `[caseOrdinal, roundOrdinal, reasonCode, relationCode,
+sourceCode, multiplicityCode]`. Every code and tuple is validated against the
+actual fingerprint-bound scenario and round BEFORE any credential access or
+network I/O; a corrupt, incompatible, blocked, out-of-range, semantically
+impossible, or wrong-profile checkpoint is rejected there. A committed scenario
+may carry at most ONE terminal diagnostic, at exactly its executed-round count; a
+mid-scenario interruption restarts that scenario on resume and already committed
+scenarios are never replayed. The recovery journal is finalized exactly once, and
+the durable ordering is preserved: round completion → cleanup → journal
+finalization where terminal → checkpoint persistence/finalization → progress →
+final report. A safe complete execution deletes ONLY the diagnostic checkpoint; a
+non-resumable failure persists a diagnostic `blocked` tombstone.
+
+**Terminal checkpoint ordering (normative).** A resumable diagnostic checkpoint
+may NEVER encode a complete-corpus cursor. The resumable validator rejects that
+cursor by design — a genuinely complete run REMOVES its checkpoint rather than
+resuming it — so writing one would leave a file the next `--resume-approved`
+invocation refuses as inconsistent. Therefore:
+
+- a NON-final scenario commit persists the advanced resumable checkpoint and then
+  emits its progress record as usual;
+- the FINAL scenario's commit is kept in memory. The runner does not write
+  `nextScenarioIndex === scenarios.length`, emits no progress record claiming a
+  resumable checkpoint was persisted for it, and enters the finalization state
+  machine directly. The guard is enforced in code, not merely by call-site
+  discipline: an attempt to persist a resumable complete-corpus cursor fails
+  closed.
+
+The last durable checkpoint therefore always remains validator-accepted and
+points at the final, still-uncommitted scenario. If the process stops before
+finalization succeeds, an approved resume safely replays exactly that one
+scenario, adds no duplicate committed diagnostic, and keeps cleanup accounting
+truthful (every counted attempt was confirmed deleted). Successful finalization
+still finalizes the journal exactly once, removes only the diagnostic checkpoint,
+emits the final executed report, and exits according to `completed`; a
+finalization failure may still persist the deliberate non-resumable `blocked`
+tombstone, which is not subject to the resumable-cursor rule.
+
+**Privacy.** The command, its output, its logs, its checkpoint, its tests, and
+its documentation must never contain prompt or answer text, tool names, tool
+arguments or schemas, model/source identifiers, thread/run/message/session ids,
+credentials, titles, request/response bodies, URLs other than the fixed public
+origin in the report, timestamps, or arbitrary exception text. Synthetic scenario
+definitions stay in source and are never emitted or persisted. The relation
+classifier reads tool names in-process and returns only a closed enum.
+
 These gates therefore remain **NOT met**. The corrected report-v4 /
 checkpoint-v3 evaluator described above (genuine agent loop, meaningful
 deterministic tool results, truthful early termination, executed-round ledger)
