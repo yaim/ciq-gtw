@@ -18,8 +18,32 @@
 import type { UpstreamErrorCode } from "../collectiviq/errors.js";
 import type { AuthObservation } from "../collectiviq/auth.js";
 
-/** The output-model version. Bump on any breaking shape change. */
-export const EVAL_REPORT_VERSION = 3 as const;
+/**
+ * The output-model version. Bump on any breaking shape change.
+ *
+ * v4 (this release) captures two related semantic corrections without changing
+ * any emitted field name:
+ *
+ *   1. Multi-step scenarios model a genuine OpenCode-style agent loop over
+ *      synthetic in-memory state: ONE initial user message states the whole
+ *      goal, later rounds accumulate only through assistant `tool_calls`
+ *      messages and exactly linked `role: "tool"` synthetic result messages,
+ *      and a scenario terminates at its first terminal failure without
+ *      issuing further upstream requests.
+ *   2. `plannedUpstreamRounds` is the complete-corpus UPPER BOUND (200 + 20×4
+ *      = 280) — not the exact number of attempts. When a scenario terminates
+ *      early it stops issuing upstream rounds, so `attemptedRounds` for a
+ *      complete failed corpus can be strictly less than
+ *      `plannedUpstreamRounds`. Section-30 gate denominators are unaffected:
+ *      every committed multi-step scenario contributes the corpus's
+ *      `expectedCallsPerScenario` (3 for this corpus) to the expected-call
+ *      denominator, and 1 to the multi-step-success denominator, regardless
+ *      of how many rounds it actually issued.
+ *
+ * v3 checkpoints and v3 reports are incompatible: an older checkpoint is
+ * rejected outright with no migration path (see `src/eval/checkpoint.ts`).
+ */
+export const EVAL_REPORT_VERSION = 4 as const;
 
 /**
  * The closed set of value-free failure reasons a scored round can produce.
@@ -301,6 +325,12 @@ export interface PreflightReport {
   readonly authMode: "password";
   readonly plannedSingleRoundCases: number;
   readonly plannedMultiStepScenarios: number;
+  /**
+   * Complete-corpus upper bound on upstream completions (200 + 20 × 4 = 280).
+   * See the {@link EVAL_REPORT_VERSION} docstring: when a multi-step scenario
+   * terminates early, actual attempts fall below this bound, but section-30
+   * gate denominators are unaffected.
+   */
   readonly plannedUpstreamRounds: number;
   readonly approvalsRequired: readonly string[];
   readonly approvalsGiven: readonly string[];
@@ -334,8 +364,13 @@ export interface ProgressEvent {
   readonly phase: "single" | "multi";
   /** 1-based case ordinal within the whole corpus. */
   readonly caseOrdinal: number;
-  /** 1-based round ordinal within the case. */
+  /** 1-based round ordinal within the case (executed rounds only). */
   readonly roundOrdinal: number;
+  /**
+   * Complete-corpus upper bound on upstream completions (see {@link
+   * EVAL_REPORT_VERSION}). Not equal to actual attempts when scenarios
+   * terminate early.
+   */
   readonly plannedUpstreamRounds: number;
   readonly attemptedRounds: number;
   readonly completedRounds: number;
@@ -352,7 +387,13 @@ export interface ExecutedReport {
   readonly mode: "executed";
   readonly origin: string;
   readonly authMode: "password";
+  /**
+   * Complete-corpus upper bound on upstream completions (see {@link
+   * EVAL_REPORT_VERSION}). Not equal to `attemptedRounds` when a complete
+   * failed corpus terminates scenarios early.
+   */
   readonly plannedUpstreamRounds: number;
+  /** Actual upstream completions issued in this run. */
   readonly attemptedRounds: number;
   readonly completedRounds: number;
   readonly completedSingleRoundCases: number;

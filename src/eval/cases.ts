@@ -3,26 +3,73 @@
  * section 30). Every tool schema, prompt, and expected-tool value here is
  * INVENTED — there is no repository content, no real file path, and no customer
  * data. The corpus is deterministic so a run is reproducible.
+ *
+ * Multi-step scenarios represent a genuine OpenCode-style agent loop over
+ * synthetic in-memory state: ONE initial user message states the whole goal,
+ * and later rounds accumulate ONLY through assistant `tool_calls` messages and
+ * exactly linked `role: "tool"` synthetic result messages. The evaluator never
+ * injects a fresh user instruction between tool results.
  */
 import { createHash } from "node:crypto";
-import type { NormalizedTool, NormalizedToolChoice } from "../tools/index.js";
+import type { NormalizedTool, NormalizedToolChoice, ParsedToolCall } from "../tools/index.js";
 
 /** Exactly 200 single-round cases (one upstream completion each). */
 export const SINGLE_ROUND_CASES = 200;
 /** Exactly 20 three-step scenarios (read → edit → test → final = 4 rounds each). */
 export const MULTI_STEP_SCENARIOS = 20;
-/** Rounds per three-step scenario (three tool steps plus one final answer). */
+/** Maximum rounds per scenario when every step is attempted (3 tool steps + 1 final answer). */
 export const MULTI_STEP_ROUNDS = 4;
-/** Hard cap on upstream completions: 200 + 20 × 4 = 280. */
+/**
+ * MAXIMUM upstream completions a full corpus can execute (200 + 20 × 4 = 280).
+ *
+ * NOTE: this is the complete-corpus UPPER BOUND, not the exact attempt count.
+ * When a multi-step scenario terminates early (spec §30, early-termination
+ * accounting) it stops issuing upstream rounds after its terminal failure, so
+ * the actual `attemptedRounds` reported by a complete failed corpus can be
+ * strictly less than this maximum. The section-30 gate denominators are
+ * unaffected: a terminated scenario still contributes {@link EvalPlan.
+ * expectedCallsPerScenario} to `expectedCall.total` and 1 to `multi.total`.
+ */
 export const MAX_UPSTREAM_COMPLETIONS =
   SINGLE_ROUND_CASES + MULTI_STEP_SCENARIOS * MULTI_STEP_ROUNDS;
 
 /** One upstream round within a scenario. */
 export interface EvalRound {
   readonly choice: NormalizedToolChoice;
+  /**
+   * The prompt string. For a SINGLE-round case, this is the sole user message.
+   * For a MULTI-step scenario, ONLY `rounds[0].prompt` is used as the ONE
+   * initial user message — later rounds' `prompt` field is ignored by the
+   * evaluator (a scenario must not inject a fresh user instruction between
+   * tool results). The field is retained so single-round cases stay simple
+   * and so the corpus fingerprint captures the intent of every round.
+   */
   readonly prompt: string;
   /** The tool the model is expected to call this round (omitted → final text). */
   readonly expectedTool?: string;
+}
+
+/**
+ * Deterministic synthetic state that backs a multi-step scenario's simulated
+ * read → edit → test → final loop. Present ONLY for multi-step scenarios;
+ * absent for single-round cases. Every field is invented (no repository or
+ * customer content) and small/bounded so persisted evidence stays truthful.
+ *
+ * The loop is entirely synthetic: no filesystem, shell, MCP, external service,
+ * repository content, or real user data is ever touched.
+ */
+export interface EvalScenarioState {
+  /** The synthetic path the loop reads/edits (e.g. `synthetic/module-<j>.txt`). */
+  readonly path: string;
+  /** The deterministic starting content (e.g. `version=1`). */
+  readonly initialContent: string;
+  /**
+   * The exact deterministic replacement the `edit` step is expected to write
+   * (e.g. `version=2`). An edit call whose `text` argument matches this value
+   * — and whose `path` argument matches {@link path} — flips the runtime
+   * state so a later `test` call reports `testsPass: true`.
+   */
+  readonly expectedFinalContent: string;
 }
 
 /** One evaluation case (a single-round case has exactly one round). */
@@ -30,6 +77,8 @@ export interface EvalCase {
   readonly tools: readonly NormalizedTool[];
   readonly selectedLlms: readonly string[];
   readonly rounds: readonly EvalRound[];
+  /** Present ONLY for multi-step scenarios; absent for single-round cases. */
+  readonly scenarioState?: EvalScenarioState;
 }
 
 /** The fixed synthetic tool set (invented schemas only). */
@@ -66,7 +115,11 @@ const SELECTED_LLMS = Object.freeze(["claude"]);
 /**
  * Build the full corpus: 200 single-round cases cycling deterministically
  * through auto / required / named-read tool choices, plus 20 three-step
- * read → edit → test → final scenarios. All content is synthetic.
+ * read → edit → test → final scenarios. Multi-step scenarios use ONE initial
+ * user message (in `rounds[0].prompt`) and a synthetic state that later
+ * `read`/`edit`/`test` results reference; later rounds carry an empty prompt
+ * as documentation only — the evaluator never re-injects user text mid-loop.
+ * All content is synthetic.
  */
 export function buildEvalCases(): EvalCase[] {
   const cases: EvalCase[] = [];
@@ -93,19 +146,24 @@ export function buildEvalCases(): EvalCase[] {
   }
 
   for (let j = 0; j < MULTI_STEP_SCENARIOS; j += 1) {
-    const doc = `synthetic/module-${j}.txt`;
+    const path = `synthetic/module-${j}.txt`;
+    const initialContent = "version=1";
+    const expectedFinalContent = "version=2";
+    // ONE initial user message states the whole goal; later rounds do not
+    // inject fresh user instructions between tool results.
+    const initialUserPrompt =
+      `Synthetic multi-step scenario #${j}: read the document at ${path}, ` +
+      `use the edit tool to overwrite its content with exactly "${expectedFinalContent}", ` +
+      `then invoke the synthetic tests, and finally return a brief summary of what happened.`;
     cases.push({
       tools: SYNTHETIC_TOOLS,
       selectedLlms: SELECTED_LLMS,
+      scenarioState: { path, initialContent, expectedFinalContent },
       rounds: [
-        { choice: { kind: "auto" }, prompt: `Read ${doc}.`, expectedTool: "read" },
-        {
-          choice: { kind: "auto" },
-          prompt: `Edit ${doc} to bump its synthetic version.`,
-          expectedTool: "edit",
-        },
-        { choice: { kind: "auto" }, prompt: `Run the synthetic test suite.`, expectedTool: "test" },
-        { choice: { kind: "auto" }, prompt: `Summarize what changed for ${doc}.` },
+        { choice: { kind: "auto" }, prompt: initialUserPrompt, expectedTool: "read" },
+        { choice: { kind: "auto" }, prompt: "", expectedTool: "edit" },
+        { choice: { kind: "auto" }, prompt: "", expectedTool: "test" },
+        { choice: { kind: "auto" }, prompt: "" },
       ],
     });
   }
@@ -122,7 +180,14 @@ export function buildEvalCases(): EvalCase[] {
  * count.
  */
 export interface EvalPlan {
-  /** Total upstream rounds a complete run performs (the hard cap). */
+  /**
+   * MAXIMUM upstream rounds a complete run can perform (the hard cap).
+   *
+   * NOTE: this is the complete-corpus UPPER BOUND, not the exact attempt
+   * count. A complete failed corpus can attempt strictly fewer rounds when
+   * multi-step scenarios terminate early (their remaining planned expected-
+   * tool steps count as gate misses, NOT as attempted upstream rounds).
+   */
   readonly plannedUpstreamRounds: number;
   /** Rounds expected to yield a tool call (schema/name/argument denominators). */
   readonly expectedCall: number;
@@ -132,16 +197,21 @@ export interface EvalPlan {
   readonly multi: number;
   /**
    * Expected-tool-call rounds per multi-step scenario — the rounds carrying an
-   * `expectedTool` (read/edit/test = 3 for this corpus). This is the GATE
-   * denominator contribution per committed scenario, and is DISTINCT from the
-   * number of upstream rounds a scenario performs.
+   * `expectedTool` (read/edit/test = 3 for this corpus). Every COMMITTED
+   * scenario contributes exactly this many rounds to the expected-call gate
+   * denominator regardless of how many rounds were actually attempted (an
+   * early-terminated scenario's remaining expected-tool rounds are counted
+   * as gate misses). This is DISTINCT from the number of upstream rounds a
+   * scenario performs.
    */
   readonly expectedCallsPerScenario: number;
   /**
-   * Maximum upstream rounds any single case contains (a three-step scenario has
-   * four: read → edit → test → final answer). This is the UPSTREAM-ROUND
-   * contribution per committed scenario, used to bound checkpoint round counters,
-   * and is DISTINCT from {@link expectedCallsPerScenario}.
+   * MAXIMUM upstream rounds any single case can contain (a three-step
+   * scenario has four: read → edit → test → final answer). This is the
+   * upstream-round CEILING per scenario, used to bound checkpoint round
+   * counters and per-scenario executed-round-count ledger entries; the
+   * ACTUAL count for a committed scenario can be lower when the scenario
+   * terminated early.
    */
   readonly maxRoundsPerCase: number;
 }
@@ -259,10 +329,6 @@ export function buildEvalCorpusProjection(cases: readonly EvalCase[]): EvalCorpu
     const projectedRounds: EvalCorpusRound[] = [];
     for (const round of evalCase.rounds) {
       if (!isDiagnosticChoiceKind(round.choice.kind)) {
-        // Fail closed at build (finding 2): a corpus containing an unsupported
-        // choice kind (currently only `"none"`) cannot be represented as a
-        // diagnostic and must not enter the pipeline. The evaluator refuses
-        // to start rather than silently relabel it.
         throw new Error(
           "eval corpus projection rejects unsupported tool choice kind (only auto/required/function are diagnostic-representable)",
         );
@@ -281,11 +347,6 @@ export function buildEvalCorpusProjection(cases: readonly EvalCase[]): EvalCorpu
         expectedCallsPerScenario = caseExpected;
         expectedCallsSet = true;
       } else if (caseExpected !== expectedCallsPerScenario) {
-        // The projection's aggregate bound cannot represent a non-uniform
-        // multi-step expected-call count. A truly non-uniform corpus would
-        // require the validator to switch to per-case denominators; today's
-        // corpus is uniform and the tests exercise both uniformity and the
-        // per-round `expectedTool` layout via `cases`.
         throw new Error(
           "eval corpus projection cannot represent non-uniform multi-step expected-call counts",
         );
@@ -328,7 +389,6 @@ export function evalPlan(cases: readonly EvalCase[] = buildEvalCases()): EvalPla
     expectedCall += caseExpected;
     if (evalCase.rounds.length > 1) {
       multi += 1;
-      // The corpus is uniform, so every multi scenario contributes the same count.
       expectedCallsPerScenario = caseExpected;
     } else {
       single += 1;
@@ -356,8 +416,8 @@ export function evalPlan(cases: readonly EvalCase[] = buildEvalCases()): EvalPla
  * `cases` value it plans and projects, so fingerprint, plan, projection, and
  * the case loop all derive from one exact corpus instance (finding 1). Every
  * bit of the deterministic corpus — case ordering, tool metadata, prompts,
- * expected tools, model set, and schemas — is included in the digest exactly
- * as before.
+ * expected tools, model set, schemas, AND each multi-step scenario's synthetic
+ * state — is included in the digest exactly as before.
  */
 export function corpusFingerprint(cases: readonly EvalCase[] = buildEvalCases()): string {
   const canonical = JSON.stringify({
@@ -367,4 +427,96 @@ export function corpusFingerprint(cases: readonly EvalCase[] = buildEvalCases())
     cases,
   });
   return createHash("sha256").update(canonical, "utf8").digest("hex");
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic synthetic tool-result rendering
+// ---------------------------------------------------------------------------
+
+/**
+ * Mutable per-scenario runtime state that {@link renderSyntheticToolResult}
+ * updates. It is entirely synthetic (no filesystem, shell, MCP, external
+ * service, repository content, or real user data): only the small deterministic
+ * fields declared here. It exists ONLY inside a scenario's run and is discarded
+ * when the scenario terminates.
+ */
+export interface ScenarioRuntimeState {
+  readonly path: string;
+  /** Current synthetic document content (starts at `scenario.initialContent`). */
+  content: string;
+  /** True after an `edit` call whose args exactly matched the scenario's expected write. */
+  edited: boolean;
+  /** True after a `test` call observed `content === scenario.expectedFinalContent`. */
+  testsPass: boolean;
+}
+
+/** Build a fresh runtime state seeded from the scenario's declared initial values. */
+export function initializeScenarioRuntime(scenario: EvalScenarioState): ScenarioRuntimeState {
+  return {
+    path: scenario.path,
+    content: scenario.initialContent,
+    edited: false,
+    testsPass: false,
+  };
+}
+
+/**
+ * Deterministically render a small, bounded, JSON-serialized synthetic tool
+ * result for one assistant tool call. The result is content-safe (no
+ * filesystem, repository, credential, prompt, or answer data), depends ONLY on
+ * the supplied scenario + runtime state, and mutates `state` for later rounds:
+ *
+ * - `read`: `{"ok":true,"path":<state.path>,"content":<state.content>}`.
+ *   Deterministic and provides sufficient content for the model to construct
+ *   the expected `edit` arguments (path + expected replacement).
+ * - `edit`: attempts to parse the call's arguments and records `ok:true` when
+ *   the `path` matches the scenario's path AND the `text` exactly matches the
+ *   scenario's expected replacement. On a match `state.content` becomes the
+ *   expected replacement and `state.edited` becomes true; otherwise `ok:false`
+ *   is returned and the state is left unchanged.
+ * - `test`: sets `state.testsPass = state.content === expectedFinalContent`
+ *   and returns `{"ok":true,"testsPass":<state.testsPass>}` — the pass/fail
+ *   value depends only on prior synthetic state.
+ * - anything else: `{"ok":false}` (an unknown-tool result the model can act on).
+ *
+ * The function is pure with respect to the supplied `state` object and never
+ * touches the outside world. It always returns a bounded, non-empty string.
+ */
+export function renderSyntheticToolResult(
+  call: ParsedToolCall,
+  scenario: EvalScenarioState,
+  state: ScenarioRuntimeState,
+): string {
+  if (call.name === "read") {
+    return JSON.stringify({ ok: true, path: state.path, content: state.content });
+  }
+  if (call.name === "edit") {
+    let path: string | undefined;
+    let text: string | undefined;
+    try {
+      const parsed = JSON.parse(call.argumentsJson) as unknown;
+      if (parsed !== null && typeof parsed === "object") {
+        const asRecord = parsed as Record<string, unknown>;
+        const p = asRecord["path"];
+        const t = asRecord["text"];
+        if (typeof p === "string") path = p;
+        if (typeof t === "string") text = t;
+      }
+    } catch {
+      // Malformed argument JSON: treat as an edit that did not land.
+    }
+    const wroteExpected = path === scenario.path && text === scenario.expectedFinalContent;
+    if (wroteExpected) {
+      state.content = scenario.expectedFinalContent;
+      state.edited = true;
+    }
+    return JSON.stringify({ ok: wroteExpected, path: state.path });
+  }
+  if (call.name === "test") {
+    state.testsPass = state.content === scenario.expectedFinalContent;
+    return JSON.stringify({ ok: true, testsPass: state.testsPass });
+  }
+  // Unknown tool (should never happen in a normal scenario because the
+  // evaluator only forwards allowed calls, but stay explicit and content-safe).
+  return JSON.stringify({ ok: false });
 }

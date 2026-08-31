@@ -79,6 +79,8 @@ import {
   buildEvalCorpusProjection,
   corpusFingerprint,
   evalPlan,
+  initializeScenarioRuntime,
+  renderSyntheticToolResult,
   SINGLE_ROUND_CASES,
   MULTI_STEP_SCENARIOS,
   MAX_UPSTREAM_COMPLETIONS,
@@ -313,9 +315,6 @@ export function defaultToolsEvalDeps(): ToolsEvalDeps {
     emit: (output) => process.stdout.write(`${JSON.stringify(output)}\n`),
   };
 }
-
-/** Fixed synthetic tool-result content fed between multi-step rounds (no repo data). */
-const SYNTHETIC_TOOL_RESULT = '{"synthetic":true,"ok":true}';
 
 /** A deleter bound to the run's transport config; value-free diagnostics. */
 type BoundDeleter = (threadId: string, signal: AbortSignal) => Promise<DeleteDiagnostics>;
@@ -834,6 +833,11 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
   };
   let noSilentFallback = resumed?.invariants.noSilentFallback ?? true;
   let injectionResistance = resumed?.invariants.injectionResistance ?? true;
+  // Per-committed-multi-step-scenario upstream-round counts. Appended once per
+  // committed multi scenario in commit order (spec §30 early-termination
+  // accounting). Its `.length` equals `completedMulti` at every persistence
+  // boundary, and its entries are bounded by `projection.maxRoundsPerCase`.
+  const executedScenarioRounds: number[] = [...(resumed?.executedScenarioRounds ?? [])];
 
   // Committed value-free failure diagnostics, both the resumed slice (rehydrated
   // from the compact on-disk ledger) and any new commits this segment will add.
@@ -890,6 +894,7 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
       multi: { ...multi },
     },
     invariants: { noSilentFallback, injectionResistance },
+    executedScenarioRounds: [...executedScenarioRounds],
     diagnosticFailures: diagnosticFailuresSnapshot(),
   });
 
@@ -1280,14 +1285,39 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
       const isMulti = evalCase.rounds.length > 1;
 
       if (isMulti) {
-        const history: NormalizedMessage[] = [];
-        const pending: RoundDecision[] = [];
+        // A multi-step scenario represents a genuine OpenCode-style agent loop
+        // over synthetic in-memory state (spec §30). ONE initial user message
+        // (rounds[0].prompt) states the whole goal; later rounds accumulate
+        // ONLY through assistant `tool_calls` messages and exactly linked
+        // `role: "tool"` synthetic result messages — the evaluator never
+        // injects a fresh user instruction between tool results. Tool results
+        // are rendered deterministically from the scenario's declared state
+        // (no filesystem, shell, MCP, external service, repository content, or
+        // real user data). The scenario STOPS at its first terminal failure:
+        // no further upstream rounds are issued and no cascade diagnostics are
+        // fabricated.
+        const scenarioState = evalCase.scenarioState;
+        if (scenarioState === undefined) {
+          throw new Error("multi-step case is missing synthetic scenarioState");
+        }
+        const initialRound = evalCase.rounds[0];
+        if (initialRound === undefined) continue;
+        const runtimeState = initializeScenarioRuntime(scenarioState);
+        const history: NormalizedMessage[] = [{ role: "user", content: initialRound.prompt }];
+        // Expected-tool round decisions actually ATTEMPTED. Committed to the
+        // scored expected-call accumulators once the whole scenario commits.
+        const pendingAttempted: RoundDecision[] = [];
         // Pending value-free diagnostics for this scenario's failed rounds.
-        // Committed into `committedDiagnostics` ONLY when the whole scenario
-        // commits; a mid-scenario abort discards them (spec §30 lifecycle).
+        // Bounded to AT MOST ONE entry: a scenario terminates at its first
+        // terminal failure, so exactly one primary diagnostic is emitted per
+        // failed scenario. Committed into `committedDiagnostics` ONLY when the
+        // whole scenario commits; a mid-scenario abort (interruption, cleanup
+        // failure, journal failure, checkpoint-persist failure) discards them.
         const pendingScenarioDiagnostics: EvalFailureDiagnostic[] = [];
         let scenarioOk = true;
         let scenarioAbort: AbortInfo | null = null;
+        let executedRounds = 0;
+        let terminated = false;
         for (let r = 0; r < evalCase.rounds.length; r += 1) {
           const round = evalCase.rounds[r];
           if (round === undefined) break;
@@ -1303,7 +1333,7 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
           }
           attemptedRounds += 1;
           segmentCompletions += 1;
-          history.push({ role: "user", content: round.prompt });
+          executedRounds += 1;
           const request = buildRequest(evalCase.tools, round.choice, history);
           const step = await runUpstreamRound(
             adapter,
@@ -1331,12 +1361,16 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
           flagViolations(decision, round.choice);
           let reason = classifyRoundFailure(decision, round.expectedTool !== undefined);
           if (round.expectedTool !== undefined) {
-            // Defer the SCORED gate accumulation until the whole scenario finishes.
-            pending.push(decision);
+            pendingAttempted.push(decision);
             const nameOk = expectedCallNameOk(decision);
             if (!nameOk) {
               scenarioOk = false;
             } else if (decision.kind === "tool_calls") {
+              // Append the assistant tool_calls message AND the deterministic
+              // synthetic tool-result messages for each call. Results are
+              // content-safe and derived only from the scenario's declared
+              // synthetic state (no filesystem, repository, credential,
+              // prompt, or answer data).
               history.push({
                 role: "assistant",
                 content: null,
@@ -1347,15 +1381,27 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
                 })),
               });
               for (const call of decision.calls) {
-                history.push({ role: "tool", content: SYNTHETIC_TOOL_RESULT, toolCallId: call.id });
+                history.push({
+                  role: "tool",
+                  content: renderSyntheticToolResult(call, scenarioState, runtimeState),
+                  toolCallId: call.id,
+                });
               }
               if (!transcriptValid(history, evalCase.tools)) {
                 scenarioOk = false;
                 // Precedence step 6: the expected tool was selected and allowed,
                 // but the transcript linkage the gateway would build for the
-                // next round fails re-validation. Override any null classifier
-                // result with the specific `transcript-invalid` reason.
-                reason = "transcript-invalid";
+                // next round fails re-validation. Fill in the specific
+                // `transcript-invalid` reason ONLY when no earlier primary
+                // reason exists — never overwrite `unauthorized-tool-call`,
+                // `expected-tool-not-invoked`, `expected-tool-returned-text`,
+                // `expected-tool-no-valid-call`, or `expected-tool-unavailable`.
+                // In this branch the classifier already returned `null`
+                // (nameOk ⇒ allAllowed ⇒ !unauthorized ⇒ expected-invoked),
+                // so this is defensively explicit rather than a semantic
+                // change; keeping the precedence check makes future refactors
+                // safe.
+                if (reason === null) reason = "transcript-invalid";
               }
             }
           } else if (decision.kind !== "text") {
@@ -1383,6 +1429,14 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
               choiceKind: projectedChoiceKind,
               reason,
             });
+            // Truthful early termination (spec §30): this scenario cannot
+            // represent a real read → edit → test → final loop from here, so
+            // stop issuing upstream rounds. Remaining planned expected-tool
+            // steps are accounted for below as gate MISSES (denominator only),
+            // NOT as attempted upstream rounds — no cascade diagnostics are
+            // fabricated for rounds that never ran.
+            terminated = true;
+            break;
           }
           // Persist per-round: cleanup counters advance, but the case cursor and
           // the scenario's gate measurements do NOT until the scenario completes.
@@ -1400,21 +1454,32 @@ export async function runToolsEval(deps: ToolsEvalDeps): Promise<number> {
           aborted = scenarioAbort;
           break outer;
         }
-        // Whole scenario completed: commit the deferred gate measurements AND
-        // the deferred diagnostics now. A mid-scenario abort above dropped
-        // both; a completed scenario commits both together, atomically.
-        for (const decision of pending) commitExpectedCall(decision);
+        // Whole scenario committed (either completed successfully OR terminated
+        // early at a terminal failure). Commit the deferred gate measurements
+        // AND the single primary diagnostic (when one was recorded) now. A
+        // mid-scenario abort above dropped both; a committed scenario commits
+        // both together, atomically.
+        for (const decision of pendingAttempted) commitExpectedCall(decision);
+        // Remaining planned expected-tool rounds that were NOT attempted (a
+        // terminated scenario) contribute MISSES to the expected-call
+        // denominator only. This preserves the section-30 planned denominator
+        // (`expectedCallsPerScenario`) even when a scenario stops early,
+        // without fabricating diagnostics or attempted upstream rounds.
+        for (let r = executedRounds; r < evalCase.rounds.length; r += 1) {
+          if (evalCase.rounds[r]?.expectedTool !== undefined) expectedCall.total += 1;
+        }
         for (const d of pendingScenarioDiagnostics) committedDiagnostics.push(d);
         multi.total += 1;
-        if (scenarioOk) multi.success += 1;
+        if (scenarioOk && !terminated) multi.success += 1;
         completedMulti += 1;
+        executedScenarioRounds.push(executedRounds);
         nextCaseIndex = i + 1;
         const persistAbort = persistCheckpoint(nextCaseIndex);
         if (persistAbort !== null) {
           aborted = persistAbort;
           break;
         }
-        emitProgress("multi", i + 1, evalCase.rounds.length);
+        emitProgress("multi", i + 1, executedRounds);
       } else {
         const round = evalCase.rounds[0];
         if (round === undefined) continue;
