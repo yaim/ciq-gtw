@@ -200,21 +200,27 @@ and any further live run is approval-gated. The controls that exist today are:
   2026-08-26 campaign (content-free resume checkpoint gated behind
   `--resume-approved`, versioned value-free output union, four-state gate
   status), and the on-disk report and checkpoint payloads are now bounded and
-  value-free by construction: **report v4** adds a `diagnostics.failures`
+  value-free by construction: **report v5** carries a `diagnostics.failures`
   collection (only on `executed` reports) whose entries carry only ordinals, a
-  closed `choiceKind` union, and a closed nine-member `EvalFailureReason` union
+  closed `choiceKind` union, and a closed TEN-member `EvalFailureReason` union
+  (v5 appends `scenario-round-budget-exhausted`, reason code `10`, scope
+  `"any"`; codes 1..9 keep their v4 meaning)
   — never prompts, answers, arguments, schemas, tool names, model names, IDs,
   credentials, titles, bodies, URLs, timestamps, or exception text; **checkpoint
-  v3** persists diagnostics as a compact `[caseOrdinal, roundOrdinal,
+  v4** persists diagnostics as a compact `[caseOrdinal, roundOrdinal,
 reasonCode]` ledger with fixed integer reason codes AND a compact per-committed-multi-step-scenario
-  `executedScenarioRounds` ledger (one integer per committed multi scenario,
-  each mapped in projection order to its corresponding committed multi-step
-  case and bounded within `[1, that case's rounds.length]` — the per-CASE
-  round count, NOT the global `maxRoundsPerCase`, so a non-uniform corpus is
-  validated round-by-round rather than reduced to the projection maximum;
-  `.length` = `completedMultiStepScenarios`), and rejects both v1 and v2
-  checkpoints with no migration path. `MAX_CHECKPOINT_BYTES` stays at 8192;
-  both ledgers fit comfortably in compact JSON. The evaluator has been
+  `scenarioEvidence` ledger — one tuple
+  `[executedRounds, satisfiedSteps, schemaMask, nameMask, argMask]` per
+  committed multi scenario, mapped in projection order to its corresponding
+  case, with the executed-round element bounded within
+  `[1, that case's rounds.length]` (the per-CASE round count, NOT the global
+  `maxRoundsPerCase`), the satisfied count within that case's planned step
+  count, and each mask confined to those same step bits. Bit `i` is the i-th
+  planned transition, so the ledger records COUNTS AND BITMASKS ONLY and never
+  a tool name. `.length` = `completedMultiStepScenarios`. Checkpoint formats
+  **1, 2, and 3 are rejected** with no migration path. `MAX_CHECKPOINT_BYTES`
+  stays at 8192; both ledgers fit comfortably in compact JSON, and the cap was
+  not raised. The evaluator has been
   revised offline to represent a genuine OpenCode-style agent loop (one
   initial user message accumulated with assistant `tool_calls` and exactly
   linked `role: "tool"` synthetic result messages), render deterministic
@@ -229,30 +235,35 @@ reasonCode]` ledger with fixed integer reason codes AND a compact per-committed-
   from the two ledgers plus the fingerprint-bound projection (not merely a
   loose upper bound): every diagnostic entry maps to a real committed case
   and executed round (case ordinal within `nextCaseIndex`, round ordinal
-  within that corpus case AND within the scenario's `executedScenarioRounds`
-  entry, reason code in the fixed set, reason structurally compatible with
-  whether the referenced round expects a tool or final text); each committed
-  case carries AT MOST ONE primary diagnostic (a scenario terminates at its
-  first failure), and a multi-step scenario's diagnostic is AT its terminal
-  round; an early-terminated multi-step scenario MUST carry a terminal
-  diagnostic; `multi.success` counts ONLY full-length scenarios with no
-  terminal diagnostic; and the expected-call schema/argument/name-accurate
-  numerators are the exact sum of per-executed-round contributions derived
-  from each round's diagnostic reason (an unexecuted expected-tool round
-  contributes 0 to every numerator, so a forged `all-passing` claim over
-  partially-executed scenarios is rejected). The committed upstream-round
-  floor is computed as `committedSingle + Σ executedScenarioRounds`, so a
+  within that corpus case AND within the scenario's executed-round count,
+  reason code in the fixed set); each committed
+  case carries AT MOST ONE primary diagnostic, and a multi-step scenario's
+  diagnostic is AT its terminal round with a SCOPE that agrees with the
+  scenario's satisfied state (an expected-tool reason only while a transition
+  is pending, a final reason only once all three succeeded); a diagnostic-free
+  scenario must have every transition satisfied, full masks, and room for a
+  final-answer round — it MAY use fewer than four rounds, because a parallel
+  batch can complete several transitions at once; `multi.success` counts ONLY
+  diagnostic-free scenarios; each mask must contain the whole satisfied
+  PREFIX (a successful transition necessarily proves schema, name, and
+  argument evidence for its step); and the expected-call
+  schema/argument/name-accurate numerators are the exact sum of the
+  single-round per-reason contributions plus the multi-step mask POPCOUNTS
+  (an unsatisfied, uncredited step contributes 0, so a forged `all-passing`
+  claim over partially-executed scenarios is rejected). The committed
+  upstream-round floor is computed as `committedSingle + Σ executedRounds`, so a
   forged or inconsistent checkpoint — including any "complete + passing,
-  zero-attempt" claim, a numerator that exceeds the diagnostic-provable
-  evidence, or a ledger entry that fits the global `maxRoundsPerCase` but
+  zero-attempt" claim, a numerator that disagrees with the mask popcounts,
+  or a ledger entry that fits the global `maxRoundsPerCase` but
   exceeds its per-case `rounds.length` — cannot grant a zero-network pass;
   a non-resumable abort writes a durable value-free `blocked` tombstone
   that a resume run rejects until an operator deliberately archives or
   removes it (no automatic destructive restart), and checkpoint files are
   accepted only at an exact `0600` mode with symlink-safe ancestry. That
   corrected evaluator was first exercised live in the completed 2026-08-31
-  campaign summarized above; section-30 stays unmet and no production security
-  boundary changed.
+  campaign summarized above; the subsequent state-aware report-v5 /
+  checkpoint-v4 correction is **offline only and has NOT been run live**.
+  Section-30 stays unmet and no production security boundary changed.
 - A separate approval-gated **multi-step transition diagnostic**
   (`npm run eval:tools:diagnose`) exists to explain those value-free
   `expected-tool-not-invoked` failures without weakening any privacy property.
@@ -266,21 +277,22 @@ reasonCode]` ledger with fixed integer reason codes AND a compact per-committed-
   classifier reads synthetic tool names in-process and returns only an enum, and
   a reason ⇄ dimension contract is enforced on both construction and persistence
   so an inconsistent diagnostic can neither be emitted nor stored. The relation is
-  HISTORY-aware (output v2): because the round request enables parallel tool
-  calls, it is judged against the names the scenario ACTUALLY invoked in accepted
-  earlier rounds, and a round whose expected tool already ran reports
-  `expected-already-invoked` rather than a fabricated skip-ahead. That
-  invoked-name set is scenario-local and in-process, is never emitted, logged, or
-  persisted, and affects ONLY diagnostic classification — never
-  release-evaluator scoring, tool execution, or upstream behavior; the persisted
-  ledger stores the relation as an integer code, never a name. It runs ONLY
+  TRANSITION-aware (output v3): because the round request enables parallel tool
+  calls, it is judged against the transitions that SUCCESSFULLY completed rather
+  than the names that were merely invoked, and the v2 member
+  `expected-already-invoked` is REMOVED as unreachable under a state-aware
+  expectation (ledger code `7` is no longer decoded; codes 1–6 keep their
+  meaning). That transition state is scenario-local and in-process, is never
+  emitted, logged, or persisted, and affects ONLY diagnostic classification —
+  never release-evaluator scoring, tool execution, or upstream behavior; the
+  persisted ledger stores the relation as an integer code, never a name. It runs ONLY
   the 20 multi-step scenarios (max 80 upstream completions), reuses the shared
   round lifecycle so each attempted round creates at most one thread and deletes
   it immediately under the ID-only recovery journal, and keeps the same cleanup
   truth: a cleanup-delete failure, a journal-persistence failure, a journal
   finalization failure, or a checkpoint persistence/finalization failure is
   non-resumable, prevents `completed`, and exits non-zero. Its resume state lives
-  in a SEPARATE format-v2 checkpoint
+  in a SEPARATE format-v3 checkpoint
   (`.agent/sessions/eval/tools-multi-step-diagnostic-checkpoint.json`) owned by a
   self-contained module that hard-codes its own filename and imports nothing from
   the release checkpoint, so the command structurally cannot read, overwrite,
@@ -288,16 +300,20 @@ reasonCode]` ledger with fixed integer reason codes AND a compact per-committed-
   `0600` mode, symlink-safe top-down ancestry validation, `O_NOFOLLOW`, atomic
   temp+rename, bounded size, and blocked-tombstone discipline, and validates
   every persisted tuple against the fingerprint-bound corpus before any
-  credential read or network I/O. A **format-v1 checkpoint is rejected** before
+  credential read or network I/O, including a per-committed-scenario
+  `scenarioEvidence` tuple `[executedRounds, satisfiedSteps]` that carries
+  counts only. **Format-v1 AND format-v2 checkpoints are rejected** before
   any credential access (no migration path), and a resumable checkpoint NEVER
   encodes a complete-corpus cursor — the final scenario's commit is kept in memory
   so the last durable file always stays one an approved resume accepts, and an
   interruption before finalization replays exactly that scenario. Diagnostic
-  versions move independently of the release evaluator's report v4 / checkpoint
-  v3, which are unchanged. The default invocation is a credential-free,
-  network-free preflight. It **establishes no release gate**, and **the live
-  diagnostic has not been run** — every live invocation is separately
-  approval-gated. `native` tool mode
+  versions move independently of the release evaluator's report v5 / checkpoint
+  v4. The default invocation is a credential-free,
+  network-free preflight. It **establishes no release gate**. **One live run has
+  completed** under the historical v2 classifier — 20/20 scenarios, 54/54
+  threads deleted, zero cleanup or journal failures, a finalized checkpoint, and
+  no abort — and **the v3 diagnostic has not been run live**; every live
+  invocation is separately approval-gated. `native` tool mode
   remains unimplemented.
   `stream` is normalized to a boolean: absent or exactly `false` selects
   the non-streamed JSON path, exactly `true` selects the synthetic-SSE path

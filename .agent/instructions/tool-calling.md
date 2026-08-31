@@ -42,24 +42,37 @@ here. What matters for tool-policy decisions:
 release report is value-free, it cannot say WHY those round-2 calls were valid,
 allowed, and yet wrong. A separate approval-gated, multi-step-only command
 collects that evidence: for each terminal failure it adds three closed value-free
-dimensions — `allowedCallRelation` (`expected-already-invoked` / `prior-only` /
-`future-only` / `prior-and-future` / `other-allowed` / `mixed-other` /
-`not-applicable`),
+dimensions — `allowedCallRelation` (`prior-only` / `future-only` /
+`prior-and-future` / `other-allowed` / `mixed-other` / `not-applicable`),
 `selectionSource` (carried from the trusted selector), and `callMultiplicity`
 (`single` / `multiple` / `not-applicable`) — alongside the existing
 `caseOrdinal` / `roundOrdinal` / `choiceKind` / `reason`. **Specification section
 30.1 owns the normative contract; `.agent/instructions/validation.md` owns the
 operational detail. Do not restate either here.**
 
-`allowedCallRelation` is HISTORY-aware: the round request enables parallel tool
-calls, so one accepted round can invoke several tools and static round position
-does not describe what ran. A round whose expected tool ALREADY ran in an accepted
-earlier round reports `expected-already-invoked` rather than a fabricated
-`future-only`. The invoked-name set is scenario-local and in-process; it affects
-ONLY diagnostic classification and never release-evaluator scoring or tool
-execution. Diagnostic output is version 2 and its checkpoint format is version 2
-(format 1 rejected, no migration); both are independent of the release
-evaluator's report v4 / checkpoint v3, which are unchanged.
+**ONE live diagnostic run has completed** (under the historical v2 classifier):
+20/20 scenarios, 54/54 threads deleted, zero cleanup/journal failures, a
+finalized checkpoint, no abort, 7 scenarios following the old static schedule
+and 13 failing at round 2 with `expected-already-invoked`. That established the
+static round-2 `edit` expectation was STALE — an accepted parallel batch had
+already invoked `edit` — but it did NOT prove those edits SUCCEEDED, because the
+v2 relation tracked names rather than transitions. It establishes no release
+gate. Section 30.1 owns the sanitized record.
+
+`allowedCallRelation` is TRANSITION-aware: the round request enables parallel
+tool calls, so one accepted round can complete several transitions and static
+round position does not describe what ran. It is judged against transitions that
+SUCCESSFULLY completed, not against names that were merely invoked — an accepted
+call can still fail semantically. The transition state is scenario-local and
+in-process; it affects ONLY diagnostic classification and never
+release-evaluator scoring or tool execution. Diagnostic output is version 3 and
+its checkpoint format is version 3 (formats 1 and 2 rejected, no migration);
+both are independent of the release evaluator's report v5 / checkpoint v4.
+
+The v2 relation member `expected-already-invoked` is REMOVED in v3. A
+state-aware expectation is always the next UNSATISFIED transition, so it can
+never name a completed one. The member survives only as the historical v2 live
+evidence in specification section 30.1.
 
 Interpretation boundaries, which matter for every tool-policy decision:
 
@@ -71,14 +84,14 @@ Interpretation boundaries, which matter for every tool-policy decision:
   still names no tool, model, source, prompt, or argument, so it cannot by itself
   attribute the behavior to the provider, the model, the prompt protocol, the
   parser, or the selector.
-- It reuses the release evaluator's own failure classifier and the shared
-  `src/eval/live-round.ts` lifecycle, so its terminal-failure precedence and
-  upstream behavior are identical to the behavior it is explaining. Do not fork
-  either.
-- **The live diagnostic has NOT been run.** Do not treat the classification
-  categories as observed findings, and do not change a production prompt, parser,
-  selector, threshold, model default, or model configuration on the strength of
-  this command existing.
+- It reuses the release evaluator's own failure classifier, the shared
+  `src/eval/live-round.ts` lifecycle, and the shared
+  `src/eval/scenario-engine.ts` transition engine, so its expectations,
+  terminal-failure precedence, and upstream behavior are identical to the
+  behavior it is explaining. Do not fork any of them.
+- **The v3 diagnostic has NOT been run live** — only the historical v2 run
+  above. Do not change a production prompt, parser, selector, threshold, model
+  default, or model configuration on the strength of either.
 
 Baseline evaluator hardening landed offline before the 2026-08-26 campaign; the
 report-v4 / checkpoint-v3 corrections were added afterwards and were first
@@ -93,18 +106,49 @@ file, `O_NOFOLLOW`, atomic temp+rename, corpus-bound semantic validation
 before any credential read or network I/O) gated behind an explicit
 `--resume-approved` flag.
 
+**State-aware multi-step scoring (report v5 / checkpoint v4) — CURRENT,
+offline only.** `EVAL_REPORT_VERSION` is `5` and `CHECKPOINT_FORMAT_VERSION` is
+`4`; **checkpoint formats 1, 2, and 3 are rejected with no migration path.** A
+multi-step scenario's expectation is now the next UNSATISFIED transition in the
+shared engine `src/eval/scenario-engine.ts` (`read → edit → test → final text`,
+prerequisite-gated, parallel batches folded in the model's returned order), NOT
+the tool named at the round's ordinal. Gate evidence is measured PER PLANNED
+TRANSITION — independent schema / argument / expected-name / satisfied flags per
+step, merged across retries, each step contributing exactly one denominator unit
+at scenario commit — and a scenario succeeds only when all three transitions AND
+an accepted final text complete within four rounds, which parallelism can reach
+in three. A budget that ends without an accepted final answer emits exactly one
+`scenario-round-budget-exhausted` (appended reason code `10`, scope `"any"`).
+Checkpoint v4 replaces `executedScenarioRounds` with the per-scenario tuple
+`[executedRounds, satisfiedSteps, schemaMask, nameMask, argMask]`, and a
+multi-step diagnostic's scope is judged from the persisted SATISFIED STATE
+rather than the round's corpus slot (a single-round case still uses its own
+`hasExpectedTool`). Like the diagnostic, the release evaluator keeps the FINAL
+case's commit in memory and never persists a complete resumable cursor, through
+one shared commit path used by both the single-round and multi-step branches. A
+corpus/engine preflight guard additionally requires every multi-step case's
+declared expected-tool sequence to equal the engine's ordered
+`read → edit → test` exactly — a correct count in the wrong order is rejected —
+before any credential read or network I/O. **Corpus
+sizes, thresholds, the 280-round upper bound, the 260 expected-step denominator,
+and all single-round behavior are UNCHANGED, and v5 has NOT been run live** — the
+last scored campaign is still the 2026-08-31 report-v4 campaign. Specification
+section 30 owns the normative contract.
+
 **Revised multi-step model + early-termination accounting (report v4 /
-checkpoint v3).** To make the diagnostic rerun scientifically valid without
+checkpoint v3) — SUPERSEDED by v5 above; retained because it describes the
+2026-08-31 campaign.** To make the diagnostic rerun scientifically valid without
 touching production tool behavior, each multi-step scenario now represents a
 **genuine OpenCode-style agent loop** over synthetic in-memory state (spec
 §30). Each scenario carries `EvalScenarioState` (`path`, `initialContent =
 "version=1"`, `expectedFinalContent = "version=2"`) plus a mutable per-run
-`ScenarioRuntimeState`. ONE initial user message (`rounds[0].prompt`) states
+a mutable per-run transition state (owned by `src/eval/scenario-engine.ts`
+under v5). ONE initial user message (`rounds[0].prompt`) states
 the whole goal; later rounds accumulate history ONLY through the previously
 ACCEPTED assistant `tool_calls` message and exactly linked `role: "tool"`
 synthetic result messages — the evaluator NEVER injects a fresh user
 instruction between tool results. Tool results are rendered by
-`renderSyntheticToolResult` and are deterministic and content-safe (no
+the shared transition engine and are deterministic and content-safe (no
 filesystem, shell, MCP, external service, repository content, or real user
 data): `read` →
 `{"ok":true,"path":<state.path>,"content":<state.content>}` (provides the
@@ -131,13 +175,14 @@ call AND the scenario ran to completion (no early termination).
 exact attempt count — a complete failed corpus reports strictly fewer
 `attemptedRounds` when multi-step scenarios terminate early.
 
-The evaluator now emits report version `4`; only the `executed` variant
+That evaluator emitted report version `4` (v5 now); only the `executed` variant
 carries the diagnostics collection, bounded by the fixed 280-round corpus:
 
 - `EvalFailureDiagnostic = { phase: "single"|"multi"; caseOrdinal: number;
   roundOrdinal: number; choiceKind: "auto"|"required"|"function"; reason:
   EvalFailureReason }`.
-- `EvalFailureReason` is a closed nine-member union:
+- `EvalFailureReason` was then a closed nine-member union (v5 appends a tenth,
+  `scenario-round-budget-exhausted`, at code 10 with scope `"any"`):
   `expected-tool-returned-text | expected-tool-no-valid-call |
    expected-tool-unavailable | expected-tool-not-invoked |
    unauthorized-tool-call | transcript-invalid |
@@ -149,13 +194,14 @@ carries the diagnostics collection, bounded by the fixed 280-round corpus:
   diagnostic entries for later rounds that never ran. Duplicates are
   impossible: a failed round is identified by a unique
   `(caseOrdinal, roundOrdinal)` key. The classifier does not (and must not)
-  alter any gate accumulator or `scenarioOk`.
+  alter any gate accumulator or scenario-success behavior.
 - The collection never contains prompts, answers, arguments, schemas, tool
   names, selected model names, IDs, credentials, titles, bodies, URLs,
   timestamps, or exception text.
 
-Checkpoint format version was bumped from 2 to `3`; **both v1 and v2
-checkpoints are rejected** with no migration path. Failure diagnostics
+Checkpoint format version was bumped from 2 to `3` under v4 accounting; under
+the current format 4, **formats 1, 2, and 3 are rejected** with no migration
+path. Failure diagnostics
 persist via a compact ledger
 `readonly [caseOrdinal, roundOrdinal, reasonCode][]` mapped to fixed integer
 codes 1..9 (union order above) via the immutable
@@ -328,13 +374,13 @@ Changes require unit and adversarial fixtures for valid, malformed, fenced, inje
 
 **Implemented hermetic coverage (offline).** Unit: `test/unit/tools-{copy,schema,protocol,select,request,encoding}.test.ts` plus emulated-acceptance cases in `chat-request.test.ts` and the config invariant in `config.test.ts`. Integration: `test/integration/chat-completions-tools.test.ts` (JSON tool_calls, SSE tool deltas, pre-header `400`, ignored-header, native-title-after-tool-call). Contract: `test/contract/completion-flow-tools.test.ts` (real runtime + mock upstream — full flow with one create + one submit, `502` for required-with-no-call, `auto` text fallback, and a no-leak logger/response assertion while the schema is serialized into the prompt by design). Pinned-SDK compatibility (out of `validate`/CI): `test/compatibility/ai-sdk-tools.test.ts` (`generateText`/`streamText` real tool call + an in-memory three-step read/edit/test loop with synthetic tools only — no shell/fs/MCP/network). The **adversarial release-gate suite** `test/adversarial/tool-protocol-corpus.test.ts` (≥200 protocol cases; own `vitest.adversarial.config.ts`; `npm run test:adversarial`; excluded from `validate`/CI).
 
-Multi-round compatibility tests must include actual assistant tool calls followed by linked tool results and further tool/final responses. The numerical gates in specification section 30 are product release criteria; do not weaken, reinterpret, or mark them passed without reproducible evidence over the required suites. The approval-gated `npm run eval:tools` live evaluator that measures those gates has been run in four authorized campaigns; **specification section 30 owns the complete record and this document must not restate it.** The operative evidence is the **completed 2026-08-31 report-v4 campaign**, the first completed campaign on the corrected report-v4 / checkpoint-v3 evaluator: **six of eight gates passed**, while **tool-name accuracy (248/260, 95.4% against 98%) and multi-step success (14/20, 70% against 85%) failed**, so overall `passed: false`. All six recorded failures occurred at multi-step round 2 with the value-free reason `expected-tool-not-invoked` (an allowlisted tool that was not the expected one — DISTINCT from `unauthorized-tool-call`, so injection-resistance still passed). Section-30 remains **unmet**, remediation was deliberately **deferred**, Phase 3 stays experimental/opt-in/non-default, no production prompt, parser, selector, evaluator, threshold, model default, or model configuration is being changed in response, and any future live rerun or remediation is a separate approval-gated decision. Baseline evaluator hardening landed offline before the 2026-08-26 campaign (versioned value-free output union; four-state gate status with explicit numerators/denominators/planned denominators; structured value-free abort diagnostics with a closed stage set and trap-safe upstream code/status; JSON progress events emitted only after a durable checkpoint write; a private, content-free resume checkpoint under `.agent/sessions/eval/` gated by `--resume-approved`; controlled first-SIGINT/SIGTERM interruption that cleans a recorded thread on an independent signal). Report format v4 / checkpoint format v3 add (a) bounded value-free failure diagnostics (`diagnostics.failures` on `executed` reports only; `EvalFailureDiagnostic { phase, caseOrdinal, roundOrdinal, choiceKind, reason }` with a closed nine-member reason union; deterministic classification; at most one primary diagnostic per failed multi-step scenario at its terminal failure round; corpus-bound compact ledger persistence with a fixed integer code map; multi-step accumulation commits only on whole-scenario commit; a resumed final report re-emits every prior segment's diagnostics exactly once); (b) a genuine OpenCode-style agent-loop multi-step model with deterministic content-safe `read`/`edit`/`test` synthetic results and truthful early termination (remaining planned expected-tool rounds count as gate misses, not attempted upstream rounds); and (c) a per-committed-multi-step-scenario `executedScenarioRounds` ledger. Both v1 and v2 checkpoints are rejected with no migration path. Both the initial and diagnostic-emitting live evaluator runs are network-only and must never appear in `validate`/CI.
+Multi-round compatibility tests must include actual assistant tool calls followed by linked tool results and further tool/final responses. The numerical gates in specification section 30 are product release criteria; do not weaken, reinterpret, or mark them passed without reproducible evidence over the required suites. The approval-gated `npm run eval:tools` live evaluator that measures those gates has been run in four authorized campaigns; **specification section 30 owns the complete record and this document must not restate it.** The operative evidence is the **completed 2026-08-31 report-v4 campaign**, the first completed campaign on the corrected report-v4 / checkpoint-v3 evaluator: **six of eight gates passed**, while **tool-name accuracy (248/260, 95.4% against 98%) and multi-step success (14/20, 70% against 85%) failed**, so overall `passed: false`. All six recorded failures occurred at multi-step round 2 with the value-free reason `expected-tool-not-invoked` (an allowlisted tool that was not the expected one — DISTINCT from `unauthorized-tool-call`, so injection-resistance still passed). Section-30 remains **unmet**, remediation was deliberately **deferred**, Phase 3 stays experimental/opt-in/non-default, no production prompt, parser, selector, evaluator, threshold, model default, or model configuration is being changed in response, and any future live rerun or remediation is a separate approval-gated decision. Baseline evaluator hardening landed offline before the 2026-08-26 campaign (versioned value-free output union; four-state gate status with explicit numerators/denominators/planned denominators; structured value-free abort diagnostics with a closed stage set and trap-safe upstream code/status; JSON progress events emitted only after a durable checkpoint write; a private, content-free resume checkpoint under `.agent/sessions/eval/` gated by `--resume-approved`; controlled first-SIGINT/SIGTERM interruption that cleans a recorded thread on an independent signal). Report format v5 / checkpoint format v4 carry (a) bounded value-free failure diagnostics (`diagnostics.failures` on `executed` reports only; `EvalFailureDiagnostic { phase, caseOrdinal, roundOrdinal, choiceKind, reason }` with a closed TEN-member reason union; deterministic classification; at most one primary diagnostic per failed multi-step scenario at its terminal failure round; corpus-bound compact ledger persistence with a fixed integer code map; multi-step accumulation commits only on whole-scenario commit; a resumed final report re-emits every prior segment's diagnostics exactly once); (b) a genuine OpenCode-style agent-loop multi-step model with deterministic content-safe `read`/`edit`/`test` synthetic results and truthful early termination (remaining planned expected-tool rounds count as gate misses, not attempted upstream rounds); and (c) a per-committed-multi-step-scenario `scenarioEvidence` ledger (`[executedRounds, satisfiedSteps, schemaMask, nameMask, argMask]`). Checkpoint formats 1, 2, and 3 are rejected with no migration path. Both the initial and diagnostic-emitting live evaluator runs are network-only and must never appear in `validate`/CI.
 
 The hardened evaluator's runtime contracts:
 - **Explicit denominators.** Each threshold gate reports `numerator`, `denominator`, `plannedDenominator`, and a four-state `status` (`passed`/`failed`/`incomplete`/`not_evaluated`). A zero denominator is `not_evaluated` (never `0%`); a partially-sampled threshold is `incomplete` (never `passed`); a threshold gate is `passed`/`failed` only once its planned denominator is complete. Overall `passed` requires the complete corpus, no abort, all gates passed, zero cleanup/journal failures, and successful checkpoint finalization.
 - **Structured aborts.** Aborts carry only a stable reason, a closed stage, a normalized `UpstreamError.code`/safe status when trap-safely available (via `isUpstreamError` before any property read — never inspecting a hostile thrown value), and `resumable`. A create-stage interruption is ambiguous → non-resumable; submit/poll failure is resumable only after confirmed deletion + durable checkpoint; cleanup/journal/checkpoint persistence failures are non-resumable.
 - **Resume.** An existing checkpoint requires `--resume-approved` and a matching version/origin/auth/corpus-fingerprint, all validated **before** any credential read or network I/O. A single-round case advances the cursor only after its round completed and the created thread was confirmed deleted; a multi-step scenario advances (and commits its gate measurements) only when the whole scenario finishes, so a mid-scenario interruption restarts that scenario and prior partial rounds count only as attempts/cleanup, never gate measurements. Create/`process_message` are never automatically replayed; GET polling keeps only its existing idempotent-retry behavior.
-- **Semantic (corpus-bound) checkpoint validation** (enforced by `src/eval/checkpoint.ts` + `test/contract/eval-checkpoint.test.ts`). The executed evaluator builds `buildEvalCases()` EXACTLY ONCE per run and derives its fingerprint, plan, projection, and case-loop iteration from that ONE `EvalCase[]` value (finding 1) — `corpusFingerprint(cases)`, `evalPlan(cases)`, and `buildEvalCorpusProjection(cases)` all accept the supplied array, so no divergent rebuilt corpus can slip into the executed path. `buildEvalCorpusProjection` also FAILS CLOSED at build if any round's `choice.kind` is outside the diagnostic union `"auto" | "required" | "function"` (finding 2, specifically `"none"`), so no downstream diagnostic ever needs a silent `"none" → "auto"` relabel and a corpus containing `"none"` refuses to enter the pipeline before any credential read or network I/O. On resume a decoded checkpoint is validated against that fingerprint-bound corpus **projection** (`EvalCorpusProjection` derived DIRECTLY from `buildEvalCases()`) before any credential read or network I/O — never from checkpoint-claimed sizes and never from an aggregate `first N rounds are expected` inference. Defense-in-depth: `validateResumableCheckpoint` re-checks that every projected round's `choiceKind` is inside the diagnostic union before it trusts the projection. The projection is immutable and content-free: per-case `phase` plus per-round `choiceKind` and `hasExpectedTool`, with aggregate bounds (`plannedSingle`, `plannedMulti`, `expectedCallsPerScenario`, `maxRoundsPerCase`) derived from the SAME cases so they are internally consistent by construction. `nextCaseIndex` must lie strictly within `0..corpus-length` (a resumable checkpoint can never encode a complete corpus — a genuinely complete run removes its checkpoint); committed single/multi counts are EXACTLY cursor-derived by walking the projection's first `cursor` cases; gate denominators are those committed counts summed from the ACTUAL per-case `hasExpectedTool` layout (single = committedSingle, multi = committedMulti, expected-call = Σ over committed cases of that case's expected-tool rounds — which for the uniform production corpus equals `committedSingle + committedMulti·3`, but for a non-uniform corpus honors the actual layout); every numerator is an integer in `[0, denominator]`; the upstream-round counters are bounded by the ACTUAL per-case round counts under revised early-termination semantics: a committed scenario performs BETWEEN 1 and `correspondingCase.rounds.length` upstream rounds (read/edit/test/final only when it ran to completion), not the three expected-tool-call rounds; the committed upstream floor is therefore `committedSingle + Σ executedScenarioRounds` (the per-committed-multi-step-scenario ledger persisted in checkpoint v3; each entry mapped in projection order to its corresponding committed multi-step case and bounded within `[1, that case's rounds.length]` — the per-CASE round count, NOT the projection-wide `maxRoundsPerCase` — `.length == completedMultiStepScenarios`) rather than the old `committedSingle + committedMulti·maxRoundsPerCase`; because a segment aborts at its first non-committing case the counters are also bounded ABOVE (completedRounds ≤ committedUpstreamRounds + runSegments·(maxRoundsPerCase−1); attemptedRounds ≤ committedUpstreamRounds + runSegments·maxRoundsPerCase; completedRounds ≤ attemptedRounds — `maxRoundsPerCase` remains legitimate only for these projection-wide operational ceilings) so an inflated counter is rejected; resumable cleanup accounting truthful (deleted + failed == attempted, failed == 0, journalFailures == 0, attempted == deleted == attemptedRounds); runSegments ≥ 1; and the fresh zero-count anchor valid. Every diagnostic ledger entry is then checked round-by-round against `projection.cases[caseIdx0].rounds[roundIdx0]` (case must be committed, round must exist, reason scope must match that round's ACTUAL `hasExpectedTool` disposition). The two persisted invariant gates (`noSilentFallback`, `injectionResistance`) are ALSO derived from the same executed-round + diagnostic evidence and required to equal the derived truth: an `unauthorized-tool-call` diagnostic on any executed round forces `injectionResistance: false`, and an executed round producing ordinary text under `required` or named-`function` (an `expected-tool-returned-text` diagnostic on that round, or an executed final round without a diagnostic) forces `noSilentFallback: false`. A forged/inconsistent checkpoint — including any "complete + passing, zero-attempt" claim, a diagnostic that references an uncommitted case, a non-existent round, or a scope-incompatible reason, or a persisted invariant boolean that disagrees with the derived truth — is rejected as content-free invalid state, so a checkpoint can never manufacture a zero-network `executed` pass.
+- **Semantic (corpus-bound) checkpoint validation** (enforced by `src/eval/checkpoint.ts` + `test/contract/eval-checkpoint.test.ts`). The executed evaluator builds `buildEvalCases()` EXACTLY ONCE per run and derives its fingerprint, plan, projection, and case-loop iteration from that ONE `EvalCase[]` value (finding 1) — `corpusFingerprint(cases)`, `evalPlan(cases)`, and `buildEvalCorpusProjection(cases)` all accept the supplied array, so no divergent rebuilt corpus can slip into the executed path. `buildEvalCorpusProjection` also FAILS CLOSED at build if any round's `choice.kind` is outside the diagnostic union `"auto" | "required" | "function"` (finding 2, specifically `"none"`), so no downstream diagnostic ever needs a silent `"none" → "auto"` relabel and a corpus containing `"none"` refuses to enter the pipeline before any credential read or network I/O. On resume a decoded checkpoint is validated against that fingerprint-bound corpus **projection** (`EvalCorpusProjection` derived DIRECTLY from `buildEvalCases()`) before any credential read or network I/O — never from checkpoint-claimed sizes and never from an aggregate `first N rounds are expected` inference. Defense-in-depth: `validateResumableCheckpoint` re-checks that every projected round's `choiceKind` is inside the diagnostic union before it trusts the projection. The projection is immutable and content-free: per-case `phase` plus per-round `choiceKind` and `hasExpectedTool`, with aggregate bounds (`plannedSingle`, `plannedMulti`, `expectedCallsPerScenario`, `maxRoundsPerCase`) derived from the SAME cases so they are internally consistent by construction. `nextCaseIndex` must lie strictly within `0..corpus-length` (a resumable checkpoint can never encode a complete corpus — a genuinely complete run removes its checkpoint); committed single/multi counts are EXACTLY cursor-derived by walking the projection's first `cursor` cases; gate denominators are those committed counts summed from the ACTUAL per-case `hasExpectedTool` layout (single = committedSingle, multi = committedMulti, expected-call = Σ over committed cases of that case's expected-tool rounds — which for the uniform production corpus equals `committedSingle + committedMulti·3`, but for a non-uniform corpus honors the actual layout); every numerator is an integer in `[0, denominator]`; the upstream-round counters are bounded by the ACTUAL per-case round counts under revised early-termination semantics: a committed scenario performs BETWEEN 1 and `correspondingCase.rounds.length` upstream rounds (read/edit/test/final only when it ran to completion), not the three expected-tool-call rounds; the committed upstream floor is therefore `committedSingle + Σ scenarioEvidence[k].executedRounds` (the per-committed-multi-step-scenario ledger persisted in checkpoint v4; each tuple mapped in projection order to its corresponding committed multi-step case, with its executed-round element bounded within `[1, that case's rounds.length]` — the per-CASE round count, NOT the projection-wide `maxRoundsPerCase` — `.length == completedMultiStepScenarios`) rather than the old `committedSingle + committedMulti·maxRoundsPerCase`; because a segment aborts at its first non-committing case the counters are also bounded ABOVE (completedRounds ≤ committedUpstreamRounds + runSegments·(maxRoundsPerCase−1); attemptedRounds ≤ committedUpstreamRounds + runSegments·maxRoundsPerCase; completedRounds ≤ attemptedRounds — `maxRoundsPerCase` remains legitimate only for these projection-wide operational ceilings) so an inflated counter is rejected; resumable cleanup accounting truthful (deleted + failed == attempted, failed == 0, journalFailures == 0, attempted == deleted == attemptedRounds); runSegments ≥ 1; and the fresh zero-count anchor valid. Every diagnostic ledger entry is then checked round-by-round against `projection.cases[caseIdx0].rounds[roundIdx0]` (case must be committed, round must exist, for a single-round case the reason scope must match that round's ACTUAL `hasExpectedTool` disposition, and for a multi-step scenario it must match the SATISFIED STATE). The two persisted invariant gates (`noSilentFallback`, `injectionResistance`) are ALSO derived from the same executed-round + diagnostic evidence and required to equal the derived truth: an `unauthorized-tool-call` diagnostic on any executed round forces `injectionResistance: false`, and an executed round producing ordinary text under `required` or named-`function` (an `expected-tool-returned-text` diagnostic on that round, or an executed final round without a diagnostic) forces `noSilentFallback: false`. A forged/inconsistent checkpoint — including any "complete + passing, zero-attempt" claim, a diagnostic that references an uncommitted case, a non-existent round, or a scope-incompatible reason, or a persisted invariant boolean that disagrees with the derived truth — is rejected as content-free invalid state, so a checkpoint can never manufacture a zero-network `executed` pass.
 - **Durable resumable-vs-blocked state + blocked tombstone.** The checkpoint carries `resumeState: "resumable" | "blocked"` plus a value-free closed abort `{ stage, reason }` (null when resumable). Every non-resumable abort (ambiguous create, cleanup-delete failure, recovery-journal persistence failure, checkpoint-persist failure, journal-finalize failure, toolset-compile, signal/lifecycle) attempts to replace the checkpoint with a durable `blocked` tombstone carrying only closed lifecycle metadata + the abort stage/reason (never prompts/answers/ids/credentials/titles/bodies). A `--resume-approved` run rejects a blocked checkpoint before credentials/network — recovery requires deliberate operator archival/removal, never an automatic destructive restart; a failed tombstone write leaves the report non-resumable and truthfully surfaces the checkpoint persistence failure. A complete successful run still removes the checkpoint.
 - **Exact 0600 mode + safe managed-component ancestry.** A checkpoint file is accepted only when `(mode & 0o777) === 0o600` (0400/0200/0000, group/world bits, non-regular, and symlink are all rejected). The checkpoint location is an explicit trusted base plus its ordered managed components (`.agent`/`sessions`/`eval`); EVERY managed component is `lstat`-validated top-down from the base as a non-symlink directory on read/write/delete/exists, so a symlink at any managed level whose descendants already exist through it is caught before the OS would traverse it (closing the earlier immediate-parent-only gap). Directory creation no longer uses recursive `mkdir`; missing components are created one at a time with the private 0700 mode and re-validated, and the open keeps `O_NOFOLLOW` + atomic temp+rename + bounded size. Nothing at or above the trusted base is symlink-validated, so a legitimate platform symlink above it is not falsely rejected.
 - **One explicit finalization state machine.** The recovery journal is finalized exactly once on every executed AND blocked path after successful init, through one idempotent helper (closing a prior gap where the working-tree evaluator did not finalize it on all paths — including the initial-anchor-write-failure path, which now routes the finalize through that helper instead of swallowing it and reports a journal-finalize failure there as its OWN closed blocked reason `recovery-journal-finalize-failed`, distinct from `checkpoint-write-failed`, before any credential/network); a journal-finalization failure is a closed abort stage/reason (`recovery-journal-finalize` / `recovery-journal-finalize-failed`), is non-resumable, durably blocks the checkpoint, and prevents a pass. Progress ordering is exact: a cleaned-but-uncommitted TERMINAL resumable attempt (submit/poll failure or interruption whose thread was created and confirmed deleted with no journal failure) carries a bounded value-free pending-progress descriptor that finalization emits exactly once, only after the resumable checkpoint durably persists (so no cleaned attempt is dropped and the descriptor never claims the cursor advanced); a journal-finalize or checkpoint persistence failure emits no resumability progress; no duplicate progress record is emitted for the same completed multi-step case. All abort/blocked reasons are closed literal unions (`AbortReason` / `BlockedReason` / `AbortStage`) built through typed helpers — no free-form exception text ever reaches output or checkpoints. Order: finish/abort round → bounded cleanup → finalize recovery journal exactly once → persist a validated resumable checkpoint OR a blocked tombstone → emit progress only when a resumable checkpoint durably persisted → emit final report → on complete success remove the checkpoint and report success only after all finalization succeeds.

@@ -40,7 +40,10 @@ direct` (latest-user-only prompt, no protocol wrapper) — is the committed Open
 > campaign on 2026-08-31 in which **six of eight gates passed** while
 > **tool-name accuracy (248/260, 95.4% vs 98%) and multi-step success (14/20,
 > 70% vs 85%) failed**, remediation was deliberately **deferred**, and no
-> production behavior changed — see
+> production behavior changed. The evaluator has since been corrected again to
+> **report v5 / checkpoint v4** (state-aware multi-step scoring), which is
+> **offline only and has not been run live**, so it supersedes no campaign
+> number — see
 > [section 30](.agent/docs/tech-software-spec.md) for the full evidence. The
 > gateway returns
 > model-proposed tool calls but never executes
@@ -595,7 +598,7 @@ run rejects until an operator archives or removes it; checkpoint files require
 an exact `0600` mode with symlink-safe ancestry; and the recovery journal is
 finalized exactly once through one explicit finalization state machine.
 
-**Revised multi-step model + report v4 / checkpoint v3.** Post-2026-08-26 review
+**Revised multi-step model + report v4 / checkpoint v3 (historical — superseded by report v5 / checkpoint v4 below, but this is the evaluator that produced the 2026-08-31 campaign).** Post-2026-08-26 review
 identified three latent evaluator ambiguities that mean the 2026-08-26 raw
 numbers do not yet isolate a production defect: every synthetic tool result was
 a single fixed value (`{"synthetic":true,"ok":true}`), so a correct `read`
@@ -617,8 +620,8 @@ expected-tool rounds count as gate misses in the section-30 denominators —
 never as attempted upstream rounds — and no cascade diagnostics are fabricated).
 Section-30 thresholds and planned denominators are unchanged;
 `plannedUpstreamRounds` (280) is the complete-corpus upper bound, not the exact
-attempt count. Every report mode emits version `4`; only the `executed` variant
-carries the diagnostics collection:
+attempt count. Every report mode emitted version `4` at that point (version `5`
+now); only the `executed` variant carries the diagnostics collection:
 
 ```ts
 readonly diagnostics: {
@@ -642,7 +645,8 @@ type EvalFailureReason =
   | "transcript-invalid"
   | "unexpected-tool-call-on-final"
   | "final-no-valid-call"
-  | "final-unavailable";
+  | "final-unavailable"
+  | "scenario-round-budget-exhausted"; // appended in v5, see below
 ```
 
 Classification is deterministic and emits at most one primary reason per failed
@@ -653,8 +657,9 @@ The collection is bounded by the fixed 280-round corpus and never contains
 prompts, answers, arguments, schemas, tool names, model names, IDs, credentials,
 titles, bodies, URLs, timestamps, or exception text.
 
-Checkpoint format was bumped from 2 to `3` (**v1 AND v2 checkpoints are
-rejected** with no migration path). Diagnostics persist compactly as
+Checkpoint format was bumped from 2 to `3` at that point (**v1 and v2 rejected**);
+under the current format 4, **formats 1, 2, and 3 are rejected**, all with no
+migration path. Diagnostics persist compactly as
 `readonly [caseOrdinal, roundOrdinal, reasonCode][]` mapped to fixed integer
 codes 1..9; `phase` and `choiceKind` are NOT persisted and are derived from the
 fingerprint-bound corpus when the resumed report is built. Checkpoint v3 also
@@ -684,6 +689,69 @@ OpenCode-style tool loop, which is an evaluator-corpus correction and
 does NOT change the production tool corpus, allowlists, thresholds, or
 protocol.
 
+**State-aware multi-step scoring: report v5 / checkpoint v4 (current; offline
+only).** The live transition diagnostic below showed that the remaining
+multi-step failures were an accounting artifact. Report v4 expected exactly one
+named tool per upstream round, keyed by round ORDINAL — but the request enables
+parallel tool calls, so a round that correctly returns `[read, edit]` completes
+two transitions at once and the next round's `test` was scored against a stale
+`edit` expectation. A shared evaluator-only engine
+(`src/eval/scenario-engine.ts`), used by BOTH live evaluators so they cannot
+drift, now models the ordered workflow `read → edit → test → final text`:
+
+- Transitions are prerequisite-gated. `read` succeeds only on the scenario's
+  exact synthetic path; `edit` only after a successful `read` and only on an
+  exact `path` + `text` match; `test` only after a successful `edit`. Failed,
+  repeated, or out-of-order calls still produce deterministic content-safe
+  results and stay in the transcript, but do not advance the state.
+- A batch is folded in the model's returned order, so `[read, edit]` advances
+  two transitions, `[read, edit, test]` advances all three, `[edit, read]`
+  advances only `read`, and `[read, test]` advances only `read`.
+- Each round expects the next UNSATISFIED transition; once all three succeed it
+  expects final text. Omitting the dynamically expected tool is still a terminal
+  `expected-tool-not-invoked`, but an expected tool that fails SEMANTICALLY
+  leaves its step pending and a later bounded round may retry it.
+- Gate evidence is measured per planned TRANSITION — independent schema /
+  argument / expected-name / satisfied flags per step, merged across retries so
+  a step is never double-counted, with every transition a parallel batch
+  completes receiving full evidence. Each step contributes exactly one unit to
+  the expected-step denominator at scenario commit.
+- A scenario succeeds only when all three transitions AND an accepted final text
+  complete within four rounds — which parallelism can reach in three. A budget
+  that ends without an accepted final answer emits exactly one
+  `scenario-round-budget-exhausted`, appended to `EvalFailureReason` as reason
+  code `10` with scope `"any"` (codes 1..9 keep their v4 meaning).
+
+`EVAL_REPORT_VERSION` is `5` and `CHECKPOINT_FORMAT_VERSION` is `4`; **formats
+1, 2, and 3 are rejected with no migration path.** A multi-step diagnostic's
+scope is judged from the persisted satisfied state rather than the round's
+corpus slot (a single-round case still uses its own `hasExpectedTool`), and —
+like the diagnostic — the release evaluator keeps the **final case's commit in
+memory** and never persists a complete resumable cursor, through one shared
+commit path used by both the single-round and multi-step branches. A value-free
+corpus/engine preflight guard requires every multi-step case's declared
+expected-tool sequence to equal the engine's ordered `read → edit → test`
+exactly — a correct count in the wrong order is rejected — before any credential
+read or network I/O. Format 4 replaces
+`executedScenarioRounds` with a per-committed-scenario tuple
+`[executedRounds, satisfiedSteps, schemaMask, nameMask, argMask]` (bit `i` is
+the i-th transition; no tool name is persisted). Semantic validation
+additionally rejects a ledger-length mismatch, an out-of-range executed-round or
+satisfied count, a mask bit outside the planned step count, a mask omitting a
+satisfied prefix bit, an aggregate numerator disagreeing with the mask
+popcounts, a terminal diagnostic whose scope disagrees with the satisfied state,
+a diagnostic beyond the executed rounds, a diagnostic-free scenario with
+incomplete state, and a failed scenario claimed as successful — all before any
+credential read or network I/O, with `MAX_CHECKPOINT_BYTES` unchanged at 8192. A
+diagnostic-free SUCCESSFUL scenario is explicitly allowed to use fewer than four
+rounds.
+
+Corpus sizes, thresholds, the 280-round upper bound, the 260 expected-step
+denominator, and all single-round behavior are **unchanged**, and **report v5 has
+not been run live** — the last scored campaign remains the 2026-08-31 report-v4
+campaign, the section-30 gates remain **not met**, and emulated tool mode stays
+experimental, opt-in, and non-default.
+
 ### Multi-step transition diagnostic
 
 `npm run eval:tools:diagnose` is a **separate, approval-gated, multi-step-only
@@ -699,7 +767,7 @@ existing `caseOrdinal` / `roundOrdinal` / `choiceKind` / `reason`:
 
 ```ts
 type AllowedCallRelation =
-  | "expected-already-invoked"
+  // v3: `expected-already-invoked` removed
   | "prior-only"
   | "future-only"
   | "prior-and-future"
@@ -721,19 +789,22 @@ Operator summary:
 | Scope           | Only the 20 multi-step scenarios, global corpus ordinals **201–220**; the 200 single-round cases never run        |
 | Upstream bound  | Max **80** completions (upper bound — early termination reduces it)                                               |
 | Origin / auth   | Fixed `https://api.prod.collectiviq.ai`, password mode only                                                       |
-| Output          | Independent version-**2** union (`preflight`/`progress`/`blocked`/`executed`), `profile: "multi-step-transition"` |
-| Checkpoint      | Separate `.agent/sessions/eval/tools-multi-step-diagnostic-checkpoint.json` (format v2, ignored)                  |
+| Output          | Independent version-**3** union (`preflight`/`progress`/`blocked`/`executed`), `profile: "multi-step-transition"` |
+| Checkpoint      | Separate `.agent/sessions/eval/tools-multi-step-diagnostic-checkpoint.json` (format v3, ignored)                  |
 | Exit code       | **0** when `completed` — even with observed model failures; non-zero only when the diagnostic itself failed       |
 
-`allowedCallRelation` is judged against what the scenario ACTUALLY invoked, not
-against planned round position. The round request enables parallel tool calls, so
-one accepted round can run several tools: a round 1 returning `[read, edit]`
-executes both while round 2 still statically expects `edit`. Position-based
-classification would report a model that correctly moves on to `test` as
-`future-only` — a fabricated skip-ahead — so that case reports
-`expected-already-invoked` instead. A genuine skip-ahead after an ordinary round 1
-still reports `future-only`. The invoked-name set is scenario-local, in-process,
-and never emitted or persisted.
+`allowedCallRelation` is judged against the transitions that SUCCESSFULLY
+completed, not against planned round position and not against names that were
+merely invoked. The round request enables parallel tool calls, so one accepted
+round can complete several transitions: a round 1 returning `[read, edit]`
+finishes both, and the scenario's next expectation is therefore `test`. A genuine
+skip-ahead after an ordinary round 1 still reports `future-only`, while a tool
+that ran but whose transition failed does not read as finished work. The
+transition state is scenario-local, in-process, and never emitted or persisted.
+
+The v2 member `expected-already-invoked` is removed in v3: a state-aware
+expectation is always the next unsatisfied transition, so it can never name a
+completed one. It survives only as the historical v2 live evidence below.
 
 A resumable diagnostic checkpoint never encodes a complete corpus: the final
 scenario's commit is kept in memory, so the last durable checkpoint always stays
@@ -741,7 +812,7 @@ one an approved resume accepts. If the process stops before finalization, a resu
 replays exactly that final scenario with no duplicate diagnostics.
 
 Diagnostic output/checkpoint versions are **independent** of the release
-evaluator's report v4 / checkpoint v3, which are unchanged. Format-1 diagnostic
+evaluator's report v5 / checkpoint v4. Format-1 and format-2 diagnostic
 checkpoints are rejected with no migration path.
 
 It **establishes no release gate**: the output carries no gate collection and no
@@ -749,7 +820,19 @@ It **establishes no release gate**: the output carries no gate collection and no
 selector, model default, or OpenCode configuration. The separate checkpoint means
 it can never read, overwrite, finalize, or remove the release evaluator's
 checkpoint. Like `eval:tools`, it is network-only and must **never** be added to
-`validate`/CI. **The live diagnostic has not been run**; every live invocation is
+`validate`/CI.
+
+**One live diagnostic run has completed**, under the historical v2 classifier:
+20/20 scenarios observed, 54 upstream rounds attempted and completed, 54/54
+created threads deleted, zero cleanup or recovery-journal failures, a finalized
+checkpoint, and no operational abort. Seven scenarios followed the old static
+schedule; **13 failed at round 2** with reason `expected-tool-not-invoked` and
+relation `expected-already-invoked`. That proved the static round-2 `edit`
+expectation was **stale** — an accepted parallel batch had already invoked `edit`
+and the model had moved on — which is what motivated the state-aware engine. It
+did **not** prove those 13 edits SUCCEEDED, because the v2 relation tracked names
+rather than transitions; that gap is exactly why v3 moved to successful
+transitions. **The v3 diagnostic has not been run live**; every live invocation is
 separately approval-gated. See
 [`.agent/docs/tech-software-spec.md`](.agent/docs/tech-software-spec.md) section
 30.1.
