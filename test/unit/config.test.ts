@@ -74,7 +74,7 @@ describe("loadConfig — environment", () => {
     expect(config.COLLECTIVIQ_GATEWAY_KEYS).toEqual(["gw-fake-a", "gw-fake-b"]);
     expect(config.models).toHaveLength(6);
     expect(config.models.map((m) => m.id)).toContain("collectiviq-fast");
-    // The experimental emulated tool model opts into tool mode (protocol prompt).
+    // The opt-in beta emulated tool model opts into tool mode (protocol prompt).
     expect(config.models.find((m) => m.id === "collectiviq-claude-tools")).toMatchObject({
       selectedLlms: ["claude"],
       answerSource: "claude",

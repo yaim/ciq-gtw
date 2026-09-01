@@ -23,7 +23,7 @@
  *    invoked, and only the parameter NAMES are recorded for the diagnostic header.
  *    `parallel_tool_calls` stays an ignored compatibility name here. A
  *    `tool_choice` that REQUIRES or NAMES a tool is always rejected.
- *  - `toolMode: "emulated"` (Phase 3, experimental / opt-in / non-default): the
+ *  - `toolMode: "emulated"` (Phase 3, supported opt-in beta / non-default): the
  *    tool policy is NORMALIZED and RETAINED, the toolset is compiled once, prior
  *    tool history is validated, and `parallel_tool_calls` is CONSUMED (a
  *    non-boolean is rejected with `param: "parallel_tool_calls"`). The validated
@@ -503,7 +503,7 @@ export function validateChatRequest(body: unknown, resolveModel: ModelResolver):
   let parallelConsumed = false;
 
   if (allowTools) {
-    // EMULATED (experimental): normalize and RETAIN the tool policy, compile the
+    // EMULATED (opt-in beta): normalize and RETAIN the tool policy, compile the
     // schemas once, and validate prior tool history. Top-level descriptor probes
     // fail closed on an accessor-backed / proxy-throwing `tools`/`tool_choice`
     // without ever reading it; all deep traversal is descriptor-safe.

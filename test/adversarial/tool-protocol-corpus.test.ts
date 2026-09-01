@@ -7,7 +7,10 @@
  *
  * Passing this corpus is necessary but NOT sufficient for production readiness:
  * the numerical section-30 gates also require the approval-gated live evaluator,
- * which has not been run. Run only via `npm run test:adversarial`.
+ * which passed all eight gates in the completed 2026-09-01 report-v5 campaign.
+ * That recorded emulated tool mode as supported opt-in beta — not production
+ * readiness, and not default enablement, which stays a separate section-30
+ * decision. Run only via `npm run test:adversarial`.
  */
 import { describe, expect, it } from "vitest";
 import { compileToolset, type CompiledToolset } from "../../src/tools/schema.js";

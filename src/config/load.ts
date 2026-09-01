@@ -489,7 +489,7 @@ function validateModel(
     });
   }
 
-  // Cross-field tool policy: experimental emulated tool calling depends on the
+  // Cross-field tool policy: opt-in beta emulated tool calling depends on the
   // full-history protocol serializer (the tool-or-final control prompt and the
   // versioned conversation envelope with prior tool calls/results). The
   // intentionally lossy `direct` profile submits only the latest user message and

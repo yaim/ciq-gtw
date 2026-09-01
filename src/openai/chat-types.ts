@@ -20,7 +20,8 @@ import type {
 
 /**
  * The supported message roles. `tool` is accepted ONLY for `toolMode: "emulated"`
- * models (experimental Phase 3); a `disabled`/`native` model still rejects a
+ * models (Phase 3, supported opt-in beta / non-default); a `disabled`/`native`
+ * model still rejects a
  * tool-role message and the model-aware boundary enforces that.
  */
 export type NormalizedRole = "system" | "developer" | "user" | "assistant" | "tool";

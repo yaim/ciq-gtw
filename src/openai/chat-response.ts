@@ -3,7 +3,7 @@
  * 8.8). Produces exactly the supported fields for a text OR tool-call completion.
  *
  * A text completion uses assistant `content` and `finish_reason: "stop"`. A
- * tool-call completion (experimental emulated mode) uses `content: null`, an
+ * tool-call completion (opt-in beta emulated mode) uses `content: null`, an
  * OpenAI `tool_calls` array, and `finish_reason: "tool_calls"`; each call's
  * `arguments` is the already-validated JSON string.
  *

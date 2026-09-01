@@ -11,8 +11,11 @@ import { defineConfig } from "vitest/config";
  * and is run only via `npm run test:adversarial`.
  *
  * Passing this suite is necessary but NOT sufficient to declare emulated tool
- * mode production-ready — the numerical section-30 gates additionally require the
- * approval-gated live evaluator, which has not been run.
+ * mode production-ready — the numerical section-30 gates additionally require
+ * the approval-gated live evaluator, which passed all eight gates in the
+ * completed 2026-09-01 report-v5 campaign. That recorded emulated tool mode as
+ * supported opt-in beta, not production-ready; default enablement remains a
+ * separate section-30 decision after the relevant Phase 4 controls.
  */
 export default defineConfig({
   test: {

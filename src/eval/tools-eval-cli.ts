@@ -3,9 +3,10 @@
  * specification section 30).
  *
  * This measures the section-30 emulated-tool release gates against the REAL
- * CollectivIQ production origin. It is EXPERIMENTAL and destructive-capable, so
- * it is heavily gated and MUST NOT be run without explicit approval. It is
- * excluded from `validate`/CI and from every automated suite.
+ * CollectivIQ production origin. It is APPROVAL-GATED and destructive-capable
+ * (it creates and deletes upstream threads and incurs cost), so it is heavily
+ * gated and MUST NOT be run without explicit approval. It is excluded from
+ * `validate`/CI and from every automated suite.
  *
  * Safety contract (mirrors the discovery/recovery CLIs):
  *  - The DEFAULT invocation is a credential-free, network-free PREFLIGHT: it
@@ -39,8 +40,12 @@
  *  - The journal and checkpoint live under the ignored `.agent/sessions/` tree;
  *    they are never committed.
  *
- * Passing every gate here would still leave emulated tool mode EXPERIMENTAL: a
- * later failing run keeps the feature non-default and unreleased.
+ * All eight gates passed in the completed 2026-09-01 report-v5 campaign, and
+ * emulated tool mode was recorded as SUPPORTED OPT-IN BETA — still non-default
+ * and OpenCode permission-gated. Gate results alone do not move product status:
+ * beta is not production readiness, and default enablement remains a separate
+ * section-30 decision taken after the relevant Phase 4 controls. A later run,
+ * passing or failing, likewise changes no status by itself.
  */
 import { pathToFileURL } from "node:url";
 import {
