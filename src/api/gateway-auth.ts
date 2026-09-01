@@ -35,12 +35,25 @@ function sha256(value: string): Buffer {
 }
 
 /**
- * The result of authenticating a presented credential. On success it carries an
- * OPAQUE, stable per-configured-key identity (`keyId`) derived from the matched
- * key's configuration index — never the raw key or its digest. The identity is
- * used only for process-local per-key capacity accounting.
+ * The result of authenticating a presented credential.
+ *
+ * Success carries TWO separate opaque identities for the matched key, and
+ * neither is the raw key or its digest:
+ *
+ *  - `keyId` — the PROCESS-LOCAL identity (`k<index>`), derived from the key's
+ *    configuration index and used only for per-key capacity accounting. It is
+ *    ordering dependent and meaningless outside this process.
+ *  - `scopeId` — the CROSS-REPLICA idempotency scope, an HMAC of the raw key
+ *    under an HKDF-derived subkey. It is identical on every replica configured
+ *    with the same encryption key and is independent of gateway-key ordering, so
+ *    reordering or adding keys never re-partitions existing idempotency state.
+ *    It is `null` when idempotency is disabled (no encryption key configured).
+ *
+ * Neither identity is ever logged, reflected, or returned to a client.
  */
-export type AuthResult = { readonly ok: true; readonly keyId: string } | { readonly ok: false };
+export type AuthResult =
+  | { readonly ok: true; readonly keyId: string; readonly scopeId: string | null }
+  | { readonly ok: false };
 
 /** Authenticates a presented `Authorization` header against configured keys. */
 export interface GatewayAuthenticator {
@@ -76,20 +89,42 @@ function extractBearerToken(header: string | undefined): string | null {
   return header.slice(separator + 1);
 }
 
+/** Optional construction seams for {@link createGatewayAuthenticator}. */
+export interface GatewayAuthenticatorOptions {
+  /**
+   * Fixed-length comparison seam; defaults to `timingSafeEqual`. Injectable only
+   * so a test can prove the comparison loop is not short-circuited. It receives
+   * SHA-256 digests, never raw key material.
+   */
+  readonly compare?: (a: Buffer, b: Buffer) => boolean;
+  /**
+   * Derives the stable cross-replica idempotency scope for a configured key.
+   * Supplied only when Redis-backed idempotency is enabled; every scope is
+   * precomputed once at construction so the raw key is not re-read per request.
+   * Omitted means `scopeId` is always `null`.
+   */
+  readonly scopeDeriver?: (rawGatewayKey: string) => string;
+}
+
 /**
  * Build an authenticator over the configured gateway keys.
  *
  * @param keys the validated, bounded gateway keys (1–64, each ≤ 8 KiB UTF-8).
- * @param compare fixed-length comparison seam; defaults to `timingSafeEqual`.
- *   Injectable only so a test can prove the comparison loop is not
- *   short-circuited. It receives SHA-256 digests, never raw key material.
+ * @param options optional comparison and idempotency-scope seams.
  */
 export function createGatewayAuthenticator(
   keys: readonly string[],
-  compare: (a: Buffer, b: Buffer) => boolean = timingSafeEqual,
+  options: GatewayAuthenticatorOptions = {},
 ): GatewayAuthenticator {
+  const compare = options.compare ?? timingSafeEqual;
   // Precompute one fixed-length digest per configured key.
   const digests = keys.map((key) => sha256(key));
+  // Precompute the opaque idempotency scope per configured key so the raw key
+  // material is used exactly once, at construction, and never again per request.
+  const scopes: (string | null)[] =
+    options.scopeDeriver === undefined
+      ? keys.map(() => null)
+      : keys.map((key) => (options.scopeDeriver as (k: string) => string)(key));
 
   return {
     authenticate(header: string | undefined): AuthResult {
@@ -103,7 +138,7 @@ export function createGatewayAuthenticator(
       // All digests are exactly DIGEST_BYTES, so timingSafeEqual never throws
       // on a length mismatch. Compare against every configured digest without
       // returning early, so a match's position does not affect the work done.
-      // The matched index (if any) yields only an opaque identity.
+      // The matched index (if any) yields only opaque identities.
       let matchedIndex = -1;
       for (let i = 0; i < digests.length; i += 1) {
         const digest = digests[i];
@@ -111,7 +146,12 @@ export function createGatewayAuthenticator(
           matchedIndex = i;
         }
       }
-      return matchedIndex >= 0 ? { ok: true, keyId: keyIdForIndex(matchedIndex) } : { ok: false };
+      if (matchedIndex < 0) return { ok: false };
+      return {
+        ok: true,
+        keyId: keyIdForIndex(matchedIndex),
+        scopeId: scopes[matchedIndex] ?? null,
+      };
     },
   };
 }

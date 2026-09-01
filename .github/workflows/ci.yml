@@ -25,6 +25,38 @@ jobs:
       - name: Run validation matrix
         run: npm run validate
 
+  redis-idempotency:
+    name: Redis idempotency contract (Node 24)
+    runs-on: ubuntu-latest
+    # The only job that needs an external service. `npm run validate` stays
+    # hermetic and Redis-free; this suite is an ADDITIONAL required gate.
+    services:
+      redis:
+        image: redis:8.8.2-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Run Redis idempotency contract suite
+        # Synthetic content and credentials only; the suite randomizes its key
+        # prefix per run and deletes every key it creates.
+        env:
+          REDIS_TEST_URL: redis://127.0.0.1:6379
+        run: npm run test:redis
+
   docker-build:
     name: Docker build (no push)
     runs-on: ubuntu-latest

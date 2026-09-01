@@ -42,6 +42,67 @@ services:
       MAX_QUEUED_REQUESTS: "${MAX_QUEUED_REQUESTS:-20}"
       MAX_QUEUE_WAIT_MS: "${MAX_QUEUE_WAIT_MS:-5000}"
       SHUTDOWN_DRAIN_MS: "${SHUTDOWN_DRAIN_MS:-30000}"
+      # OPTIONAL Redis-backed cross-replica idempotency (Phase 4A). Empty by
+      # default, which disables Redis entirely: unkeyed requests behave exactly
+      # as before and a supplied `Idempotency-Key` fails closed with 503. To
+      # enable it locally, start the `redis` profile below and export both
+      # REDIS_URL and IDEMPOTENCY_ENCRYPTION_KEY in your shell or .env.
+      #
+      # There is deliberately NO `depends_on: [redis]`: the gateway must start
+      # and serve `/healthz` whether or not Redis is running.
+      #
+      # When BOTH services run in Compose, REDIS_URL must use the Redis service
+      # hostname (`redis://redis:6379`); `127.0.0.1` inside this container is the
+      # gateway itself. Use `redis://127.0.0.1:6379` only for a gateway running
+      # natively against the published port.
+      REDIS_URL: "${REDIS_URL:-}"
+      IDEMPOTENCY_ENCRYPTION_KEY: "${IDEMPOTENCY_ENCRYPTION_KEY:-}"
+      IDEMPOTENCY_TTL_MS: "${IDEMPOTENCY_TTL_MS:-600000}"
+      REDIS_KEY_PREFIX: "${REDIS_KEY_PREFIX:-collectiviq-gateway}"
     volumes:
       # Provide your own model file (copied from config/models.example.yaml).
       - "./config/models.yaml:/app/config/models.yaml:ro"
+
+  # OPT-IN local Redis for idempotency development and manual testing.
+  #
+  # Redis ONLY (for a natively run gateway, or `npm run test:redis`) — naming the
+  # service keeps the gateway container out of it:
+  #   docker compose --profile redis up -d redis
+  #   export REDIS_URL=redis://127.0.0.1:6379
+  #
+  # Gateway AND Redis together — inside the gateway container 127.0.0.1 is that
+  # container, so the Redis host must be this service's name:
+  #   REDIS_URL=redis://redis:6379 docker compose --profile redis up --build
+  #
+  # Production requirements are NOT met by this local service. A hosted
+  # deployment must additionally provide: network isolation (private subnet or
+  # equivalent), Redis ACL/authentication, TLS (`rediss://`) where the endpoint
+  # is not on a trusted private link, the application-layer
+  # IDEMPOTENCY_ENCRYPTION_KEY, and an IDENTICAL REDIS_URL, encryption key,
+  # REDIS_KEY_PREFIX, and COLLECTIVIQ_GATEWAY_KEYS set across every replica.
+  redis:
+    profiles: ["redis"]
+    image: redis:8.8.2-alpine
+    restart: unless-stopped
+    # Published only to host loopback, exactly like the gateway.
+    ports:
+      - "127.0.0.1:6379:6379"
+    # Persistence is disabled on purpose: idempotency records are short-lived,
+    # encrypted cache state bounded by IDEMPOTENCY_TTL_MS. Losing them costs at
+    # most the replay protection for in-flight keys; it is never a data-loss
+    # event, so RDB snapshots and AOF are unnecessary (and would write
+    # ciphertext to disk for no benefit).
+    command:
+      - "redis-server"
+      - "--save"
+      - ""
+      - "--appendonly"
+      - "no"
+    # No password is configured here. This service is reachable only from the
+    # Compose network and host loopback; a production deployment must use a
+    # managed secret, never a password embedded in a committed file.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5

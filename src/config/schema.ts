@@ -4,8 +4,7 @@ import { Type, type Static } from "typebox";
  * Configuration schemas and typed shapes for the gateway scaffold.
  *
  * Only the settings consumed by the runnable foundation are modelled here.
- * Completion, upstream, tool, and Redis settings are intentionally absent
- * until the components that consume them exist.
+ * Settings whose consumers do not exist yet are intentionally absent.
  */
 
 export const ENVIRONMENTS = ["development", "staging", "production"] as const;
@@ -72,6 +71,35 @@ export const GATEWAY_KEY_LIMITS = {
 } as const;
 
 /**
+ * Conservative, non-overridable bounds for the OPTIONAL Redis-backed
+ * idempotency layer (Phase 4A; specification sections 18, 22.2, 24). Redis is
+ * disabled entirely when `REDIS_URL` is blank/absent. Relaxing any bound is a
+ * configuration-contract/security change, not a runtime override.
+ */
+export const IDEMPOTENCY_LIMITS = {
+  /**
+   * Lifetime of a committed `final` record, in ms. Bounds the window in which a
+   * repeated key replays a cached answer; protection is bounded to this TTL.
+   */
+  ttlMs: { min: 60_000, max: 3_600_000 },
+  /** Allowed Redis key-namespace length, in characters. */
+  keyPrefixLength: { min: 1, max: 64 },
+  /** Exact master-key size, in bytes (AES-256 / HKDF input keying material). */
+  encryptionKeyBytes: 32,
+} as const;
+
+/** Allowed characters for `REDIS_KEY_PREFIX` (a value-free operational namespace). */
+export const REDIS_KEY_PREFIX_PATTERN = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * Canonical, unpadded base64url encoding of exactly
+ * {@link IDEMPOTENCY_LIMITS.encryptionKeyBytes} bytes (43 characters). The
+ * loader additionally re-encodes the decoded bytes and requires an exact
+ * round-trip, so a non-canonical trailing-bit encoding is rejected.
+ */
+export const IDEMPOTENCY_ENCRYPTION_KEY_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+
+/**
  * Conservative, non-overridable foundation limits for the model configuration
  * file. Relaxing any of these is a configuration-contract/security change, not
  * a runtime override. See `.agent/docs/tech-software-spec.md` section 24.
@@ -115,6 +143,8 @@ export const ENV_DEFAULTS = {
   MAX_QUEUED_REQUESTS: 20,
   MAX_QUEUE_WAIT_MS: 5_000,
   SHUTDOWN_DRAIN_MS: 30_000,
+  IDEMPOTENCY_TTL_MS: 600_000, // 10 minutes (specification section 18)
+  REDIS_KEY_PREFIX: "collectiviq-gateway",
 } as const;
 
 /**
@@ -177,6 +207,21 @@ export const EnvConfigSchema = Type.Object(
     SHUTDOWN_DRAIN_MS: Type.Integer({
       minimum: CAPACITY_LIMITS.shutdownDrainMs.min,
       maximum: CAPACITY_LIMITS.shutdownDrainMs.max,
+    }),
+    // Optional Redis-backed idempotency (Phase 4A). A blank/absent REDIS_URL
+    // disables Redis entirely and BOTH optional fields stay absent; when Redis
+    // is enabled the loader requires the encryption key and populates both. The
+    // TTL and namespace always carry their validated defaults so the shape is
+    // stable whether or not Redis is enabled.
+    REDIS_URL: Type.Optional(Type.String({ minLength: 1 })),
+    IDEMPOTENCY_ENCRYPTION_KEY: Type.Optional(Type.String({ minLength: 1 })),
+    IDEMPOTENCY_TTL_MS: Type.Integer({
+      minimum: IDEMPOTENCY_LIMITS.ttlMs.min,
+      maximum: IDEMPOTENCY_LIMITS.ttlMs.max,
+    }),
+    REDIS_KEY_PREFIX: Type.String({
+      minLength: IDEMPOTENCY_LIMITS.keyPrefixLength.min,
+      maxLength: IDEMPOTENCY_LIMITS.keyPrefixLength.max,
     }),
   },
   { additionalProperties: false },

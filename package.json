@@ -24,6 +24,7 @@
     "test:contract": "vitest run test/contract",
     "test:compatibility": "vitest run -c vitest.compatibility.config.ts",
     "test:adversarial": "vitest run -c vitest.adversarial.config.ts",
+    "test:redis": "vitest run -c vitest.redis.config.ts",
     "test:coverage": "vitest run --coverage",
     "test:build": "node test/smoke/import-built.mjs",
     "validate": "npm run format:check && npm run lint && npm run typecheck && npm run test && npm run build && npm run test:build",
@@ -40,6 +41,7 @@
     "ajv-formats": "3.0.1",
     "fastify": "5.11.2",
     "pino": "10.3.1",
+    "redis": "6.2.1",
     "typebox": "1.3.10",
     "ulid": "2.4.0",
     "yaml": "2.9.0"

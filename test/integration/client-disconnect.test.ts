@@ -52,6 +52,8 @@ function configFor(baseUrl: string): AppConfig {
     MAX_QUEUED_REQUESTS: 20,
     MAX_QUEUE_WAIT_MS: 5_000,
     SHUTDOWN_DRAIN_MS: 30_000,
+    IDEMPOTENCY_TTL_MS: 600_000,
+    REDIS_KEY_PREFIX: "collectiviq-gateway",
     models: [MODEL],
   };
 }

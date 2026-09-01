@@ -14,9 +14,12 @@ import {
   ENV_DEFAULTS,
   EnvConfigSchema,
   GATEWAY_KEY_LIMITS,
+  IDEMPOTENCY_ENCRYPTION_KEY_PATTERN,
+  IDEMPOTENCY_LIMITS,
   MODEL_CONFIG_LIMITS,
   MODEL_PROPERTY_NAMES,
   ModelsFileShapeSchema,
+  REDIS_KEY_PREFIX_PATTERN,
   VirtualModelSchema,
   type AppConfig,
   type EnvConfig,
@@ -71,6 +74,10 @@ const KNOWN_ENV_KEYS = [
   "MAX_QUEUED_REQUESTS",
   "MAX_QUEUE_WAIT_MS",
   "SHUTDOWN_DRAIN_MS",
+  "REDIS_URL",
+  "IDEMPOTENCY_ENCRYPTION_KEY",
+  "IDEMPOTENCY_TTL_MS",
+  "REDIS_KEY_PREFIX",
 ] as const;
 
 export interface LoadConfigOptions {
@@ -130,6 +137,41 @@ function isHttpUrl(raw: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Accept only a canonical `redis://` / `rediss://` endpoint: the value must
+ * parse, use exactly one of the two supported lowercase schemes, carry a
+ * hostname, omit any query/fragment, and serialize back to the submitted string
+ * byte-for-byte. The round-trip rejects an uppercase scheme, a non-normalized
+ * escape, and other non-canonical spellings, so every replica derives the same
+ * endpoint from the same value. The URL may embed credentials; it is treated as
+ * secret-bearing and is never echoed in an error or a log.
+ */
+function isCanonicalRedisUrl(raw: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== "redis:" && url.protocol !== "rediss:") return false;
+  if (url.hostname === "") return false;
+  if (url.search !== "" || url.hash !== "") return false;
+  return url.href === raw;
+}
+
+/**
+ * Accept only exactly {@link IDEMPOTENCY_LIMITS.encryptionKeyBytes} bytes in
+ * canonical unpadded base64url. The decoded bytes are re-encoded and compared
+ * so a non-canonical trailing-bit encoding (which would decode to the same key
+ * from two different strings) is rejected.
+ */
+function isCanonicalEncryptionKey(raw: string): boolean {
+  if (!IDEMPOTENCY_ENCRYPTION_KEY_PATTERN.test(raw)) return false;
+  const decoded = Buffer.from(raw, "base64url");
+  if (decoded.length !== IDEMPOTENCY_LIMITS.encryptionKeyBytes) return false;
+  return decoded.toString("base64url") === raw;
 }
 
 /** A non-empty string with no leading/trailing whitespace (case preserved). */
@@ -252,6 +294,51 @@ function loadEnvConfig(source: NodeJS.ProcessEnv): EnvConfig {
   const maxQueued = coerceEnvInteger("MAX_QUEUED_REQUESTS", ENV_DEFAULTS.MAX_QUEUED_REQUESTS);
   const maxQueueWaitMs = coerceEnvInteger("MAX_QUEUE_WAIT_MS", ENV_DEFAULTS.MAX_QUEUE_WAIT_MS);
   const shutdownDrainMs = coerceEnvInteger("SHUTDOWN_DRAIN_MS", ENV_DEFAULTS.SHUTDOWN_DRAIN_MS);
+  const idempotencyTtlMs = coerceEnvInteger("IDEMPOTENCY_TTL_MS", ENV_DEFAULTS.IDEMPOTENCY_TTL_MS);
+
+  // Optional Redis-backed idempotency (Phase 4A). A blank/absent REDIS_URL
+  // disables Redis; the gateway then behaves exactly as before for unkeyed
+  // requests and fails closed (503) for a supplied `Idempotency-Key`. When Redis
+  // IS configured the application-layer encryption key is mandatory, because
+  // every cached final response is stored encrypted (specification §22.2).
+  let redisUrl: string | undefined;
+  const rawRedisUrl = raw.REDIS_URL;
+  const redisEnabled = present(rawRedisUrl);
+  if (present(rawRedisUrl)) {
+    const candidateUrl = rawRedisUrl.trim();
+    if (!isCanonicalRedisUrl(candidateUrl)) {
+      issues.push({
+        field: "REDIS_URL",
+        reason: "must be a canonical redis:// or rediss:// URL",
+      });
+    } else {
+      redisUrl = candidateUrl;
+    }
+  }
+
+  let encryptionKey: string | undefined;
+  if (present(raw.IDEMPOTENCY_ENCRYPTION_KEY)) {
+    // Preserved EXACTLY (no trimming): the canonical pattern already forbids
+    // whitespace, so a padded value is a rejection rather than a silent repair.
+    const candidateKey = raw.IDEMPOTENCY_ENCRYPTION_KEY;
+    if (!isCanonicalEncryptionKey(candidateKey)) {
+      issues.push({
+        field: "IDEMPOTENCY_ENCRYPTION_KEY",
+        reason: "must be 32 bytes encoded as canonical unpadded base64url",
+      });
+    } else {
+      encryptionKey = candidateKey;
+    }
+  } else if (redisEnabled) {
+    issues.push({ field: "IDEMPOTENCY_ENCRYPTION_KEY", reason: "is required" });
+  }
+
+  const redisKeyPrefix = present(raw.REDIS_KEY_PREFIX)
+    ? raw.REDIS_KEY_PREFIX.trim()
+    : ENV_DEFAULTS.REDIS_KEY_PREFIX;
+  if (!REDIS_KEY_PREFIX_PATTERN.test(redisKeyPrefix)) {
+    issues.push({ field: "REDIS_KEY_PREFIX", reason: "has unsupported value" });
+  }
 
   let logContent: boolean = ENV_DEFAULTS.LOG_CONTENT;
   if (present(raw.LOG_CONTENT)) {
@@ -355,6 +442,16 @@ function loadEnvConfig(source: NodeJS.ProcessEnv): EnvConfig {
     MAX_QUEUED_REQUESTS: maxQueued,
     MAX_QUEUE_WAIT_MS: maxQueueWaitMs,
     SHUTDOWN_DRAIN_MS: shutdownDrainMs,
+    // Both optional fields are omitted unless they validated, so structural
+    // validation never double-reports an already-recorded issue.
+    ...(redisUrl !== undefined ? { REDIS_URL: redisUrl } : {}),
+    ...(encryptionKey !== undefined ? { IDEMPOTENCY_ENCRYPTION_KEY: encryptionKey } : {}),
+    IDEMPOTENCY_TTL_MS: idempotencyTtlMs,
+    // A rejected prefix is already reported; keep the validated default in the
+    // candidate so the length/type keywords do not add a second issue.
+    REDIS_KEY_PREFIX: REDIS_KEY_PREFIX_PATTERN.test(redisKeyPrefix)
+      ? redisKeyPrefix
+      : ENV_DEFAULTS.REDIS_KEY_PREFIX,
   };
 
   // Structural/enum/bounds validation. Reasons are generic; env keys are static.
@@ -583,5 +680,27 @@ function deepFreeze<T>(value: T): T {
 export function loadConfig(options: LoadConfigOptions = {}): AppConfig {
   const env = loadEnvConfig(options.env ?? process.env);
   const models = loadModels(env, options.cwd ?? process.cwd());
+
+  // Cross-file policy: a cached response must outlive the request that produced
+  // it. If IDEMPOTENCY_TTL_MS were shorter than a model's total deadline, a
+  // client retrying after its OWN attempt timed out would find the record
+  // already expired and silently pay for a duplicate upstream completion —
+  // exactly what the idempotency key was supplied to prevent. Only enforced
+  // when Redis is enabled; the reason stays value-free.
+  if (env.REDIS_URL !== undefined) {
+    const longestRequestMs = models.reduce(
+      (max, model) => Math.max(max, model.requestTimeoutMs),
+      0,
+    );
+    if (env.IDEMPOTENCY_TTL_MS < longestRequestMs) {
+      throw new ConfigError([
+        {
+          field: "IDEMPOTENCY_TTL_MS",
+          reason: "must not be less than the largest model requestTimeoutMs",
+        },
+      ]);
+    }
+  }
+
   return deepFreeze({ ...env, models });
 }

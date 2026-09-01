@@ -14,6 +14,18 @@
 import type { OpenAIErrorBody } from "./errors.js";
 import type { ParsedToolCall } from "../tools/index.js";
 
+/**
+ * The minimum a stream needs to encode one completed generation: the trusted
+ * discriminator plus either assistant text or validated tool calls.
+ *
+ * A live `CompletionResult` satisfies this structurally (it merely adds the
+ * internal `upstreamThreadId`), and so does a decrypted cached completion
+ * replayed from Redis — so both drive the SAME deterministic frame sequence.
+ */
+export type StreamableResult =
+  | { readonly kind: "text"; readonly content: string }
+  | { readonly kind: "tool_calls"; readonly toolCalls: readonly ParsedToolCall[] };
+
 /** The stable identity shared by every frame of one streamed response. */
 export interface StreamMeta {
   /** The `chatcmpl_ciq_*` id, identical across every chunk. */

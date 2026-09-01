@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -225,6 +226,186 @@ describe("loadConfig — capacity and shutdown", () => {
       expect(error).toBeInstanceOf(ConfigError);
       const fields = (error as ConfigError).issues.map((i) => i.field);
       expect(fields).toContain("MAX_CONCURRENT_REQUESTS_PER_KEY");
+    }
+  });
+});
+
+describe("loadConfig — optional Redis idempotency", () => {
+  const VALID_KEY = randomBytes(32).toString("base64url");
+
+  /** The value-free issues raised by a given environment. */
+  function issuesFor(overrides: Record<string, string | undefined>): ConfigError["issues"] {
+    try {
+      loadConfig({ env: baseEnv(overrides) });
+      throw new Error("expected ConfigError");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfigError);
+      return (error as ConfigError).issues;
+    }
+  }
+
+  it("disables Redis when REDIS_URL is absent or blank", () => {
+    for (const REDIS_URL of [undefined, "", "   "]) {
+      const config = loadConfig({ env: baseEnv({ REDIS_URL }) });
+      expect(config.REDIS_URL).toBeUndefined();
+      // The encryption key is not required while Redis is disabled.
+      expect(config.IDEMPOTENCY_ENCRYPTION_KEY).toBeUndefined();
+      // The TTL and namespace always carry their validated defaults.
+      expect(config.IDEMPOTENCY_TTL_MS).toBe(600_000);
+      expect(config.REDIS_KEY_PREFIX).toBe("collectiviq-gateway");
+    }
+  });
+
+  it("accepts canonical redis:// and rediss:// URLs", () => {
+    for (const url of [
+      "redis://127.0.0.1:6379",
+      "redis://redis:6379",
+      "rediss://cache.example.internal:6380",
+      "redis://cache:6379/0",
+      "redis://user:p%40ss@cache:6379",
+      "redis://[::1]:6379",
+    ]) {
+      const config = loadConfig({
+        env: baseEnv({ REDIS_URL: url, IDEMPOTENCY_ENCRYPTION_KEY: VALID_KEY }),
+      });
+      expect(config.REDIS_URL).toBe(url);
+    }
+  });
+
+  it("rejects a non-canonical or unsupported Redis URL", () => {
+    for (const url of [
+      "REDIS://cache:6379", // non-canonical scheme casing
+      "http://cache:6379",
+      "https://cache:6379",
+      "rediss//cache:6379",
+      "cache:6379",
+      "redis://", // no host
+      "redis://cache:6379?db=1", // query rejected
+      "redis://cache:6379#frag", // fragment rejected
+      "not a url",
+    ]) {
+      const issues = issuesFor({ REDIS_URL: url, IDEMPOTENCY_ENCRYPTION_KEY: VALID_KEY });
+      expect(issues).toContainEqual({
+        field: "REDIS_URL",
+        reason: "must be a canonical redis:// or rediss:// URL",
+      });
+      // The submitted URL is never echoed (it may embed credentials).
+      expect(JSON.stringify(issues)).not.toContain("cache");
+    }
+  });
+
+  it("requires the encryption key whenever Redis is enabled", () => {
+    expect(issuesFor({ REDIS_URL: "redis://127.0.0.1:6379" })).toContainEqual({
+      field: "IDEMPOTENCY_ENCRYPTION_KEY",
+      reason: "is required",
+    });
+  });
+
+  it("accepts exactly 32 bytes of canonical unpadded base64url", () => {
+    const config = loadConfig({
+      env: baseEnv({ REDIS_URL: "redis://127.0.0.1:6379", IDEMPOTENCY_ENCRYPTION_KEY: VALID_KEY }),
+    });
+    expect(config.IDEMPOTENCY_ENCRYPTION_KEY).toBe(VALID_KEY);
+  });
+
+  it("rejects a wrongly sized, padded, non-canonical, or wrong-alphabet key", () => {
+    const padded = `${Buffer.from(randomBytes(32)).toString("base64")}`; // standard base64 + "="
+    // 43 base64url characters whose final character carries non-zero trailing
+    // bits: it decodes to 32 bytes but is NOT the canonical encoding of them.
+    const nonCanonical = `${"A".repeat(42)}B`;
+    for (const key of [
+      randomBytes(16).toString("base64url"),
+      randomBytes(64).toString("base64url"),
+      padded,
+      nonCanonical,
+      `${"A".repeat(42)}+`,
+      `${"A".repeat(42)}/`,
+      `  ${VALID_KEY}  `,
+    ]) {
+      const issues = issuesFor({
+        REDIS_URL: "redis://127.0.0.1:6379",
+        IDEMPOTENCY_ENCRYPTION_KEY: key,
+      });
+      expect(issues).toContainEqual({
+        field: "IDEMPOTENCY_ENCRYPTION_KEY",
+        reason: "must be 32 bytes encoded as canonical unpadded base64url",
+      });
+      expect(JSON.stringify(issues)).not.toContain(key.trim().slice(0, 8));
+    }
+  });
+
+  it("treats a whitespace-only encryption key as absent", () => {
+    // Blank means "not set", so with Redis enabled it is a required-field issue
+    // rather than a format issue.
+    expect(
+      issuesFor({ REDIS_URL: "redis://127.0.0.1:6379", IDEMPOTENCY_ENCRYPTION_KEY: "   " }),
+    ).toContainEqual({ field: "IDEMPOTENCY_ENCRYPTION_KEY", reason: "is required" });
+  });
+
+  it("enforces the TTL bounds", () => {
+    const at = (value: string): number =>
+      loadConfig({ env: baseEnv({ IDEMPOTENCY_TTL_MS: value }) }).IDEMPOTENCY_TTL_MS;
+    expect(at("60000")).toBe(60_000);
+    expect(at("3600000")).toBe(3_600_000);
+    for (const value of ["59999", "3600001", "0", "-1", "abc", "1.5"]) {
+      expect(() => loadConfig({ env: baseEnv({ IDEMPOTENCY_TTL_MS: value }) })).toThrow(
+        ConfigError,
+      );
+    }
+  });
+
+  it("enforces the key-prefix bounds and alphabet", () => {
+    for (const prefix of ["a", "collectiviq-gateway", "A_b-9", "x".repeat(64)]) {
+      expect(loadConfig({ env: baseEnv({ REDIS_KEY_PREFIX: prefix }) }).REDIS_KEY_PREFIX).toBe(
+        prefix,
+      );
+    }
+    for (const prefix of ["has space", "has:colon", "has.dot", "café", "%"]) {
+      expect(issuesFor({ REDIS_KEY_PREFIX: prefix })).toContainEqual({
+        field: "REDIS_KEY_PREFIX",
+        reason: "has unsupported value",
+      });
+    }
+    // An over-long but otherwise well-formed prefix is a bounds issue.
+    expect(issuesFor({ REDIS_KEY_PREFIX: "x".repeat(65) })).toContainEqual({
+      field: "REDIS_KEY_PREFIX",
+      reason: "length is outside allowed bounds",
+    });
+  });
+
+  it("requires the TTL to cover the largest model requestTimeoutMs", () => {
+    // A TTL shorter than a model's own deadline means a client retrying after
+    // its attempt timed out finds nothing cached and silently pays for a
+    // duplicate upstream completion. The example catalog uses 90 s deadlines.
+    const redis = {
+      REDIS_URL: "redis://127.0.0.1:6379",
+      IDEMPOTENCY_ENCRYPTION_KEY: VALID_KEY,
+    };
+    expect(
+      loadConfig({ env: baseEnv({ ...redis, IDEMPOTENCY_TTL_MS: "90000" }) }).IDEMPOTENCY_TTL_MS,
+    ).toBe(90_000);
+    expect(issuesFor({ ...redis, IDEMPOTENCY_TTL_MS: "60000" })).toContainEqual({
+      field: "IDEMPOTENCY_TTL_MS",
+      reason: "must not be less than the largest model requestTimeoutMs",
+    });
+    // The check applies only when Redis is enabled.
+    expect(loadConfig({ env: baseEnv({ IDEMPOTENCY_TTL_MS: "60000" }) }).IDEMPOTENCY_TTL_MS).toBe(
+      60_000,
+    );
+  });
+
+  it("never echoes the Redis URL or the encryption key in a formatted error", () => {
+    const secretUrl = "redis://admin:SUPERSECRET@cache.example:6379";
+    try {
+      loadConfig({
+        env: baseEnv({ REDIS_URL: `${secretUrl}?x=1`, IDEMPOTENCY_ENCRYPTION_KEY: "SENSITIVE" }),
+      });
+      throw new Error("expected ConfigError");
+    } catch (error) {
+      const formatted = (error as ConfigError).format();
+      expect(formatted).not.toContain("SUPERSECRET");
+      expect(formatted).not.toContain("SENSITIVE");
+      expect(formatted).not.toContain("cache.example");
     }
   });
 });

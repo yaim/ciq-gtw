@@ -41,13 +41,32 @@ const config = {
   MAX_QUEUED_REQUESTS: 20,
   MAX_QUEUE_WAIT_MS: 5_000,
   SHUTDOWN_DRAIN_MS: 30_000,
+  // Redis-backed idempotency CONFIGURED but not wired: `buildServer` must still
+  // open no socket. The Redis client is owned by the process composition root,
+  // never by construction (specification section 31.3).
+  REDIS_URL: "redis://127.0.0.1:6379",
+  IDEMPOTENCY_ENCRYPTION_KEY: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  IDEMPOTENCY_TTL_MS: 600_000,
+  REDIS_KEY_PREFIX: "collectiviq-gateway",
   models: [],
 };
+
+/** Names of TCP-related libuv handles; none may exist during construction. */
+const tcpHandles = () => process.getActiveResourcesInfo().filter((name) => name.startsWith("TCP"));
+
+assert.deepEqual(tcpHandles(), [], "no TCP handle may exist before constructing the server");
 
 const app = server.buildServer({ config, readiness: { isReady: () => false } });
 await app.ready();
 assert.equal(app.server.listening, false, "buildServer must not open a listening socket");
 assert.equal(fetchCalls, 0, "constructing the server must not make any network/login call");
+// Covers both CollectivIQ and Redis: neither may be connected at construction,
+// even though the configuration above enables idempotency.
+assert.deepEqual(
+  tcpHandles(),
+  [],
+  "constructing the server must not open any TCP connection (CollectivIQ or Redis)",
+);
 await app.close();
 
 globalThis.fetch = realFetch;

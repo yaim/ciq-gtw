@@ -12,7 +12,10 @@ import type { ServerResponse } from "node:http";
 import { buildServer, type GatewayServer } from "../../src/server.js";
 import { createReadinessState } from "../../src/api/health-route.js";
 import { createCompletionRuntime } from "../../src/generation/runtime.js";
-import { RequestCancelledError } from "../../src/generation/chat-completion.js";
+import {
+  RequestCancelledError,
+  type PreparedCompletion,
+} from "../../src/generation/chat-completion.js";
 import type { AppConfig, VirtualModel } from "../../src/config/schema.js";
 import type { NormalizedChatRequest } from "../../src/openai/chat-types.js";
 import {
@@ -74,6 +77,8 @@ function configFor(baseUrl: string): AppConfig {
     MAX_QUEUED_REQUESTS: 20,
     MAX_QUEUE_WAIT_MS: 5_000,
     SHUTDOWN_DRAIN_MS: 30_000,
+    IDEMPOTENCY_TTL_MS: 600_000,
+    REDIS_KEY_PREFIX: "collectiviq-gateway",
     models: [MODEL, DIRECT_MODEL],
   };
 }
@@ -440,5 +445,108 @@ describe("completion flow — cancellation", () => {
     const promise = runtime.chatService.run(prepared, controller.signal);
     setTimeout(() => controller.abort(), 50);
     await expect(promise).rejects.toBeInstanceOf(RequestCancelledError);
+  });
+});
+
+describe("completion flow — capacity lifecycle hook", () => {
+  /** Drive the REAL completion service against the mock server. */
+  function prepareReal(runtime: ReturnType<typeof createCompletionRuntime>): PreparedCompletion {
+    const request: NormalizedChatRequest = {
+      model: "collectiviq-consensus",
+      messages: [{ role: "user", content: "hi" }],
+      ignoredParameters: [],
+      stream: false,
+    };
+    return runtime.chatService.prepare({
+      request,
+      model: MODEL,
+      keyId: "k0",
+      signal: new AbortController().signal,
+    });
+  }
+
+  /** Start the happy-path mock and return its base URL. */
+  async function startHappyMock(): Promise<string> {
+    const started = await startMockServer((req, res) => {
+      if (req.path === "/create_thread") return void replyJson(res, { thread_id: 7 });
+      if (req.path === "/process_message") return void replyJson(res, { status: "ok" }, 202);
+      if (req.path === "/get_messages") {
+        return void replyJson(res, {
+          messages: [
+            { source: "combined", content: "answer", create_time: "2026-01-01T00:00:00Z" },
+          ],
+        });
+      }
+      res.writeHead(404).end();
+    });
+    mock = started;
+    return started.baseUrl;
+  }
+
+  /** Upstream requests captured so far, for ordering assertions. */
+  const capturedPaths = (path: string): readonly CapturedRequest[] =>
+    (mock?.requests ?? []).filter((request) => request.path === path);
+
+  it("runs the hook AFTER capacity and BEFORE create_thread", async () => {
+    // The hook is the single seam the idempotency layer uses to move a claim to
+    // `processing`. Its ordering is a load-bearing guarantee, so it is asserted
+    // against the real service — not against a fake that calls the hook itself.
+    const baseUrl = await startHappyMock();
+    const runtime = createCompletionRuntime(configFor(baseUrl));
+    const observed: { active: number; creates: number } = { active: -1, creates: -1 };
+
+    const result = await runtime.chatService.run(
+      prepareReal(runtime),
+      new AbortController().signal,
+      {
+        onCapacityAcquired: () => {
+          // A permit is already held...
+          observed.active = runtime.capacity.activeCount;
+          // ...and no upstream request has been issued yet.
+          observed.creates = capturedPaths("/create_thread").length;
+          return Promise.resolve();
+        },
+      },
+    );
+
+    expect(result).toEqual({ kind: "text", content: "answer", upstreamThreadId: "7" });
+    expect(observed.active).toBe(1);
+    expect(observed.creates).toBe(0);
+    // The permit is released once the completion finishes.
+    expect(runtime.capacity.activeCount).toBe(0);
+  });
+
+  it("makes NO upstream call and releases capacity when the hook rejects", async () => {
+    const baseUrl = await startHappyMock();
+    const runtime = createCompletionRuntime(configFor(baseUrl));
+    const failure = new Error("hook rejected");
+
+    await expect(
+      runtime.chatService.run(prepareReal(runtime), new AbortController().signal, {
+        onCapacityAcquired: () => Promise.reject(failure),
+      }),
+    ).rejects.toBe(failure);
+
+    // Nothing whatsoever reached CollectivIQ.
+    expect(mock?.requests ?? []).toHaveLength(0);
+    // And the permit was released, so the next request can still be admitted.
+    expect(runtime.capacity.activeCount).toBe(0);
+    const second = await runtime.chatService.run(
+      prepareReal(runtime),
+      new AbortController().signal,
+    );
+    expect(second.kind).toBe("text");
+    expect(capturedPaths("/create_thread")).toHaveLength(1);
+  });
+
+  it("behaves exactly as before when no hook is supplied", async () => {
+    const baseUrl = await startHappyMock();
+    const runtime = createCompletionRuntime(configFor(baseUrl));
+    const result = await runtime.chatService.run(
+      prepareReal(runtime),
+      new AbortController().signal,
+    );
+    expect(result.kind).toBe("text");
+    expect(capturedPaths("/create_thread")).toHaveLength(1);
   });
 });

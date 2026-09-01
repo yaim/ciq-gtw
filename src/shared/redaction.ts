@@ -68,6 +68,17 @@ export const REDACT_PATHS: readonly string[] = [
   "*.username",
   "email",
   "*.email",
+  // Optional Redis-backed idempotency (Phase 4A). The Redis URL may embed
+  // credentials and the master key derives every idempotency subkey, so both
+  // are treated as secret-bearing everywhere.
+  "REDIS_URL",
+  "*.REDIS_URL",
+  "redisUrl",
+  "*.redisUrl",
+  "IDEMPOTENCY_ENCRYPTION_KEY",
+  "*.IDEMPOTENCY_ENCRYPTION_KEY",
+  "encryptionKey",
+  "*.encryptionKey",
 ];
 
 /** Substrings that unambiguously mark a credential-bearing or identity key. */
@@ -82,6 +93,10 @@ const SECRET_KEY_MARKERS = [
   // logs no user content, so redacting these in logs is pure defense in depth.
   "username",
   "email",
+  // Optional Redis-backed idempotency: the connection URL may embed credentials
+  // and the encryption master key derives every idempotency subkey.
+  "redisurl",
+  "encryptionkey",
 ];
 
 /** Exact normalized key names that are always credentials. */

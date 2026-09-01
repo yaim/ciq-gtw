@@ -186,6 +186,24 @@ export type CompletionResult =
       readonly upstreamThreadId: string;
     };
 
+/**
+ * Optional lifecycle hooks observed by {@link ChatCompletionService.run}.
+ *
+ * They exist so a cross-cutting concern (currently only Redis-backed
+ * idempotency, specification section 18) can interpose at an exact point in the
+ * flow WITHOUT the generation layer learning anything about that concern.
+ */
+export interface CompletionRunHooks {
+  /**
+   * Invoked once, AFTER the capacity permit is acquired and BEFORE
+   * `create_thread`. A rejection aborts the completion: the permit is released
+   * on the normal exit path and NO upstream call is made. Throw a
+   * {@link ChatCompletionError} to choose the public envelope; anything else
+   * propagates to the route's fixed `500`.
+   */
+  readonly onCapacityAcquired?: (signal: AbortSignal) => Promise<void>;
+}
+
 /** The narrow completion use case consumed by the route (prepare then run). */
 export interface ChatCompletionService {
   /**
@@ -196,13 +214,18 @@ export interface ChatCompletionService {
    */
   prepare(ctx: ChatCompletionRequestContext): PreparedCompletion;
   /**
-   * Execute the prepared completion: acquire capacity, create exactly one
+   * Execute the prepared completion: acquire capacity, run any
+   * {@link CompletionRunHooks.onCapacityAcquired} hook, create exactly one
    * thread, submit once, poll under the model's total deadline, and return the
    * trusted answer text. Throws a {@link ChatCompletionError} (public envelope)
    * or {@link RequestCancelledError} (client/shutdown abort); an unexpected
    * error propagates unmapped.
    */
-  run(prepared: PreparedCompletion, signal: AbortSignal): Promise<CompletionResult>;
+  run(
+    prepared: PreparedCompletion,
+    signal: AbortSignal,
+    hooks?: CompletionRunHooks,
+  ): Promise<CompletionResult>;
 }
 
 /** Build the completion service from its ports. */
@@ -248,7 +271,11 @@ export function createChatCompletionService(deps: ChatCompletionDeps): ChatCompl
       };
     },
 
-    async run(prepared: PreparedCompletion, signal: AbortSignal): Promise<CompletionResult> {
+    async run(
+      prepared: PreparedCompletion,
+      signal: AbortSignal,
+      hooks: CompletionRunHooks = {},
+    ): Promise<CompletionResult> {
       const model = prepared.policy;
 
       // Compose the total deadline with the client/shutdown signal. The combined
@@ -278,6 +305,12 @@ export function createChatCompletionService(deps: ChatCompletionDeps): ChatCompl
         }
 
         try {
+          // Capacity is held. Any lifecycle hook runs HERE — before the first
+          // upstream call — so a hook failure releases the permit on the normal
+          // exit path below and no thread is ever created.
+          if (hooks.onCapacityAcquired !== undefined) {
+            await hooks.onCapacityAcquired(combined);
+          }
           // Create exactly one thread, submit exactly once, then poll.
           const thread = await deps.adapter.createThread({
             title: THREAD_TITLE,

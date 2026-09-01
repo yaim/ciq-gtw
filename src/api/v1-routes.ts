@@ -4,6 +4,7 @@ import type { GatewayAuthenticator } from "./gateway-auth.js";
 import type { ModelCatalog } from "../generation/model-catalog.js";
 import type { ChatCompletionService } from "../generation/chat-completion.js";
 import type { TitleBridge } from "../opencode/title-bridge.js";
+import type { IdempotencyCoordinator } from "../idempotency/index.js";
 import { registerModelRoutes } from "./models-route.js";
 import { registerChatCompletionsRoute } from "./chat-completions-route.js";
 import { registerOpenCodeTitleRoute } from "./opencode-title-route.js";
@@ -18,6 +19,13 @@ declare module "fastify" {
      * `null` until authenticated.
      */
     gatewayKeyId: string | null;
+    /**
+     * Opaque, stable CROSS-REPLICA idempotency scope for the matched key (never
+     * the raw key). Independent of gateway-key ordering, identical on every
+     * replica sharing the encryption key, and never logged or reflected. `null`
+     * until authenticated, and also `null` when idempotency is disabled.
+     */
+    gatewayScopeId: string | null;
   }
 }
 
@@ -31,6 +39,12 @@ export interface V1RouteDeps {
   readonly titleBridge: TitleBridge;
   /** Aborts when the process begins its shutdown drain-cancel step. */
   readonly shutdownSignal: AbortSignal;
+  /**
+   * Optional cross-replica idempotency coordinator. Absent means Redis-backed
+   * idempotency is disabled for this instance: unkeyed requests are unaffected
+   * and a supplied `Idempotency-Key` fails closed with `503`.
+   */
+  readonly idempotency?: IdempotencyCoordinator;
 }
 
 /**
@@ -54,8 +68,9 @@ export function registerV1Routes(app: GatewayServer, deps: V1RouteDeps): void {
     (instance, _opts, done) => {
       const scope = instance.withTypeProvider<TypeBoxTypeProvider>();
 
-      // Default the identity so every request in this scope carries the property.
+      // Default the identities so every request in this scope carries them.
       scope.decorateRequest("gatewayKeyId", null);
+      scope.decorateRequest("gatewayScopeId", null);
 
       // Any unexpected failure inside the group becomes the fixed internal
       // envelope. The thrown value's message/stack/cause/body is never read.
@@ -73,6 +88,7 @@ export function registerV1Routes(app: GatewayServer, deps: V1RouteDeps): void {
           return;
         }
         request.gatewayKeyId = result.keyId;
+        request.gatewayScopeId = result.scopeId;
         // Trusted provenance marker: authentication completed normally. The chat
         // route's error boundary uses this (plus the not-yet-in-handler marker)
         // to prove a subsequent throw came from Fastify's parser phase — the only
@@ -87,6 +103,7 @@ export function registerV1Routes(app: GatewayServer, deps: V1RouteDeps): void {
         catalog: deps.catalog,
         titleBridge: deps.titleBridge,
         shutdownSignal: deps.shutdownSignal,
+        ...(deps.idempotency !== undefined ? { idempotency: deps.idempotency } : {}),
       });
       // Authenticated CollectivIQ/OpenCode extension (not OpenAI-compatible).
       registerOpenCodeTitleRoute(scope, {

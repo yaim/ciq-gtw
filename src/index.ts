@@ -3,6 +3,7 @@ import { ConfigError, loadConfig } from "./config/load.js";
 import { createLogger, emitContentLoggingWarning } from "./observability/logger.js";
 import { createReadinessState } from "./api/health-route.js";
 import { createCompletionRuntime } from "./generation/runtime.js";
+import { createIdempotencyRuntime } from "./idempotency/index.js";
 import { buildServer } from "./server.js";
 
 /** Fixed message returned for any non-{@link ConfigError} startup failure. */
@@ -47,15 +48,23 @@ export interface GracefulShutdownDeps {
   readonly close: () => Promise<void>;
   /** Bounded drain window (ms) before remaining work is force-cancelled. */
   readonly drainMs: number;
+  /**
+   * Close shared external resources (currently Redis) AFTER the application has
+   * drained, so an in-flight completion can still persist or settle its
+   * idempotency record while requests are winding down. Bounded and
+   * non-rejecting by contract.
+   */
+  readonly closeDependencies?: () => Promise<void>;
   /** Optional content-free error sink for a close() failure. */
   readonly onError?: (error: unknown) => void;
 }
 
 /**
  * Run the graceful-shutdown sequence (specification section 31.3): mark
- * not-ready, stop new admission, allow a bounded drain window, then force-cancel
- * remaining work and clean up the drain timer. Never calls `process.exit` — the
- * caller owns process termination — and leaves no timer behind.
+ * not-ready, stop new admission, allow a bounded drain window, force-cancel
+ * remaining work, clean up the drain timer, and only THEN close shared external
+ * resources. Never calls `process.exit` — the caller owns process termination —
+ * and leaves no timer behind.
  */
 export async function runGracefulShutdown(deps: GracefulShutdownDeps): Promise<void> {
   // 1. Flip readiness and 2. stop admitting new completions immediately.
@@ -75,6 +84,15 @@ export async function runGracefulShutdown(deps: GracefulShutdownDeps): Promise<v
     clearTimeout(drainTimer);
     deps.abortInFlight();
   }
+  // 6. Application draining is complete: close Redis and any other shared
+  //    resource last, so idempotency finalization stayed possible throughout.
+  if (deps.closeDependencies !== undefined) {
+    try {
+      await deps.closeDependencies();
+    } catch (error) {
+      deps.onError?.(error);
+    }
+  }
 }
 
 /**
@@ -87,7 +105,17 @@ export async function main(): Promise<void> {
   emitContentLoggingWarning(config);
   const logger = createLogger(config);
 
-  const readiness = createReadinessState(false);
+  // Optional Redis-backed idempotency (Phase 4A). `null` when REDIS_URL is
+  // blank/absent; construction creates no socket either way.
+  const idempotency = createIdempotencyRuntime(config);
+
+  // Readiness is dependency aware: when Redis is CONFIGURED the instance is
+  // ready only while the client is actually connected, so a disconnected or
+  // reconnecting Redis keeps `/readyz` at 503 while `/healthz` stays 200.
+  // Neither endpoint calls CollectivIQ.
+  const readiness = createReadinessState(false, {
+    dependencies: idempotency === null ? [] : [{ isReady: () => idempotency.isReady() }],
+  });
 
   // Build the completion runtime once so the process root can share the same
   // capacity controller for shutdown draining. Construction opens no socket and
@@ -103,6 +131,7 @@ export async function main(): Promise<void> {
       titleBridge: runtime.titleBridge,
       shutdownSignal: shutdownController.signal,
     },
+    ...(idempotency !== null ? { idempotency: idempotency.coordinator } : {}),
   });
 
   let shuttingDown = false;
@@ -111,11 +140,16 @@ export async function main(): Promise<void> {
     shuttingDown = true;
     logger.info({ signal }, "shutting down");
     await runGracefulShutdown({
-      setNotReady: () => readiness.setReady(false),
+      // Shutdown always forces not-ready; the latch means no later dependency
+      // recovery can flip readiness back on.
+      setNotReady: () => readiness.markShuttingDown(),
       closeAdmission: () => runtime.capacity.closeAdmission(),
       abortInFlight: () => shutdownController.abort(),
       close: () => app.close(),
       drainMs: config.SHUTDOWN_DRAIN_MS,
+      // Redis stays available throughout draining so an in-flight completion can
+      // still commit or settle its idempotency record; it is closed last.
+      ...(idempotency !== null ? { closeDependencies: () => idempotency.close() } : {}),
       onError: (error) =>
         logger.error(
           { err: { name: error instanceof Error ? error.name : "unknown" } },
@@ -127,6 +161,11 @@ export async function main(): Promise<void> {
 
   process.on("SIGINT", () => void shutdown("SIGINT"));
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
+
+  // Start connecting to Redis WITHOUT blocking startup: the listener binds
+  // regardless, `/healthz` stays 200, `/readyz` stays 503 until the client is
+  // ready, and the client reconnects automatically if Redis is down or restarts.
+  idempotency?.connect();
 
   await app.listen({ host: config.HOST, port: config.PORT });
   readiness.setReady(true);

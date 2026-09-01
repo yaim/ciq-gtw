@@ -26,18 +26,33 @@ import type { GatewayServer } from "../server.js";
 import { isAuthenticated, isHandlerStarted, markHandlerStarted } from "./request-phase.js";
 import type { ModelCatalog } from "../generation/model-catalog.js";
 import {
+  ChatCompletionError,
   isChatCompletionError,
   isRequestCancelledError,
   type ChatCompletionService,
   type CompletionResult,
+  type CompletionRunHooks,
+  type PreparedCompletion,
 } from "../generation/chat-completion.js";
 import type { TitleBridge } from "../opencode/title-bridge.js";
 import { SESSION_ID_HEADER, normalizeSessionId } from "../opencode/session-header.js";
+import {
+  IDEMPOTENCY_KEY_HEADER,
+  readIdempotencyKeyHeader,
+  type CachedCompletion,
+  type CachedResult,
+  type IdempotencyCoordinator,
+  type IdempotencyOwnerSession,
+} from "../idempotency/index.js";
 import { validateChatRequest } from "../openai/chat-request.js";
 import { ChatCompletionSchema, encodeChatCompletion } from "../openai/chat-response.js";
 import { streamChatCompletion } from "./chat-stream-response.js";
 import {
+  COMPLETION_TIMEOUT_ERROR,
+  IDEMPOTENCY_KEY_CONFLICT_ERROR,
+  IDEMPOTENCY_UNAVAILABLE_ERROR,
   INTERNAL_ERROR,
+  INVALID_IDEMPOTENCY_KEY_ERROR,
   INVALID_REQUEST_ERROR,
   OpenAIErrorSchema,
   REQUEST_BODY_TOO_LARGE_ERROR,
@@ -53,6 +68,25 @@ export interface ChatCompletionsRouteDeps {
   readonly titleBridge: TitleBridge;
   /** Aborts when the process begins its shutdown drain-cancel step. */
   readonly shutdownSignal: AbortSignal;
+  /**
+   * Optional cross-replica idempotency coordinator (Phase 4A). Absent means the
+   * feature is disabled for this instance: unkeyed requests are completely
+   * unaffected, and a supplied `Idempotency-Key` fails closed with `503`.
+   */
+  readonly idempotency?: IdempotencyCoordinator;
+}
+
+/**
+ * Project a live completion result onto the cacheable shape.
+ *
+ * This is where the internal `upstreamThreadId` is DROPPED: it is used only for
+ * process-local native-title correlation and is deliberately never persisted
+ * (specification sections 9.5, 22.2).
+ */
+function toCachedResult(result: CompletionResult): CachedResult {
+  return result.kind === "tool_calls"
+    ? { kind: "tool_calls", toolCalls: result.toolCalls }
+    : { kind: "text", content: result.content };
 }
 
 /** Diagnostic header listing accepted-but-ignored optional parameter names. */
@@ -129,6 +163,7 @@ export function registerChatCompletionsRoute(
             400: OpenAIErrorSchema,
             401: OpenAIErrorSchema,
             404: OpenAIErrorSchema,
+            409: OpenAIErrorSchema,
             413: OpenAIErrorSchema,
             429: OpenAIErrorSchema,
             502: OpenAIErrorSchema,
@@ -146,8 +181,11 @@ export function registerChatCompletionsRoute(
         const sendError = (apiError: OpenAIApiError): OpenAIApiError["body"] => {
           // Every envelope status is a declared response code; the cast satisfies
           // the typed reply without widening the public contract.
-          reply.code(apiError.status as 400 | 401 | 404 | 413 | 429 | 502 | 503 | 504 | 500);
+          reply.code(apiError.status as 400 | 401 | 404 | 409 | 413 | 429 | 502 | 503 | 504 | 500);
           if (apiError.status === 429) reply.header("retry-after", "5");
+          else if (apiError.retryAfterSeconds !== undefined) {
+            reply.header("retry-after", String(apiError.retryAfterSeconds));
+          }
           return apiError.body;
         };
 
@@ -163,6 +201,42 @@ export function registerChatCompletionsRoute(
         // The auth hook guarantees an identity before the handler runs.
         const keyId = request.gatewayKeyId;
         if (keyId === null) return sendError(INTERNAL_ERROR);
+
+        // Optional cross-replica idempotency (specification section 18). The
+        // header is read AFTER normal request validation so an invalid body
+        // still produces its usual error, and the body is fingerprinted while
+        // the ORIGINAL parsed value is still available — every submitted field
+        // participates, including tolerated-and-discarded tool metadata.
+        const header = readIdempotencyKeyHeader(
+          request.headers[IDEMPOTENCY_KEY_HEADER],
+          request.raw.rawHeaders,
+        );
+        if (header.kind === "invalid") return sendError(INVALID_IDEMPOTENCY_KEY_ERROR);
+
+        let claim: {
+          readonly coordinator: IdempotencyCoordinator;
+          readonly clientKey: string;
+          readonly scopeId: string;
+          readonly fingerprint: string;
+        } | null = null;
+        if (header.kind === "key") {
+          // A supplied key REQUIRES configured, healthy Redis. Failing closed
+          // here means no completion work is started for a request whose
+          // idempotency guarantee the gateway cannot honour.
+          const coordinator = deps.idempotency;
+          const scopeId = request.gatewayScopeId;
+          if (coordinator === undefined || scopeId === null || !coordinator.isAvailable()) {
+            return sendError(IDEMPOTENCY_UNAVAILABLE_ERROR);
+          }
+          const fingerprint = coordinator.fingerprintBody(request.body);
+          if (!fingerprint.ok) return sendError(INVALID_IDEMPOTENCY_KEY_ERROR);
+          claim = {
+            coordinator,
+            clientKey: header.value,
+            scopeId,
+            fingerprint: fingerprint.fingerprint,
+          };
+        }
 
         // Native-title correlation (best-effort). A valid OpenCode session header
         // arms a one-thread title bridge; an absent/malformed header simply skips
@@ -194,7 +268,7 @@ export function registerChatCompletionsRoute(
         // Prepare (resolve + serialize + bound the prompt, mint the stream-stable
         // identity) BEFORE committing any SSE header. A preparation failure (e.g.
         // an oversized prompt) always stays a normal JSON error — never SSE.
-        let prepared;
+        let prepared: PreparedCompletion;
         try {
           prepared = deps.service.prepare({
             request: normalized,
@@ -211,65 +285,223 @@ export function registerChatCompletionsRoute(
           return sendError(INTERNAL_ERROR);
         }
 
-        // Synthetic-SSE path: authenticate/validate/resolve/prepare all happened
-        // above (pre-header), so from here on every failure is an SSE record. The
-        // writer hijacks the reply and owns all response output.
-        if (normalized.stream) {
-          if (normalized.ignoredParameters.length > 0) {
-            reply.raw.setHeader(IGNORED_HEADER, normalized.ignoredParameters.join(","));
-          }
-          try {
-            await streamChatCompletion({
-              reply,
-              meta: { id: prepared.id, created: prepared.created, model: prepared.model, index: 0 },
-              run: (runSignal) => deps.service.run(prepared, runSignal),
-              runSignal: signal,
-              clientAbort,
-              // Register the correlation ONLY after the terminal chunk + [DONE]
-              // were delivered — never on a failed/cancelled/disconnected stream.
-              onCompleted: registerTitleCorrelation,
-            });
-          } finally {
-            reply.raw.removeListener("close", onClose);
-          }
-          return reply;
-        }
+        const setIgnoredHeader = (streamed: boolean): void => {
+          if (normalized.ignoredParameters.length === 0) return;
+          const value = normalized.ignoredParameters.join(",");
+          if (streamed) reply.raw.setHeader(IGNORED_HEADER, value);
+          else reply.header(IGNORED_HEADER, value);
+        };
 
-        // Non-streamed JSON path.
-        try {
-          const result = await deps.service.run(prepared, signal);
-          // Register the native-title correlation after run() succeeded and before
-          // returning the encoded response (synchronous, bounded, non-throwing).
-          registerTitleCorrelation(result);
-          if (normalized.ignoredParameters.length > 0) {
-            reply.header(IGNORED_HEADER, normalized.ignoredParameters.join(","));
-          }
-          const identity = { id: prepared.id, created: prepared.created, model: prepared.model };
+        /** Emit an already-completed result (live or replayed) as JSON. */
+        const encodeJson = (
+          identity: { id: string; created: number; model: string },
+          result: CachedResult,
+        ): ReturnType<typeof encodeChatCompletion> => {
+          setIgnoredHeader(false);
           return encodeChatCompletion(
             result.kind === "tool_calls"
               ? { ...identity, kind: "tool_calls", toolCalls: result.toolCalls }
               : { ...identity, content: result.content },
           );
-        } catch (error) {
-          // Identify gateway errors by identity (trap-safe: no property read, no
-          // instanceof/prototype trap). An untrusted thrown value is NEVER
-          // inspected and is NEVER re-thrown to the framework — it fails closed to
-          // the fixed 500 here, so neither this route nor Fastify ever touches it.
-          if (isChatCompletionError(error)) {
-            return sendError(error.apiError);
-          }
-          if (isRequestCancelledError(error)) {
-            if (clientAbort.signal.aborted) {
-              // The client is gone; do not attempt to send a body.
-              reply.hijack();
-              return reply;
+        };
+
+        // --- Idempotent replay / wait ---------------------------------------
+        // Resolved BEFORE any SSE header is committed, because a replay must use
+        // the ORIGINAL response identity: the duplicate `prepare` above minted a
+        // fresh id that is now discarded and must never be returned.
+        let owner: IdempotencyOwnerSession | null = null;
+        if (claim !== null) {
+          const { coordinator } = claim;
+          let cached: CachedCompletion | null = null;
+          try {
+            const begun = await coordinator.begin({
+              clientKey: claim.clientKey,
+              gatewayKeyScope: claim.scopeId,
+              bodyFingerprint: claim.fingerprint,
+              identity: { id: prepared.id, created: prepared.created, model: prepared.model },
+              signal,
+              timeoutMs: model.requestTimeoutMs,
+            });
+            if (begun.kind === "conflict") {
+              reply.raw.removeListener("close", onClose);
+              return sendError(IDEMPOTENCY_KEY_CONFLICT_ERROR);
             }
-            // Cancelled by shutdown while the client is still connected.
-            return sendError(SERVICE_UNAVAILABLE_ERROR);
+            if (begun.kind === "unavailable") {
+              reply.raw.removeListener("close", onClose);
+              return sendError(IDEMPOTENCY_UNAVAILABLE_ERROR);
+            }
+            if (begun.kind === "owner") {
+              owner = begun.session;
+            } else {
+              const resolved = await begun.resolve();
+              if (resolved.kind !== "cached") {
+                reply.raw.removeListener("close", onClose);
+                if (resolved.kind === "conflict") return sendError(IDEMPOTENCY_KEY_CONFLICT_ERROR);
+                if (resolved.kind === "timeout") return sendError(COMPLETION_TIMEOUT_ERROR);
+                if (resolved.kind === "cancelled") {
+                  // Disconnect and shutdown keep their existing behaviour.
+                  if (clientAbort.signal.aborted) {
+                    reply.hijack();
+                    return reply;
+                  }
+                  return sendError(SERVICE_UNAVAILABLE_ERROR);
+                }
+                return sendError(IDEMPOTENCY_UNAVAILABLE_ERROR);
+              }
+              cached = resolved.cached;
+            }
+          } catch {
+            // The coordinator is total and should never throw; fail closed
+            // without inspecting the thrown value.
+            reply.raw.removeListener("close", onClose);
+            return sendError(IDEMPOTENCY_UNAVAILABLE_ERROR);
           }
-          // Unexpected/untrusted: fail closed without inspecting or reflecting it.
-          return sendError(INTERNAL_ERROR);
+
+          if (owner === null) {
+            // Replay. A waiter/replay NEVER registers a native-title correlation:
+            // that is the original owner's process-local concern and the upstream
+            // thread id is deliberately not cached.
+            if (cached === null) {
+              reply.raw.removeListener("close", onClose);
+              return sendError(IDEMPOTENCY_UNAVAILABLE_ERROR);
+            }
+            const replayed = cached;
+            if (!normalized.stream) {
+              reply.raw.removeListener("close", onClose);
+              return encodeJson(replayed, replayed.result);
+            }
+            setIgnoredHeader(true);
+            try {
+              await streamChatCompletion({
+                reply,
+                meta: {
+                  id: replayed.id,
+                  created: replayed.created,
+                  model: replayed.model,
+                  index: 0,
+                },
+                // Deterministic frames from the original metadata and result;
+                // timing and keep-alive comments are not reproduced.
+                run: () => Promise.resolve(replayed.result),
+                runSignal: signal,
+                clientAbort,
+              });
+            } finally {
+              reply.raw.removeListener("close", onClose);
+            }
+            return reply;
+          }
+        }
+
+        // --- Live completion (owner, or no idempotency at all) ---------------
+        const session = owner;
+
+        /** Settle the claim (`ambiguous` / compare-and-delete) before responding. */
+        const finishClaim = async (): Promise<void> => {
+          if (session === null) return;
+          try {
+            await session.finish();
+          } catch {
+            // Best effort only; it can never change the response.
+          }
+        };
+
+        // ONE try/finally covers every remaining statement, so no path can leave
+        // the claim unsettled. That matters more than a bounded leak would: an
+        // unsettled owner session keeps renewing its own lease, so a leaked claim
+        // would block the key until process exit rather than until the lease
+        // elapsed.
+        try {
+          // A lost claim aborts the run, so upstream work stops promptly and no
+          // other replica can proceed while this one is still working.
+          const runSignal = session === null ? signal : AbortSignal.any([signal, session.signal]);
+          const hooks: CompletionRunHooks | undefined =
+            session === null
+              ? undefined
+              : {
+                  // Runs after capacity is acquired and BEFORE `create_thread`. A
+                  // failure here releases capacity and performs no upstream call.
+                  onCapacityAcquired: async (): Promise<void> => {
+                    if ((await session.markProcessing()) !== "ok") {
+                      throw new ChatCompletionError(IDEMPOTENCY_UNAVAILABLE_ERROR);
+                    }
+                  },
+                };
+
+          const execute = async (innerSignal: AbortSignal): Promise<CompletionResult> => {
+            if (session === null) return deps.service.run(prepared, innerSignal);
+            try {
+              const result = await deps.service.run(prepared, innerSignal, hooks);
+              // Durably committed before the JSON body and before any SSE
+              // content/terminal frame (§18.1). The SSE headers and role opener
+              // were already written by design, so a failure here surfaces as an
+              // SSE error record on that path.
+              if ((await session.commit(toCachedResult(result))) !== "ok") {
+                throw new ChatCompletionError(IDEMPOTENCY_UNAVAILABLE_ERROR);
+              }
+              return result;
+            } catch (error) {
+              // A cancellation caused by a LOST CLAIM is an idempotency failure,
+              // not a client disconnect or a shutdown.
+              if (session.ownershipLost && isRequestCancelledError(error)) {
+                throw new ChatCompletionError(IDEMPOTENCY_UNAVAILABLE_ERROR);
+              }
+              throw error;
+            }
+          };
+
+          // Synthetic-SSE path: authenticate/validate/resolve/prepare/claim all
+          // happened above (pre-header), so from here on every failure is an SSE
+          // record. The writer hijacks the reply and owns all response output.
+          if (normalized.stream) {
+            setIgnoredHeader(true);
+            await streamChatCompletion({
+              reply,
+              meta: { id: prepared.id, created: prepared.created, model: prepared.model, index: 0 },
+              run: execute,
+              runSignal,
+              clientAbort,
+              // Register the correlation ONLY after the terminal chunk + [DONE]
+              // were delivered — never on a failed/cancelled/disconnected stream.
+              onCompleted: registerTitleCorrelation,
+            });
+            return reply;
+          }
+
+          // Non-streamed JSON path.
+          try {
+            const result = await execute(runSignal);
+            // Register the native-title correlation after run() succeeded and
+            // before returning the encoded response (synchronous, bounded,
+            // non-throwing).
+            registerTitleCorrelation(result);
+            return encodeJson(
+              { id: prepared.id, created: prepared.created, model: prepared.model },
+              toCachedResult(result),
+            );
+          } catch (error) {
+            // Identify gateway errors by identity (trap-safe: no property read, no
+            // instanceof/prototype trap). An untrusted thrown value is NEVER
+            // inspected and is NEVER re-thrown to the framework — it fails closed
+            // to the fixed 500 here, so neither this route nor Fastify ever
+            // touches it.
+            if (isChatCompletionError(error)) {
+              return sendError(error.apiError);
+            }
+            if (isRequestCancelledError(error)) {
+              if (clientAbort.signal.aborted) {
+                // The client is gone; do not attempt to send a body.
+                reply.hijack();
+                return reply;
+              }
+              // Cancelled by shutdown while the client is still connected.
+              return sendError(SERVICE_UNAVAILABLE_ERROR);
+            }
+            // Unexpected/untrusted: fail closed without inspecting or reflecting it.
+            return sendError(INTERNAL_ERROR);
+          }
         } finally {
+          await finishClaim();
           reply.raw.removeListener("close", onClose);
         }
       },

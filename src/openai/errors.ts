@@ -35,6 +35,11 @@ export type OpenAIErrorBody = Static<typeof OpenAIErrorSchema>;
 export interface OpenAIApiError {
   readonly status: number;
   readonly body: OpenAIErrorBody;
+  /**
+   * Fixed `Retry-After` value, in seconds, when this envelope always carries
+   * one. Absent means the route emits no `Retry-After` for it.
+   */
+  readonly retryAfterSeconds?: number;
 }
 
 function apiError(
@@ -43,8 +48,10 @@ function apiError(
   type: string,
   code: string,
   param: string | null,
+  retryAfterSeconds?: number,
 ): OpenAIApiError {
-  return { status, body: { error: { message, type, param, code } } };
+  const body: OpenAIErrorBody = { error: { message, type, param, code } };
+  return retryAfterSeconds === undefined ? { status, body } : { status, body, retryAfterSeconds };
 }
 
 /**
@@ -234,6 +241,52 @@ export const SERVICE_UNAVAILABLE_ERROR: OpenAIApiError = apiError(
   "server_error",
   "service_unavailable",
   null,
+);
+
+// --- Phase 4A: optional Redis-backed idempotency (specification section 18) --
+
+/** The public parameter name reported for every idempotency failure. */
+export const IDEMPOTENCY_KEY_PARAM = "Idempotency-Key";
+
+/**
+ * `400` — the supplied `Idempotency-Key` header is unusable (duplicated,
+ * empty, oversized, or carrying a space/control/non-ASCII character), or the
+ * request body could not be canonically fingerprinted. The submitted header
+ * value and the body are never reflected.
+ */
+export const INVALID_IDEMPOTENCY_KEY_ERROR: OpenAIApiError = apiError(
+  400,
+  "The Idempotency-Key header is invalid for this request.",
+  "invalid_request_error",
+  "invalid_idempotency_key",
+  IDEMPOTENCY_KEY_PARAM,
+);
+
+/**
+ * `409` — the same scoped `Idempotency-Key` is already associated with a
+ * DIFFERENT request body (specification section 18). Neither body is reflected.
+ */
+export const IDEMPOTENCY_KEY_CONFLICT_ERROR: OpenAIApiError = apiError(
+  409,
+  "This Idempotency-Key was already used with a different request body.",
+  "invalid_request_error",
+  "idempotency_key_conflict",
+  IDEMPOTENCY_KEY_PARAM,
+);
+
+/**
+ * `503` — idempotency was requested but cannot be honoured: Redis is disabled
+ * or unavailable, the stored state is ambiguous/corrupt/tampered, or this
+ * request lost its claim. The gateway fails CLOSED rather than risk a duplicate
+ * upstream completion. Always paired with `Retry-After: 2`.
+ */
+export const IDEMPOTENCY_UNAVAILABLE_ERROR: OpenAIApiError = apiError(
+  503,
+  "Idempotent request handling is currently unavailable.",
+  "server_error",
+  "idempotency_unavailable",
+  null,
+  2,
 );
 
 /**

@@ -39,7 +39,6 @@
  */
 import type { FastifyReply } from "fastify";
 import type { ServerResponse } from "node:http";
-import type { CompletionResult } from "../generation/chat-completion.js";
 import { isChatCompletionError, isRequestCancelledError } from "../generation/chat-completion.js";
 import {
   INTERNAL_ERROR,
@@ -57,6 +56,7 @@ import {
   terminalChunk,
   terminalToolChunk,
   toolCallsChunk,
+  type StreamableResult,
   type StreamMeta,
 } from "../openai/chat-stream.js";
 
@@ -66,14 +66,20 @@ export const KEEP_ALIVE_INTERVAL_MS = 15_000;
 /** The result of a single frame write. */
 export type WriteOutcome = "written" | "closed";
 
-/** Inputs for streaming one prepared completion to the client. */
-export interface StreamChatCompletionOptions {
+/**
+ * Inputs for streaming one completion to the client.
+ *
+ * Generic over the result type so the SAME transport serves a live completion
+ * (`CompletionResult`) and an idempotent replay of a cached completion, which
+ * carries no upstream thread id. Both produce identical deterministic frames.
+ */
+export interface StreamChatCompletionOptions<R extends StreamableResult = StreamableResult> {
   /** The Fastify reply (hijacked here so Fastify never touches the response). */
   readonly reply: FastifyReply;
   /** The stream-stable identity for every frame. */
   readonly meta: StreamMeta;
-  /** Execute the prepared completion under the combined abort signal. */
-  readonly run: (signal: AbortSignal) => Promise<CompletionResult>;
+  /** Produce the completion under the combined abort signal. */
+  readonly run: (signal: AbortSignal) => Promise<R>;
   /**
    * Combined client-disconnect + shutdown signal passed to {@link run} and used
    * by the writer to unblock an actively backpressured write (force-close).
@@ -92,8 +98,10 @@ export interface StreamChatCompletionOptions {
    * delivered stream). A failed, cancelled, disconnected, or incomplete stream
    * never invokes it. It cannot alter the response; any throw is swallowed. Used
    * to register the native-title correlation after a confirmed streamed success.
+   * A replayed cached completion deliberately supplies no hook: only the
+   * ORIGINAL owner registers a correlation.
    */
-  readonly onCompleted?: (result: CompletionResult) => void;
+  readonly onCompleted?: (result: R) => void;
   /** Keep-alive cadence override (tests only). */
   readonly keepAliveMs?: number;
 }
@@ -329,13 +337,15 @@ function mapStreamFailure(failure: unknown, clientAbort: AbortController): OpenA
  * has been fully written and ended; NEVER rejects (all failures are encoded as
  * SSE records or a silent close). The caller must `return reply` afterwards.
  */
-export async function streamChatCompletion(opts: StreamChatCompletionOptions): Promise<void> {
+export async function streamChatCompletion<R extends StreamableResult = StreamableResult>(
+  opts: StreamChatCompletionOptions<R>,
+): Promise<void> {
   const { reply, meta, run, runSignal, clientAbort } = opts;
   const keepAliveMs = opts.keepAliveMs ?? KEEP_ALIVE_INTERVAL_MS;
   const res = reply.raw;
 
   /** Fire the success hook once, swallowing any throw (it must never affect the stream). */
-  const notifyCompleted = (result: CompletionResult): void => {
+  const notifyCompleted = (result: R): void => {
     try {
       opts.onCompleted?.(result);
     } catch {
@@ -384,7 +394,7 @@ export async function streamChatCompletion(opts: StreamChatCompletionOptions): P
     }, keepAliveMs);
     if (typeof keepAlive.unref === "function") keepAlive.unref();
 
-    let result: CompletionResult | undefined;
+    let result: R | undefined;
     let failure: unknown;
     let failed = false;
     try {

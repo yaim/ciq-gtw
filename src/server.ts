@@ -14,6 +14,7 @@ import { createModelCatalog, type ModelCatalog } from "./generation/model-catalo
 import { createCompletionRuntime } from "./generation/runtime.js";
 import type { ChatCompletionService } from "./generation/chat-completion.js";
 import type { TitleBridge } from "./opencode/title-bridge.js";
+import { buildGatewayScopeDeriver, type IdempotencyCoordinator } from "./idempotency/index.js";
 import type { AppConfig } from "./config/schema.js";
 
 /** The chat-completions wiring the `/v1` scope needs. */
@@ -65,6 +66,16 @@ export interface BuildServerOptions {
    * way, construction performs no network or login I/O.
    */
   readonly completion?: CompletionWiring;
+  /**
+   * Optional cross-replica idempotency coordinator (Phase 4A).
+   *
+   * Deliberately NOT built here even when `REDIS_URL` is configured: a Redis
+   * client is a live connection, so it is owned by the process composition root
+   * and `buildServer` stays socket-free. When it is omitted, idempotency is
+   * disabled for the constructed instance — unkeyed requests behave exactly as
+   * before and a supplied `Idempotency-Key` fails closed with `503`.
+   */
+  readonly idempotency?: IdempotencyCoordinator;
 }
 
 /**
@@ -92,8 +103,15 @@ export function buildServer(options: BuildServerOptions): GatewayServer {
   // timestamp at construction and reuses it for every model object it serves.
   const now = options.now ?? (() => Math.floor(Date.now() / 1000));
   const catalog = options.catalog ?? createModelCatalog(config.models, now());
+  // The idempotency scope deriver is pure HKDF/HMAC over already-validated
+  // config: no socket, no Redis client, no I/O. It is `null` (so every
+  // `scopeId` is `null`) when idempotency is not configured.
+  const scopeDeriver = buildGatewayScopeDeriver(config);
   const authenticator =
-    options.authenticator ?? createGatewayAuthenticator(config.COLLECTIVIQ_GATEWAY_KEYS);
+    options.authenticator ??
+    createGatewayAuthenticator(config.COLLECTIVIQ_GATEWAY_KEYS, {
+      ...(scopeDeriver !== null ? { scopeDeriver } : {}),
+    });
 
   // A default completion runtime is built from config when none is injected
   // (tests/smoke). Construction opens no socket and makes no CollectivIQ call.
@@ -114,6 +132,7 @@ export function buildServer(options: BuildServerOptions): GatewayServer {
     chatService: completion.chatService,
     titleBridge: completion.titleBridge,
     shutdownSignal: completion.shutdownSignal,
+    ...(options.idempotency !== undefined ? { idempotency: options.idempotency } : {}),
   });
 
   return app;
