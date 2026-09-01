@@ -16,7 +16,7 @@
 | `npm run test:contract` | Upstream contract | Vitest `test/contract` only (hermetic mock HTTP server, no network) |
 | `npm run test:compatibility` | SDK compatibility | Standalone hermetic suite (`test/compatibility`, own `vitest.compatibility.config.ts`); pinned `ai`/`@ai-sdk/openai-compatible` SDK vs an ephemeral loopback gateway with a **fake** completion — no network/credentials/CollectivIQ. **Excluded from `validate`/CI** |
 | `npm run test:adversarial` | Tool release gate | Standalone hermetic suite (`test/adversarial`, own `vitest.adversarial.config.ts`); ≥200 deterministic tool-protocol cases against the pure engine — no network/credentials/CollectivIQ. **Excluded from `validate`/CI** |
-| `npm run eval:tools` | Live tool gate | Approval-gated LIVE evaluator (`src/eval/`). Default is a credential-free/network-free preflight; the fully-approved path probes the fixed CollectivIQ origin. Network-only; **must NEVER be added to `validate`/CI**. Five authorized campaigns have run. The operative evidence is the **completed 2026-09-01 report-v5 campaign** (the first completed campaign on the state-aware report-v5 / checkpoint-v4 evaluator): it finished the full corpus across two resumable execution segments with cleanup and checkpoint finalization succeeding, **all eight gates passed**, and overall **`passed: true`**, so the numerical section-30 criteria are **met**. Phase 3 nevertheless stays experimental, opt-in, and non-default by explicit product decision, and any future live run is separately approval-gated. The 2026-08-31 report-v4 campaign is historical evidence. See specification section 30 for the complete record and all gate values. |
+| `npm run eval:tools` | Live tool gate | Approval-gated LIVE evaluator (`src/eval/`). Default is a credential-free/network-free preflight; the fully-approved path probes the fixed CollectivIQ origin. Network-only; **must NEVER be added to `validate`/CI**. Five authorized campaigns have run. The operative evidence is the **completed 2026-09-01 report-v5 campaign** (the first completed campaign on the state-aware report-v5 / checkpoint-v4 evaluator): it finished the full corpus across two resumable execution segments with cleanup and checkpoint finalization succeeding, **all eight gates passed**, and overall **`passed: true`**, so the numerical section-30 criteria are **met** and Phase 3 graduated to supported opt-in beta while staying non-default and permission-gated. Any future live run is separately approval-gated. The 2026-08-31 report-v4 campaign is historical evidence. See specification section 30 for the complete record and all gate values. |
 | `npm run eval:tools:diagnose` | Live tool diagnostic | Approval-gated LIVE **multi-step transition diagnostic** (`src/eval/tools-diagnostic-cli.ts`). Default is a credential-free/network-free preflight; the fully-approved path runs ONLY the 20 multi-step scenarios (global corpus ordinals 201–220, max 80 upstream rounds) against the fixed CollectivIQ origin in password mode. It **establishes no release gate** — its output has no gates and no `passed` field, only `completed` — and it uses a SEPARATE diagnostic checkpoint so it can never touch the release evaluator's. Network-only; **must NEVER be added to `validate`/CI**. **ONE live run has completed**, under the historical v2 classifier (20/20 scenarios, 54/54 threads deleted, zero cleanup/journal failures, finalized checkpoint, no abort; 7 scenarios followed the old static schedule and 13 failed at round 2 with `expected-already-invoked`). It showed the static round-2 expectation was stale but did NOT prove those edits succeeded. The current **v3** diagnostic has NOT been run live; every live invocation is separately approval-gated. See specification section 30.1. |
 | `npm run test:coverage` | Coverage | Vitest with V8 coverage |
 | `npm run build` | Build | `tsc -p tsconfig.json`, emits `dist/` |
@@ -179,11 +179,13 @@ evaluator operation and resume validation) are:
 - **All eight gates passed** and overall **`passed: true`**, so the numerical
   section-30 criteria are **met**. Section 30 owns the exact numerators,
   denominators, and percentages — do not duplicate them here.
-- Phase 3 stays **experimental, opt-in, and non-default by explicit product
-  decision pending a separate graduation review** — not because a gate failed.
-  No production prompt, parser, selector, evaluator, threshold, model default, or
-  model configuration changed in response. Any future live run remains
-  **separately approval-gated** and must never enter `validate`/CI.
+- On that evidence Phase 3 graduated to **supported opt-in beta** and stays
+  **non-default and OpenCode permission-gated**; beta is not production
+  readiness, and default enablement is a separate decision after the Phase 4
+  controls. Section 30 owns the graduation decision. No production prompt,
+  parser, selector, evaluator, threshold, model default, or model configuration
+  changed in response to the campaign or as part of graduation. Any future live
+  run remains **separately approval-gated** and must never enter `validate`/CI.
 
 Baseline evaluator hardening landed offline before the 2026-08-26 campaign: a versioned
 value-free output union (`preflight | progress | blocked | executed`), a
@@ -534,4 +536,4 @@ Model the configured four active/twenty queued baseline and long upstream latenc
 - Run applicable checks and record the exact commands/results.
 - State skipped suites and why (missing scaffold, credentials, Docker, OpenCode, or explicit approval).
 - Inspect the diff for test-only production hooks, focused-test markers, snapshots with secrets/content, generated output, and unrelated lockfile changes.
-- Do not call tool mode production-ready. The numerical evidence required by specification section 30 now exists, but one passing campaign is not production readiness, repeatability, or a cross-account guarantee, and Phase 3 stays experimental, opt-in, and non-default by explicit product decision.
+- Do not call tool mode production-ready. The numerical evidence required by specification section 30 exists and Phase 3 is **supported opt-in beta**, but one passing campaign is not production readiness, repeatability, or a cross-account guarantee; never restate "supported beta" as "production-ready", and keep tool mode non-default and permission-gated.

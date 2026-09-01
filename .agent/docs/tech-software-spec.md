@@ -41,7 +41,7 @@ The gateway must therefore support two distinct operating capabilities:
 
 Text generation can be implemented directly from the supplied CollectivIQ sample.
 
-Tool calling is not demonstrated by the supplied CollectivIQ API. The first gateway release will therefore implement an optional prompt-mediated tool-call protocol. This mechanism must be considered experimental until it meets the release-quality test thresholds defined in this specification.
+Tool calling is not demonstrated by the supplied CollectivIQ API. The first gateway release will therefore implement an optional prompt-mediated tool-call protocol. This mechanism must be considered experimental until it meets the release-quality test thresholds defined in this specification. Those thresholds are now met, and the mechanism is **supported opt-in beta** — still non-default and still OpenCode permission-gated; section 30 owns the graduation decision.
 
 The gateway must not attempt to execute OpenCode tools itself. It only translates tool definitions and model-generated tool requests. OpenCode remains responsible for authorizing and executing tools.
 
@@ -958,7 +958,7 @@ reflected back.
 | `model`                 | Required and enforced                                |
 | `messages`              | Required and enforced                                |
 | `stream`                | Supported                                            |
-| `tools`                 | Tolerated + discarded for disabled models (Phase 2.1); normalized + retained (and proposed calls emitted) for `emulated` models (Phase 3, experimental/opt-in/non-default); rejected for `native` (unimplemented) |
+| `tools`                 | Tolerated + discarded for disabled models (Phase 2.1); normalized + retained (and proposed calls emitted) for `emulated` models (Phase 3, supported opt-in beta / non-default); rejected for `native` (unimplemented) |
 | `tool_choice`           | `auto`/`none` tolerated + discarded for disabled models (Phase 2.1); `auto`/`none`/`required`/named honored for `emulated` models; `required`/named rejected for disabled/`native` |
 | `parallel_tool_calls`   | Ignored (name only) for disabled models; consumed for `emulated` models (absent → `true`; non-boolean rejected) |
 | `temperature`           | Accepted but ignored unless CollectivIQ adds support |
@@ -1021,17 +1021,20 @@ Behavior:
 
 If a required tool call cannot be parsed, the gateway must not silently return ordinary text. It must return a structured gateway failure.
 
-**Implementation status.** Emulated tool calling (Phase 3) is implemented but
-**experimental, opt-in, and non-default**: only the `collectiviq-claude-tools`
-model / `collectiviq-tools-experimental` agent enable it. Its numerical
-section-30 release gates are **met**: the state-aware report-v5 / checkpoint-v4
-evaluator completed a full live campaign on **2026-09-01** in which all eight
-gates passed and overall `passed: true`. The earlier 2026-08-31 report-v4
-campaign (six of eight gates passing) is historical evidence. Phase 3 stays
-experimental, opt-in, and non-default **by explicit product decision pending a
-separate graduation review**, not because a gate failed. **See
-section 30** for the complete campaign evidence and accounting. Every committed
-default virtual model
+**Implementation status.** Emulated tool calling (Phase 3) is implemented and is
+**supported opt-in beta: non-default and OpenCode permission-gated**.
+`collectiviq-claude-tools` is the single tool-enabled virtual model, exposed by
+two functional, behaviorally identical OpenCode agent entries — the canonical
+`collectiviq-tools-beta` and the deprecated `collectiviq-tools-experimental`
+compatibility alias retained through Phase 4 — and no committed default selects
+either. Its numerical section-30
+release gates are **met**: the state-aware report-v5 / checkpoint-v4 evaluator
+completed a full live campaign on **2026-09-01** in which all eight gates passed
+and overall `passed: true`. The earlier 2026-08-31 report-v4 campaign (six of
+eight gates passing) is historical evidence. Beta is not production readiness,
+and default enablement remains a separate decision after the Phase 4 controls.
+**See section 30** for the canonical graduation decision, the complete campaign
+evidence, and the accounting. Every committed default virtual model
 is `toolMode: "disabled"`, so the request boundary only
 TOLERATES the tool metadata OpenCode sends automatically: it accepts a
 `tool_choice` of exactly `"auto"` or `"none"` (discarded, name recorded) and
@@ -1143,7 +1146,7 @@ against a `native` model (not implemented) is rejected with the
 stable content-free `unsupported_parameter` `400` (`param` = `tools` or
 `tool_choice`). In this disabled-mode bridge no tool definition ever reaches the
 prompt, upstream, logs, storage, or the response, and no tool call is emitted or
-executed. (An `emulated` model — experimental, opt-in, non-default — instead
+executed. (An `emulated` model — supported opt-in beta, non-default — instead
 normalizes and retains the policy, serializes the validated schemas into the
 upstream prompt, and can emit model-proposed calls; see section 12.)
 Conservative initial collection bounds apply (`MAX_MESSAGES = 512`,
@@ -1519,7 +1522,7 @@ Emulated tool calling converts a strict JSON response generated as ordinary text
 
 It is required only if CollectivIQ does not provide native structured tool calling.
 
-**Implementation status (Phase 3, implemented offline, EXPERIMENTAL).** The
+**Implementation status (Phase 3, implemented offline, SUPPORTED OPT-IN BETA).** The
 parsing algorithm (§12.2), candidate selection and consensus fallback (§12.3),
 final-answer fallback (§12.3.2), `call_ciq_<ULID>` ids (§12.4), the parallel-call
 policy (§12.5), and the tool-loop model (§12.6) are all implemented in `src/tools/`
@@ -1847,14 +1850,14 @@ exact answer with no trimming or loss.
 
 ### 14.4 Tool-call streaming
 
-Tool-call streaming is **implemented (Phase 3, EXPERIMENTAL)**: for a
+Tool-call streaming is **implemented (Phase 3, SUPPORTED OPT-IN BETA)**: for a
 `toolMode: "emulated"` model a streamed tool-call response emits one complete,
 indexed tool-call delta (using the trusted `call_ciq_*` ids) rather than
 character-by-character, then a terminal chunk with `finish_reason: "tool_calls"`,
 then `data: [DONE]`, with no `usage` (`src/openai/chat-stream.ts`
 `toolCallsChunk`/`terminalToolChunk`, `src/api/chat-stream-response.ts`). The
-Phase 2 text stream is unchanged. Emulated tool mode remains experimental and
-non-default (§30).
+Phase 2 text stream is unchanged. Emulated tool mode is supported opt-in beta and
+remains non-default (§30).
 
 Example:
 
@@ -2648,10 +2651,14 @@ Recommended OpenCode configuration:
 
 OpenCode documents provider-level timeout and streamed-chunk timeout settings, as well as custom models and separate `small_model` selection.
 
-Because emulated tool calling is experimental and non-default (Phase 3), the
+Because emulated tool calling is opt-in beta and non-default (Phase 3), the
 committed `opencode.jsonc` ships a text-only default primary agent — a
 `collectiviq-text` agent with a wildcard permission `deny`, selected as the
-`default_agent`. Denying permissions
+`default_agent`. Tool calling requires explicitly selecting one of the two
+tool-enabled agent entries, which are functional and behaviorally identical
+(wildcard permission `"ask"`): the canonical `collectiviq-tools-beta` and the
+deprecated `collectiviq-tools-experimental` compatibility alias retained through
+Phase 4. Denying permissions
 stops OpenCode from EXECUTING tools but does not stop it from SENDING tool
 definitions to the model, so the agent depends on the disabled-mode
 tool-metadata compatibility bridge (section 9.4.4, Phase 2.1) to discard that
@@ -2816,8 +2823,8 @@ it is not current behavior and does not prove general GPT/non-Claude foreground
 routing (section 34.7), which remains unverified. This keeps the streamed and
 non-streamed foreground text paths within the disabled-mode, tool-free contract
 (tool DEFINITIONS tolerated and discarded, tool CALLS never emitted). Emulated tool
-calling (Phase 3) is implemented but experimental, opt-in, and non-default, so it
-is not part of the committed foreground default.
+calling (Phase 3) is implemented and is supported opt-in beta, but it stays
+non-default, so it is not part of the committed foreground default.
 
 No context-window values should be declared until CollectivIQ’s effective limits are measured or documented.
 
@@ -3124,6 +3131,63 @@ Emulated tool mode must not be enabled as the default production OpenCode model 
 
 These are release criteria, not guarantees of model reasoning quality.
 
+**Graduation decision — CANONICAL. This section owns the graduation decision and
+the campaign evidence behind it; every other document must carry only a short
+routed summary and link here.**
+
+The state-aware report-v5 / checkpoint-v4 evaluator completed a full live
+campaign on **2026-09-01**. All eight numerical gates above passed and the report
+was overall **`passed: true`** (the campaign entry later in this section owns the
+numerators, denominators, segments, and accounting — do not restate them
+elsewhere). On that evidence, Phase 3 emulated tool calling is **graduated from
+experimental to SUPPORTED OPT-IN BETA**. The following are normative:
+
+* **Beta is not production readiness.** "Supported opt-in beta" must never be
+  restated as "production-ready", "GA", "stable", or "verified". One passing
+  campaign establishes the measured section-30 criteria; it does NOT establish
+  repeatability across runs, cross-account reliability, cross-version behavior,
+  or a general provider guarantee.
+* **The feature stays non-default and permission-gated.** Every committed default
+  virtual model remains `toolMode: "disabled"`. `collectiviq-claude-tools` is the
+  single tool-enabled VIRTUAL MODEL, and the committed `opencode.jsonc` exposes
+  that one model through TWO tool-enabled AGENT ENTRIES: the canonical
+  `collectiviq-tools-beta` and the DEPRECATED `collectiviq-tools-experimental`
+  compatibility alias. Both agents are functional and behaviorally identical —
+  same model, `mode: "primary"`, and wildcard permission `"ask"` — so the alias is
+  a second tool-enabled entry, not a disabled or legacy stub. The alias is
+  retained through Phase 4; removing it requires a separately announced breaking
+  configuration change. No committed default selects either agent, and OpenCode
+  owns the permission prompt for every proposed call.
+* **The gateway never executes or authorizes a tool.** It returns model-PROPOSED
+  calls only; OpenCode owns authorization, execution, results, and loop limits.
+  Graduation does not change that boundary.
+* **The single value-free diagnostic stands.** The campaign's one
+  `expected-tool-unavailable` diagnostic is legitimate measured evidence, not an
+  error and not an outstanding defect: it is already accounted for inside the
+  reported numerators and leaves every gate within its threshold.
+* **Privacy warnings are unchanged.** For a `toolMode: "emulated"` model the
+  validated tool schemas, prior tool arguments, and prior tool results ARE
+  serialized into the prompt sent to CollectivIQ. They remain never logged and
+  never retained by the gateway, each tool-loop round still creates a new upstream
+  thread, and every existing warning to that effect must be preserved verbatim in
+  meaning wherever it appears.
+* **Graduation changed no behavior.** No production prompt, parser, candidate
+  selector, threshold, evaluator, corpus, model policy, model default, public
+  route, or other runtime behavior was changed to reach the passing result, in
+  response to it, or as part of this graduation. Graduation is a status and
+  labeling decision only.
+* **Any further live run remains separately approval-gated**, including a
+  re-scored campaign, the section 30.1 transition diagnostic, and any OpenCode
+  live smoke.
+
+**Default enablement is still blocked.** Making emulated tool mode the default
+production OpenCode model remains a SEPARATE decision that may only be taken
+after the relevant Phase 4 production-hardening controls exist and have been
+reviewed: Redis idempotency; per-key rate limiting; metrics; tracing; the section
+29.5 load testing; security review; dependency scanning; runbooks; backup
+configuration; and the release process. Until that separate decision is recorded
+here, tool mode stays opt-in.
+
 **Implementation status.** The emulated engine, its hermetic unit/integration/
 contract/compatibility coverage, and a deterministic **adversarial corpus**
 (`npm run test:adversarial`, ≥200 protocol cases covering §29.4) are implemented.
@@ -3333,9 +3397,10 @@ must not be read as the current status.
   therefore satisfies the numerical section-30 release criteria. It does NOT by
   itself establish production readiness, cross-account reliability, repeatability
   across runs, or a general provider guarantee, and it introduces no new
-  threshold. **Phase 3 emulated tool calling remains experimental, opt-in, and
-  non-default by explicit product decision, pending a separate graduation
-  review** — that status is a policy choice, NOT a consequence of an unmet gate.
+  threshold. **On this evidence Phase 3 emulated tool calling was graduated from
+  experimental to supported opt-in beta — still non-default, still OpenCode
+  permission-gated, and still not production-ready; the graduation decision at
+  the top of this section is canonical.**
   No production prompt, parser, selector, threshold, model default, model
   configuration, OpenCode configuration, or public route was changed in response
   to this campaign, and any further live run remains separately approval-gated.
@@ -3861,10 +3926,10 @@ checkpoint finalization. No production prompt, parser, selector, threshold,
 corpus size, model default, or model configuration changed in order to reach that
 result — only the evaluator's accounting did. Section 30's numerical release
 gates are therefore **met** by that campaign, the last scored campaign is the
-2026-09-01 report-v5 campaign, and emulated tool mode nevertheless stays
-**experimental, opt-in, and non-default by explicit product decision pending a
-separate graduation review**. Any further live run is a separate,
-approval-gated decision.
+2026-09-01 report-v5 campaign, and emulated tool mode is on that evidence
+**supported opt-in beta: still non-default, still OpenCode permission-gated, and
+still not production-ready** (see the graduation decision at the top of this
+section). Any further live run is a separate, approval-gated decision.
 
 ### 30.1 Multi-step transition diagnostic (`npm run eval:tools:diagnose`)
 
@@ -4156,11 +4221,10 @@ implemented offline, passes its hermetic coverage, and **has NOT been run live**
 only the historical v2 run recorded in this section exists. It establishes **no**
 release gate either way.
 
-**Phase 3 nevertheless remains experimental, opt-in, and non-default by explicit
-product decision, pending a separate graduation review.** That posture is a
-policy choice made with the gates met — it is NOT a consequence of a failed or
-unmet gate, and enabling tool mode by default remains a separate, approved
-decision.
+**Phase 3 is supported opt-in beta: still non-default and still OpenCode
+permission-gated.** Section 30 owns that graduation decision. Beta is not
+production readiness, and enabling tool mode by default remains a separate,
+approved decision taken only after the Phase 4 controls.
 
 If the thresholds are not met, the gateway may still expose:
 
@@ -4556,7 +4620,7 @@ automatically even when all tool permissions are denied:
   non-array, over-count, or over-budget `tools`; an accessor, cycle,
   sparse/exotic/over-deep structure, or unsupported value anywhere; and any tool
   metadata against a `native` model (not implemented) are rejected with the stable
-  `unsupported_parameter` `400`. An `emulated` model (experimental, opt-in,
+  `unsupported_parameter` `400`. An `emulated` model (supported opt-in beta,
   non-default) instead normalizes and retains the policy — see section 12.
 * `collectiviq-claude-direct` (a Claude source with `promptMode: "direct"`, section
   8.3/8.4) is the committed OpenCode foreground/`small_model` default because
@@ -4591,10 +4655,16 @@ Deliverables:
 
 Exit criterion:
 
-* tool-calling release thresholds are met or the feature remains explicitly experimental.
+* tool-calling release thresholds are met or the feature remains explicitly
+  experimental. **Met (2026-09-01):** the completed report-v5 campaign passed all
+  eight section-30 gates with overall `passed: true`, and on that evidence the
+  feature graduated from experimental to **supported opt-in beta** — non-default
+  and OpenCode permission-gated. Beta is not production readiness; default
+  enablement remains a separate decision after the Phase 4 controls. Section 30
+  owns the canonical graduation decision.
 
-**Implemented (offline; EXPERIMENTAL; live upstream only at request time).** The
-emulated engine lives in `src/tools/` (`copy.ts` descriptor-safe bounded JSON
+**Implemented (offline; SUPPORTED OPT-IN BETA; live upstream only at request
+time).** The emulated engine lives in `src/tools/` (`copy.ts` descriptor-safe bounded JSON
 copy; `schema.ts` per-request Ajv compile that selects the meta-schema dialect
 from each tool schema's ROOT `$schema` — **draft-07** is the default when
 `$schema` is absent (or a boolean root), and **draft-07** and **draft 2020-12**
@@ -4617,18 +4687,23 @@ result; and the JSON and synthetic-SSE encoders emit `tool_calls` with
 `finish_reason: "tool_calls"` and no `usage`. The gateway returns model-PROPOSED
 calls and NEVER executes, authorizes, or simulates a tool; OpenCode owns
 permissions and execution. Each tool-loop round creates a new upstream thread. The
-opt-in `collectiviq-claude-tools` model + `collectiviq-tools-experimental` agent
-(wildcard `"ask"`) are the only tool-enabled surfaces; every default stays
-`toolMode: "disabled"`. Hermetic unit/integration/contract/compatibility/
-adversarial suites pass (see §29–30 status notes). The approval-gated live
-evaluator (`npm run eval:tools`, implemented under `src/eval/`) has been run in
-five authorized campaigns. The state-aware report-v5 / checkpoint-v4 evaluator
-completed a full live campaign on **2026-09-01**: **all eight gates passed** and
-overall `passed: true`, so the numerical section-30 release gates are **met**.
-Phase 3 nevertheless stays experimental, opt-in, and non-default **by explicit
-product decision pending a separate graduation review**, and any further live
-run is a separate approval-gated decision. The earlier 2026-08-31 report-v4
-campaign (six of eight gates passing, `passed: false`) is historical evidence.
+opt-in `collectiviq-claude-tools` model is the single tool-enabled virtual model,
+and `opencode.jsonc` exposes it through two functional, behaviorally identical
+tool-enabled agent entries (wildcard `"ask"`): the canonical
+`collectiviq-tools-beta` and the deprecated `collectiviq-tools-experimental`
+compatibility alias retained through Phase 4. Every committed default stays
+`toolMode: "disabled"` and selects neither agent. Hermetic unit/integration/contract/
+compatibility/adversarial suites pass (see §29–30 status notes). The
+approval-gated live evaluator (`npm run eval:tools`, implemented under
+`src/eval/`) has been run in five authorized campaigns. The state-aware report-v5
+/ checkpoint-v4 evaluator completed a full live campaign on **2026-09-01**: **all
+eight gates passed** and overall `passed: true`, so the numerical section-30
+release gates are **met** and the feature graduated to **supported opt-in beta**
+— still non-default, still permission-gated, and still not production-ready.
+Default enablement remains a separate decision after the Phase 4 controls, and
+any further live run is a separate approval-gated decision. The earlier
+2026-08-31 report-v4 campaign (six of eight gates passing, `passed: false`) is
+historical evidence.
 The approval-gated `npm run eval:tools:diagnose` transition diagnostic has
 completed ONE live run under its historical v2 classifier; its current **v3**
 path is **offline only and has NOT been run live**, and it establishes no
@@ -4637,8 +4712,10 @@ the complete five-campaign
 record, gate evidence, and accounting. The draft-2020-12 dialect support closes the
 confirmed OpenCode 1.18.21 schema-compilation gap both **offline** (hermetic
 suites, including a pinned-SDK `read` tool declaring draft 2020-12) and in one
-**sanitized, user-authorized live smoke on 2026-08-24** (the experimental
-`collectiviq-tools-experimental` agent + `collectiviq-claude-tools` model):
+**sanitized, user-authorized live smoke on 2026-08-24** (the then-experimental
+`collectiviq-tools-experimental` agent — now the deprecated alias of
+`collectiviq-tools-beta`, same model/mode/permission — + `collectiviq-claude-tools`
+model):
 OpenCode's built-in `read` tool schema (draft-2020-12 root `$schema`) passed
 request validation with no `tools is not supported for this request.` warning;
 OpenCode presented a permission prompt, the user granted one-time approval, and
@@ -4710,7 +4787,7 @@ The initial gateway release is accepted when:
 17. Docker binds only to host loopback in the provided configuration.
 18. The OpenCode configuration in this specification passes an end-to-end smoke test. **Met for the tested account (2026-08-18):** the protocol-mode `collectiviq-claude` path had objected to the gateway's serialized protocol wrapper on 2026-08-15, but the committed-default `collectiviq-claude-direct` (`promptMode: "direct"`) profile was observed live on 2026-08-18 to return a relevant, correct answer to a natural coding request, complete synthetic streaming with no protocol objection / tool alert / tool call, and drive a valid `collectiviq-fast` title on its first attempt. This is a sanitized single-account observation, **not** production readiness or a repeatable upstream guarantee. Capability-aware and still not verified for the discovery account: a combined answer, long-duration streaming, and general non-Claude routing.
 19. The service recovers from a CollectivIQ outage without restart.
-20. Tool support is labeled experimental until its separate release gates are met. **Numerical gates met (completed 2026-09-01 report-v5 campaign, §30);** tool support nevertheless stays labeled experimental, opt-in, and non-default by explicit product decision pending a separate graduation review.
+20. Tool support is labeled experimental until its separate release gates are met. **Met (completed 2026-09-01 report-v5 campaign, §30):** all eight numerical gates passed with overall `passed: true`, and tool support is now labeled **supported opt-in beta** — still non-default and still OpenCode permission-gated. Beta is not production readiness, and enabling tool mode by default remains a separate decision after the Phase 4 controls. Section 30 owns the canonical graduation decision.
 
 ---
 
@@ -5009,8 +5086,9 @@ toolMode: emulated
 ```
 
 and remain explicitly experimental until it satisfies the defined release gates.
-Those numerical gates are now **met** (§30); the feature nevertheless stays
-experimental, opt-in, and non-default by explicit product decision pending a
-separate graduation review.
+Those numerical gates are now **met** (§30), so the feature is **supported opt-in
+beta** — still non-default and still OpenCode permission-gated. Beta is not
+production readiness; default enablement remains a separate decision after the
+Phase 4 controls.
 
 This architecture meets the central requirement that all model generation passes through CollectivIQ while minimizing changes to OpenCode and preserving a path toward native CollectivIQ capabilities.

@@ -55,7 +55,7 @@ failures; and ANY tool metadata against a `native` model (not implemented) with
 the stable `unsupported_parameter` `400`. The ignored optional-parameter NAMES are
 echoed in `X-CollectivIQ-Ignored-Parameters`.
 
-For a `toolMode: "emulated"` model (Phase 3, EXPERIMENTAL, implemented offline)
+For a `toolMode: "emulated"` model (Phase 3, SUPPORTED OPT-IN BETA, implemented offline)
 the boundary instead NORMALIZES and RETAINS the tool policy: it descriptor-safe-
 copies `tools` into trusted plain data (deep-frozen so the retained schemas are
 immutable), normalizes `tool_choice` (`auto`/`none`/`required`/named) and
@@ -66,7 +66,8 @@ linked tool-result messages (unique gateway ids, declared names, schema-valid
 arguments, exactly one correctly-linked result). A `required`/named `tool_choice`
 with no declared tools is a stable `400 unsupported_parameter` before capacity/
 headers/upstream. Emulated tool calling and tool-call streaming are implemented
-but stay experimental (see the tool-calling guide and spec §30); the gateway
+and are supported opt-in beta — still non-default and OpenCode permission-gated,
+and not production-ready (see the tool-calling guide and spec §30); the gateway
 returns model-PROPOSED calls and never executes a tool.
 
 - Require a configured `model` and an ordered non-empty `messages` collection according to the public schema.
@@ -130,7 +131,7 @@ Phase 3.
 4. Split text on code-point-safe boundaries (target 128 / max 256 / min 32 code
    points), preferring paragraph, then sentence, then whitespace boundaries;
    concatenating all content deltas reproduces the answer exactly.
-5. (Implemented, Phase 3, experimental) for a tool-call result, emit one complete indexed tool-call delta with the stable gateway `call_ciq_*` ids, then a terminal chunk with `finish_reason: "tool_calls"` — never `usage`.
+5. (Implemented, Phase 3, opt-in beta) for a tool-call result, emit one complete indexed tool-call delta with the stable gateway `call_ciq_*` ids, then a terminal chunk with `finish_reason: "tool_calls"` — never `usage`.
 6. Emit a terminal chunk with `finish_reason: "stop"`, then `data: [DONE]`. An
    empty answer emits role + terminal + `[DONE]` and no content frames. No
    `usage` is emitted on a stream.

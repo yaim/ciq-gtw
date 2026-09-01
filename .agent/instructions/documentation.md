@@ -34,7 +34,7 @@ Do not create empty owner docs just to satisfy the planned tree.
 ## Documentation Rules
 
 - Preserve normative force: use “must” for requirements and “may/should” only where the specification does.
-- Distinguish verified behavior, planned design, provisional upstream assumptions, experimental features, and future possibilities.
+- Distinguish verified behavior, planned design, provisional upstream assumptions, experimental features, supported opt-in beta features, and future possibilities. "Supported beta" means gated evidence exists but the feature is non-default and unproven in production; never restate it as "production-ready".
 - Do not claim full OpenAI compatibility, true streaming, native tools, exact token usage, context windows, upstream idempotency, zero retention, or production tool readiness without evidence.
 - Keep examples synthetic and secrets unmistakably fake. Never paste live prompts, answers, headers, thread IDs, or account data.
 - Prefer one detailed owner and concise links elsewhere. Remove or update stale duplicated examples in the same change.

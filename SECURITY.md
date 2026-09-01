@@ -24,7 +24,7 @@ a fix and disclosure timeline privately.
 This repository is a **runnable foundation**, the Phase 1A authenticated public
 model surface, the Phase 1B non-streamed chat-completions path wired through the
 CollectivIQ adapter, Phase 2 text-only synthetic SSE streaming
-(`stream: true`), and Phase 3 **experimental, opt-in, non-default** emulated tool
+(`stream: true`), and Phase 3 **supported opt-in beta, non-default** emulated tool
 calling (its numerical section-30 release gates are **met** — the state-aware
 report-v5 evaluator completed a full live campaign on 2026-09-01 in which all
 eight gates passed, including the security-relevant **no-silent-fallback**,
@@ -35,9 +35,10 @@ to it**. Security-relevant operational outcome: every emitted report, diagnostic
 and persisted checkpoint stayed value-free; the campaign's approved resume across
 two execution segments behaved as specified; all created threads were deleted
 with zero remaining and zero recovery-journal failures; and the checkpoint
-finalized. The feature nevertheless stays experimental, opt-in, and non-default
-by explicit product decision pending a separate graduation review. Specification
-section 30 owns the campaign and gate details). Redis, metrics/tracing, true upstream streaming, and
+finalized. On that evidence the feature graduated from experimental to supported
+opt-in beta; it stays non-default and OpenCode permission-gated, and beta is not
+production readiness. Specification
+section 30 owns the graduation decision and the campaign and gate details). Redis, metrics/tracing, true upstream streaming, and
 native tool mode are not implemented. The completion path calls CollectivIQ only
 when a real request is served (never during import/construction/build smoke). A
 user-observed, sanitized live OpenCode/CollectivIQ foreground **transport** smoke
@@ -167,8 +168,8 @@ and any further live run is approval-gated. The controls that exist today are:
   metadata against a `native` model all fail closed with the stable
   content-free `unsupported_parameter` `400`. For a `disabled` model a tool
   definition never reaches the prompt, upstream, logs, persistence, errors, or a
-  tool-call response, and no tool call is emitted or executed. **EXPERIMENTAL
-  emulated tool mode (Phase 3, opt-in, non-default):** a `toolMode: "emulated"`
+  tool-call response, and no tool call is emitted or executed. **SUPPORTED OPT-IN
+  BETA emulated tool mode (Phase 3, non-default):** a `toolMode: "emulated"`
   model instead NORMALIZES and RETAINS the tool policy — a descriptor-safe bounded
   deep copy of the definitions into trusted plain JSON (never invoking a getter/
   `[[Get]]`/`toJSON`/iterator; failing closed on accessors/cycles/sparse/exotic/
@@ -184,10 +185,13 @@ and any further live run is approval-gated. The controls that exist today are:
   serialized into the prompt sent to CollectivIQ (they are still never logged or
   retained); each tool-loop round creates a new upstream thread; and the gateway
   returns model-**proposed** calls but never executes, authorizes, or simulates a
-  tool (OpenCode owns permissions and execution). Emulated mode stays
-  experimental, opt-in, and non-default by explicit product decision pending a
-  separate graduation review, even though its numerical section-30 release gates
-  are now **met**. The approval-gated live evaluator (`npm run eval:tools`) has
+  tool (OpenCode owns permissions and execution). Its numerical section-30 release
+  gates are **met**, so emulated mode graduated to supported opt-in beta; it stays
+  non-default and OpenCode permission-gated, and beta is **not** production
+  readiness. Graduation relaxed no boundary above: the schema/argument/result
+  serialization warning, the no-logging and no-retention guarantees, and the
+  never-execute-a-tool rule are unchanged.
+  The approval-gated live evaluator (`npm run eval:tools`) has
   been run in five authorized campaigns; **specification section 30 owns the
   campaign and gate details.** The security-relevant outcome of the latest
   (state-aware report-v5) campaign, completed live on 2026-09-01, is that **every
@@ -600,10 +604,14 @@ errorCode, resolved, resolution, persisted }] }` (no longer `succeeded`/
   any further live run is approval-gated. No live CollectivIQ request is made from
   this repository except when a real completion request is served against a
   configured upstream credential.
-- Emulated tool calling is implemented but **experimental, opt-in, and
-  non-default** (only the `collectiviq-claude-tools` model / `collectiviq-tools-experimental`
-  agent enable it; every committed default stays `toolMode: "disabled"` and
-  discards tool metadata). `native` tool mode and Redis/idempotency are not
+- Emulated tool calling is implemented and is **supported opt-in beta, still
+  non-default** (`collectiviq-claude-tools` is the single tool-enabled virtual
+  model, and `opencode.jsonc` exposes it through TWO functional, behaviorally
+  identical tool-enabled agent entries — the canonical `collectiviq-tools-beta`
+  and the deprecated `collectiviq-tools-experimental` compatibility alias
+  retained through Phase 4, both wildcard `"ask"`; every committed default
+  selects neither agent, stays `toolMode: "disabled"`, and
+  discards tool metadata). Beta is not production readiness. `native` tool mode and Redis/idempotency are not
   implemented; those requests are rejected or unavailable rather than silently
   degraded. Streaming
   (`stream: true`/SSE) is implemented as text-only buffered synthetic SSE, not
