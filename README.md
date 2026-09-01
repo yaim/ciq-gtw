@@ -48,8 +48,10 @@ direct` (latest-user-only prompt, no protocol wrapper) — is the committed Open
 > [section 30](.agent/docs/tech-software-spec.md) for the full evidence. The
 > gateway returns
 > model-proposed tool calls but never executes
-> a tool. It does **not** implement
-> native CollectivIQ tools, Redis/idempotency, or metrics/tracing; those remain
+> a tool. Optional Redis-backed idempotency is implemented but **off by default**
+> (see "Idempotent requests"). It does **not** implement
+> native CollectivIQ tools, metrics/tracing, distributed rate limiting, or shared
+> cross-replica capacity; those remain
 > planned per
 > [`.agent/docs/tech-software-spec.md`](.agent/docs/tech-software-spec.md). This
 > is the bounded OpenCode Chat Completions profile, not full OpenAI API
@@ -182,7 +184,11 @@ keep-alive` comments every 15 s while polling waits, deterministic
 
 ## What is not implemented yet
 
-`GET /metrics`, native CollectivIQ tool calling, and Redis/idempotency.
+`GET /metrics`, native CollectivIQ tool calling, distributed rate limiting, and
+shared cross-replica capacity accounting.
+(Optional Redis-backed idempotency IS implemented — see "Idempotent requests"
+below — but it is **off by default** and covers idempotency only; capacity stays
+process-local.)
 (Supported opt-in beta emulated tool calling is implemented but **not enabled by
 default**. Its numerical section-30 release gates are met — the state-aware
 report-v5 evaluator completed a full live campaign on 2026-09-01 in which all
@@ -530,6 +536,122 @@ field. The gateway therefore cannot currently claim verified GPT/Gemini/Grok
 execution for this account; this is an account-side routing observation and does
 not generalize to every CollectivIQ account.
 
+### Idempotent requests (optional Redis; off by default)
+
+`POST /v1/chat/completions` accepts one optional header:
+
+```http
+Idempotency-Key: <opaque-client-value>
+```
+
+**This feature is off unless you configure Redis.** With a blank/absent
+`REDIS_URL` the gateway behaves exactly as it did before: unkeyed requests are
+unaffected and Redis is never contacted. A supplied `Idempotency-Key` _requires_
+configured, healthy Redis — otherwise the request fails closed before any
+completion work rather than silently losing its guarantee.
+
+Enable it by setting both `REDIS_URL` and `IDEMPOTENCY_ENCRYPTION_KEY`:
+
+```bash
+# Generate a fresh 32-byte master key (never commit it).
+node -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'))"
+```
+
+`REDIS_URL` must be resolvable **from wherever the gateway process runs**, so the
+two supported local setups use different hosts:
+
+**A — gateway natively, Redis in Docker.** Start only the `redis` service, then
+point the native process at the published loopback port:
+
+```bash
+docker compose --profile redis up -d redis
+export REDIS_URL=redis://127.0.0.1:6379
+export IDEMPOTENCY_ENCRYPTION_KEY=<the generated key>
+npm run dev
+```
+
+**B — gateway and Redis both in Compose.** Inside the gateway container
+`127.0.0.1` is that container, not the Redis service, so use the Compose service
+hostname `redis`:
+
+```bash
+export IDEMPOTENCY_ENCRYPTION_KEY=<the generated key>
+REDIS_URL=redis://redis:6379 docker compose --profile redis up --build
+```
+
+(`compose.yaml` forwards `REDIS_URL` and `IDEMPOTENCY_ENCRYPTION_KEY` from your
+shell; both default to empty, which leaves Redis disabled. Workflow B also needs
+everything the gateway service normally requires: `COLLECTIVIQ_GATEWAY_KEYS`, a
+credential matching `COLLECTIVIQ_AUTH_MODE` — `COLLECTIVIQ_API_KEY` in the
+default `bearer` mode — and an existing `config/models.yaml` for the bind mount.
+See "Docker" below.)
+
+Behaviour:
+
+| Situation                                                            | Result                                                                                                                                                                                                           |
+| -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| No header                                                            | Unchanged; no Redis interaction                                                                                                                                                                                  |
+| Same key, same body, first request                                   | Runs the completion once and caches the result                                                                                                                                                                   |
+| Same key, same body, repeat                                          | Replays the ORIGINAL id, timestamp, model, content/tool calls, and finish reason — for both JSON and SSE. The zero/unavailable `usage` object is reproduced on the JSON path; streams never carry `usage` at all |
+| Same key, same body, still in flight                                 | Waits for the first request's result under this request's own deadline (a reached deadline is the usual `504`)                                                                                                   |
+| Same key, **different** body                                         | `409` `idempotency_key_conflict`                                                                                                                                                                                 |
+| Invalid header, or a body that cannot be canonically fingerprinted   | `400` `invalid_idempotency_key`                                                                                                                                                                                  |
+| Redis disabled/unavailable, ambiguous/corrupt state, or a lost claim | `503` `idempotency_unavailable` + `Retry-After: 2`                                                                                                                                                               |
+
+The header must be a single occurrence of 1–255 bytes of visible ASCII
+(`0x21`–`0x7E`; no spaces or control characters). Its value is never logged,
+reflected, or stored — only a keyed HMAC of it reaches Redis.
+
+**"Same body" means the canonical full parsed JSON.** Key order and JSON
+whitespace do not matter; array order does; and _every_ submitted field counts,
+including tool metadata the gateway accepts and discards for a text-only model.
+Changing any field makes it a different body and therefore a `409`.
+
+**What Redis stores.** Only opaque coordination state plus the AES-256-GCM
+ciphertext of the cached completion: a record version, a state
+(`reserved`/`processing`/`final`/`ambiguous`), a keyed body fingerprint, a random
+owner token, and an expiry. Never a prompt, a request body, an authorization
+value, a gateway key, your idempotency key, a thread title, or an upstream thread
+id — and the Redis key itself is an HMAC, not your key.
+
+**Operational requirements and limits.**
+
+- The Redis instance must **not evict keys** — set `maxmemory-policy noeviction`
+  (or size it so eviction never happens). An evicted in-flight record silently
+  allows a duplicate upstream completion; an evicted cached record silently
+  re-runs a completed request. The gateway cannot detect either.
+- Every replica must use the **same** `IDEMPOTENCY_ENCRYPTION_KEY`,
+  `REDIS_KEY_PREFIX`, Redis endpoint, `COLLECTIVIQ_GATEWAY_KEYS`, **and model
+  configuration**. Mixed encryption keys during a rolling deployment are
+  **unsupported**, and divergent `config/models.yaml` is worse: the storage key
+  does not cover the resolved model policy.
+- `IDEMPOTENCY_TTL_MS` must be at least the largest model `requestTimeoutMs`
+  (enforced at startup when Redis is enabled), so a client retrying after its own
+  timeout still finds the cached result.
+- Rotating the encryption key requires draining traffic and waiting at least one
+  maximum `IDEMPOTENCY_TTL_MS`.
+- Protection is bounded to the configured TTL (default 10 minutes).
+- `stream` is part of the body, so reusing a key with `stream` flipped is a `409`,
+  not a cross-transport replay.
+- A completion that fails **after** upstream work may have started — including a
+  `504` timeout — blocks that key for the full TTL. That is stricter than an
+  unkeyed retry, and it is deliberate.
+- On the streamed path the `200` and the assistant-role opener are already sent
+  before the completion runs, so a late idempotency failure arrives as a
+  content-free SSE `data: {"error": …}` record plus `[DONE]`, not an HTTP `503`.
+- Waiters hold no capacity permit and are not separately rate limited.
+- CollectivIQ's own POST-idempotency semantics are **unknown**, so this is a
+  gateway-side guarantee only. If a completion fails after upstream work may have
+  started, the key is deliberately blocked (`503`) for the TTL rather than risking
+  a duplicate completion.
+- Redis persistence and backups are **not required**: this is short-lived,
+  encrypted cache state, and the supplied Compose profile disables RDB and AOF.
+- Redis buys cross-replica **idempotency** only. Concurrency limits
+  (`MAX_CONCURRENT_REQUESTS*`, the queue) remain **process-local**; distributed
+  rate limiting and shared capacity accounting are not implemented.
+- A hosted Redis additionally needs network isolation, ACL/authentication from a
+  managed secret, and TLS (`rediss://`) where the link is not private.
+
 ## Validation
 
 ```bash
@@ -538,21 +660,45 @@ npm run validate        # format check, lint, typecheck, tests, build, build smo
 
 Individual checks:
 
-| Command                    | Purpose                                       |
-| -------------------------- | --------------------------------------------- |
-| `npm run format:check`     | Prettier formatting check                     |
-| `npm run lint`             | ESLint (typed rules)                          |
-| `npm run typecheck`        | Strict `tsc --noEmit` over sources and tests  |
-| `npm test`                 | Vitest unit + integration + contract suites   |
-| `npm run test:unit`        | Unit tests only                               |
-| `npm run test:integration` | Server integration tests only                 |
-| `npm run test:contract`    | Hermetic upstream contract tests (mock HTTP)  |
-| `npm run test:coverage`    | Tests with V8 coverage                        |
-| `npm run build`            | Compile to `dist/`                            |
-| `npm run test:build`       | Import compiled output; assert no open socket |
+| Command                    | Purpose                                                                                  |
+| -------------------------- | ---------------------------------------------------------------------------------------- |
+| `npm run format:check`     | Prettier formatting check                                                                |
+| `npm run lint`             | ESLint (typed rules)                                                                     |
+| `npm run typecheck`        | Strict `tsc --noEmit` over sources and tests                                             |
+| `npm test`                 | Vitest unit + integration + contract suites                                              |
+| `npm run test:unit`        | Unit tests only                                                                          |
+| `npm run test:integration` | Server integration tests only                                                            |
+| `npm run test:contract`    | Hermetic upstream contract tests (mock HTTP)                                             |
+| `npm run test:coverage`    | Tests with V8 coverage                                                                   |
+| `npm run build`            | Compile to `dist/`                                                                       |
+| `npm run test:build`       | Import compiled output; assert no open socket                                            |
+| `npm run test:redis`       | Real-Redis idempotency contract suite (needs `REDIS_TEST_URL`; excluded from `validate`) |
 
-`validate` is hermetic: it makes no network, live-upstream, Docker, or load
-checks. The contract suite runs against a local mock HTTP server.
+`validate` is hermetic: it makes no network, live-upstream, Docker, Redis, or
+load checks. The contract suite runs against a local mock HTTP server.
+
+`npm run test:redis` is the one suite that needs an **external service**: a real
+Redis at `REDIS_TEST_URL`. It proves the atomic Lua claim/compare-and-transition
+behaviour under concurrency, that two independent coordinator instances sharing
+one Redis execute a completion once, lease renewal and expiry, readiness transitions,
+that corrupt/tampered/relocated records fail closed, and that the raw stored
+values contain none of its synthetic sentinels. It uses only synthetic
+credentials and content, randomizes its key namespace per run, and deletes every
+key it creates. It is excluded from `validate` and runs as its own required CI
+gate against the pinned `redis:8.8.2-alpine`; it **fails loudly** rather than
+skipping when `REDIS_TEST_URL` is unset. Never point it at a production Redis.
+
+The suite runs natively, so start ONLY the `redis` service — naming it keeps the
+gateway container out of it (the gateway would also demand
+`COLLECTIVIQ_GATEWAY_KEYS`, and it plays no part in this suite):
+
+```bash
+docker compose --profile redis up -d redis
+REDIS_TEST_URL=redis://127.0.0.1:6379 npm run test:redis
+docker compose --profile redis down
+```
+
+Any disposable local Redis works; the Compose profile is just a convenience.
 
 `npm run test:compatibility` is a **separate** hermetic suite
 (`test/compatibility/`, its own `vitest.compatibility.config.ts`) that drives the
@@ -882,7 +1028,9 @@ principal's own-thread delete returned `403` (2026-08-07); a cross-principal
 recovery attempt also returned `403` — consistent with a permission/scope check,
 but the provider's evaluation order is unconfirmed, so recovery's exact-`404`
 convergence was not exercised. Phase 0 has advanced substantially but is not
-auto-declared complete — open provider questions remain (idempotency,
+auto-declared complete — open provider questions remain (**upstream**
+`create_thread`/`process_message` idempotency, which is distinct from the
+implemented gateway-side layer described under "Idempotent requests";
 ordering/pagination, prompt/rate limits, retention, native tools, SSE scope,
 token lifetime). It runs a single
 bounded `baseline` session against a **fixed** destination origin
@@ -964,6 +1112,25 @@ export COLLECTIVIQ_GATEWAY_KEYS=gw-fake-key-change-me
 docker compose up --build
 ```
 
+An **opt-in** Redis profile is available for idempotency development. It is not
+started by default and the gateway has no `depends_on` on it, so the gateway
+starts and serves `/healthz` whether or not Redis is running:
+
+```bash
+# Redis only (for a natively run gateway, or for `npm run test:redis`):
+docker compose --profile redis up -d redis
+
+# Gateway AND Redis together — inside the container the Redis host is the
+# service name `redis`, never 127.0.0.1:
+REDIS_URL=redis://redis:6379 docker compose --profile redis up --build
+```
+
+That service uses the pinned `redis:8.8.2-alpine`, publishes only on
+`127.0.0.1:6379`, disables persistence (the records are short-lived encrypted
+cache state), and configures **no password** — it is reachable only from the
+Compose network and host loopback. It does **not** meet production requirements:
+see "Idempotent requests" above and `SECURITY.md`.
+
 The container binds `HOST=0.0.0.0` internally, but Compose publishes the port
 only on `127.0.0.1:8787`. Credentials are supplied via environment
 interpolation; none are stored in `compose.yaml`. Compose forwards
@@ -974,26 +1141,30 @@ gateway validates the mode-appropriate credential at startup. Only
 
 ## Configuration reference
 
-| Variable                          | Required | Default                           | Notes                                                                                                     |
-| --------------------------------- | -------- | --------------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `ENVIRONMENT`                     | no       | `production`                      | `development` \| `staging` \| `production`                                                                |
-| `HOST`                            | no       | `127.0.0.1`                       | Loopback by default                                                                                       |
-| `PORT`                            | no       | `8787`                            | 1–65535                                                                                                   |
-| `COLLECTIVIQ_BASE_URL`            | no       | `https://api.prod.collectiviq.ai` | Must be an absolute http(s) URL                                                                           |
-| `COLLECTIVIQ_AUTH_MODE`           | no       | `bearer`                          | `bearer` \| `password`; selects the upstream credential                                                   |
-| `COLLECTIVIQ_API_KEY`             | bearer   | —                                 | Bearer-mode upstream token (≤16 KiB, preserved exactly); required when `COLLECTIVIQ_AUTH_MODE=bearer`     |
-| `COLLECTIVIQ_USERNAME`            | password | —                                 | Password-mode username (trimmed, ≤320 bytes); required when `COLLECTIVIQ_AUTH_MODE=password`              |
-| `COLLECTIVIQ_PASSWORD`            | password | —                                 | Password-mode password (preserved exactly, ≤4096 bytes); required when `COLLECTIVIQ_AUTH_MODE=password`   |
-| `COLLECTIVIQ_GATEWAY_KEYS`        | **yes**  | —                                 | Comma-separated client keys; trimmed, de-duplicated, ≤64 keys, ≤8192 UTF-8 bytes/key; enforced on `/v1/*` |
-| `MODEL_CONFIG_PATH`               | no       | `./config/models.yaml`            | Path to the YAML model file                                                                               |
-| `LOG_LEVEL`                       | no       | `info`                            | Pino level                                                                                                |
-| `LOG_CONTENT`                     | no       | `false`                           | May be `true` only when `ENVIRONMENT=development`                                                         |
-| `MAX_REQUEST_BODY_BYTES`          | no       | `8388608`                         | 1024 – 67108864                                                                                           |
-| `MAX_CONCURRENT_REQUESTS`         | no       | `4`                               | Global active completions (process-local); 1–1024                                                         |
-| `MAX_CONCURRENT_REQUESTS_PER_KEY` | no       | `2`                               | Per-gateway-key active completions; 1–1024 and ≤ `MAX_CONCURRENT_REQUESTS`                                |
-| `MAX_QUEUED_REQUESTS`             | no       | `20`                              | Bounded admission queue length; 0–100000 (0 disables queueing)                                            |
-| `MAX_QUEUE_WAIT_MS`               | no       | `5000`                            | Max time in the admission queue before a `429`; 1–600000                                                  |
-| `SHUTDOWN_DRAIN_MS`               | no       | `30000`                           | Graceful-shutdown drain before in-flight polling is cancelled; 0–600000                                   |
+| Variable                          | Required   | Default                           | Notes                                                                                                                   |
+| --------------------------------- | ---------- | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `ENVIRONMENT`                     | no         | `production`                      | `development` \| `staging` \| `production`                                                                              |
+| `HOST`                            | no         | `127.0.0.1`                       | Loopback by default                                                                                                     |
+| `PORT`                            | no         | `8787`                            | 1–65535                                                                                                                 |
+| `COLLECTIVIQ_BASE_URL`            | no         | `https://api.prod.collectiviq.ai` | Must be an absolute http(s) URL                                                                                         |
+| `COLLECTIVIQ_AUTH_MODE`           | no         | `bearer`                          | `bearer` \| `password`; selects the upstream credential                                                                 |
+| `COLLECTIVIQ_API_KEY`             | bearer     | —                                 | Bearer-mode upstream token (≤16 KiB, preserved exactly); required when `COLLECTIVIQ_AUTH_MODE=bearer`                   |
+| `COLLECTIVIQ_USERNAME`            | password   | —                                 | Password-mode username (trimmed, ≤320 bytes); required when `COLLECTIVIQ_AUTH_MODE=password`                            |
+| `COLLECTIVIQ_PASSWORD`            | password   | —                                 | Password-mode password (preserved exactly, ≤4096 bytes); required when `COLLECTIVIQ_AUTH_MODE=password`                 |
+| `COLLECTIVIQ_GATEWAY_KEYS`        | **yes**    | —                                 | Comma-separated client keys; trimmed, de-duplicated, ≤64 keys, ≤8192 UTF-8 bytes/key; enforced on `/v1/*`               |
+| `MODEL_CONFIG_PATH`               | no         | `./config/models.yaml`            | Path to the YAML model file                                                                                             |
+| `LOG_LEVEL`                       | no         | `info`                            | Pino level                                                                                                              |
+| `LOG_CONTENT`                     | no         | `false`                           | May be `true` only when `ENVIRONMENT=development`                                                                       |
+| `MAX_REQUEST_BODY_BYTES`          | no         | `8388608`                         | 1024 – 67108864                                                                                                         |
+| `MAX_CONCURRENT_REQUESTS`         | no         | `4`                               | Global active completions (process-local); 1–1024                                                                       |
+| `MAX_CONCURRENT_REQUESTS_PER_KEY` | no         | `2`                               | Per-gateway-key active completions; 1–1024 and ≤ `MAX_CONCURRENT_REQUESTS`                                              |
+| `MAX_QUEUED_REQUESTS`             | no         | `20`                              | Bounded admission queue length; 0–100000 (0 disables queueing)                                                          |
+| `MAX_QUEUE_WAIT_MS`               | no         | `5000`                            | Max time in the admission queue before a `429`; 1–600000                                                                |
+| `SHUTDOWN_DRAIN_MS`               | no         | `30000`                           | Graceful-shutdown drain before in-flight polling is cancelled; 0–600000                                                 |
+| `REDIS_URL`                       | no         | _(empty — Redis disabled)_        | Canonical `redis://` / `rediss://` only (no query/fragment). **Secret-bearing** (may embed credentials); redacted       |
+| `IDEMPOTENCY_ENCRYPTION_KEY`      | with Redis | —                                 | **Required when `REDIS_URL` is set.** Exactly 32 bytes as canonical unpadded base64url (43 chars). **Secret**; redacted |
+| `IDEMPOTENCY_TTL_MS`              | no         | `600000`                          | Lifetime of a cached final response; 60000–3600000                                                                      |
+| `REDIS_KEY_PREFIX`                | no         | `collectiviq-gateway`             | Redis key namespace; 1–64 chars matching `[A-Za-z0-9_-]+`                                                               |
 
 The upstream credential authenticates the gateway to CollectivIQ: in `bearer`
 mode `COLLECTIVIQ_API_KEY` is sent as a static bearer token; in `password` mode

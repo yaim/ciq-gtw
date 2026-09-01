@@ -611,17 +611,92 @@ errorCode, resolved, resolution, persisted }] }` (no longer `succeeded`/
   and the deprecated `collectiviq-tools-experimental` compatibility alias
   retained through Phase 4, both wildcard `"ask"`; every committed default
   selects neither agent, stays `toolMode: "disabled"`, and
-  discards tool metadata). Beta is not production readiness. `native` tool mode and Redis/idempotency are not
-  implemented; those requests are rejected or unavailable rather than silently
+  discards tool metadata). Beta is not production readiness. `native` tool mode is not
+  implemented; those requests are rejected rather than silently
   degraded. Streaming
   (`stream: true`/SSE) is implemented as text-only buffered synthetic SSE, not
   true upstream streaming; a basic live stream completed on 2026-08-15, but the
   long-running / keep-alive streaming smoke test is not run.
 - Capacity/backpressure is **process-local** — it does not coordinate across
-  replicas. Cross-replica limits require shared state that does not yet exist.
+  replicas. Cross-replica rate limits and shared capacity accounting require
+  shared state that does not yet exist. (Redis provides cross-replica
+  **idempotency** only; see below.)
+- Optional Redis-backed idempotency is implemented but **off by default**. Its
+  protection is bounded to `IDEMPOTENCY_TTL_MS`, CollectivIQ's own
+  POST-idempotency semantics are unknown, and a hard replica kill mid-completion
+  can permit one duplicate upstream completion once the lease expires.
 - No metrics endpoint is exposed.
-- Readiness reports a simple ready/not-ready state; it does not yet probe
-  dependencies.
+- Readiness probes only the optional Redis dependency; CollectivIQ is
+  deliberately not probed, and the response body remains a simple
+  ready/not-ready state.
+
+## Optional Redis-backed idempotency (Phase 4A)
+
+Redis is **optional and disabled by default**. With a blank/absent `REDIS_URL`
+nothing is written to or read from Redis, and unkeyed requests are unaffected. A
+supplied `Idempotency-Key` requires configured, healthy Redis; otherwise the
+request fails closed with `503 idempotency_unavailable` before any completion
+work, so an idempotency guarantee is never silently dropped.
+
+**Two new secret-bearing settings.** `REDIS_URL` may embed credentials and
+`IDEMPOTENCY_ENCRYPTION_KEY` derives every idempotency subkey. Both are redacted
+from logs, and configuration errors never echo either value.
+
+**Key derivation and isolation.** One configured 32-byte master key is expanded
+with HKDF-SHA-256 into three domain-separated subkeys (Redis key/scope HMAC, body
+fingerprint HMAC, AES-256-GCM). The Redis key is an HMAC of the namespace, a
+stable per-gateway-key scope, and the client's idempotency key — so the client's
+raw key never reaches Redis. The scope is an HMAC of the raw gateway key computed
+once at startup: identical on every replica, independent of key ordering, never
+logged or returned, and separate from the process-local capacity identity. A
+cached answer is reachable only through the exact namespace + scope + client-key
+triple, and the ciphertext's associated data binds the record version, the storage
+key, and the body fingerprint, so a relocated, rebound, or tampered record fails
+authentication and returns `503` rather than another caller's answer.
+
+**What Redis holds.** Only a record version, a state
+(`reserved`/`processing`/`final`/`ambiguous`), a keyed body fingerprint, a random
+owner token, an informational expiry, and — for a committed record — the
+AES-256-GCM ciphertext of the cached completion (fresh random 96-bit nonce per
+record). Never a prompt, request body, authorization value, raw gateway key, raw
+idempotency key, thread title, Redis URL, or upstream thread id. Encryption is
+application layer, so Redis at-rest encryption is not relied upon.
+
+**Fail-closed behaviour.** The claim is created atomically before capacity or any
+upstream work; `reserved → processing` runs after capacity and before
+`create_thread`; `processing → final` must commit before the non-streamed
+response body and before any SSE content or terminal frame (the SSE headers and
+assistant-role opener are sent earlier by design, so a late failure on that path
+is a content-free SSE error record, not an HTTP status);
+and any failure at or after `processing` leaves an `ambiguous` record that blocks
+repeats for the TTL rather than risking a duplicate upstream completion. No
+`create_thread`/`process_message` retry was added.
+
+**Operational requirements.** The instance must not evict keys
+(`maxmemory-policy noeviction`): an evicted in-flight record silently permits a
+duplicate upstream completion and an evicted cached record silently re-runs a
+completed request, neither of which the gateway can detect. Every replica must
+share the same `IDEMPOTENCY_ENCRYPTION_KEY`, `REDIS_KEY_PREFIX`, Redis endpoint,
+`COLLECTIVIQ_GATEWAY_KEYS`, and model configuration; mixed encryption keys during
+a rolling deployment are unsupported, and rotating the key requires draining
+traffic and waiting at least one maximum TTL. A hosted Redis needs network
+isolation, ACL/authentication from a managed secret, and TLS (`rediss://`) where
+the link is not private. The committed Compose `redis` profile is opt-in,
+loopback-published, persistence-free, and password-free — it is a development
+convenience, not a production configuration. Redis persistence and backups are
+not required for this ephemeral state.
+
+**Residual risks, stated plainly.** Protection is bounded to the configured TTL.
+The record's metadata (state, body fingerprint, owner token, expiry) is not
+individually authenticated, so an actor with Redis WRITE access can force a
+targeted `409` or `503` denial of service — but cannot obtain another caller's
+answer, because the payload's associated data binds the record version, the
+storage key, and the body fingerprint, and a relocated or rebound ciphertext
+fails authentication. A hard replica kill during an in-flight completion blocks
+that key until its lease expires rather than risking a duplicate. Waiters take no
+capacity permit and are not separately rate limited. CollectivIQ's own
+POST-idempotency semantics remain unknown, so this is a gateway-side guarantee
+only.
 
 ## Remote deployment
 

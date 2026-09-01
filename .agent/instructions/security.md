@@ -75,6 +75,57 @@ Acquire capacity before upstream thread creation. Return the documented `429` pl
 - Same idempotency key with a different body returns `409`; do not use a permanent prompt hash as an implicit key across trust boundaries.
 - CollectivIQ-side retention/training/deletion/regional behavior is unknown until verified; do not promise zero retention end to end.
 
+**Implementation status (Phase 4A, implemented — OPTIONAL, off by default).**
+`src/idempotency/` is the only code that writes to Redis. Specification section
+18.1 owns the normative contract; the security-relevant guarantees are:
+
+- **Off unless configured.** A blank/absent `REDIS_URL` disables Redis entirely
+  and nothing is written or read. A supplied `Idempotency-Key` without configured,
+  healthy Redis fails CLOSED (`503 idempotency_unavailable` + `Retry-After: 2`)
+  before any completion work — it is never silently ignored.
+- **Two new secret-bearing settings.** `REDIS_URL` may embed credentials and
+  `IDEMPOTENCY_ENCRYPTION_KEY` derives every idempotency subkey; both are in
+  `REDACT_PATHS` and matched by `isSecretKey`, and configuration errors never
+  echo either value.
+- **Key derivation.** One 32-byte master key is expanded with HKDF-SHA-256 into
+  three domain-separated subkeys (Redis-key/scope HMAC, body-fingerprint HMAC,
+  AES-256-GCM). The Redis key is an HMAC of namespace + gateway-key scope + client
+  key, so the client's raw idempotency key never reaches Redis. The gateway-key
+  scope is an HMAC of the raw key, computed ONCE at authenticator construction —
+  stable across replicas, independent of key ORDER, never logged or returned, and
+  kept separate from the process-local capacity identity `k<index>`.
+- **Cross-tenant isolation.** A cached answer is reachable only through the exact
+  `(namespace, gateway-key scope, client key)` triple, and the ciphertext's
+  associated data binds the record version, the storage key, and the body
+  fingerprint — so a relocated, rebound, or tampered record fails authentication
+  and returns `503` instead of another caller's answer.
+- **What Redis holds.** Only a record version, the state
+  (`reserved`/`processing`/`final`/`ambiguous`), a keyed body fingerprint, a
+  random owner token, an informational expiry, and — for `final` — AES-256-GCM
+  ciphertext with a fresh random 96-bit nonce. Never a prompt, request body,
+  authorization value, raw gateway key, raw idempotency key, thread title, Redis
+  URL, or upstream thread id. Records are strictly validated and size bounded;
+  anything unparseable is treated as corrupt and fails closed.
+- **Untrusted-input safety.** The body fingerprinter traverses only data-property
+  descriptors — never a getter, `toJSON`, iterator, or Proxy `get` — is iterative
+  and bounded in depth/nodes/bytes, and fails closed without inspecting a thrown
+  value. The `Idempotency-Key` header is bounded to 1–255 bytes of visible ASCII
+  and is never logged or reflected.
+- **No new upstream side effect.** No `create_thread`/`process_message` retry was
+  added. Any failure at or after `processing` stays `ambiguous` for the TTL rather
+  than risking a duplicate completion.
+- **Bounded client.** Mandatory content-free `error` listener (so Redis error text,
+  which can contain the endpoint or credentials, is never logged), offline queue
+  disabled, bounded connect/command deadlines, capped reconnect, and a bounded
+  graceful close with force-destroy on shutdown.
+- **Residual risks to state honestly.** Protection is bounded to the configured
+  TTL; CollectivIQ's own POST-idempotency semantics remain unknown; a hard replica
+  kill during `processing` can permit one duplicate completion once the lease
+  expires; rotating the encryption key requires draining traffic and waiting at
+  least one maximum TTL; and all replicas must share the same key, namespace,
+  endpoint, and gateway-key set (mixed keys during a rolling deployment are
+  unsupported).
+
 ## Network and Deployment
 
 - Native local default is `127.0.0.1:8787`.

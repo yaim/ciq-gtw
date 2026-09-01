@@ -10,12 +10,13 @@
 | `npm run format` | Formatting | Prettier write |
 | `npm run lint` | Lint | ESLint flat config, typed rules |
 | `npm run typecheck` | Types | `tsc -p tsconfig.test.json --noEmit` over sources and tests |
-| `npm run test` | Unit + integration | Vitest (`test/unit`, `test/integration`) |
+| `npm run test` | Full hermetic run | Bare `vitest run` — default discovery over `test/**/*.test.ts` (unit, integration, AND contract), minus the `test/compatibility`, `test/adversarial`, and `test/redis` exclusions in `vitest.config.ts` |
 | `npm run test:unit` | Unit | Vitest `test/unit` only |
 | `npm run test:integration` | Integration | Vitest `test/integration` only (in-process `inject`, no socket) |
 | `npm run test:contract` | Upstream contract | Vitest `test/contract` only (hermetic mock HTTP server, no network) |
 | `npm run test:compatibility` | SDK compatibility | Standalone hermetic suite (`test/compatibility`, own `vitest.compatibility.config.ts`); pinned `ai`/`@ai-sdk/openai-compatible` SDK vs an ephemeral loopback gateway with a **fake** completion — no network/credentials/CollectivIQ. **Excluded from `validate`/CI** |
 | `npm run test:adversarial` | Tool release gate | Standalone hermetic suite (`test/adversarial`, own `vitest.adversarial.config.ts`); ≥200 deterministic tool-protocol cases against the pure engine — no network/credentials/CollectivIQ. **Excluded from `validate`/CI** |
+| `npm run test:redis` | Redis idempotency gate | Standalone suite (`test/redis`, own `vitest.redis.config.ts`) requiring a REAL Redis at `REDIS_TEST_URL`. Synthetic credentials/content only, randomized key prefix per run, every key deleted. **Excluded from `validate`** (which stays hermetic and Redis-free) but run in CI as an **additional required gate** with the pinned `redis:8.8.2-alpine` service. Never point it at a production Redis. |
 | `npm run eval:tools` | Live tool gate | Approval-gated LIVE evaluator (`src/eval/`). Default is a credential-free/network-free preflight; the fully-approved path probes the fixed CollectivIQ origin. Network-only; **must NEVER be added to `validate`/CI**. Five authorized campaigns have run. The operative evidence is the **completed 2026-09-01 report-v5 campaign** (the first completed campaign on the state-aware report-v5 / checkpoint-v4 evaluator): it finished the full corpus across two resumable execution segments with cleanup and checkpoint finalization succeeding, **all eight gates passed**, and overall **`passed: true`**, so the numerical section-30 criteria are **met** and Phase 3 graduated to supported opt-in beta while staying non-default and permission-gated. Any future live run is separately approval-gated. The 2026-08-31 report-v4 campaign is historical evidence. See specification section 30 for the complete record and all gate values. |
 | `npm run eval:tools:diagnose` | Live tool diagnostic | Approval-gated LIVE **multi-step transition diagnostic** (`src/eval/tools-diagnostic-cli.ts`). Default is a credential-free/network-free preflight; the fully-approved path runs ONLY the 20 multi-step scenarios (global corpus ordinals 201–220, max 80 upstream rounds) against the fixed CollectivIQ origin in password mode. It **establishes no release gate** — its output has no gates and no `passed` field, only `completed` — and it uses a SEPARATE diagnostic checkpoint so it can never touch the release evaluator's. Network-only; **must NEVER be added to `validate`/CI**. **ONE live run has completed**, under the historical v2 classifier (20/20 scenarios, 54/54 threads deleted, zero cleanup/journal failures, finalized checkpoint, no abort; 7 scenarios followed the old static schedule and 13 failed at round 2 with `expected-already-invoked`). It showed the static round-2 expectation was stale but did NOT prove those edits succeeded. The current **v3** diagnostic has NOT been run live; every live invocation is separately approval-gated. See specification section 30.1. |
 | `npm run test:coverage` | Coverage | Vitest with V8 coverage |
@@ -23,6 +24,44 @@
 | `npm run test:build` | Build smoke | Imports compiled `dist/*.js`; asserts no listening socket |
 | `npm run validate` | Aggregate | format check → lint → typecheck → test → build → test:build |
 | `npm run dev` / `npm start` | Run | Local watch run / run compiled `dist/index.js` |
+
+**Redis idempotency evidence (Phase 4A, implemented — optional, off by default).**
+Specification section 29.6 owns the layered test inventory and section 18.1 the
+normative contract; do not restate them here. Operationally:
+
+- `test/redis/**` is excluded from `vitest.config.ts`, so `npm run test`, every
+  scoped script, and `npm run validate` remain hermetic and need no Redis.
+- `npm run test:redis` FAILS LOUDLY when `REDIS_TEST_URL` is unset rather than
+  skipping: a silently skipped gate is not a gate. Bring Redis up locally with
+  `docker compose --profile redis up -d redis` — name the `redis` service, since
+  a bare `--profile redis up` also starts the gateway container, which this suite
+  does not use and which demands `COLLECTIVIQ_GATEWAY_KEYS` — or use an
+  equivalent disposable pinned `redis:8.8.2-alpine` container, then export
+  `REDIS_TEST_URL=redis://127.0.0.1:6379`.
+- The suite uses only synthetic sentinels and a randomized `ciqtest-<hex>` key
+  namespace, and deletes every key it creates in `afterEach`/`afterAll`. One of
+  its assertions scans the raw stored values for the synthetic prompt, answer,
+  tool-argument, gateway-key, and idempotency-key sentinels and requires none of
+  them to be present.
+- Hermetic coverage that must accompany any change in this area:
+  `test/unit/idempotency-{header,fingerprint,crypto,records,coordinator,redis-store}.test.ts`,
+  `test/unit/readiness.test.ts`, the Redis blocks in `test/unit/config.test.ts`
+  and `test/unit/gateway-auth.test.ts`, and
+  `test/integration/chat-completions-idempotency.test.ts` — then
+  `npm run validate`, and `npm run test:redis` against a real Redis.
+- Three of those hermetic cases exist specifically to keep review findings from
+  regressing. Each was confirmed red-before-green by MANUALLY reverting the
+  corresponding fix and observing only those cases fail — a property the suite
+  itself cannot assert, so re-verify it by hand if you change any of them:
+  the renewal/transition interleaving must still apply the processing lease;
+  distinct unpaired surrogates (as values AND as object keys, and against a
+  literal `U+FFFD`) must produce distinct fingerprints and a route-level `409`
+  rather than a replay; and the record read must go through a bounded script,
+  never a direct `GET`.
+- The shared in-memory store fake lives at
+  `test/support/fake-idempotency-store.ts` and mirrors the Lua owner-token and
+  expected-state guards. It stands in for the SERVER, never for the coordinator
+  logic under test; real atomicity is proven only by `test/redis/`.
 
 `validate` is hermetic. The upstream contract suite (`test/contract`) is now
 implemented and hermetic (a local mock HTTP server; no network, credentials, or
@@ -34,7 +73,11 @@ must **never** be added to `validate` or CI. `test:compatibility` is hermetic bu
 is likewise kept **out** of `validate`/CI and run only on its own. The
 **adversarial tool-protocol release-gate suite** `test:adversarial`
 (`vitest.adversarial.config.ts`) is now implemented and is likewise hermetic but
-kept **out** of `validate`/CI. The network-only `eval:tools` live evaluator, the
+kept **out** of `validate`/CI. The **Redis idempotency contract suite**
+`test:redis` (`vitest.redis.config.ts`) is the one suite that requires an
+external service; it must **never** be added to `validate`, but it IS a required
+CI gate in its own job with a pinned `redis:8.8.2-alpine` service. The
+network-only `eval:tools` live evaluator, the
 network-only `eval:tools:diagnose` live diagnostic, and the `contract:*`
 commands must **never** be added to `validate` or CI. Load,
 live-upstream, end-to-end OpenCode, and Docker/live checks remain **not

@@ -2094,6 +2094,190 @@ Rules:
 
 The gateway must not automatically derive a permanent idempotency key from the full prompt because doing so could reveal prompt hashes across trust boundaries.
 
+### 18.1 Implementation status (Phase 4A, implemented — optional, off by default)
+
+Redis-backed, cross-replica idempotency for `POST /v1/chat/completions` is
+implemented in `src/idempotency/` and is **optional**. With a blank/absent
+`REDIS_URL` the gateway behaves exactly as it did before Phase 4A for unkeyed
+requests, and Redis is never contacted. Process-local capacity (section 19)
+remains process-local; only idempotency spans replicas.
+
+**Public contract.** Exactly one optional request header is supported:
+
+```http
+Idempotency-Key: <opaque-client-value>
+```
+
+It must be a single occurrence of 1–255 bytes of visible ASCII (`0x21`–`0x7E`).
+The value is preserved byte-for-byte and is never logged, reflected, or stored:
+only a keyed HMAC of it reaches Redis. An array/duplicate header, an empty or
+oversized value, and any space/control/non-ASCII character are rejected. Node
+joins a duplicated header with `", "`, which the space rule already rejects; the
+raw header list is additionally counted when available.
+
+| Condition | HTTP | Type | Code | `param` |
+| --- | ---: | --- | --- | --- |
+| Invalid header, or a body that cannot be canonically fingerprinted | 400 | `invalid_request_error` | `invalid_idempotency_key` | `Idempotency-Key` |
+| Same scoped key, different body | 409 | `invalid_request_error` | `idempotency_key_conflict` | `Idempotency-Key` |
+| Redis disabled/unavailable, ambiguous/corrupt/tampered state, or lost claim | 503 | `server_error` | `idempotency_unavailable` | `null` |
+
+The `503` always carries `Retry-After: 2`. A same-body waiter that reaches the
+request deadline receives the existing `504 completion_timeout`; client
+disconnect and shutdown keep their existing behaviour (no body, and `503
+service_unavailable` respectively). A supplied key **requires** configured,
+healthy Redis: otherwise the request fails closed **before** any completion work.
+
+**"Same body" is the canonical full parsed JSON.** JSON whitespace and object-key
+order are insignificant; array order is significant; and EVERY submitted field
+participates, including tool metadata the gateway tolerates and discards for a
+text-only model (section 9.4). The fingerprint is computed after authentication
+and successful normal request validation, while the original parsed body is
+still available. The canonicalizer traverses only data-property descriptors
+(never a getter, `toJSON`, iterator, or Proxy `get`), preserves every JSON key
+including `__proto__`, sorts object keys recursively, is iterative and bounded in
+depth/nodes/bytes, streams canonical tokens directly into an HMAC, and fails
+closed without inspecting a thrown value.
+
+String and object-key encoding MUST be LOSSLESS over the whole JavaScript string
+domain, so the fingerprint is injective for every distinct parsed body. A raw
+UTF-8 encoding is not: every unpaired UTF-16 surrogate — and a literal `U+FFFD` —
+collapses onto the same replacement bytes, which would let one body replay
+another's cached answer instead of returning `409`. Each string is therefore
+emitted in a well-formed escaped form that encodes an unpaired surrogate
+explicitly, length-framed so the token stream stays unambiguous.
+
+**Key derivation (Node built-in cryptography).** One configured 32-byte master
+key (`IDEMPOTENCY_ENCRYPTION_KEY`) is expanded with HKDF-SHA-256 into three
+domain-separated subkeys: a Redis-key/scope HMAC key, a body-fingerprint HMAC
+key, and an AES-256-GCM key. The Redis storage key is an HMAC over the configured
+namespace, a stable gateway-key scope, and the client's idempotency key. That
+scope is itself an HMAC of the raw gateway key, so it is identical on every
+replica and independent of `COLLECTIVIQ_GATEWAY_KEYS` ordering — unlike the
+process-local capacity identity `k<index>` (section 9.1). Gateway authentication
+now exposes both identities; neither is ever logged or returned.
+
+**Stored state.** Records are versioned, strictly validated, size-bounded JSON
+with four states — `reserved`, `processing`, `final`, `ambiguous` — carrying only
+a record version, the state, the keyed body fingerprint, a random owner token, an
+informational expiry (Redis `PX` is authoritative), and, for `final`, the
+encrypted payload. Redis never holds a prompt, request body, authorization value,
+raw gateway key, raw idempotency key, thread title, Redis URL, or upstream thread
+id. The cached payload is a versioned document holding only the original
+completion id, the original creation time, the requested model, the result
+discriminator, and either the assistant text or the validated tool calls. It is
+encrypted with a fresh random 96-bit nonce per record, and the record version,
+storage key, and body fingerprint are bound through the authenticated associated
+data, so a relocated, rebound, or tampered ciphertext fails closed.
+
+**Lifecycle.** Claim and every compare-and-transition are single atomic Lua
+scripts (never a GET-then-SET sequence):
+
+1. `reserved` is created atomically **before** capacity or upstream work. The same
+   fingerprint may wait; a different fingerprint is `409`.
+2. The owner enters the existing completion run.
+3. After capacity succeeds, an asynchronous lifecycle hook atomically moves
+   `reserved → processing`.
+4. Only after that transition succeeds may `create_thread` be attempted.
+5. A successful completion must atomically persist `processing → final` **before**
+   any successful JSON body or SSE content/terminal frame is emitted.
+6. Any failure at or after `processing` remains blocked as `ambiguous` for the
+   TTL, because `create_thread`/`process_message` have no proven idempotency
+   (section 17.1) and the upstream side effect may already have happened.
+7. A proven failure **before** `processing` — capacity rejection, cancellation, or
+   the transition itself failing — compare-and-deletes the owner's own `reserved`
+   record, so a transient local failure does not block the key.
+8. A Redis failure while marking `processing` releases capacity and performs no
+   upstream call.
+9. A Redis failure while persisting `final` never emits the answer: the request
+   returns `idempotency_unavailable` and the record is best-effort tombstoned as
+   `ambiguous`.
+10. Active owners renew their lease periodically (30 s lease, 10 s cadence). A lost
+    renewal aborts the request and never permits takeover.
+11. A waiter never takes over a disappeared, expired, corrupt, or ownerless record
+    during the same request; it fails `503`.
+12. The `final` TTL starts when `final` is committed. Active and ambiguous records
+    stay bounded by the lease/TTL policy.
+
+Waiting is bounded, cancellation-aware polling with backoff (100 ms → ×1.25 →
+1000 ms, jittered) under the model's own request deadline, plus an absolute
+iteration ceiling as a stalled-clock backstop. Pub/Sub is deliberately not used
+as a source of truth. Waiters take no capacity permit because they perform no
+upstream work.
+
+**Replay.** A successful replay reuses the original identity and result: the JSON
+response repeats the original id, timestamp, model, content or tool calls, finish
+reason, and zero/unavailable usage representation; the SSE response emits
+deterministic frames built from the original metadata and result (timing and
+keep-alive comments are not reproduced). The duplicate request's own `prepare`
+still runs first — so a preparation failure creates no record — and its freshly
+minted completion id is discarded and never returned. Native-title correlation
+(section 9.5) is registered only for the original owner while its in-memory
+result still carries the upstream thread id; waiters and replays never register
+one, and Redis retention is not expanded to recover it.
+
+**Lease policy.** The two active states carry DIFFERENT leases, because losing
+them has different consequences. A `reserved` record (claimed, no upstream call
+yet) uses a short 30 s lease: losing it is safe, since the original owner's
+`reserved → processing` transition is owner-token guarded and reports `lost`
+rather than proceeding. A `processing` record instead uses a lease derived from
+the request's own total deadline (`requestTimeoutMs` + 30 s, capped at 630 s), so
+a LIVE owner's record can never expire mid-completion — even under event-loop
+starvation that delays renewal — because the owner's own deadline fires first.
+The lease therefore acts as a crash reaper rather than a race window. A hard
+replica kill during `processing` consequently blocks that key for up to the
+derived lease, which is deliberately preferred over risking a duplicate billed
+completion.
+
+Because the two leases differ, the renewal operation MUST choose between them
+from the AUTHORITATIVE STORED STATE, atomically, and must never accept a single
+duration selected by the caller. A renewal races the `reserved → processing`
+transition: Redis can apply that transition while the transitioning caller is
+still awaiting its reply, so a caller-selected duration could carry the stale
+`reserved` view and shorten a live `processing` record's TTL — which is precisely
+the expiry the derived lease exists to prevent. The renewal reply reports which
+state it observed.
+
+**Required Redis server configuration.** The instance backing idempotency MUST
+NOT evict keys: `maxmemory-policy` must be `noeviction` (or the instance must be
+sized so eviction never occurs). Under `allkeys-*` or `volatile-*` an evicted
+`processing` record silently permits a concurrent claim and therefore a duplicate
+upstream completion, and an evicted `final` record silently re-runs a completed
+request. The gateway cannot detect this, so it is a deployment requirement.
+Similarly, a Redis endpoint with asynchronous replication and failover, or a
+standalone instance that loses its state, can drop an acknowledged `final` record
+and permit one duplicate completion.
+
+**Residual limits.** Protection is bounded to the configured TTL. CollectivIQ's
+own POST-idempotency semantics remain unknown, so the gateway's guarantee is
+gateway-side only. Rotating the encryption key requires draining traffic and
+waiting at least one maximum TTL. All replicas must share the same encryption
+key, namespace, Redis endpoint, gateway-key set, AND model configuration:
+`REDIS_KEY_PREFIX` and the key HMAC do not cover the resolved virtual-model
+policy, so two replicas that resolve the same model id to different
+`selectedLlms`/`promptMode`/`answerSource` would treat their answers as
+interchangeable. Mixed encryption keys during a rolling deployment are
+unsupported. The `stream` flag is part of the submitted body, so replaying the
+same key with a different transport is a `409`, not a cross-transport replay. A
+completion that fails at or after `processing` — including a `504` timeout —
+blocks that key for the full TTL, which is stricter than an unkeyed retry would
+be; that is the intended fail-closed trade. Record metadata (`s`, `f`, `o`, `e`)
+is not individually authenticated: an actor with Redis WRITE access can cause a
+targeted denial of service (a forced `409` or `503`) but cannot obtain another
+caller's answer, because the payload's associated data binds the record version,
+storage key, and body fingerprint. Waiters take no capacity permit and are not
+themselves rate limited, so a client retrying one slow key many times produces
+proportional bounded polling — distributed rate limiting remains outstanding
+Phase 4 work.
+
+**Transport note.** On the streamed path, response headers (HTTP `200`) and the
+assistant-role opener are committed before `run()`, so a `reserved → processing`
+or `processing → final` failure cannot be an HTTP `503`. It is emitted instead as
+a single content-free `data: {"error": …}` SSE record carrying the
+`idempotency_unavailable` envelope, followed by `data: [DONE]`, with no content
+and no terminal chunk. Only pre-header failures (invalid header, conflict,
+unavailable Redis, and a waiter's own conflict/timeout/unavailable outcome) use a
+real HTTP status.
+
 ---
 
 ## 19. Concurrency and Backpressure
@@ -2137,6 +2321,9 @@ Queued requests must have a maximum queue duration.
 | Invalid gateway key         |  401 | `authentication_error`    | `invalid_api_key`                |
 | Unknown model               |  404 | `invalid_request_error`   | `model_not_found`                |
 | Invalid request             |  400 | `invalid_request_error`   | `invalid_request`                |
+| Invalid `Idempotency-Key`   |  400 | `invalid_request_error`   | `invalid_idempotency_key`        |
+| Idempotency-key body conflict | 409 | `invalid_request_error`  | `idempotency_key_conflict`       |
+| Idempotency unavailable     |  503 | `server_error`            | `idempotency_unavailable`        |
 | Unsupported content         |  400 | `invalid_request_error`   | `unsupported_content_type`       |
 | Prompt too large            |  400 | `invalid_request_error`   | `context_length_exceeded`        |
 | Gateway capacity            |  429 | `rate_limit_error`        | `gateway_capacity_exceeded`      |
@@ -2396,6 +2583,20 @@ Prompt content should not be stored unless explicitly required.
 
 If final responses are cached, encryption at rest and short TTLs are required.
 
+**Implementation status (Phase 4A, implemented — optional).** The only Redis
+state the gateway writes is the idempotency record described in section 18.1. It
+holds a record version, the state, a keyed body fingerprint, a random owner
+token, an informational expiry, and — for `final` only — the AES-256-GCM
+ciphertext of the cached completion. No prompt, request body, authorization
+value, raw gateway key, raw idempotency key, thread title, Redis URL, or upstream
+thread id is ever stored, and the Redis key itself is an HMAC rather than any
+client-supplied value. Encryption is application layer, so Redis at-rest
+encryption is not relied upon; every record is bounded by `IDEMPOTENCY_TTL_MS`
+(active records by a shorter lease). Concurrency counters are NOT stored: capacity
+remains process-local. Redis cache persistence and backups are not required for
+this ephemeral state — losing it costs at most in-flight replay protection — and
+the supplied Compose profile disables RDB and AOF for that reason.
+
 ### 22.3 CollectivIQ-side retention
 
 The gateway cannot control CollectivIQ’s thread retention based on the supplied endpoints.
@@ -2566,6 +2767,22 @@ submitted value). Capacity is **process-local** — it does not span replicas.
 `REQUEST_TIMEOUT_MS`/`DEFAULT_UPSTREAM_TIMEOUT_MS`/`POLL_INTERVAL_MS`/
 `POLL_MAX_INTERVAL_MS` remain per-model settings (`requestTimeoutMs`,
 `pollIntervalMs`, `maxPollIntervalMs`) rather than global env vars in this phase.
+
+**Implementation status (Phase 4A, implemented).** The optional Redis-backed
+idempotency layer (section 18.1) adds four validated environment variables. A
+blank/absent `REDIS_URL` disables Redis entirely; every other field still carries
+a validated value so the configuration shape is stable either way.
+
+| Variable | Default | Rule |
+| --- | --- | :--- |
+| `REDIS_URL` | *(empty — disabled)* | Only a canonical `redis://` / `rediss://` URL: supported lowercase scheme, non-empty host, no query or fragment, and an exact round-trip through URL serialization. Secret-bearing (it may embed credentials) and redacted everywhere. |
+| `IDEMPOTENCY_ENCRYPTION_KEY` | *(none)* | **Required** whenever `REDIS_URL` is set. Exactly 32 bytes encoded as canonical unpadded base64url (43 characters); a non-canonical trailing-bit encoding is rejected. Secret; redacted everywhere. |
+| `IDEMPOTENCY_TTL_MS` | 600000 | Integer, 60000–3600000. Lifetime of a committed `final` record. When Redis is enabled it must additionally be **≥ the largest configured model `requestTimeoutMs`**, so a client retrying after its own attempt timed out still finds the cached result instead of silently paying for a duplicate completion. |
+| `REDIS_KEY_PREFIX` | `collectiviq-gateway` | 1–64 characters matching `[A-Za-z0-9_-]+`. |
+
+All four produce value-free `ConfigError` issues (a stable field/reason pair; the
+submitted URL, key, or prefix is never echoed). Every replica must be configured
+with the SAME encryption key, namespace, Redis endpoint, and gateway-key set.
 
 Gateway client keys (`COLLECTIVIQ_GATEWAY_KEYS`) are bounded by conservative,
 non-overridable initial limits: at most **64** configured keys, and at most
@@ -2873,6 +3090,16 @@ collectiviq-gateway/
 │   │   ├── validator.ts
 │   │   ├── canonicalize.ts
 │   │   └── candidate-selector.ts
+│   ├── idempotency/
+│   │   ├── header.ts
+│   │   ├── fingerprint.ts
+│   │   ├── keyring.ts
+│   │   ├── crypto.ts
+│   │   ├── records.ts
+│   │   ├── payload.ts
+│   │   ├── store.ts
+│   │   ├── redis-store.ts
+│   │   └── coordinator.ts
 │   ├── observability/
 │   │   ├── logger.ts
 │   │   ├── metrics.ts
@@ -2888,6 +3115,7 @@ collectiviq-gateway/
 │   ├── contract/
 │   ├── integration/
 │   ├── compatibility/
+│   ├── redis/
 │   └── fixtures/
 ├── Dockerfile
 ├── compose.yaml
@@ -3006,6 +3234,28 @@ Example:
 }
 ```
 
+**Implementation status (Phase 4A, implemented).** Readiness is a bounded,
+dependency-aware view. Configuration and models are validated before the listener
+binds (an invalid configuration exits non-zero), so the remaining runtime
+dependency is optional Redis:
+
+* Redis **disabled** (blank/absent `REDIS_URL`): unchanged behaviour — readiness
+  follows the listener flag alone.
+* Redis **configured but disconnected or reconnecting**: not ready.
+* Redis **ready**: readiness may become healthy.
+* **Shutdown**: always forces not-ready, latched, so no later dependency recovery
+  can flip it back.
+
+A dependency probe must be synchronous, bounded, and non-throwing and may return
+only already-known safe state; a probe that throws counts as not ready. Neither
+`/healthz` nor `/readyz` calls CollectivIQ, and neither returns configuration
+values or credentials. When Redis is configured but unavailable at startup the
+process still starts the HTTP listener, `/healthz` stays `200`, `/readyz` stays
+`503`, the client reconnects automatically with a bounded capped backoff, and
+readiness becomes healthy once the connection is established. The response bodies
+remain the existing fixed `{"status":"ready"}` / `{"status":"not_ready"}`; the
+`checks` object above is still illustrative, not implemented.
+
 ---
 
 ## 29. Testing Strategy
@@ -3113,6 +3363,60 @@ No memory growth above an agreed steady-state threshold
 ```
 
 The load test must model 90-second upstream latency.
+
+### 29.6 Redis idempotency tests (Phase 4A, implemented)
+
+Idempotency is covered at three layers. The first two are hermetic and run
+inside `npm run validate`; the third requires a real Redis and is a SEPARATE
+gate.
+
+**Unit** (`test/unit/idempotency-header.test.ts`, `-fingerprint`, `-crypto`,
+`-records`, `-coordinator`, `-redis-store`, plus `test/unit/readiness.test.ts`
+and additions to
+`config.test.ts` / `gateway-auth.test.ts`): header bounds, duplicate detection
+and non-reflection; lossless string/key encoding, so distinct unpaired
+surrogates — and a literal `U+FFFD` — never share a fingerprint; the renewal
+race, in which the store has already applied `reserved → processing` while its
+caller is still awaiting the reply and an overlapping renewal must still apply
+the processing lease; the record-read command shape, proving the gateway issues
+no direct unbounded `GET`; canonical equivalence for reordered keys and whitespace;
+a different fingerprint for any changed submitted field including ignored tool
+metadata; descriptor, accessor, `toJSON`, Proxy, cycle, sparse, exotic, depth,
+and size failures; per-gateway-key scoping that is stable independent of
+configured key ORDER; HKDF domain separation; AES-GCM round trip, fresh random
+nonce, associated-data binding, tampering, wrong key, and size bounds; strict
+parsing of every record state and version and of the cached payload; every state
+transition with owner-token mismatch, TTL, renewal, corruption, and store
+failures; and the absence of any secret or content in errors and stored bytes.
+
+**Integration with an injected store**
+(`test/integration/chat-completions-idempotency.test.ts`), covering both JSON and
+SSE: no header preserves current behaviour with zero Redis interaction; a header
+with disabled or unavailable Redis returns `503` and performs no completion work;
+concurrent same-key/same-body requests execute the completion service exactly
+once; the same key with a different body returns `409`; waiters and replays use
+the ORIGINAL completion metadata; separate gateway keys do not collide; a
+pre-`processing` failure releases the claim; a post-`processing` failure becomes
+`ambiguous` and blocks a retry; cancellation, deadline, disconnect, and shutdown
+never duplicate work; a final-persistence failure never emits the answer on
+either transport; and only original owners register native-title correlation.
+
+**Real Redis** (`npm run test:redis`, `test/redis/`, `vitest.redis.config.ts`):
+runs against `REDIS_TEST_URL` with synthetic credentials and content only, a
+randomized key prefix per run, and full key cleanup. It covers Lua claim/CAS
+behaviour under concurrency; two independent application/coordinator instances
+sharing one Redis executing the completion once; lease renewal and expiry;
+`EVALSHA`→`EVAL` recovery after `SCRIPT FLUSH`; connect/close readiness
+transitions and an unreachable endpoint that never throws; corrupt, tampered, and
+relocated records failing closed; renewal selecting its lease from the stored
+state rather than the caller's; an oversized value rejected with the server's own
+command counters showing that no `GET` executed at all (paired with a
+within-bound read that does register one, so the counter assertion cannot pass
+vacuously); and a scan proving raw Redis values contain
+none of the synthetic prompt, answer, tool-argument, gateway-key, or
+idempotency-key sentinels. It is excluded from ordinary Vitest discovery and from
+`npm run validate` (which stays hermetic and Redis-free) and runs in CI as an
+additional required gate with the pinned `redis:8.8.2-alpine` service.
 
 ---
 
@@ -4261,6 +4565,22 @@ services:
 
 The container may listen on `0.0.0.0` internally because Docker publishes it only to host loopback.
 
+**Implementation status (Phase 4A, implemented).** The committed `compose.yaml`
+adds an **opt-in** `redis` profile running
+the pinned image `redis:8.8.2-alpine`, published only on `127.0.0.1:6379`, with
+persistence disabled (`--save "" --appendonly no`) because idempotency records
+are short-lived encrypted cache state. The gateway service has **no**
+`depends_on` on it: the gateway must start and serve `/healthz` whether or not
+Redis is running. No password is embedded in the committed file.
+
+`REDIS_URL` is resolved by the gateway PROCESS, so the two local setups use
+different hosts: with the gateway running natively, start only the Redis service
+(`docker compose --profile redis up -d redis`) and use
+`redis://127.0.0.1:6379`; with both services in Compose, use the Redis service
+hostname (`REDIS_URL=redis://redis:6379 docker compose --profile redis up
+--build`), because inside the gateway container `127.0.0.1` is that container.
+Local Compose does NOT satisfy production requirements; see section 31.2.
+
 ### 31.2 Hosted deployment
 
 Required controls:
@@ -4278,6 +4598,30 @@ Required controls:
 
 Sticky sessions are not required because requests are stateless.
 
+**Redis requirements when idempotency is enabled (Phase 4A).** Beyond the
+application-layer `IDEMPOTENCY_ENCRYPTION_KEY`, a hosted Redis must have:
+
+* network isolation — a private subnet/VPC or equivalent, never a public endpoint;
+* Redis ACL/authentication with a managed secret, never a committed password;
+* TLS (`rediss://`) wherever the endpoint is not on a trusted private link;
+* `maxmemory-policy noeviction` (or headroom such that eviction never occurs) —
+  see section 18.1; an evicted active or final record silently breaks the
+  guarantee;
+* the SAME `IDEMPOTENCY_ENCRYPTION_KEY`, `REDIS_KEY_PREFIX`, Redis endpoint,
+  `COLLECTIVIQ_GATEWAY_KEYS`, and MODEL CONFIGURATION on EVERY replica. Mixed
+  encryption keys during a rolling deployment are unsupported: a replica with a
+  different key computes different storage keys and cannot read the other
+  replicas' records. Divergent model configuration is worse — the storage key
+  does not cover the resolved model policy, so replicas would treat answers
+  produced under different policies as interchangeable. Rotating the key
+  requires draining traffic and waiting at least one maximum
+  `IDEMPOTENCY_TTL_MS`.
+
+Persistence and backups are not required for this state (section 22.2). Redis
+gives cross-replica **idempotency** only; concurrency accounting remains
+process-local, so distributed rate limiting and shared capacity are still
+outstanding Phase 4 work.
+
 ### 31.3 Graceful shutdown
 
 On `SIGTERM`:
@@ -4294,6 +4638,16 @@ Default drain period:
 ```text
 30 seconds
 ```
+
+**Implementation status (Phase 4A, implemented).** The sequence is: latch
+readiness not-ready → close admission → allow `SHUTDOWN_DRAIN_MS`, then abort the
+shared in-flight signal → `app.close()` → and only THEN close Redis. Redis stays
+available for the whole drain so an in-flight completion can still commit or
+settle (`ambiguous`) its idempotency record. The Redis close is a bounded
+graceful close with a force-destroy fallback, so shutdown can never hang on a
+half-open socket. Default `buildServer`, the test suites, and the compiled-import
+smoke test remain socket-free: the Redis client is created without connecting and
+only the process composition root calls `connect()`.
 
 ---
 
@@ -4532,9 +4886,9 @@ single-account result — **not** production readiness, a repeatable upstream
 guarantee, combined-answer support, long-duration streaming, or general non-Claude
 routing. Any further live run still requires separate explicit approval before live
 CollectivIQ traffic. `stream:true` synthetic SSE is
-implemented (Phase 2, below); tools stay in Phase 3; Redis/idempotency and
-metrics/tracing remain unimplemented; thread reuse and upstream deletion are not
-performed.
+implemented (Phase 2, below); tools stay in Phase 3; optional Redis-backed
+idempotency is Phase 4A (section 18.1); metrics/tracing remain unimplemented;
+thread reuse and upstream deletion are not performed.
 
 Deliverables:
 
@@ -4734,7 +5088,8 @@ deleted (no cleanup result was supplied). This tool-schema smoke is a separate
 event from the same-date partial 2026-08-24 `eval:tools` evaluator campaign
 (section 30) and proves nothing about the section-30 gates; do not conflate
 them. `native` tool
-mode, Redis/idempotency, and true upstream streaming remain unimplemented.
+mode and true upstream streaming remain unimplemented; optional Redis-backed
+idempotency is implemented as Phase 4A (section 18.1).
 
 ### Phase 4 — Production hardening
 
@@ -4750,6 +5105,26 @@ Deliverables:
 * runbooks;
 * backup configuration;
 * release process.
+
+**Phase 4A — Redis idempotency: implemented (optional, off by default).** The
+first Phase 4 deliverable is complete and documented in sections 18.1, 22.2, 24,
+28.2, 29.6, 31.1, 31.2, and 31.3. It is OPTIONAL: with a blank/absent `REDIS_URL`
+the gateway is byte-for-byte unchanged for unkeyed requests. Evidence is
+hermetic (`test/unit/idempotency-*.test.ts`, `test/unit/readiness.test.ts`,
+`test/integration/chat-completions-idempotency.test.ts`) plus a real-Redis
+contract suite (`npm run test:redis`, `test/redis/`) run against the pinned
+`redis:8.8.2-alpine`. No live CollectivIQ call was made or required.
+
+**Explicitly still outstanding in Phase 4:**
+
+* distributed (cross-replica) rate limiting;
+* shared cross-replica capacity accounting — capacity stays PROCESS-LOCAL;
+* metrics and tracing;
+* load testing and a security review of the idempotency layer;
+* backup and release procedures, and runbooks.
+
+Native tool mode (section 13) and true upstream streaming (section 14.5) remain
+Phase 5 work and are unaffected.
 
 ### Phase 5 — Native CollectivIQ capabilities
 

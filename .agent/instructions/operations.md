@@ -17,6 +17,16 @@ When adding or renaming configuration, update schema, loader, example environmen
 
 ## Health and Readiness
 
+**Implementation status (Phase 4A, implemented).** `createReadinessState` in
+`src/api/health-route.ts` now takes bounded, synchronous, non-throwing dependency
+probes and a `markShuttingDown()` latch. Readiness is the local listener flag AND
+every probe; a probe that throws or returns a non-boolean counts as not ready,
+and shutdown latches not-ready permanently. Optional Redis is the only probe
+today: disabled Redis registers none (unchanged behaviour), a configured but
+disconnected/reconnecting client keeps `/readyz` at `503`, and readiness recovers
+automatically when the client connects. CollectivIQ is deliberately not a probe.
+The response bodies are unchanged (`{"status":"ready"}` / `{"status":"not_ready"}`).
+
 - `/healthz` proves the process/router event loop is alive and never calls CollectivIQ.
 - `/readyz` checks loaded config/models/secrets, optional Redis, and initialized capacity state.
 - Temporary CollectivIQ unavailability may be reported without necessarily making the instance unready.
@@ -35,8 +45,60 @@ acquired **before** `createThread` and released on every exit path; overflow/
 closed-admission returns `429` + `Retry-After: 5`. Graceful shutdown
 (`src/index.ts`) marks readiness false, calls `closeAdmission()`, allows
 `SHUTDOWN_DRAIN_MS`, then aborts the shared shutdown signal to cancel in-flight
-polling and release permits. Capacity is process-local (not cross-replica);
-Redis-backed idempotency remains unimplemented.
+polling and release permits. Capacity is process-local (not cross-replica).
+
+**Implementation status (Phase 4A, implemented — OPTIONAL, off by default).**
+Cross-replica idempotency for `POST /v1/chat/completions` lives in
+`src/idempotency/` and is enabled only by a non-blank `REDIS_URL`. Specification
+section 18.1 owns the normative contract — do not restate it here. Operationally:
+
+- **Optional and fail-closed.** Without `REDIS_URL` nothing changes for unkeyed
+  requests and Redis is never contacted; a supplied `Idempotency-Key` then
+  returns `503 idempotency_unavailable` + `Retry-After: 2`. The same `503`
+  applies while a configured Redis is disconnected, when the stored state is
+  ambiguous/corrupt/tampered, and when a request loses its claim.
+- **Four validated variables** (spec §24): `REDIS_URL` (canonical
+  `redis://`/`rediss://` only; secret-bearing), `IDEMPOTENCY_ENCRYPTION_KEY`
+  (required with Redis; 32 bytes canonical unpadded base64url; secret),
+  `IDEMPOTENCY_TTL_MS` (60000–3600000, default 600000), `REDIS_KEY_PREFIX`
+  (1–64 chars, `[A-Za-z0-9_-]+`). Errors stay value-free.
+- **Every replica must share** the same encryption key, namespace, Redis
+  endpoint, gateway-key set, AND model configuration. Mixed encryption keys
+  during a rolling deployment are unsupported; rotating the key means draining
+  traffic and waiting at least one maximum TTL. The storage key does not cover
+  the resolved model policy, so divergent `config/models.yaml` across replicas
+  would make answers produced under different policies interchangeable.
+- **Redis must not evict keys** (`maxmemory-policy noeviction`). An evicted
+  active record silently permits a duplicate upstream completion; an evicted
+  cached record silently re-runs a completed request. Neither is detectable by
+  the gateway, so it is a deployment requirement, not a runtime check.
+- **Lease policy is state dependent.** A `reserved` record uses a short 30 s
+  lease (losing it is safe — the owner-guarded transition reports `lost` and
+  aborts); a `processing` record uses a lease derived from the request's own
+  deadline, so a live owner's record cannot expire mid-completion. Do not
+  collapse them back into one constant.
+- **`IDEMPOTENCY_TTL_MS` must be ≥ the largest model `requestTimeoutMs`**,
+  enforced at startup when Redis is enabled.
+- **Claim before capacity, commit before emit.** The claim is created atomically
+  before capacity or upstream work; `reserved → processing` runs after capacity
+  and before `create_thread`; `processing → final` must commit before the
+  non-streamed response body and before any SSE content or terminal frame. The
+  SSE status line and assistant-role opener are committed earlier by design, so a
+  late failure on that path is a content-free SSE error record, not an HTTP
+  status. A failure at or after `processing` leaves `ambiguous`, which blocks
+  repeats for the TTL because `create_thread`/`process_message` still have no
+  proven idempotency. No POST retry was added.
+- **Lifecycle.** The client is created without connecting (construction stays
+  socket-free); the process root connects in the background without blocking
+  startup, and closes Redis LAST during shutdown — after draining — with a
+  bounded graceful close and a force-destroy fallback.
+- **Bounded client behaviour.** Mandatory content-free `error` listener, offline
+  command queue disabled, bounded connect/command deadlines, capped automatic
+  reconnect, explicit `isReady`-based availability, and no dynamic error text in
+  logs.
+- **Still process-local:** capacity, queueing, and rate limiting. Redis buys
+  cross-replica idempotency only. Distributed rate limiting and shared capacity
+  accounting remain outstanding Phase 4 work.
 
 - Acquire a global/per-key permit before creating an upstream thread.
 - Bound the queue and queue duration; reject overflow with documented OpenAI-shaped `429` and `Retry-After`.
@@ -94,6 +156,29 @@ remains authoritative; `/user/events` is not used.
 Local native execution binds to loopback. Local Docker may bind the process to all container interfaces only when compose publishes `127.0.0.1:8787:8787` on the host.
 
 Hosted deployments require the controls in specification section 31.2. Requests are stateless, so sticky sessions are unnecessary; Redis is required when idempotency and concurrency semantics must span replicas.
+
+**Redis in Compose (Phase 4A, implemented).** `compose.yaml` carries an OPT-IN
+`redis` profile using the pinned
+`redis:8.8.2-alpine`, published only on `127.0.0.1:6379`, with persistence
+disabled and no embedded password. The gateway deliberately has no `depends_on`
+on it, so it starts and serves `/healthz` whether or not Redis is running.
+
+`REDIS_URL` must resolve from wherever the GATEWAY PROCESS runs, so the two local
+setups differ and must not be mixed:
+
+- Redis only, gateway native (also the `npm run test:redis` setup) —
+  `docker compose --profile redis up -d redis`, then
+  `REDIS_URL=redis://127.0.0.1:6379`. Naming the service keeps the gateway
+  container out of it.
+- Both in Compose — `REDIS_URL=redis://redis:6379 docker compose --profile redis
+  up --build`. Inside the gateway container `127.0.0.1` is that container, not
+  the Redis service.
+
+This local profile does NOT meet production requirements: a hosted Redis additionally
+needs network isolation, ACL/authentication from a managed secret, TLS where the
+link is not private, the application-layer encryption key, and identical
+Redis/key/prefix/gateway-key configuration on every replica. Redis persistence
+and backups are not required for this ephemeral encrypted cache state.
 
 ## Operational Validation
 
