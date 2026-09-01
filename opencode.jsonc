@@ -45,13 +45,23 @@
         "collectiviq-fast": {
           "name": "CollectivIQ Fast",
         },
-        // EXPERIMENTAL emulated tool-calling model (opt-in; used only by the
-        // collectiviq-tools-experimental agent below, never the default). The
-        // gateway returns model-PROPOSED tool calls but never executes,
-        // authorizes, or simulates a tool; OpenCode still owns permissions and
-        // execution. Release gates (spec section 30) have not been run/met.
+        // Supported opt-in BETA emulated tool-calling model. The two committed
+        // tool-enabled agent entries below expose this model: the canonical
+        // collectiviq-tools-beta and its deprecated
+        // collectiviq-tools-experimental compatibility alias. Because the model
+        // is declared in this catalog it can also be selected directly (for
+        // example `--model collectiviq/collectiviq-claude-tools`), so those two
+        // agents are not its exclusive access path; what matters is that no
+        // committed default selects the model or either agent. It must remain
+        // non-default until a separate default-enablement decision is recorded
+        // in spec section 30 after the relevant Phase 4 controls. The gateway
+        // returns model-PROPOSED tool calls but never executes, authorizes, or
+        // simulates a tool; OpenCode still owns permissions and execution. All
+        // eight release gates in spec section 30 were measured live on
+        // 2026-09-01 and passed; beta does NOT mean production-ready,
+        // repeatable, or verified across accounts or versions.
         "collectiviq-claude-tools": {
-          "name": "CollectivIQ Claude (Tools, experimental)",
+          "name": "CollectivIQ Claude (Tools, beta)",
         },
       },
     },
@@ -66,8 +76,15 @@
   // (never executing getters/toJSON), never serialized into the CollectivIQ
   // prompt, never forwarded upstream, and never turned into a tool call — so
   // denying all permissions plus discarding the definitions keeps every request
-  // within the supported text-only surface. Actual tool calling stays disabled
-  // (Phase 3).
+  // within the supported text-only surface. Tool CALLING stays disabled for
+  // collectiviq-text and every other `toolMode: disabled` model — which is every
+  // model the committed default_agent, model, and small_model select. Emulated
+  // tool calling (Phase 3) is supported opt-in beta and activates only when the
+  // collectiviq-claude-tools model is explicitly chosen — normally by selecting
+  // one of the two tool-enabled agent entries below (the canonical
+  // collectiviq-tools-beta, or its behaviorally identical deprecated
+  // collectiviq-tools-experimental alias), which also supply the wildcard "ask"
+  // permission prompt that gates every proposed call.
   "agent": {
     "collectiviq-text": {
       "description": "Text-only CollectivIQ agent (Claude direct source; no tools; Phase 2 SSE).",
@@ -77,22 +94,41 @@
         "*": "deny",
       },
     },
-    // EXPERIMENTAL emulated tool-calling agent (opt-in; NOT the default). It uses
+    // Supported opt-in BETA emulated tool-calling agent (NOT the default). It uses
     // the collectiviq-claude-tools (toolMode: emulated) model, which asks
     // CollectivIQ to emit a strict tool-or-final JSON envelope that the gateway
     // parses into OpenAI tool_calls. The gateway NEVER executes, authorizes, or
     // simulates a tool — it only returns the model's proposed calls; OpenCode
     // performs the permission prompt (wildcard "ask" below) and the actual tool
-    // execution. Emulated tool mode is EXPERIMENTAL: the release gates in
-    // .agent/docs/tech-software-spec.md section 30 have NOT been run or met, so do
-    // not treat this agent as production-ready. In emulated mode the validated
-    // tool schemas, prior tool arguments, and prior tool results ARE serialized
-    // into the prompt sent to CollectivIQ (never logged or retained by the
-    // gateway); each tool-loop round creates a new upstream thread. The tested
+    // execution. Emulated tool mode graduated from experimental to supported
+    // opt-in beta after the completed 2026-09-01 live campaign in which all eight
+    // .agent/docs/tech-software-spec.md section-30 gates passed. Beta is NOT
+    // production-ready: one passing campaign is not repeatability, a cross-account
+    // guarantee, or a cross-version guarantee, and enabling tool mode by default
+    // stays a separate decision after the Phase 4 controls. In emulated mode the
+    // validated tool schemas, prior tool arguments, and prior tool results ARE
+    // serialized into the prompt sent to CollectivIQ (never logged or retained by
+    // the gateway); each tool-loop round creates a new upstream thread. The tested
     // account may still reject the protocol wrapper — do not change the default or
     // weaken parsing to work around that.
+    "collectiviq-tools-beta": {
+      "description": "Supported beta emulated tool calling (opt-in; proposed calls only; OpenCode owns permissions/execution).",
+      "mode": "primary",
+      "model": "collectiviq/collectiviq-claude-tools",
+      "permission": {
+        "*": "ask",
+      },
+    },
+    // DEPRECATED compatibility alias for collectiviq-tools-beta, kept so existing
+    // local workflows keep resolving. It is a fully functional second tool-enabled
+    // agent entry, not a disabled stub: its model, mode, and wildcard permission
+    // are IDENTICAL to collectiviq-tools-beta above, so it is the same behavior
+    // under the former name rather than a different or older tool surface. New
+    // usage must select collectiviq-tools-beta. This alias is retained through
+    // Phase 4; removing it requires a separately announced breaking configuration
+    // change.
     "collectiviq-tools-experimental": {
-      "description": "EXPERIMENTAL emulated tool calling (opt-in; proposed calls only; OpenCode owns permissions/execution).",
+      "description": "DEPRECATED alias for collectiviq-tools-beta (identical behavior; select collectiviq-tools-beta for new usage).",
       "mode": "primary",
       "model": "collectiviq/collectiviq-claude-tools",
       "permission": {

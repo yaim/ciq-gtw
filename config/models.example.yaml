@@ -6,12 +6,17 @@
 # any CollectivIQ account and carry no context-window or token-limit claims.
 #
 # Most examples set toolMode: disabled. The single exception,
-# collectiviq-claude-tools, sets toolMode: emulated to opt into EXPERIMENTAL
+# collectiviq-claude-tools, sets toolMode: emulated to opt into SUPPORTED BETA
 # emulated tool calling (see .agent/docs/tech-software-spec.md sections 12 and
-# 30). Emulated tool mode is experimental and NOT production-ready: its release
-# gates (spec section 30) have not been run or met, and it must never be the
-# foreground/default model. `toolMode: emulated` REQUIRES `promptMode: protocol`;
-# `toolMode: native` remains unavailable and is rejected at request time.
+# 30). All eight section-30 release gates were measured live on 2026-09-01 and
+# passed, which graduated the mode from experimental to supported opt-in beta.
+# Beta is NOT production-ready — one passing campaign is not repeatability, a
+# cross-account guarantee, or a cross-version guarantee — so no committed default
+# selects this model, and it must remain non-default until a separate
+# default-enablement decision is recorded in spec section 30 after the relevant
+# Phase 4 controls exist and have been reviewed. `toolMode: emulated` REQUIRES
+# `promptMode: protocol`; `toolMode: native` remains unavailable and is rejected
+# at request time.
 #
 # The gateway returns model-PROPOSED tool calls but never executes, authorizes,
 # or simulates a tool; OpenCode remains responsible for tool permissions and
@@ -97,13 +102,15 @@ models:
     maxPollIntervalMs: 5000
     maximumPromptBytes: 6291456
 
-  # EXPERIMENTAL emulated tool-calling model (opt-in; NOT a default). Claude-only
-  # source; protocol prompt mode is required for emulated tools. Release gates
-  # (spec section 30) have not been run or met; keep this out of foreground/
-  # default use. The gateway returns proposed tool calls only — it never executes
-  # a tool.
+  # Supported opt-in BETA emulated tool-calling model; no committed default selects
+  # it. Claude-only source; protocol prompt mode is required for emulated tools.
+  # All eight section-30 release gates passed in the completed 2026-09-01 live
+  # campaign, but beta is not production readiness, so keep this out of foreground/
+  # default use until a separate default-enablement decision is recorded in spec
+  # section 30 after the relevant Phase 4 controls.
+  # The gateway returns proposed tool calls only — it never executes a tool.
   collectiviq-claude-tools:
-    displayName: CollectivIQ Claude (Tools, experimental)
+    displayName: CollectivIQ Claude (Tools, beta)
     selectedLlms:
       - claude
     generateCombined: false
