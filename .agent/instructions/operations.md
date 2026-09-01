@@ -26,6 +26,9 @@ today: disabled Redis registers none (unchanged behaviour), a configured but
 disconnected/reconnecting client keeps `/readyz` at `503`, and readiness recovers
 automatically when the client connects. CollectivIQ is deliberately not a probe.
 The response bodies are unchanged (`{"status":"ready"}` / `{"status":"not_ready"}`).
+Since Phase 4B that stays ONE probe over the ONE shared Redis connection,
+covering idempotency, rate limiting, or both — enabling a second Redis-backed
+feature adds no second probe.
 
 - `/healthz` proves the process/router event loop is alive and never calls CollectivIQ.
 - `/readyz` checks loaded config/models/secrets, optional Redis, and initialized capacity state.
@@ -96,9 +99,59 @@ section 18.1 owns the normative contract — do not restate it here. Operational
   command queue disabled, bounded connect/command deadlines, capped automatic
   reconnect, explicit `isReady`-based availability, and no dynamic error text in
   logs.
-- **Still process-local:** capacity, queueing, and rate limiting. Redis buys
-  cross-replica idempotency only. Distributed rate limiting and shared capacity
-  accounting remain outstanding Phase 4 work.
+- **Still process-local:** capacity and queueing. Rate limiting is process-local
+  only while Phase 4B is disabled; when `RATE_LIMIT_ENABLED=true` the per-key
+  quota spans replicas (below). Shared cross-replica capacity accounting remains
+  outstanding Phase 4 work.
+
+**Implementation status (Phase 4B, implemented — OPTIONAL, off by default).**
+Cross-replica per-gateway-key rate limiting for `POST /v1/chat/completions` lives
+in `src/rate-limit/` over the shared substrate in `src/redis/`, and is enabled
+only by `RATE_LIMIT_ENABLED=true`. Specification section 19.1 owns the normative
+contract — do not restate it here. Operationally:
+
+- **Optional and fail-closed.** With the feature disabled no limiter is built, no
+  scope is derived, and no Redis rate-limit operation runs; the route behaves
+  exactly as it did before Phase 4B. When enabled, a disconnected Redis, a
+  command timeout, or corrupt stored state returns `503 rate_limit_unavailable` +
+  `Retry-After: 2` rather than admitting unmetered traffic. Enabling it therefore
+  trades availability for correctness on the completion path.
+- **Four validated variables** (spec §24): `RATE_LIMIT_ENABLED` (strict
+  `"true"`/`"false"`, default `false`; enabling it REQUIRES `REDIS_URL`, which
+  already requires `IDEMPOTENCY_ENCRYPTION_KEY` — no new secret),
+  `RATE_LIMIT_REQUESTS` (1–100000, default 60), `RATE_LIMIT_WINDOW_MS`
+  (1000–3600000, default 60000), `RATE_LIMIT_BURST` (1–10000 and ≤
+  `RATE_LIMIT_REQUESTS`, default 8). Present values are validated even while the
+  feature is disabled, so a deployment cannot carry a silently broken setting.
+  Errors stay value-free.
+- **Every replica must share** the same Redis endpoint, encryption key,
+  `REDIS_KEY_PREFIX`, gateway-key set, AND rate-limit settings. Divergent
+  settings mean the quota is not the single shared quota it appears to be.
+- **Redis's own clock decides.** The GCRA decision runs in one atomic Lua script
+  against Redis `TIME`, never a Node or process clock — a replica's clock drift
+  would otherwise corrupt a shared quota. Do not introduce a local clock, a local
+  counter, or a read-then-write here.
+- **`noeviction` applies here too.** An evicted quota key resets that key's
+  allowance to a full burst. The gateway cannot detect it, so it stays a
+  deployment requirement.
+- **Metering position.** The gate sits after all input validation and prompt
+  preparation and before the idempotency claim, capacity, any SSE header, and any
+  upstream call. Every otherwise-valid attempt spends exactly one unit —
+  including an idempotency owner, waiter, cached replay, and different-body
+  conflict — and quota is never refunded. Rejected requests spend nothing. Only
+  the completion route is metered; `/healthz`, `/readyz`, the model endpoints,
+  and the session-title extension are not.
+- **Public responses.** `429 gateway_rate_limit_exceeded` with a DYNAMIC
+  `Retry-After` computed by the limiter, or `503 rate_limit_unavailable` with a
+  fixed `Retry-After: 2`. Every other `429` (capacity, upstream quota) keeps the
+  long-standing fixed `Retry-After: 5`. A streamed request rejected at this gate
+  gets a normal JSON error, never an SSE error record. No success or
+  remaining-quota headers exist.
+- **One connection.** `src/redis/client.ts` is the ONLY module importing
+  node-redis, and `src/redis/runtime.ts` creates exactly one client per process
+  shared by idempotency and rate limiting. Readiness is one probe over that one
+  connection, and shutdown closes it last, exactly once. Do not add a second
+  client.
 
 - Acquire a global/per-key permit before creating an upstream thread.
 - Bound the queue and queue duration; reject overflow with documented OpenAI-shaped `429` and `Retry-After`.
@@ -157,11 +210,14 @@ Local native execution binds to loopback. Local Docker may bind the process to a
 
 Hosted deployments require the controls in specification section 31.2. Requests are stateless, so sticky sessions are unnecessary; Redis is required when idempotency and concurrency semantics must span replicas.
 
-**Redis in Compose (Phase 4A, implemented).** `compose.yaml` carries an OPT-IN
+**Redis in Compose (Phase 4A/4B, implemented).** `compose.yaml` carries an OPT-IN
 `redis` profile using the pinned
 `redis:8.8.2-alpine`, published only on `127.0.0.1:6379`, with persistence
 disabled and no embedded password. The gateway deliberately has no `depends_on`
-on it, so it starts and serves `/healthz` whether or not Redis is running.
+on it, so it starts and serves `/healthz` whether or not Redis is running. That
+ONE Redis backs BOTH optional features — idempotency (`:idem:` keys) and rate
+limiting (`:rate:` keys) — and the gateway opens exactly ONE connection for them,
+so the same profile serves either feature or both.
 
 `REDIS_URL` must resolve from wherever the GATEWAY PROCESS runs, so the two local
 setups differ and must not be mixed:
@@ -177,8 +233,9 @@ setups differ and must not be mixed:
 This local profile does NOT meet production requirements: a hosted Redis additionally
 needs network isolation, ACL/authentication from a managed secret, TLS where the
 link is not private, the application-layer encryption key, and identical
-Redis/key/prefix/gateway-key configuration on every replica. Redis persistence
-and backups are not required for this ephemeral encrypted cache state.
+Redis/key/prefix/gateway-key **and `RATE_LIMIT_*`** configuration on every
+replica. Redis persistence and backups are not required for this ephemeral
+encrypted cache state, nor for the self-expiring rate-limit timestamps.
 
 ## Operational Validation
 
@@ -187,6 +244,8 @@ Cover as relevant:
 - invalid startup config and secret-redacted failure output;
 - liveness/readiness success and dependency-degraded states;
 - capacity acquisition, queue timeout, overload response, and permit cleanup;
+- rate-limit admission, exhaustion (`429` + computed `Retry-After`), fail-closed
+  `503` on an unavailable Redis, and zero limiter activity while disabled;
 - client disconnect during create/submit/poll and during SSE;
 - total timeout and transient poll retries;
 - bounded/log-safe metrics and tracing;

@@ -16,7 +16,7 @@
 | `npm run test:contract` | Upstream contract | Vitest `test/contract` only (hermetic mock HTTP server, no network) |
 | `npm run test:compatibility` | SDK compatibility | Standalone hermetic suite (`test/compatibility`, own `vitest.compatibility.config.ts`); pinned `ai`/`@ai-sdk/openai-compatible` SDK vs an ephemeral loopback gateway with a **fake** completion — no network/credentials/CollectivIQ. **Excluded from `validate`/CI** |
 | `npm run test:adversarial` | Tool release gate | Standalone hermetic suite (`test/adversarial`, own `vitest.adversarial.config.ts`); ≥200 deterministic tool-protocol cases against the pure engine — no network/credentials/CollectivIQ. **Excluded from `validate`/CI** |
-| `npm run test:redis` | Redis idempotency gate | Standalone suite (`test/redis`, own `vitest.redis.config.ts`) requiring a REAL Redis at `REDIS_TEST_URL`. Synthetic credentials/content only, randomized key prefix per run, every key deleted. **Excluded from `validate`** (which stays hermetic and Redis-free) but run in CI as an **additional required gate** with the pinned `redis:8.8.2-alpine` service. Never point it at a production Redis. |
+| `npm run test:redis` | Redis gate (idempotency + rate limiting) | Standalone suite directory (`test/redis`, own `vitest.redis.config.ts`) requiring a REAL Redis at `REDIS_TEST_URL`. Now covers TWO suites: `idempotency-store.test.ts` (Phase 4A) and `rate-limit-store.test.ts` (Phase 4B). Synthetic credentials/content only, randomized key prefix per run, every key deleted. **Excluded from `validate`** (which stays hermetic and Redis-free) but run in CI as an **additional required gate** with the pinned `redis:8.8.2-alpine` service. Never point it at a production Redis. Both suites were run together under explicit approval in the implementing Phase 4B change and passed. |
 | `npm run eval:tools` | Live tool gate | Approval-gated LIVE evaluator (`src/eval/`). Default is a credential-free/network-free preflight; the fully-approved path probes the fixed CollectivIQ origin. Network-only; **must NEVER be added to `validate`/CI**. Five authorized campaigns have run. The operative evidence is the **completed 2026-09-01 report-v5 campaign** (the first completed campaign on the state-aware report-v5 / checkpoint-v4 evaluator): it finished the full corpus across two resumable execution segments with cleanup and checkpoint finalization succeeding, **all eight gates passed**, and overall **`passed: true`**, so the numerical section-30 criteria are **met** and Phase 3 graduated to supported opt-in beta while staying non-default and permission-gated. Any future live run is separately approval-gated. The 2026-08-31 report-v4 campaign is historical evidence. See specification section 30 for the complete record and all gate values. |
 | `npm run eval:tools:diagnose` | Live tool diagnostic | Approval-gated LIVE **multi-step transition diagnostic** (`src/eval/tools-diagnostic-cli.ts`). Default is a credential-free/network-free preflight; the fully-approved path runs ONLY the 20 multi-step scenarios (global corpus ordinals 201–220, max 80 upstream rounds) against the fixed CollectivIQ origin in password mode. It **establishes no release gate** — its output has no gates and no `passed` field, only `completed` — and it uses a SEPARATE diagnostic checkpoint so it can never touch the release evaluator's. Network-only; **must NEVER be added to `validate`/CI**. **ONE live run has completed**, under the historical v2 classifier (20/20 scenarios, 54/54 threads deleted, zero cleanup/journal failures, finalized checkpoint, no abort; 7 scenarios followed the old static schedule and 13 failed at round 2 with `expected-already-invoked`). It showed the static round-2 expectation was stale but did NOT prove those edits succeeded. The current **v3** diagnostic has NOT been run live; every live invocation is separately approval-gated. See specification section 30.1. |
 | `npm run test:coverage` | Coverage | Vitest with V8 coverage |
@@ -63,6 +63,40 @@ normative contract; do not restate them here. Operationally:
   expected-state guards. It stands in for the SERVER, never for the coordinator
   logic under test; real atomicity is proven only by `test/redis/`.
 
+**Redis rate-limiting evidence (Phase 4B, implemented — optional, off by
+default).** Specification section 29.7 owns the layered test inventory and
+section 19.1 the normative contract; do not restate them here. Operationally:
+
+- Hermetic coverage that must accompany any change in this area:
+  `test/unit/rate-limit-{gcra,keyring,redis-limiter}.test.ts`,
+  `test/unit/redis-client.test.ts`, the rate-limit blocks in
+  `test/unit/config.test.ts` and `test/unit/gateway-auth.test.ts`, and
+  `test/integration/chat-completions-rate-limit.test.ts` (JSON and SSE) over the
+  injected fake in `test/support/fake-rate-limiter.ts` — then
+  `npm run validate`, and `npm run test:redis` against a real Redis.
+- `test/support/fake-rate-limiter.ts` stands in for the REDIS SERVER, never for
+  the limiter logic under test: it forces each of the four closed decisions and
+  records which scopes were charged, in order, relative to the rest of the route.
+  Real atomicity, the Lua script, and Redis's own clock are proven only by
+  `test/redis/rate-limit-store.test.ts`.
+- `npm run test:redis` now runs BOTH `test/redis/` suites and keeps its existing
+  contract: excluded from `vitest.config.ts` and from `validate` (which stays
+  hermetic and Redis-free), a required CI gate in its own job with the pinned
+  `redis:8.8.2-alpine`, failing loudly rather than skipping when `REDIS_TEST_URL`
+  is unset, and never pointed at a production Redis.
+- **The rate-limit real-Redis suite HAS been run**, under explicit approval, in
+  the implementing Phase 4B change: the pinned `redis:8.8.2-alpine` Compose
+  profile was started, both `test/redis/` suites passed together (40 tests), the
+  randomized namespace was verified empty afterwards, and the container was
+  stopped. Starting Redis or Docker still requires approval every time.
+- The integration suite is where the ORDERING guarantees are asserted, because
+  they are route properties rather than limiter properties: quota is spent after
+  all validation and preparation and before the claim, capacity, any SSE header,
+  and any upstream call; owners, waiters, replays, and conflicts each spend one
+  unit; rejected requests spend none; quota is never refunded; a streamed
+  rejection stays a JSON error; and a disabled limiter performs zero operations.
+  Do not weaken those into limiter-level assertions.
+
 `validate` is hermetic. The upstream contract suite (`test/contract`) is now
 implemented and hermetic (a local mock HTTP server; no network, credentials, or
 CollectivIQ calls); it runs as part of `npm run test` and therefore inside
@@ -73,10 +107,11 @@ must **never** be added to `validate` or CI. `test:compatibility` is hermetic bu
 is likewise kept **out** of `validate`/CI and run only on its own. The
 **adversarial tool-protocol release-gate suite** `test:adversarial`
 (`vitest.adversarial.config.ts`) is now implemented and is likewise hermetic but
-kept **out** of `validate`/CI. The **Redis idempotency contract suite**
-`test:redis` (`vitest.redis.config.ts`) is the one suite that requires an
-external service; it must **never** be added to `validate`, but it IS a required
-CI gate in its own job with a pinned `redis:8.8.2-alpine` service. The
+kept **out** of `validate`/CI. The **Redis contract suites**
+`test:redis` (`vitest.redis.config.ts`; idempotency and, since Phase 4B, rate
+limiting) are the only suites that require an
+external service; they must **never** be added to `validate`, but they ARE a
+required CI gate in their own job with a pinned `redis:8.8.2-alpine` service. The
 network-only `eval:tools` live evaluator, the
 network-only `eval:tools:diagnose` live diagnostic, and the `contract:*`
 commands must **never** be added to `validate` or CI. Load,
@@ -560,6 +595,7 @@ Model the configured four active/twenty queued baseline and long upstream latenc
 | Tool parser/schema/candidate logic | Unit and adversarial corpus, determinism, required-choice failure, and release-gate regression run |
 | Auth, secrets, or logging | Positive/negative auth tests and assertions that secrets/content never appear |
 | Limits, capacity, or Redis | Boundary, queue/permit cleanup, conflict/TTL, and cross-request isolation tests |
+| Rate limiting | GCRA arithmetic, key-derivation separation, fail-closed corrupt/unavailable state, route ordering and quota accounting, plus the real-Redis suite |
 | Health, shutdown, or Docker | Lifecycle/integration test and safe-binding inspection |
 | Dependency update | Clean locked install, type/lint/test/build, compatibility suite, and security review proportional to change |
 | Documentation only | Link/path/terminology scan and direct comparison with owning spec sections |

@@ -2264,10 +2264,11 @@ be; that is the intended fail-closed trade. Record metadata (`s`, `f`, `o`, `e`)
 is not individually authenticated: an actor with Redis WRITE access can cause a
 targeted denial of service (a forced `409` or `503`) but cannot obtain another
 caller's answer, because the payload's associated data binds the record version,
-storage key, and body fingerprint. Waiters take no capacity permit and are not
-themselves rate limited, so a client retrying one slow key many times produces
-proportional bounded polling — distributed rate limiting remains outstanding
-Phase 4 work.
+storage key, and body fingerprint. Waiters take no capacity permit, so a client
+retrying one slow key many times produces proportional bounded polling. Since
+Phase 4B a waiter DOES consume one cross-replica rate-limit unit when that
+optional feature is enabled (section 19.1); with it disabled — the default — a
+waiter is not metered at all.
 
 **Transport note.** On the streamed path, response headers (HTTP `200`) and the
 assistant-role opener are committed before `run()`, so a `reserved → processing`
@@ -2312,6 +2313,223 @@ A semaphore must be acquired before creating a CollectivIQ thread.
 
 Queued requests must have a maximum queue duration.
 
+### 19.1 Cross-replica rate limiting (Phase 4B, implemented — optional, off by default)
+
+Redis-backed, cross-replica, per-gateway-key rate limiting for
+`POST /v1/chat/completions` is implemented in `src/rate-limit/` and is
+**optional**. With `RATE_LIMIT_ENABLED=false` (the default) no limiter is built,
+no scope is derived, and not a single Redis rate-limit operation occurs: the
+route behaves exactly as it did before Phase 4B. The capacity semaphore above
+stays **process-local** and is unchanged; only the quota spans replicas.
+
+The two concerns are deliberately distinct. Capacity answers "is this replica
+busy right now"; the rate limit answers "has this API key consumed its
+configured share", independently of how busy any replica is. They have separate
+identities, separate errors, and separate exhaustion behaviour.
+
+**Configuration.** Four validated environment variables (section 24). Present
+values are validated even while the feature is disabled, so a deployment cannot
+carry a silently broken setting that only fails the day it is switched on.
+Enabling the feature **requires** a valid `REDIS_URL`, which by the existing
+Phase 4A rule requires `IDEMPOTENCY_ENCRYPTION_KEY`; a shared quota cannot be
+enforced from process-local state, so enabling it without an endpoint is a
+value-free `ConfigError` rather than a silent downgrade to no limiting.
+
+**GCRA.** The generic cell rate algorithm is used instead of a fixed window
+because its entire state is one integer — the theoretical arrival time (TAT) of
+the next conforming request — which makes the decision a single atomic
+compare-and-set and keeps the stored value free of any counter history:
+
+```text
+intervalUs  = ceil(RATE_LIMIT_WINDOW_MS * 1000 / RATE_LIMIT_REQUESTS)
+toleranceUs = (RATE_LIMIT_BURST - 1) * intervalUs
+tat         = max(storedTat, now)            // an absent record means `now`
+allowed    <=> now >= tat - toleranceUs
+newTat      = tat + intervalUs               // written on allow only
+delayUs     = tat - toleranceUs - now        // returned on reject only
+```
+
+The parameters are derived once from validated configuration. The interval is
+additionally floored at 1 µs and the tolerance at 0 as fail-closed backstops;
+within the configured bounds neither clamp ever changes a value (the smallest
+reachable interval is 10 µs, and `RATE_LIMIT_BURST = 1` yields a tolerance of
+exactly 0 — no immediate burst). With the defaults — 60 requests / 60 000 ms /
+burst 8 — the interval is 1 000 000 µs, so a cold scope admits 8 requests
+immediately and then one per second.
+
+Exactly ONE atomic Lua script runs per request. There is no read-then-write
+anywhere: the script reads the clock, reads the stored TAT, decides, and writes
+only when it admits the request. Two replicas racing the same scope are
+serialized by Redis, not by any local lock or counter.
+
+**Time comes from Redis `TIME`, never a Node or process clock.** Replica clocks
+drift and can jump; a process clock would make the shared quota inconsistent
+between gateways and would let a skewed replica admit a burst another replica had
+already spent. Redis is the single source of time exactly as it is the single
+source of state.
+
+On allow the new TAT is stored with `PX = max(1, ceil((newTat - now) / 1000))`
+milliseconds — long enough for the bucket to replenish fully, so an expired key
+is indistinguishable from a fully replenished one. On reject nothing is written
+and the script returns `delayUs`; the caller converts it with `ceil` to whole
+seconds, clamped to `[1, 3600]`. A non-finite or non-positive delay is treated as
+the minimum rather than trusted, so a corrupt reply can never produce a
+nonsensical header.
+
+**Key derivation and privacy.** The rate-limit HMAC subkey is derived from the
+same configured 32-byte master key (`IDEMPOTENCY_ENCRYPTION_KEY`) but expanded
+under a DISTINCT HKDF-SHA-256 salt and `info` label, with its own domain tags
+mixed into each HMAC input. It is therefore cryptographically independent of
+every idempotency subkey, and a gateway key's rate-limit scope is a different
+value from its idempotency scope. No code is shared with
+`src/idempotency/keyring.ts` — the small length-framing helper is deliberately
+duplicated — so a change here can never re-key already-stored idempotency
+records. Derivation is deterministic, so every replica configured with the same
+master key computes the same scope for the same gateway key (which is what makes
+one quota span replicas) and it is independent of `COLLECTIVIQ_GATEWAY_KEYS`
+ORDER, unlike the process-local capacity identity `k<index>` (section 9.1). The
+scope is computed ONCE per configured key at authenticator construction, so the
+raw key is never re-read per request. Gateway authentication now exposes three
+opaque identities — `keyId`, the idempotency `scopeId`, and the rate-limit scope
+— and none is ever logged, reflected, or returned.
+
+The Redis key is `<REDIS_KEY_PREFIX>:rate:<HMAC digest>`: a readable operational
+prefix, the fixed `rate` category that keeps quota keys from ever colliding with
+the `idem` keyspace, and a keyed digest. Redis therefore never holds a raw
+gateway key, the process-local `k<index>`, an authorization value, a prompt, a
+request body, a model id, a thread id, or completion content.
+
+**Stored state and its validation.** The value is ONLY a bounded decimal integer
+of microseconds — no counter history, no identity, no content. Its size is
+checked with `STRLEN` **before** the script's internal `GET`, so an oversized or
+hostile value is classified corrupt without its bytes ever being read; there is
+no direct Node/client `GET` at all. A value that is missing-but-present (empty
+yet existing), non-integer, negative, oversized, or otherwise unparseable fails
+**CLOSED** as unavailable. The script never resets the value, never repairs it,
+and never silently admits the request.
+
+Limiter operations are abort-aware and TOTAL: they return a closed
+`allowed | limited | unavailable | cancelled` decision rather than throwing, so
+the caller can always fail closed without inspecting a thrown value.
+
+**Admission order.** For `POST /v1/chat/completions`, on both transports:
+
+```text
+gateway authentication (the /v1 onRequest hook)
+  -> request validation, model resolution, tool normalization
+  -> Idempotency-Key validation and canonical body fingerprinting (when supplied)
+  -> keyed request whose idempotency cannot be honoured -> 503 idempotency_unavailable
+  -> prompt preparation
+  -> cross-replica rate limit                          -> 429 / 503
+  -> idempotency claim, wait, or replay                -> 409 / 503 / cached result
+  -> process-local capacity                            -> 429 gateway_capacity_exceeded
+  -> upstream work
+```
+
+The idempotency header and fingerprint steps precede prompt preparation because
+that is the pre-existing Phase 4A order (section 18.1), deliberately preserved so
+no Phase 4A behaviour changed. What Phase 4B requires is that the rate-limit gate
+sits after ALL input validation and preparation and before the claim, capacity,
+any SSE header, and any upstream call.
+
+**What consumes quota.** Exactly one unit per otherwise-valid attempt, and quota
+is NEVER refunded — a later capacity rejection or completion failure keeps its
+already-spent unit.
+
+| Attempt | Consumes |
+| --- | :--- |
+| A normal completion | one unit |
+| An idempotency owner, a waiter, a cached replay, and a different-body `409` conflict | one unit EACH |
+| Invalid authentication, an invalid request, or a preparation failure | nothing |
+| An invalid `Idempotency-Key`, an unfingerprintable body, or a keyed request whose idempotency is unavailable | nothing |
+| A request the limiter itself rejects | nothing (the stored TAT is not mutated) |
+
+A limited request creates no idempotency claim, takes no capacity permit, commits
+no SSE header, registers no native-title correlation (section 9.5), and makes no
+upstream call. A **streamed** request rejected at this gate therefore receives an
+ordinary JSON `429`/`503`, never an SSE error record. Only
+`POST /v1/chat/completions` is metered: `/healthz`, `/readyz`,
+`GET /v1/models`, `GET /v1/models/:model`, and `GET /v1/opencode/session-title`
+are NOT rate limited, because model metadata and the session-title extension are
+cheap, non-generative reads that must stay available while a key's completion
+quota is exhausted.
+
+**Public errors** (section 20). Both bodies are fixed and content-free: neither
+reveals the configured limit, the remaining quota, the scope, or the key.
+
+| Condition | HTTP | Type | Code | `param` | `Retry-After` |
+| --- | ---: | --- | --- | --- | --- |
+| Quota exhausted for the presented key | 429 | `rate_limit_error` | `gateway_rate_limit_exceeded` | `null` | DYNAMIC positive integer computed by the limiter |
+| The decision could not be made | 503 | `server_error` | `rate_limit_unavailable` | `null` | fixed `2` |
+
+The `429` message is
+`The gateway rate limit for this API key has been exceeded.`; the `503` message
+is `Gateway rate limiting is currently unavailable.` The route's `Retry-After`
+handling was refactored so an envelope carrying its OWN value wins and every
+other `429` keeps the long-standing fixed `Retry-After: 5` — so gateway capacity
+and upstream quota `429`s are unchanged. No success or remaining-quota headers
+were added in this phase.
+
+**Fail-closed dependency behaviour.** A disconnected Redis, a command timeout, a
+corrupt stored value, an unusable reply, a limiter wired without a derived scope,
+and `RATE_LIMIT_ENABLED=true` with no limiter composed at all each produce
+`503 rate_limit_unavailable`. Validated CONFIGURATION — not the presence of an
+injected limiter — decides whether the gate runs, so an enabled-but-unwired
+instance fails closed instead of silently serving unmetered traffic; only the
+consistent disabled state (`RATE_LIMIT_ENABLED=false` and no limiter) skips the
+gate entirely. The gateway never admits unmetered traffic when the limiter is
+enabled but cannot decide. While the
+decision is awaited, a client disconnect produces no response body and a shutdown
+keeps the existing `503 service_unavailable`, matching every other cancellation
+on this route.
+
+**Shared connection.** Phase 4B introduces `src/redis/`, the shared internal
+Redis substrate. `client.ts` is the ONLY module in the repository that imports
+node-redis; it owns the client, the mandatory content-free `error` listener, the
+disabled offline queue, the bounded connect/command deadlines, the capped
+reconnect strategy, synchronous `isReady`, connect/close (bounded graceful close
+with a force-destroy fallback), and a generic `evalScript` with an
+`EVALSHA` → `EVAL` `NOSCRIPT` fallback that is TOTAL (every failure returns
+`null`; it never throws). The four connection bounds moved from
+`src/idempotency/limits.ts` to `src/redis/limits.ts` with their VALUES
+unchanged. `src/redis/runtime.ts` is the Redis composition root: it creates
+EXACTLY ONE client per process and composes every enabled Redis-backed service
+over it, or returns nothing when `REDIS_URL` is blank/absent. It is deliberately
+not re-exported from the substrate barrel, so the dependency direction stays
+one-way (features → substrate).
+
+`src/idempotency/redis-store.ts` now builds its store over that substrate instead
+of owning a connection. Its five Lua scripts, every derivation constant, the
+record and payload formats, and all reply semantics are BYTE-FOR-BYTE unchanged,
+so existing Redis keys and records remain readable and no Phase 4A behaviour
+changed. A second client would double the socket budget, split readiness, and
+make "Redis is up" mean two different things.
+
+**Readiness and shutdown** keep their section 28.2 and 31.3 semantics, now over
+one shared connection and ONE probe covering every enabled Redis-backed feature.
+A configured but disconnected or reconnecting Redis keeps `/readyz` at `503`
+while `/healthz` stays `200`; recovery restores readiness without a restart;
+shutdown stops admission, drains, and then closes the one Redis connection last,
+exactly once. CollectivIQ readiness semantics are unchanged (still not a probe).
+
+**Residual limits.**
+
+- Enforcement is bounded to the configured window: the algorithm smooths a rate,
+  it does not cap total spend over a longer horizon.
+- Capacity, queueing, and queue-wait remain **process-local**. Shared
+  cross-replica capacity accounting is still outstanding Phase 4 work.
+- Every replica must share the same Redis endpoint, encryption key,
+  `REDIS_KEY_PREFIX`, gateway-key set, AND rate-limit settings. Divergent
+  settings mean the quota is not the single shared quota it appears to be.
+- A Redis outage fails closed, so enabling this feature deliberately trades
+  availability for correctness on the completion path. That is the intended
+  trade: unmetered traffic during an outage would defeat the control.
+- The `maxmemory-policy noeviction` requirement of section 18.1 applies here too.
+  An evicted quota key resets that key's allowance to a full burst; the gateway
+  cannot detect this, so it remains a deployment requirement.
+- No dependency was added: `redis` was already a pinned direct dependency, and
+  the lockfile is unchanged.
+
 ---
 
 ## 20. Error Mapping
@@ -2327,6 +2545,8 @@ Queued requests must have a maximum queue duration.
 | Unsupported content         |  400 | `invalid_request_error`   | `unsupported_content_type`       |
 | Prompt too large            |  400 | `invalid_request_error`   | `context_length_exceeded`        |
 | Gateway capacity            |  429 | `rate_limit_error`        | `gateway_capacity_exceeded`      |
+| Gateway rate limit          |  429 | `rate_limit_error`        | `gateway_rate_limit_exceeded`    |
+| Rate limiting unavailable   |  503 | `server_error`            | `rate_limit_unavailable`         |
 | CollectivIQ quota           |  429 | `rate_limit_error`        | `upstream_quota_exceeded`        |
 | CollectivIQ authentication  |  502 | `upstream_error`          | `upstream_authentication_failed` |
 | Malformed upstream response |  502 | `upstream_protocol_error` | `invalid_upstream_response`      |
@@ -2396,6 +2616,17 @@ rejection is never reinterpreted as a timeout or transport error; a poll or answ
 arriving at/after the deadline (with no cancellation) becomes `504
 completion_timeout`. No raw upstream body, exception detail, credential, prompt,
 answer, or identifier appears in any envelope.
+
+**Implementation status (Phase 4B, implemented — optional, off by default).** The
+two rate-limiting rows above are reachable only when `RATE_LIMIT_ENABLED=true`.
+`gateway_rate_limit_exceeded` reports the CROSS-REPLICA per-gateway-key quota and
+is distinct from the process-local `gateway_capacity_exceeded`; its `Retry-After`
+is computed per response by the limiter rather than fixed.
+`rate_limit_unavailable` is the fail-closed outcome when the decision cannot be
+made, always with `Retry-After: 2`. The route's `Retry-After` handling now lets an
+envelope's OWN value win, so both idempotency's fixed `2` and the limiter's
+computed delay are emitted verbatim while every other `429` keeps the
+long-standing fixed `Retry-After: 5`. Section 19.1 owns the normative contract.
 
 ---
 
@@ -2597,6 +2828,17 @@ remains process-local. Redis cache persistence and backups are not required for
 this ephemeral state — losing it costs at most in-flight replay protection — and
 the supplied Compose profile disables RDB and AOF for that reason.
 
+**Implementation status (Phase 4B, implemented — optional).** When cross-replica
+rate limiting is enabled (section 19.1), Redis additionally holds ONE bounded
+decimal integer timestamp per gateway-key scope under a separate `:rate:` key
+category. That value is a theoretical arrival time in microseconds and nothing
+else: no content, no credential, no identity, no counter history, and no
+client-supplied value — the key itself is an HMAC. Each quota key expires on its
+own replenishment deadline, so the state is self-clearing. This does not change
+the no-content-retention posture, does not require persistence or backups, and
+the "concurrency counters are NOT stored" statement above still holds: capacity
+remains process-local.
+
 ### 22.3 CollectivIQ-side retention
 
 The gateway cannot control CollectivIQ’s thread retention based on the supplied endpoints.
@@ -2783,6 +3025,25 @@ a validated value so the configuration shape is stable either way.
 All four produce value-free `ConfigError` issues (a stable field/reason pair; the
 submitted URL, key, or prefix is never echoed). Every replica must be configured
 with the SAME encryption key, namespace, Redis endpoint, and gateway-key set.
+
+**Implementation status (Phase 4B, implemented).** The optional Redis-backed
+cross-replica rate limiter (section 19.1) adds four more validated environment
+variables. The feature is OFF by default; a PRESENT value is validated even while
+it is disabled, so a deployment cannot carry a silently broken setting that only
+fails the day it is switched on. The bounds live in `RATE_LIMIT_LIMITS` in
+`src/config/schema.ts`.
+
+| Variable | Default | Rule |
+| --- | --- | :--- |
+| `RATE_LIMIT_ENABLED` | `false` | Strictly `"true"` or `"false"` (the same parser as `LOG_CONTENT`). Enabling it **requires** a valid `REDIS_URL`, which in turn already requires `IDEMPOTENCY_ENCRYPTION_KEY`. No new secret is introduced. |
+| `RATE_LIMIT_REQUESTS` | 60 | Integer, 1–100000. Sustained requests admitted per window, per gateway key. |
+| `RATE_LIMIT_WINDOW_MS` | 60000 | Integer, 1000–3600000. The window the sustained rate is expressed over. |
+| `RATE_LIMIT_BURST` | 8 | Integer, 1–10000, and must **not exceed** `RATE_LIMIT_REQUESTS`. Requests admitted immediately from an idle key. |
+
+All four produce value-free `ConfigError` issues. Every replica must be
+configured with the SAME Redis endpoint, encryption key, `REDIS_KEY_PREFIX`,
+gateway-key set, AND rate-limit settings, or the quota is not the single shared
+quota it appears to be.
 
 Gateway client keys (`COLLECTIVIQ_GATEWAY_KEYS`) are bounded by conservative,
 non-overridable initial limits: at most **64** configured keys, and at most
@@ -3256,6 +3517,14 @@ readiness becomes healthy once the connection is established. The response bodie
 remain the existing fixed `{"status":"ready"}` / `{"status":"not_ready"}`; the
 `checks` object above is still illustrative, not implemented.
 
+**Implementation status (Phase 4B, implemented).** The semantics above are
+unchanged. Because the Redis composition root creates exactly ONE client for the
+process (section 19.1), readiness stays ONE probe over ONE shared connection
+covering every enabled Redis-backed feature — idempotency, rate limiting, or
+both. "Redis is ready" therefore means the same thing regardless of which
+features are enabled, and enabling rate limiting adds no second probe, no second
+connection, and no additional readiness state.
+
 ---
 
 ## 29. Testing Strategy
@@ -3417,6 +3686,63 @@ none of the synthetic prompt, answer, tool-argument, gateway-key, or
 idempotency-key sentinels. It is excluded from ordinary Vitest discovery and from
 `npm run validate` (which stays hermetic and Redis-free) and runs in CI as an
 additional required gate with the pinned `redis:8.8.2-alpine` service.
+
+### 29.7 Redis rate-limiting tests (Phase 4B, implemented)
+
+Cross-replica rate limiting (section 19.1) is covered at the same three layers.
+The first two are hermetic and run inside `npm run validate`; the third requires a
+real Redis and joins the SEPARATE `npm run test:redis` gate, which now covers two
+suites.
+
+**Unit** (`test/unit/rate-limit-gcra.test.ts`, `-keyring`, `-redis-limiter`,
+`test/unit/redis-client.test.ts`, plus additions to `config.test.ts` and
+`gateway-auth.test.ts`): the derived GCRA parameters and the bounded, clamped
+`Retry-After` conversion, including a non-finite or non-positive delay; scope and
+storage-key derivation that is deterministic, independent of configured key
+ORDER, distinct from the idempotency scope for the same gateway key, and
+length-framed so no two component tuples collide; the limiter's mapping of every
+script reply and of a `null` substrate reply onto the closed decision union,
+abort awareness, and the absence of any direct client `GET`; the shared client's
+mandatory content-free `error` listener, disabled offline queue, bounded
+command/connect deadlines, capped reconnect, `EVALSHA` → `EVAL` `NOSCRIPT`
+fallback, total non-throwing `evalScript`, and bounded close with force-destroy;
+the four new configuration variables including strict boolean parsing, each
+range, the `RATE_LIMIT_BURST ≤ RATE_LIMIT_REQUESTS` cross-field rule, validation
+of present values while the feature is disabled, and the `REDIS_URL` requirement
+when it is enabled; and the third opaque authentication identity, which is `null`
+when rate limiting is off and never equal to the idempotency scope when it is on.
+
+**Integration with an injected fake limiter**
+(`test/integration/chat-completions-rate-limit.test.ts` over
+`test/support/fake-rate-limiter.ts`), covering both JSON and SSE: a disabled
+limiter performs zero limiter and zero Redis operations; a `limited` decision
+returns `429 gateway_rate_limit_exceeded` with the limiter's own `Retry-After`
+while capacity, upstream work, the idempotency claim, any SSE header, and
+native-title correlation are all untouched; an `unavailable` decision returns
+`503 rate_limit_unavailable` + `Retry-After: 2`; a cancellation sends no body on
+client disconnect and keeps `503 service_unavailable` on shutdown; a streamed
+request rejected at the gate receives a JSON error, never an SSE error record;
+idempotency owners, waiters, cached replays, and different-body conflicts each
+consume exactly one unit while invalid authentication, invalid requests,
+preparation failures, and invalid/unfingerprintable idempotency inputs consume
+none; quota is not refunded by a later capacity rejection; separate gateway keys
+do not share a scope; and the other `/v1` routes are never metered.
+
+**Real Redis** (`npm run test:redis`, `test/redis/rate-limit-store.test.ts`,
+`vitest.redis.config.ts`): runs against `REDIS_TEST_URL` with synthetic values
+only, a randomized key prefix per run, and full key cleanup. It covers the atomic
+Lua decision under concurrency, burst then steady-state admission against Redis's
+own clock, the replenishment TTL, `EVALSHA` → `EVAL` recovery after
+`SCRIPT FLUSH`, two independent limiter instances sharing one Redis enforcing one
+quota, and every corrupt-state class (empty-but-present, non-integer, negative,
+oversized) failing closed without the value being reset or the request admitted.
+This suite is approval-gated. It **was run under explicit approval** in the
+implementing change: both `test/redis/` suites executed together against a
+disposable pinned `redis:8.8.2-alpine` and passed (40 tests), the randomized
+namespace was verified empty afterwards, and the container was removed. That is a
+standing result rather than a rerun, and it authorizes no future Docker or Redis
+command — each run needs fresh approval. `npm run validate` stays hermetic and
+Redis-free.
 
 ---
 
@@ -4617,10 +4943,21 @@ application-layer `IDEMPOTENCY_ENCRYPTION_KEY`, a hosted Redis must have:
   requires draining traffic and waiting at least one maximum
   `IDEMPOTENCY_TTL_MS`.
 
-Persistence and backups are not required for this state (section 22.2). Redis
-gives cross-replica **idempotency** only; concurrency accounting remains
-process-local, so distributed rate limiting and shared capacity are still
-outstanding Phase 4 work.
+Persistence and backups are not required for this state (section 22.2).
+
+**Redis requirements when rate limiting is enabled (Phase 4B).** The same
+controls apply, plus: `RATE_LIMIT_ENABLED=true` requires `REDIS_URL` (and
+therefore the encryption key, from which a separate rate-limit subkey is
+derived), and every replica must additionally share IDENTICAL `RATE_LIMIT_*`
+settings. `noeviction` matters here too — an evicted quota key resets that key's
+allowance to a full burst. A Redis outage fails the completion path closed with
+`503 rate_limit_unavailable`, so enabling this feature trades availability for
+correctness; size and monitor the endpoint accordingly. One Redis backs both
+features and the gateway opens ONE connection for them (section 19.1).
+
+Redis now gives cross-replica **idempotency** (Phase 4A) and cross-replica
+**rate limiting** (Phase 4B). Concurrency accounting remains process-local, so
+shared capacity is still outstanding Phase 4 work.
 
 ### 31.3 Graceful shutdown
 
@@ -4648,6 +4985,12 @@ graceful close with a force-destroy fallback, so shutdown can never hang on a
 half-open socket. Default `buildServer`, the test suites, and the compiled-import
 smoke test remain socket-free: the Redis client is created without connecting and
 only the process composition root calls `connect()`.
+
+**Implementation status (Phase 4B, implemented).** The sequence is unchanged.
+Because the Redis composition root owns exactly one client, the shutdown closes
+ONE connection, last and exactly once, whichever Redis-backed features are
+enabled. `buildServer` still builds only the pure, socket-free scope derivers and
+never creates a client.
 
 ---
 
@@ -5115,12 +5458,27 @@ hermetic (`test/unit/idempotency-*.test.ts`, `test/unit/readiness.test.ts`,
 contract suite (`npm run test:redis`, `test/redis/`) run against the pinned
 `redis:8.8.2-alpine`. No live CollectivIQ call was made or required.
 
+**Phase 4B — per-key rate limiting: implemented (optional, off by default).** The
+second Phase 4 deliverable is complete and documented in sections 19.1, 20, 22.2,
+24, 28.2, 29.7, 31.2, and 31.3. It is OPTIONAL: with `RATE_LIMIT_ENABLED=false`
+the gateway performs no limiter or Redis rate-limit operation at all. Evidence is
+hermetic (`test/unit/rate-limit-*.test.ts`, `test/unit/redis-client.test.ts`,
+`test/unit/redis-runtime.test.ts`,
+`test/integration/chat-completions-rate-limit.test.ts`) plus a real-Redis
+contract suite (`test/redis/rate-limit-store.test.ts`) that joins
+`npm run test:redis` and **was run under explicit approval in the implementing
+change** against the pinned `redis:8.8.2-alpine` Compose profile: both
+`test/redis/` suites passed together (40 tests), the randomized key namespace was
+left empty, and the container was stopped afterwards. No live CollectivIQ call
+was made or required, and no dependency or lockfile entry changed. Capacity
+remains PROCESS-LOCAL.
+
 **Explicitly still outstanding in Phase 4:**
 
-* distributed (cross-replica) rate limiting;
 * shared cross-replica capacity accounting — capacity stays PROCESS-LOCAL;
 * metrics and tracing;
-* load testing and a security review of the idempotency layer;
+* load testing and a security review of the idempotency and rate-limiting layers;
+* dependency scanning;
 * backup and release procedures, and runbooks.
 
 Native tool mode (section 13) and true upstream streaming (section 14.5) remain

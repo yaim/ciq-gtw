@@ -8,7 +8,7 @@ Read `.agent/docs/tech-software-spec.md` sections 19, 21–23, 24, 31, 33, and 3
 
 These controls exist today and must be preserved:
 
-- **Gateway client authentication** — `src/api/gateway-auth.ts` authenticates every `/v1/*` route (`src/api/v1-routes.ts` route group) via `Authorization: Bearer <gateway-key>` against `COLLECTIVIQ_GATEWAY_KEYS`; `/healthz` and `/readyz` stay unauthenticated. The scheme is case-insensitive, the token is compared **exactly** (no trim/normalize), and comparison is fixed-length: configured keys become SHA-256 digests once, the presented token is hashed once, and each digest is checked with `node:crypto` `timingSafeEqual` **without** an early return on a match. Bounds (`GATEWAY_KEY_LIMITS` in `src/config/schema.ts`): ≤64 keys, ≤8192 UTF-8 bytes/key, with the same byte cap bounding a presented token before hashing. Missing/malformed/empty/oversized/incorrect credentials all return one fixed OpenAI `401`; authentication is mandatory (no disable switch); the gateway key is never forwarded upstream, logged, or reflected. On a successful match the route records only an **opaque** per-configured-key identity (`k<index>` — never the raw key or its digest), used solely for process-local per-key capacity. Public errors come only from the shared bounded OpenAI envelopes in `src/openai/errors.ts` (the full Phase 1B set: `400`/`401`/`404`/`413`/`429`/`500`/`502`/`503`/`504`); the fixed `500` and the completion route's fail-closed boundary (below) never inspect, serialize, log, or reflect the thrown value. Keep this separate from the upstream credential provider (`auth.ts`).
+- **Gateway client authentication** — `src/api/gateway-auth.ts` authenticates every `/v1/*` route (`src/api/v1-routes.ts` route group) via `Authorization: Bearer <gateway-key>` against `COLLECTIVIQ_GATEWAY_KEYS`; `/healthz` and `/readyz` stay unauthenticated. The scheme is case-insensitive, the token is compared **exactly** (no trim/normalize), and comparison is fixed-length: configured keys become SHA-256 digests once, the presented token is hashed once, and each digest is checked with `node:crypto` `timingSafeEqual` **without** an early return on a match. Bounds (`GATEWAY_KEY_LIMITS` in `src/config/schema.ts`): ≤64 keys, ≤8192 UTF-8 bytes/key, with the same byte cap bounding a presented token before hashing. Missing/malformed/empty/oversized/incorrect credentials all return one fixed OpenAI `401`; authentication is mandatory (no disable switch); the gateway key is never forwarded upstream, logged, or reflected. On a successful match the route records only **opaque** per-configured-key identities — never the raw key or its digest: `k<index>` for process-local per-key capacity, plus (when the corresponding optional feature is configured) the cross-replica idempotency scope and, since Phase 4B, a THIRD identity, the cross-replica rate-limit scope. All three are precomputed once at authenticator construction so the raw key is never re-read per request; the two cross-replica scopes are derived under separate HKDF domains, so a key's rate-limit scope is a different value from its idempotency scope; each is `null` when its feature is disabled; and none is ever logged, reflected, or returned. Public errors come only from the shared bounded OpenAI envelopes in `src/openai/errors.ts` (the full Phase 1B set: `400`/`401`/`404`/`413`/`429`/`500`/`502`/`503`/`504`); the fixed `500` and the completion route's fail-closed boundary (below) never inspect, serialize, log, or reflect the thrown value. Keep this separate from the upstream credential provider (`auth.ts`).
 - **Bounded model configuration** — `MODEL_CONFIG_LIMITS` in `src/config/schema.ts` (spec section 24.1): file byte cap (checked before and after read), regular-file requirement, strict UTF-8 decode, YAML alias/duplicate-key rejection, and bounds on model/source counts, string lengths, timeouts, polling, and prompt bytes. Blank/whitespace-padded ids and sources are rejected.
 - **Value-free diagnostics** — configuration errors are stable allowlisted field/reason pairs (no ids, unknown field names, submitted values, file contents, library text, or paths); an unexpected startup failure prints only `gateway failed to start (internal error)`.
 - **Recursive bounded log sanitization** — `src/shared/redaction.ts` (`sanitizeLogValue`) plus the logger's `formatters` and `logMethod` hook sanitize every record, child binding, and Error argument, with Pino redact paths as additional defense. Never bypass the logger with a second Pino configuration; never emit `Error.message`/stack/cause.
@@ -61,6 +61,7 @@ Preserve configurable bounds for:
 - tool count, total schema size, argument size, and calls per response;
 - upstream response size;
 - global/per-key active requests, queue length, and queue duration;
+- the optional cross-replica per-gateway-key quota (`RATE_LIMIT_*`) and its bounded stored state and `Retry-After`;
 - connect/operation/total deadlines;
 - polling intervals and retry count implied by the total deadline.
 
@@ -70,13 +71,15 @@ Acquire capacity before upstream thread creation. Return the documented `429` pl
 
 - Default mode retains no content after request completion.
 - Keep only transient in-memory values needed for the active request and release references promptly.
-- Redis is optional and initially limited to short-lived idempotency/status/final-response state and counters.
+- Redis is optional and limited to short-lived idempotency/status/final-response state plus, when Phase 4B is enabled, one bounded per-scope rate-limit timestamp. It holds no concurrency counters: capacity is process-local.
 - Do not persist prompt content by default. Cached final responses require an explicit TTL, encryption-at-rest expectations, access controls, and documentation.
 - Same idempotency key with a different body returns `409`; do not use a permanent prompt hash as an implicit key across trust boundaries.
 - CollectivIQ-side retention/training/deletion/regional behavior is unknown until verified; do not promise zero retention end to end.
 
 **Implementation status (Phase 4A, implemented — OPTIONAL, off by default).**
-`src/idempotency/` is the only code that writes to Redis. Specification section
+`src/idempotency/` owns every idempotency record written to Redis (since Phase 4B
+it is one of exactly two features permitted to store state there, and it writes
+nothing outside its own `:idem:` keyspace). Specification section
 18.1 owns the normative contract; the security-relevant guarantees are:
 
 - **Off unless configured.** A blank/absent `REDIS_URL` disables Redis entirely
@@ -125,6 +128,54 @@ Acquire capacity before upstream thread creation. Return the documented `429` pl
   least one maximum TTL; and all replicas must share the same key, namespace,
   endpoint, and gateway-key set (mixed keys during a rolling deployment are
   unsupported).
+
+**Implementation status (Phase 4B, implemented — OPTIONAL, off by default).**
+`src/rate-limit/` is the second — and only other — feature allowed to know its
+state lives in Redis, and `src/redis/client.ts` is the only module that imports
+node-redis. Specification section 19.1 owns the normative contract; the
+security-relevant guarantees are:
+
+- **Off unless explicitly enabled, and fail-closed when on.** With
+  `RATE_LIMIT_ENABLED=false` (the default) no limiter is built, no scope is
+  derived, and no Redis rate-limit operation runs. When enabled, a disconnected
+  Redis, a command timeout, corrupt stored state, an unusable reply, or a limiter
+  wired without a derived scope all return `503 rate_limit_unavailable` +
+  `Retry-After: 2`. The gateway NEVER admits unmetered traffic to cover a
+  dependency failure.
+- **No new secret.** Enabling it requires `REDIS_URL` (already secret-bearing and
+  redacted) and reuses the existing `IDEMPOTENCY_ENCRYPTION_KEY`; the three
+  numeric settings are non-secret bounds. Configuration errors stay value-free.
+- **Separate key domain.** The rate-limit HMAC subkey is expanded from the same
+  master key under a DISTINCT HKDF salt and `info` label with its own domain
+  tags, so it is cryptographically independent of every idempotency subkey and a
+  key's two scopes are unrelated values. No code is shared with
+  `src/idempotency/keyring.ts` — the length-framing helper is deliberately
+  duplicated — so a change here can never re-key stored idempotency records.
+  Derivation is deterministic across replicas and independent of
+  `COLLECTIVIQ_GATEWAY_KEYS` ORDER.
+- **What Redis holds.** One bounded decimal integer of microseconds (a
+  theoretical arrival time) per scope, under `<REDIS_KEY_PREFIX>:rate:<HMAC>` —
+  domain-separated from the `:idem:` keyspace. Never a raw gateway key, the
+  process-local `k<index>`, an authorization value, a prompt, a request body, a
+  model id, a thread id, or completion content. Neither the scope nor the storage
+  key is ever logged or reflected.
+- **Untrusted-state safety.** `STRLEN` is checked BEFORE the script's internal
+  `GET`, so an oversized or hostile value is classified corrupt without its bytes
+  ever being read; there is no direct client `GET`. Empty-but-present,
+  non-integer, negative, oversized, and unparseable state all fail CLOSED — never
+  reset, never silently allowed. The decision is one atomic Lua script against
+  Redis's own `TIME`, never a Node clock, and limiter operations are total
+  (a closed decision union, never a thrown value).
+- **Content-free public errors.** The `429` and `503` bodies are fixed and never
+  reveal the configured limit, the remaining quota, the scope, or the key. A
+  limited request creates no idempotency claim, takes no capacity, commits no SSE
+  header, registers no title correlation, and makes no upstream call.
+- **Residual risks to state honestly.** Enforcement is bounded to the configured
+  window; a Redis outage deliberately trades availability for correctness on the
+  completion path; an evicted quota key (a `noeviction` violation) resets that
+  key's allowance to a full burst undetectably; capacity accounting is still
+  process-local; and all replicas must share the endpoint, key, prefix,
+  gateway-key set, and `RATE_LIMIT_*` settings.
 
 ## Network and Deployment
 

@@ -49,8 +49,9 @@ direct` (latest-user-only prompt, no protocol wrapper) — is the committed Open
 > gateway returns
 > model-proposed tool calls but never executes
 > a tool. Optional Redis-backed idempotency is implemented but **off by default**
-> (see "Idempotent requests"). It does **not** implement
-> native CollectivIQ tools, metrics/tracing, distributed rate limiting, or shared
+> (see "Idempotent requests"), as is optional Redis-backed cross-replica rate
+> limiting (see "Rate limiting"). It does **not** implement
+> native CollectivIQ tools, metrics/tracing, or shared
 > cross-replica capacity; those remain
 > planned per
 > [`.agent/docs/tech-software-spec.md`](.agent/docs/tech-software-spec.md). This
@@ -184,11 +185,11 @@ keep-alive` comments every 15 s while polling waits, deterministic
 
 ## What is not implemented yet
 
-`GET /metrics`, native CollectivIQ tool calling, distributed rate limiting, and
-shared cross-replica capacity accounting.
-(Optional Redis-backed idempotency IS implemented — see "Idempotent requests"
-below — but it is **off by default** and covers idempotency only; capacity stays
-process-local.)
+`GET /metrics`, native CollectivIQ tool calling, and shared cross-replica
+capacity accounting.
+(Optional Redis-backed idempotency and optional Redis-backed cross-replica rate
+limiting ARE implemented — see "Idempotent requests" and "Rate limiting" below —
+but both are **off by default**, and capacity/queueing stay process-local.)
 (Supported opt-in beta emulated tool calling is implemented but **not enabled by
 default**. Its numerical section-30 release gates are met — the state-aware
 report-v5 evaluator completed a full live campaign on 2026-09-01 in which all
@@ -639,18 +640,102 @@ id — and the Redis key itself is an HMAC, not your key.
 - On the streamed path the `200` and the assistant-role opener are already sent
   before the completion runs, so a late idempotency failure arrives as a
   content-free SSE `data: {"error": …}` record plus `[DONE]`, not an HTTP `503`.
-- Waiters hold no capacity permit and are not separately rate limited.
+- Waiters hold no capacity permit. When the optional rate limiter is enabled, a
+  waiter — like an owner, a cached replay, and a `409` conflict — does spend one
+  quota unit; with it disabled (the default) nothing here is metered.
 - CollectivIQ's own POST-idempotency semantics are **unknown**, so this is a
   gateway-side guarantee only. If a completion fails after upstream work may have
   started, the key is deliberately blocked (`503`) for the TTL rather than risking
   a duplicate completion.
 - Redis persistence and backups are **not required**: this is short-lived,
   encrypted cache state, and the supplied Compose profile disables RDB and AOF.
-- Redis buys cross-replica **idempotency** only. Concurrency limits
-  (`MAX_CONCURRENT_REQUESTS*`, the queue) remain **process-local**; distributed
-  rate limiting and shared capacity accounting are not implemented.
+- Redis buys cross-replica **idempotency** and, separately, cross-replica **rate
+  limiting** (below). Concurrency limits (`MAX_CONCURRENT_REQUESTS*`, the queue)
+  remain **process-local**; shared capacity accounting is not implemented.
 - A hosted Redis additionally needs network isolation, ACL/authentication from a
   managed secret, and TLS (`rediss://`) where the link is not private.
+
+### Rate limiting (optional Redis; off by default)
+
+`POST /v1/chat/completions` can enforce a **cross-replica, per-gateway-key**
+request quota. **It is off unless you turn it on.** With
+`RATE_LIMIT_ENABLED=false` (the default) no limiter is built and no Redis
+rate-limit operation ever runs — the route behaves exactly as it did before.
+
+It **requires Redis**: enabling it without a valid `REDIS_URL` is a startup
+configuration error, not a silent downgrade to no limiting. Because `REDIS_URL`
+already requires `IDEMPOTENCY_ENCRYPTION_KEY`, no new secret is introduced — the
+limiter derives its own key from that master key under a separate cryptographic
+domain. Enable it on top of either Redis setup shown above:
+
+```bash
+export RATE_LIMIT_ENABLED=true
+export RATE_LIMIT_REQUESTS=60
+export RATE_LIMIT_WINDOW_MS=60000
+export RATE_LIMIT_BURST=8
+```
+
+| Variable               | Default | Rule                                                                                |
+| ---------------------- | ------- | ----------------------------------------------------------------------------------- |
+| `RATE_LIMIT_ENABLED`   | `false` | Exactly `"true"` or `"false"`. `true` requires a valid `REDIS_URL`                  |
+| `RATE_LIMIT_REQUESTS`  | `60`    | Sustained requests per window, per gateway key; 1–100000                            |
+| `RATE_LIMIT_WINDOW_MS` | `60000` | The window the sustained rate is expressed over, in ms; 1000–3600000                |
+| `RATE_LIMIT_BURST`     | `8`     | Requests admitted immediately from an idle key; 1–10000 and ≤ `RATE_LIMIT_REQUESTS` |
+
+Present values are validated even while the feature is disabled, so a deployment
+cannot carry a broken setting that only fails the day it is switched on. With the
+defaults an idle key is admitted 8 requests at once, and its allowance then
+refills at one request per second.
+
+**What counts against the quota.** Every otherwise-valid completion attempt
+spends exactly one unit, and a spent unit is **never refunded** — a later
+capacity rejection or completion failure keeps it. That includes an idempotency
+owner, a waiter, a cached replay, and a different-body `409` conflict: each is a
+request the gateway had to serve. Nothing is spent by invalid authentication, an
+invalid request, a prompt-preparation failure, an invalid `Idempotency-Key`, or a
+request the limiter itself rejects. Only the completion route is metered —
+`/healthz`, `/readyz`, `GET /v1/models`, `GET /v1/models/:model`, and
+`GET /v1/opencode/session-title` are not, so model metadata and session titles
+stay available while a key's completion quota is exhausted.
+
+| Situation                                               | Result                                                                                   |
+| ------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| Feature disabled (default)                              | Unchanged; no limiter and no Redis rate-limit interaction                                |
+| Within the quota                                        | Runs normally; no new response header is added                                           |
+| Quota exhausted for that key                            | `429` `gateway_rate_limit_exceeded` + a computed `Retry-After` (seconds until admission) |
+| Redis unavailable, timing out, or holding corrupt state | Fails closed: `503` `rate_limit_unavailable` + `Retry-After: 2`                          |
+
+A rejected request creates no idempotency claim, takes no capacity, opens no
+stream, and makes no CollectivIQ call — so a `"stream": true` request rejected
+here gets an ordinary JSON error, never an SSE error record. Other `429`s
+(gateway capacity, upstream quota) are unchanged and keep their fixed
+`Retry-After: 5`.
+
+**Operational requirements and limits.**
+
+- **All replicas must share** the same `REDIS_URL`, `IDEMPOTENCY_ENCRYPTION_KEY`,
+  `REDIS_KEY_PREFIX`, `COLLECTIVIQ_GATEWAY_KEYS`, **and `RATE_LIMIT_*` settings**.
+  Otherwise the quota is not the single shared quota it appears to be.
+- One Redis backs both optional features and the gateway opens **one**
+  connection. Quota keys live under a separate `:rate:` category and cannot
+  collide with idempotency records.
+- **What Redis stores:** one bounded integer timestamp per key scope, and nothing
+  else. No prompt, request body, model id, thread id, gateway key, or
+  authorization value — the Redis key itself is an HMAC, and it expires on its own
+  replenishment deadline.
+- `maxmemory-policy noeviction` applies here too: an evicted quota key resets that
+  key's allowance to a full burst, and the gateway cannot detect it.
+- **A Redis outage fails the completion path closed** (`503`). Enabling this
+  feature deliberately trades availability for correctness; unmetered traffic
+  during an outage would defeat the control.
+- Enforcement is bounded to the configured window — it smooths a rate rather than
+  capping total spend over a longer horizon — and capacity/queueing stay
+  process-local.
+
+The full contract (the GCRA algorithm, key derivation, stored-state validation,
+and the exact admission order) is in
+[`.agent/docs/tech-software-spec.md`](.agent/docs/tech-software-spec.md)
+section 19.1.
 
 ## Validation
 
@@ -660,33 +745,41 @@ npm run validate        # format check, lint, typecheck, tests, build, build smo
 
 Individual checks:
 
-| Command                    | Purpose                                                                                  |
-| -------------------------- | ---------------------------------------------------------------------------------------- |
-| `npm run format:check`     | Prettier formatting check                                                                |
-| `npm run lint`             | ESLint (typed rules)                                                                     |
-| `npm run typecheck`        | Strict `tsc --noEmit` over sources and tests                                             |
-| `npm test`                 | Vitest unit + integration + contract suites                                              |
-| `npm run test:unit`        | Unit tests only                                                                          |
-| `npm run test:integration` | Server integration tests only                                                            |
-| `npm run test:contract`    | Hermetic upstream contract tests (mock HTTP)                                             |
-| `npm run test:coverage`    | Tests with V8 coverage                                                                   |
-| `npm run build`            | Compile to `dist/`                                                                       |
-| `npm run test:build`       | Import compiled output; assert no open socket                                            |
-| `npm run test:redis`       | Real-Redis idempotency contract suite (needs `REDIS_TEST_URL`; excluded from `validate`) |
+| Command                    | Purpose                                                                                                       |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `npm run format:check`     | Prettier formatting check                                                                                     |
+| `npm run lint`             | ESLint (typed rules)                                                                                          |
+| `npm run typecheck`        | Strict `tsc --noEmit` over sources and tests                                                                  |
+| `npm test`                 | Vitest unit + integration + contract suites                                                                   |
+| `npm run test:unit`        | Unit tests only                                                                                               |
+| `npm run test:integration` | Server integration tests only                                                                                 |
+| `npm run test:contract`    | Hermetic upstream contract tests (mock HTTP)                                                                  |
+| `npm run test:coverage`    | Tests with V8 coverage                                                                                        |
+| `npm run build`            | Compile to `dist/`                                                                                            |
+| `npm run test:build`       | Import compiled output; assert no open socket                                                                 |
+| `npm run test:redis`       | Real-Redis contract suites — idempotency and rate limiting (needs `REDIS_TEST_URL`; excluded from `validate`) |
 
 `validate` is hermetic: it makes no network, live-upstream, Docker, Redis, or
 load checks. The contract suite runs against a local mock HTTP server.
 
-`npm run test:redis` is the one suite that needs an **external service**: a real
-Redis at `REDIS_TEST_URL`. It proves the atomic Lua claim/compare-and-transition
-behaviour under concurrency, that two independent coordinator instances sharing
-one Redis execute a completion once, lease renewal and expiry, readiness transitions,
-that corrupt/tampered/relocated records fail closed, and that the raw stored
-values contain none of its synthetic sentinels. It uses only synthetic
-credentials and content, randomizes its key namespace per run, and deletes every
-key it creates. It is excluded from `validate` and runs as its own required CI
-gate against the pinned `redis:8.8.2-alpine`; it **fails loudly** rather than
-skipping when `REDIS_TEST_URL` is unset. Never point it at a production Redis.
+`npm run test:redis` is the one command that needs an **external service**: a real
+Redis at `REDIS_TEST_URL`. The idempotency suite proves the atomic Lua
+claim/compare-and-transition behaviour under concurrency, that two independent
+coordinator instances sharing one Redis execute a completion once, lease renewal
+and expiry, readiness transitions, that corrupt/tampered/relocated records fail
+closed, and that the raw stored values contain none of its synthetic sentinels.
+The rate-limit suite proves the atomic GCRA decision under concurrency against
+Redis's own clock, burst-then-steady-state admission, the replenishment TTL,
+`EVALSHA`→`EVAL` recovery after `SCRIPT FLUSH`, two limiter instances sharing one
+quota, and every corrupt-state class failing closed. Both use only synthetic
+values, randomize their key namespace per run, and delete every key they create.
+The command is excluded from `validate` and runs as its own required CI gate
+against the pinned `redis:8.8.2-alpine`; it **fails loudly** rather than skipping
+when `REDIS_TEST_URL` is unset. Never point it at a production Redis. Both
+suites were last run together under explicit approval and passed (40 tests)
+against a disposable `redis:8.8.2-alpine`, with the randomized namespace verified
+empty afterwards. That is a standing result, not a rerun: starting Redis or
+Docker requires fresh approval every time.
 
 The suite runs natively, so start ONLY the `redis` service — naming it keeps the
 gateway container out of it (the gateway would also demand
@@ -695,8 +788,12 @@ gateway container out of it (the gateway would also demand
 ```bash
 docker compose --profile redis up -d redis
 REDIS_TEST_URL=redis://127.0.0.1:6379 npm run test:redis
-docker compose --profile redis down
+docker compose --profile redis rm -sf redis
 ```
+
+Tear down with `rm -sf redis`, which targets that one service. Do **not** use
+`docker compose --profile redis down` here: `down` acts on the whole project, so
+it will also stop and remove a gateway container you already had running.
 
 Any disposable local Redis works; the Compose profile is just a convenience.
 
@@ -1112,9 +1209,10 @@ export COLLECTIVIQ_GATEWAY_KEYS=gw-fake-key-change-me
 docker compose up --build
 ```
 
-An **opt-in** Redis profile is available for idempotency development. It is not
-started by default and the gateway has no `depends_on` on it, so the gateway
-starts and serves `/healthz` whether or not Redis is running:
+An **opt-in** Redis profile is available for idempotency and rate-limit
+development. One Redis backs both features and the gateway opens one connection.
+It is not started by default and the gateway has no `depends_on` on it, so the
+gateway starts and serves `/healthz` whether or not Redis is running:
 
 ```bash
 # Redis only (for a natively run gateway, or for `npm run test:redis`):
@@ -1127,9 +1225,10 @@ REDIS_URL=redis://redis:6379 docker compose --profile redis up --build
 
 That service uses the pinned `redis:8.8.2-alpine`, publishes only on
 `127.0.0.1:6379`, disables persistence (the records are short-lived encrypted
-cache state), and configures **no password** — it is reachable only from the
-Compose network and host loopback. It does **not** meet production requirements:
-see "Idempotent requests" above and `SECURITY.md`.
+cache state and self-expiring rate-limit timestamps), and configures **no
+password** — it is reachable only from the Compose network and host loopback. It
+does **not** meet production requirements: see "Idempotent requests" and "Rate
+limiting" above and `SECURITY.md`.
 
 The container binds `HOST=0.0.0.0` internally, but Compose publishes the port
 only on `127.0.0.1:8787`. Credentials are supplied via environment
@@ -1164,7 +1263,11 @@ gateway validates the mode-appropriate credential at startup. Only
 | `REDIS_URL`                       | no         | _(empty — Redis disabled)_        | Canonical `redis://` / `rediss://` only (no query/fragment). **Secret-bearing** (may embed credentials); redacted       |
 | `IDEMPOTENCY_ENCRYPTION_KEY`      | with Redis | —                                 | **Required when `REDIS_URL` is set.** Exactly 32 bytes as canonical unpadded base64url (43 chars). **Secret**; redacted |
 | `IDEMPOTENCY_TTL_MS`              | no         | `600000`                          | Lifetime of a cached final response; 60000–3600000                                                                      |
-| `REDIS_KEY_PREFIX`                | no         | `collectiviq-gateway`             | Redis key namespace; 1–64 chars matching `[A-Za-z0-9_-]+`                                                               |
+| `REDIS_KEY_PREFIX`                | no         | `collectiviq-gateway`             | Redis key namespace shared by both optional features; 1–64 chars matching `[A-Za-z0-9_-]+`                              |
+| `RATE_LIMIT_ENABLED`              | no         | `false`                           | Cross-replica per-key rate limiting; exactly `"true"`/`"false"`. `true` **requires** `REDIS_URL`. Adds no new secret    |
+| `RATE_LIMIT_REQUESTS`             | no         | `60`                              | Sustained requests per window, per gateway key; 1–100000. Validated even while disabled                                 |
+| `RATE_LIMIT_WINDOW_MS`            | no         | `60000`                           | Window the sustained rate is expressed over, in ms; 1000–3600000. Validated even while disabled                         |
+| `RATE_LIMIT_BURST`                | no         | `8`                               | Requests admitted immediately from an idle key; 1–10000 and ≤ `RATE_LIMIT_REQUESTS`                                     |
 
 The upstream credential authenticates the gateway to CollectivIQ: in `bearer`
 mode `COLLECTIVIQ_API_KEY` is sent as a static bearer token; in `password` mode

@@ -38,7 +38,10 @@ with zero remaining and zero recovery-journal failures; and the checkpoint
 finalized. On that evidence the feature graduated from experimental to supported
 opt-in beta; it stays non-default and OpenCode permission-gated, and beta is not
 production readiness. Specification
-section 30 owns the graduation decision and the campaign and gate details). Redis, metrics/tracing, true upstream streaming, and
+section 30 owns the graduation decision and the campaign and gate details). Two
+OPTIONAL Redis-backed features exist and are **off by default** — cross-replica
+idempotency (Phase 4A) and cross-replica per-gateway-key rate limiting
+(Phase 4B), both described below. Metrics/tracing, true upstream streaming, and
 native tool mode are not implemented. The completion path calls CollectivIQ only
 when a real request is served (never during import/construction/build smoke). A
 user-observed, sanitized live OpenCode/CollectivIQ foreground **transport** smoke
@@ -343,9 +346,13 @@ reasonCode]` ledger with fixed integer reason codes AND a compact per-committed-
   with **no** property read and no `instanceof`/prototype trap (gateway completion
   errors are matched by identity via a `WeakSet`, normalized upstream errors by an
   `isUpstreamError` identity guard, and untrusted values are never inspected or
-  re-thrown to the framework). The matched gateway key is exposed internally as an
-  **opaque** index-based identity (`k<index>`), never the raw key, and is used only
-  for per-key capacity accounting. **Process-local** capacity (global + per-key
+  re-thrown to the framework). The matched gateway key is exposed internally only
+  as **opaque** identities, never the raw key or its digest: the index-based
+  `k<index>` used solely for per-key capacity accounting, plus — when the
+  corresponding optional feature is configured — the cross-replica idempotency
+  scope and the cross-replica rate-limit scope, which are derived under separate
+  cryptographic domains and are therefore different values for the same key. All
+  are precomputed at startup, and none is logged, reflected, or returned. **Process-local** capacity (global + per-key
   active limits, a bounded FIFO queue, and a bounded queue wait) is acquired
   **before** the upstream thread is created and released on every exit path
   (success, upstream failure, timeout, client disconnect, shutdown); overflow
@@ -618,13 +625,17 @@ errorCode, resolved, resolution, persisted }] }` (no longer `succeeded`/
   true upstream streaming; a basic live stream completed on 2026-08-15, but the
   long-running / keep-alive streaming smoke test is not run.
 - Capacity/backpressure is **process-local** — it does not coordinate across
-  replicas. Cross-replica rate limits and shared capacity accounting require
-  shared state that does not yet exist. (Redis provides cross-replica
-  **idempotency** only; see below.)
+  replicas, and shared capacity accounting requires state that does not yet
+  exist. Cross-replica **rate limiting** is now available as an optional,
+  off-by-default Redis feature (see below); it does not make capacity shared.
 - Optional Redis-backed idempotency is implemented but **off by default**. Its
   protection is bounded to `IDEMPOTENCY_TTL_MS`, CollectivIQ's own
   POST-idempotency semantics are unknown, and a hard replica kill mid-completion
   can permit one duplicate upstream completion once the lease expires.
+- Optional Redis-backed rate limiting is implemented but **off by default**. Its
+  enforcement is bounded to the configured window, it fails closed on a Redis
+  outage (trading availability for correctness on the completion path), and an
+  evicted quota key silently resets that key's allowance.
 - No metrics endpoint is exposed.
 - Readiness probes only the optional Redis dependency; CollectivIQ is
   deliberately not probed, and the response body remains a simple
@@ -694,9 +705,67 @@ answer, because the payload's associated data binds the record version, the
 storage key, and the body fingerprint, and a relocated or rebound ciphertext
 fails authentication. A hard replica kill during an in-flight completion blocks
 that key until its lease expires rather than risking a duplicate. Waiters take no
-capacity permit and are not separately rate limited. CollectivIQ's own
-POST-idempotency semantics remain unknown, so this is a gateway-side guarantee
-only.
+capacity permit. CollectivIQ's own POST-idempotency semantics remain unknown, so
+this is a gateway-side guarantee only.
+
+## Optional Redis-backed rate limiting (Phase 4B)
+
+Cross-replica, per-gateway-key rate limiting for `POST /v1/chat/completions` is
+**optional and disabled by default**. With `RATE_LIMIT_ENABLED=false` no limiter
+is built, no scope is derived, and no Redis rate-limit operation ever runs.
+Specification section 19.1 owns the normative contract; the security-relevant
+posture is:
+
+**No new secret.** Enabling it requires `REDIS_URL` (already secret-bearing and
+redacted) and reuses the existing `IDEMPOTENCY_ENCRYPTION_KEY`. The three numeric
+settings are non-secret bounds, and every configuration failure stays value-free.
+
+**Separate key domain.** The rate-limit HMAC subkey is expanded from that same
+master key under a **distinct** HKDF salt and `info` label with its own domain
+tags, so it is cryptographically independent of every idempotency subkey and a
+gateway key's rate-limit scope is a different value from its idempotency scope.
+No code is shared with the idempotency keyring — the length-framing helper is
+deliberately duplicated — so a change on this side can never re-key stored
+idempotency records. Derivation is deterministic across replicas and independent
+of gateway-key ORDER, and the scope is computed once at startup so the raw key is
+never re-read per request. It is never logged, reflected, or returned.
+
+**Nothing sensitive reaches Redis.** The stored value is one bounded decimal
+integer of microseconds — a theoretical arrival time — under
+`<REDIS_KEY_PREFIX>:rate:<HMAC digest>`, domain-separated from the idempotency
+keyspace. Never a raw gateway key, the process-local capacity identity, an
+authorization value, a prompt, a request body, a model id, a thread id, or
+completion content. The key is an HMAC, not any client-supplied value, and each
+entry expires on its own replenishment deadline.
+
+**Fail-closed, never fail-open.** The decision is one atomic Lua script against
+Redis's own clock (never a Node clock, whose drift would corrupt a shared quota).
+Size is checked with `STRLEN` before the script's internal `GET`, so an oversized
+or hostile value is classified corrupt without its bytes ever being read, and
+there is no direct client `GET` at all. Empty-but-present, non-integer, negative,
+oversized, and unparseable state all fail closed — never reset, never silently
+allowed. A disconnected Redis, a command timeout, an unusable reply, or a limiter
+without a derived scope all return `503 rate_limit_unavailable` +
+`Retry-After: 2`. The gateway never admits unmetered traffic to cover a
+dependency failure.
+
+**Content-free responses.** The `429 gateway_rate_limit_exceeded` and `503`
+bodies are fixed and reveal neither the configured limit, the remaining quota,
+the scope, nor the key; the only variable is the computed `Retry-After`. A
+limited request creates no idempotency claim, takes no capacity, commits no SSE
+header, registers no title correlation, and makes no upstream call. Health,
+readiness, the model endpoints, and the session-title extension are not metered.
+
+**Residual risks, stated plainly.** Enforcement is bounded to the configured
+window rather than a longer horizon. A Redis outage deliberately trades
+availability for correctness on the completion path. `maxmemory-policy
+noeviction` applies here too: an evicted quota key resets that key's allowance to
+a full burst and the gateway cannot detect it. Every replica must share the same
+Redis endpoint, encryption key, `REDIS_KEY_PREFIX`, gateway-key set, and
+`RATE_LIMIT_*` settings, or the quota is not the single shared quota it appears
+to be. Capacity accounting is still process-local. The real-Redis contract suite
+for this feature has been run once under explicit approval, alongside the
+Phase 4A suite, against a disposable pinned Redis.
 
 ## Remote deployment
 
