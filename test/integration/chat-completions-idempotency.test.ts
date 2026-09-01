@@ -89,6 +89,10 @@ function makeConfig(over: Partial<AppConfig> = {}): AppConfig {
     IDEMPOTENCY_ENCRYPTION_KEY: MASTER_KEY,
     IDEMPOTENCY_TTL_MS: 600_000,
     REDIS_KEY_PREFIX: "test-ns",
+    RATE_LIMIT_ENABLED: false,
+    RATE_LIMIT_REQUESTS: 60,
+    RATE_LIMIT_WINDOW_MS: 60_000,
+    RATE_LIMIT_BURST: 8,
     models: [model("collectiviq-consensus")],
     ...over,
   };

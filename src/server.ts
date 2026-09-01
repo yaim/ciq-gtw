@@ -15,6 +15,7 @@ import { createCompletionRuntime } from "./generation/runtime.js";
 import type { ChatCompletionService } from "./generation/chat-completion.js";
 import type { TitleBridge } from "./opencode/title-bridge.js";
 import { buildGatewayScopeDeriver, type IdempotencyCoordinator } from "./idempotency/index.js";
+import { buildRateLimitScopeDeriver, type RateLimiter } from "./rate-limit/index.js";
 import type { AppConfig } from "./config/schema.js";
 
 /** The chat-completions wiring the `/v1` scope needs. */
@@ -76,6 +77,19 @@ export interface BuildServerOptions {
    * before and a supplied `Idempotency-Key` fails closed with `503`.
    */
   readonly idempotency?: IdempotencyCoordinator;
+  /**
+   * The cross-replica rate limiter (Phase 4B).
+   *
+   * Like {@link BuildServerOptions.idempotency} it is deliberately NOT built
+   * here: it rides the same process-owned Redis connection, which the
+   * composition root owns so `buildServer` stays socket-free.
+   *
+   * Whether the feature is ON comes from `config.RATE_LIMIT_ENABLED`, never from
+   * this field. Omitting it is safe only when configuration also has the feature
+   * disabled; omitting it while `RATE_LIMIT_ENABLED=true` is an unavailable
+   * dependency and every completion fails closed with `503`.
+   */
+  readonly rateLimiter?: RateLimiter;
 }
 
 /**
@@ -103,14 +117,17 @@ export function buildServer(options: BuildServerOptions): GatewayServer {
   // timestamp at construction and reuses it for every model object it serves.
   const now = options.now ?? (() => Math.floor(Date.now() / 1000));
   const catalog = options.catalog ?? createModelCatalog(config.models, now());
-  // The idempotency scope deriver is pure HKDF/HMAC over already-validated
-  // config: no socket, no Redis client, no I/O. It is `null` (so every
-  // `scopeId` is `null`) when idempotency is not configured.
+  // Both scope derivers are pure HKDF/HMAC over already-validated config: no
+  // socket, no Redis client, no I/O. Each is `null` (so the matching identity is
+  // always `null`) when its feature is not configured, and they derive under
+  // different HKDF domains so a key's two scopes never coincide.
   const scopeDeriver = buildGatewayScopeDeriver(config);
+  const rateLimitScopeDeriver = buildRateLimitScopeDeriver(config);
   const authenticator =
     options.authenticator ??
     createGatewayAuthenticator(config.COLLECTIVIQ_GATEWAY_KEYS, {
       ...(scopeDeriver !== null ? { scopeDeriver } : {}),
+      ...(rateLimitScopeDeriver !== null ? { rateLimitScopeDeriver } : {}),
     });
 
   // A default completion runtime is built from config when none is injected
@@ -133,6 +150,11 @@ export function buildServer(options: BuildServerOptions): GatewayServer {
     titleBridge: completion.titleBridge,
     shutdownSignal: completion.shutdownSignal,
     ...(options.idempotency !== undefined ? { idempotency: options.idempotency } : {}),
+    // Validated configuration — not the presence of an injected limiter —
+    // decides whether the gate runs, so an enabled-but-unwired instance fails
+    // closed instead of serving unmetered traffic.
+    rateLimitEnabled: config.RATE_LIMIT_ENABLED,
+    ...(options.rateLimiter !== undefined ? { rateLimiter: options.rateLimiter } : {}),
   });
 
   return app;

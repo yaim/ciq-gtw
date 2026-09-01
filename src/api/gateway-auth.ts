@@ -37,8 +37,8 @@ function sha256(value: string): Buffer {
 /**
  * The result of authenticating a presented credential.
  *
- * Success carries TWO separate opaque identities for the matched key, and
- * neither is the raw key or its digest:
+ * Success carries THREE separate opaque identities for the matched key, and none
+ * of them is the raw key or its digest:
  *
  *  - `keyId` — the PROCESS-LOCAL identity (`k<index>`), derived from the key's
  *    configuration index and used only for per-key capacity accounting. It is
@@ -48,11 +48,20 @@ function sha256(value: string): Buffer {
  *    with the same encryption key and is independent of gateway-key ordering, so
  *    reordering or adding keys never re-partitions existing idempotency state.
  *    It is `null` when idempotency is disabled (no encryption key configured).
+ *  - `rateLimitScopeId` — the CROSS-REPLICA rate-limit scope, derived the same
+ *    way but under a SEPARATE HKDF salt/label, so it is a different value from
+ *    `scopeId` for the same key and the two features can never share, correlate,
+ *    or collide on a Redis key. It is `null` when rate limiting is disabled.
  *
- * Neither identity is ever logged, reflected, or returned to a client.
+ * No identity is ever logged, reflected, or returned to a client.
  */
 export type AuthResult =
-  | { readonly ok: true; readonly keyId: string; readonly scopeId: string | null }
+  | {
+      readonly ok: true;
+      readonly keyId: string;
+      readonly scopeId: string | null;
+      readonly rateLimitScopeId: string | null;
+    }
   | { readonly ok: false };
 
 /** Authenticates a presented `Authorization` header against configured keys. */
@@ -104,6 +113,14 @@ export interface GatewayAuthenticatorOptions {
    * Omitted means `scopeId` is always `null`.
    */
   readonly scopeDeriver?: (rawGatewayKey: string) => string;
+  /**
+   * Derives the stable cross-replica RATE-LIMIT scope for a configured key.
+   * Supplied only when Redis-backed rate limiting is enabled, and independent of
+   * {@link GatewayAuthenticatorOptions.scopeDeriver} — the two produce different
+   * values for the same key. Precomputed once at construction for the same
+   * reason. Omitted means `rateLimitScopeId` is always `null`.
+   */
+  readonly rateLimitScopeDeriver?: (rawGatewayKey: string) => string;
 }
 
 /**
@@ -119,12 +136,14 @@ export function createGatewayAuthenticator(
   const compare = options.compare ?? timingSafeEqual;
   // Precompute one fixed-length digest per configured key.
   const digests = keys.map((key) => sha256(key));
-  // Precompute the opaque idempotency scope per configured key so the raw key
-  // material is used exactly once, at construction, and never again per request.
-  const scopes: (string | null)[] =
-    options.scopeDeriver === undefined
-      ? keys.map(() => null)
-      : keys.map((key) => (options.scopeDeriver as (k: string) => string)(key));
+  // Precompute both opaque cross-replica scopes per configured key so the raw
+  // key material is used exactly once, at construction, and never again per
+  // request. They are derived under different HKDF domains, so a key's
+  // idempotency scope and its rate-limit scope are unrelated values.
+  const derive = (deriver: ((key: string) => string) | undefined): (string | null)[] =>
+    deriver === undefined ? keys.map(() => null) : keys.map((key) => deriver(key));
+  const scopes = derive(options.scopeDeriver);
+  const rateLimitScopes = derive(options.rateLimitScopeDeriver);
 
   return {
     authenticate(header: string | undefined): AuthResult {
@@ -151,6 +170,7 @@ export function createGatewayAuthenticator(
         ok: true,
         keyId: keyIdForIndex(matchedIndex),
         scopeId: scopes[matchedIndex] ?? null,
+        rateLimitScopeId: rateLimitScopes[matchedIndex] ?? null,
       };
     },
   };

@@ -41,13 +41,18 @@ const config = {
   MAX_QUEUED_REQUESTS: 20,
   MAX_QUEUE_WAIT_MS: 5_000,
   SHUTDOWN_DRAIN_MS: 30_000,
-  // Redis-backed idempotency CONFIGURED but not wired: `buildServer` must still
-  // open no socket. The Redis client is owned by the process composition root,
-  // never by construction (specification section 31.3).
+  // Redis-backed idempotency AND rate limiting CONFIGURED but not wired:
+  // `buildServer` must still open no socket. The Redis client is owned by the
+  // process composition root, never by construction (specification §31.3), and
+  // both features share that one connection.
   REDIS_URL: "redis://127.0.0.1:6379",
   IDEMPOTENCY_ENCRYPTION_KEY: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
   IDEMPOTENCY_TTL_MS: 600_000,
   REDIS_KEY_PREFIX: "collectiviq-gateway",
+  RATE_LIMIT_ENABLED: true,
+  RATE_LIMIT_REQUESTS: 60,
+  RATE_LIMIT_WINDOW_MS: 60_000,
+  RATE_LIMIT_BURST: 8,
   models: [],
 };
 

@@ -289,6 +289,46 @@ export const IDEMPOTENCY_UNAVAILABLE_ERROR: OpenAIApiError = apiError(
   2,
 );
 
+// --- Phase 4B: optional Redis-backed rate limiting (specification §19.1) -----
+
+/**
+ * `429` — the per-gateway-key cross-replica rate limit is exhausted.
+ *
+ * Distinct from `gateway_capacity_exceeded`, which reports PROCESS-LOCAL
+ * admission pressure: this one reports the configured shared quota for the
+ * presented key and is deliberately unrelated to how busy any single replica is.
+ *
+ * `Retry-After` is DYNAMIC — the limiter computes the exact delay until the next
+ * admissible request — so the value is supplied per response rather than fixed
+ * on a shared constant. The body is fixed and content-free: it never reveals the
+ * configured limit, the remaining quota, the scope, or the key.
+ */
+export function gatewayRateLimitExceeded(retryAfterSeconds: number): OpenAIApiError {
+  return apiError(
+    429,
+    "The gateway rate limit for this API key has been exceeded.",
+    "rate_limit_error",
+    "gateway_rate_limit_exceeded",
+    null,
+    retryAfterSeconds,
+  );
+}
+
+/**
+ * `503` — rate limiting is enabled but its decision could not be made (Redis
+ * disabled for this instance, disconnected, timed out, or holding corrupt
+ * state). The gateway fails CLOSED rather than admitting unmetered traffic.
+ * Always paired with `Retry-After: 2`.
+ */
+export const RATE_LIMIT_UNAVAILABLE_ERROR: OpenAIApiError = apiError(
+  503,
+  "Gateway rate limiting is currently unavailable.",
+  "server_error",
+  "rate_limit_unavailable",
+  null,
+  2,
+);
+
 /**
  * Map a normalized {@link UpstreamError} to its public OpenAI envelope
  * (specification section 20). Only the closed `category` drives the mapping;

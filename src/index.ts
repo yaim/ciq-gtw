@@ -3,7 +3,7 @@ import { ConfigError, loadConfig } from "./config/load.js";
 import { createLogger, emitContentLoggingWarning } from "./observability/logger.js";
 import { createReadinessState } from "./api/health-route.js";
 import { createCompletionRuntime } from "./generation/runtime.js";
-import { createIdempotencyRuntime } from "./idempotency/index.js";
+import { createRedisRuntime } from "./redis/runtime.js";
 import { buildServer } from "./server.js";
 
 /** Fixed message returned for any non-{@link ConfigError} startup failure. */
@@ -49,9 +49,9 @@ export interface GracefulShutdownDeps {
   /** Bounded drain window (ms) before remaining work is force-cancelled. */
   readonly drainMs: number;
   /**
-   * Close shared external resources (currently Redis) AFTER the application has
-   * drained, so an in-flight completion can still persist or settle its
-   * idempotency record while requests are winding down. Bounded and
+   * Close shared external resources (the one Redis connection) AFTER the
+   * application has drained, so an in-flight completion can still persist or
+   * settle its idempotency record while requests are winding down. Bounded and
    * non-rejecting by contract.
    */
   readonly closeDependencies?: () => Promise<void>;
@@ -105,16 +105,19 @@ export async function main(): Promise<void> {
   emitContentLoggingWarning(config);
   const logger = createLogger(config);
 
-  // Optional Redis-backed idempotency (Phase 4A). `null` when REDIS_URL is
-  // blank/absent; construction creates no socket either way.
-  const idempotency = createIdempotencyRuntime(config);
+  // Optional Redis-backed services: idempotency (Phase 4A) and cross-replica
+  // rate limiting (Phase 4B). `null` when REDIS_URL is blank/absent; either way
+  // construction creates no socket, and both services share the ONE client this
+  // runtime owns.
+  const redis = createRedisRuntime(config);
 
   // Readiness is dependency aware: when Redis is CONFIGURED the instance is
   // ready only while the client is actually connected, so a disconnected or
-  // reconnecting Redis keeps `/readyz` at 503 while `/healthz` stays 200.
+  // reconnecting Redis keeps `/readyz` at 503 while `/healthz` stays 200. One
+  // connection means one probe, whichever Redis-backed features are enabled.
   // Neither endpoint calls CollectivIQ.
   const readiness = createReadinessState(false, {
-    dependencies: idempotency === null ? [] : [{ isReady: () => idempotency.isReady() }],
+    dependencies: redis === null ? [] : [{ isReady: () => redis.isReady() }],
   });
 
   // Build the completion runtime once so the process root can share the same
@@ -131,7 +134,8 @@ export async function main(): Promise<void> {
       titleBridge: runtime.titleBridge,
       shutdownSignal: shutdownController.signal,
     },
-    ...(idempotency !== null ? { idempotency: idempotency.coordinator } : {}),
+    ...(redis?.idempotency != null ? { idempotency: redis.idempotency } : {}),
+    ...(redis?.rateLimiter != null ? { rateLimiter: redis.rateLimiter } : {}),
   });
 
   let shuttingDown = false;
@@ -148,8 +152,9 @@ export async function main(): Promise<void> {
       close: () => app.close(),
       drainMs: config.SHUTDOWN_DRAIN_MS,
       // Redis stays available throughout draining so an in-flight completion can
-      // still commit or settle its idempotency record; it is closed last.
-      ...(idempotency !== null ? { closeDependencies: () => idempotency.close() } : {}),
+      // still commit or settle its idempotency record; the one shared connection
+      // is closed last, exactly once.
+      ...(redis !== null ? { closeDependencies: () => redis.close() } : {}),
       onError: (error) =>
         logger.error(
           { err: { name: error instanceof Error ? error.name : "unknown" } },
@@ -165,7 +170,7 @@ export async function main(): Promise<void> {
   // Start connecting to Redis WITHOUT blocking startup: the listener binds
   // regardless, `/healthz` stays 200, `/readyz` stays 503 until the client is
   // ready, and the client reconnects automatically if Redis is down or restarts.
-  idempotency?.connect();
+  redis?.connect();
 
   await app.listen({ host: config.HOST, port: config.PORT });
   readiness.setReady(true);

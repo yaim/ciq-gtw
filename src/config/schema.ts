@@ -88,6 +88,26 @@ export const IDEMPOTENCY_LIMITS = {
   encryptionKeyBytes: 32,
 } as const;
 
+/**
+ * Conservative, non-overridable bounds for the OPTIONAL Redis-backed
+ * cross-replica rate limiter (Phase 4B; specification sections 19.1, 24). The
+ * feature is disabled entirely unless `RATE_LIMIT_ENABLED=true`, which
+ * additionally requires a valid `REDIS_URL`. Relaxing any bound is a
+ * configuration-contract/security change, not a runtime override.
+ */
+export const RATE_LIMIT_LIMITS = {
+  /** Sustained requests admitted per window, per gateway key. */
+  requests: { min: 1, max: 100_000 },
+  /** The window the sustained rate is expressed over, in ms. */
+  windowMs: { min: 1_000, max: 3_600_000 },
+  /**
+   * Requests admitted immediately from a cold scope. Must not exceed
+   * `RATE_LIMIT_REQUESTS`: a burst larger than the window's own budget would let
+   * one instant of traffic exceed the sustained limit it is meant to smooth.
+   */
+  burst: { min: 1, max: 10_000 },
+} as const;
+
 /** Allowed characters for `REDIS_KEY_PREFIX` (a value-free operational namespace). */
 export const REDIS_KEY_PREFIX_PATTERN = /^[A-Za-z0-9_-]+$/;
 
@@ -145,6 +165,13 @@ export const ENV_DEFAULTS = {
   SHUTDOWN_DRAIN_MS: 30_000,
   IDEMPOTENCY_TTL_MS: 600_000, // 10 minutes (specification section 18)
   REDIS_KEY_PREFIX: "collectiviq-gateway",
+  // Optional cross-replica rate limiting (Phase 4B, specification section 19.1).
+  // OFF by default; the remaining values are validated regardless so the
+  // configuration shape is stable whether or not the feature is enabled.
+  RATE_LIMIT_ENABLED: false,
+  RATE_LIMIT_REQUESTS: 60,
+  RATE_LIMIT_WINDOW_MS: 60_000,
+  RATE_LIMIT_BURST: 8,
 } as const;
 
 /**
@@ -222,6 +249,23 @@ export const EnvConfigSchema = Type.Object(
     REDIS_KEY_PREFIX: Type.String({
       minLength: IDEMPOTENCY_LIMITS.keyPrefixLength.min,
       maxLength: IDEMPOTENCY_LIMITS.keyPrefixLength.max,
+    }),
+    // Optional Redis-backed cross-replica rate limiting (Phase 4B). Disabled by
+    // default; enabling it requires a valid REDIS_URL (enforced by the loader).
+    // The three numeric fields always carry validated values so the shape is
+    // stable whether or not the feature is enabled.
+    RATE_LIMIT_ENABLED: Type.Boolean(),
+    RATE_LIMIT_REQUESTS: Type.Integer({
+      minimum: RATE_LIMIT_LIMITS.requests.min,
+      maximum: RATE_LIMIT_LIMITS.requests.max,
+    }),
+    RATE_LIMIT_WINDOW_MS: Type.Integer({
+      minimum: RATE_LIMIT_LIMITS.windowMs.min,
+      maximum: RATE_LIMIT_LIMITS.windowMs.max,
+    }),
+    RATE_LIMIT_BURST: Type.Integer({
+      minimum: RATE_LIMIT_LIMITS.burst.min,
+      maximum: RATE_LIMIT_LIMITS.burst.max,
     }),
   },
   { additionalProperties: false },

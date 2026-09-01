@@ -59,11 +59,24 @@ services:
       IDEMPOTENCY_ENCRYPTION_KEY: "${IDEMPOTENCY_ENCRYPTION_KEY:-}"
       IDEMPOTENCY_TTL_MS: "${IDEMPOTENCY_TTL_MS:-600000}"
       REDIS_KEY_PREFIX: "${REDIS_KEY_PREFIX:-collectiviq-gateway}"
+      # OPTIONAL Redis-backed cross-replica per-gateway-key rate limiting
+      # (Phase 4B). Disabled by default, in which case no limiter or Redis
+      # rate-limit operation runs at all. Enabling it REQUIRES REDIS_URL (and
+      # therefore IDEMPOTENCY_ENCRYPTION_KEY) above; it shares that one Redis
+      # connection with idempotency under a separate `:rate:` key category.
+      RATE_LIMIT_ENABLED: "${RATE_LIMIT_ENABLED:-false}"
+      RATE_LIMIT_REQUESTS: "${RATE_LIMIT_REQUESTS:-60}"
+      RATE_LIMIT_WINDOW_MS: "${RATE_LIMIT_WINDOW_MS:-60000}"
+      RATE_LIMIT_BURST: "${RATE_LIMIT_BURST:-8}"
     volumes:
       # Provide your own model file (copied from config/models.example.yaml).
       - "./config/models.yaml:/app/config/models.yaml:ro"
 
-  # OPT-IN local Redis for idempotency development and manual testing.
+  # OPT-IN local Redis for idempotency and rate-limit development and manual
+  # testing. One Redis backs both features; the gateway opens ONE connection.
+  #
+  # The correct REDIS_URL depends on where the GATEWAY PROCESS runs, so the two
+  # local setups must not be mixed:
   #
   # Redis ONLY (for a natively run gateway, or `npm run test:redis`) — naming the
   # service keeps the gateway container out of it:
@@ -79,7 +92,8 @@ services:
   # equivalent), Redis ACL/authentication, TLS (`rediss://`) where the endpoint
   # is not on a trusted private link, the application-layer
   # IDEMPOTENCY_ENCRYPTION_KEY, and an IDENTICAL REDIS_URL, encryption key,
-  # REDIS_KEY_PREFIX, and COLLECTIVIQ_GATEWAY_KEYS set across every replica.
+  # REDIS_KEY_PREFIX, COLLECTIVIQ_GATEWAY_KEYS set, and RATE_LIMIT_* settings
+  # across every replica.
   redis:
     profiles: ["redis"]
     image: redis:8.8.2-alpine

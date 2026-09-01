@@ -1,9 +1,11 @@
 /**
  * Public surface of the optional Redis-backed idempotency boundary (Phase 4A).
  *
- * Consumers outside `src/idempotency/` import from here. The Redis client, the
- * Lua scripts, and the record/payload wire formats stay internal to this
- * boundary — nothing above it knows Redis exists.
+ * Consumers outside `src/idempotency/` import from here. The Lua scripts, the
+ * derived subkeys, and the record/payload wire formats stay internal to this
+ * boundary — nothing above it knows how idempotency state is stored. The
+ * connection itself belongs to the shared substrate in `src/redis/`, which the
+ * Redis composition root wires in.
  */
 export {
   createIdempotencyCoordinator,
@@ -35,10 +37,10 @@ export {
 } from "./payload.js";
 export {
   buildGatewayScopeDeriver,
-  createIdempotencyRuntime,
+  createIdempotencyCoordinatorFromConfig,
   type GatewayKeyScopeDeriver,
-  type IdempotencyRuntime,
 } from "./runtime.js";
+export { createRedisIdempotencyStore } from "./redis-store.js";
 export type {
   ActiveLeases,
   CasResult,

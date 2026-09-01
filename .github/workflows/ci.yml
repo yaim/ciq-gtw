@@ -25,11 +25,13 @@ jobs:
       - name: Run validation matrix
         run: npm run validate
 
-  redis-idempotency:
-    name: Redis idempotency contract (Node 24)
+  redis-contract:
+    name: Redis idempotency and rate-limit contracts (Node 24)
     runs-on: ubuntu-latest
     # The only job that needs an external service. `npm run validate` stays
-    # hermetic and Redis-free; this suite is an ADDITIONAL required gate.
+    # hermetic and Redis-free; these suites are an ADDITIONAL required gate.
+    # `npm run test:redis` runs BOTH real-Redis suites: Phase 4A idempotency and
+    # Phase 4B cross-replica rate limiting.
     services:
       redis:
         image: redis:8.8.2-alpine
@@ -50,8 +52,8 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci
-      - name: Run Redis idempotency contract suite
-        # Synthetic content and credentials only; the suite randomizes its key
+      - name: Run Redis contract suites (idempotency and rate limiting)
+        # Synthetic content and credentials only; each suite randomizes its key
         # prefix per run and deletes every key it creates.
         env:
           REDIS_TEST_URL: redis://127.0.0.1:6379

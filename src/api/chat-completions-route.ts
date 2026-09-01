@@ -19,6 +19,20 @@
  * commits SSE headers and owns all response output. Success and every failure
  * produce a bounded, content-free response; a disconnected client receives no
  * body.
+ *
+ * Admission order (both transports):
+ *
+ * ```text
+ * gateway authentication (the /v1 onRequest hook)
+ *   -> request validation, model resolution, tool normalization
+ *   -> Idempotency-Key validation and canonical body fingerprinting
+ *   -> keyed request with unusable idempotency  -> 503 idempotency_unavailable
+ *   -> prompt preparation
+ *   -> cross-replica rate limit                 -> 429 / 503 (§19.1)
+ *   -> idempotency claim, wait, or replay       -> 409 / 503 / cached result
+ *   -> process-local capacity                   -> 429 gateway_capacity_exceeded
+ *   -> upstream work
+ * ```
  */
 import { Type } from "@fastify/type-provider-typebox";
 import type { FastifyError } from "fastify";
@@ -47,18 +61,29 @@ import {
 import { validateChatRequest } from "../openai/chat-request.js";
 import { ChatCompletionSchema, encodeChatCompletion } from "../openai/chat-response.js";
 import { streamChatCompletion } from "./chat-stream-response.js";
+import type { RateLimiter } from "../rate-limit/index.js";
 import {
   COMPLETION_TIMEOUT_ERROR,
+  gatewayRateLimitExceeded,
   IDEMPOTENCY_KEY_CONFLICT_ERROR,
   IDEMPOTENCY_UNAVAILABLE_ERROR,
   INTERNAL_ERROR,
   INVALID_IDEMPOTENCY_KEY_ERROR,
   INVALID_REQUEST_ERROR,
   OpenAIErrorSchema,
+  RATE_LIMIT_UNAVAILABLE_ERROR,
   REQUEST_BODY_TOO_LARGE_ERROR,
   SERVICE_UNAVAILABLE_ERROR,
   type OpenAIApiError,
 } from "../openai/errors.js";
+
+/**
+ * Fixed `Retry-After`, in seconds, for a `429` whose envelope does not carry its
+ * own value — process-local capacity and upstream quota (specification §19).
+ * The rate limiter instead computes an exact per-response delay, which its
+ * envelope supplies and which overrides this default for that response only.
+ */
+const DEFAULT_RETRY_AFTER_SECONDS = 5;
 
 /** Dependencies for the chat-completions route. */
 export interface ChatCompletionsRouteDeps {
@@ -74,6 +99,23 @@ export interface ChatCompletionsRouteDeps {
    * unaffected, and a supplied `Idempotency-Key` fails closed with `503`.
    */
   readonly idempotency?: IdempotencyCoordinator;
+  /**
+   * Whether validated configuration turned rate limiting ON
+   * (`RATE_LIMIT_ENABLED`). This is REQUIRED and authoritative: configuration,
+   * not the presence of an injected object, decides whether the gate runs.
+   * Enabled-but-unwired must fail closed rather than silently admit unmetered
+   * traffic, so the flag cannot be inferred from {@link rateLimiter}.
+   */
+  readonly rateLimitEnabled: boolean;
+  /**
+   * The cross-replica per-gateway-key rate limiter (Phase 4B).
+   *
+   * Omitting it is safe ONLY when {@link rateLimitEnabled} is `false` — that is
+   * the consistent disabled state, in which no limiter or Redis operation ever
+   * runs. Omitting it while the feature is ENABLED is an unavailable dependency,
+   * not a disabled feature, and every completion then fails closed with `503`.
+   */
+  readonly rateLimiter?: RateLimiter;
 }
 
 /**
@@ -182,10 +224,13 @@ export function registerChatCompletionsRoute(
           // Every envelope status is a declared response code; the cast satisfies
           // the typed reply without widening the public contract.
           reply.code(apiError.status as 400 | 401 | 404 | 409 | 413 | 429 | 502 | 503 | 504 | 500);
-          if (apiError.status === 429) reply.header("retry-after", "5");
-          else if (apiError.retryAfterSeconds !== undefined) {
-            reply.header("retry-after", String(apiError.retryAfterSeconds));
-          }
+          // An envelope that carries its own value wins (the rate limiter's exact
+          // delay, idempotency's fixed `2`); every other `429` keeps the
+          // long-standing fixed `5`.
+          const retryAfter =
+            apiError.retryAfterSeconds ??
+            (apiError.status === 429 ? DEFAULT_RETRY_AFTER_SECONDS : undefined);
+          if (retryAfter !== undefined) reply.header("retry-after", String(retryAfter));
           return apiError.body;
         };
 
@@ -283,6 +328,53 @@ export function registerChatCompletionsRoute(
           reply.raw.removeListener("close", onClose);
           if (isChatCompletionError(error)) return sendError(error.apiError);
           return sendError(INTERNAL_ERROR);
+        }
+
+        // --- Cross-replica rate limiting (specification §19.1) ---------------
+        // Positioned deliberately: AFTER authentication, request validation,
+        // prompt preparation, and idempotency-header/fingerprint validation — so
+        // a rejected or unusable request never spends quota, and a supplied key
+        // whose idempotency guarantee cannot be honoured still reports
+        // `idempotency_unavailable` rather than being metered — and BEFORE the
+        // idempotency claim, process-local capacity, any SSE header, and any
+        // upstream call. Every otherwise-valid attempt therefore consumes exactly
+        // one unit, including an owner, a waiter, a cached replay, and a
+        // different-body conflict; quota is never refunded by a later failure.
+        //
+        // CONFIGURATION is authoritative for whether the gate runs. Keying it on
+        // the injected limiter instead would mean an enabled-but-unwired instance
+        // silently served unmetered traffic — the failure mode this control
+        // exists to prevent. The gate therefore also runs when a limiter was
+        // injected without configuration deriving a scope, so an inconsistent
+        // wiring fails closed instead of being treated as "disabled".
+        if (deps.rateLimitEnabled || deps.rateLimiter !== undefined) {
+          const limiter = deps.rateLimiter;
+          const rateScopeId = request.gatewayRateLimitScopeId;
+          const decision =
+            limiter === undefined || rateScopeId === null
+              ? // Enabled but unwired, or wired without a scope: an unavailable
+                // dependency. Never call the limiter, never admit the request.
+                ({ kind: "unavailable" } as const)
+              : await limiter
+                  .consume(rateScopeId, signal)
+                  .catch(() => ({ kind: "unavailable" }) as const);
+
+          if (decision.kind !== "allowed") {
+            reply.raw.removeListener("close", onClose);
+            if (decision.kind === "limited") {
+              return sendError(gatewayRateLimitExceeded(decision.retryAfterSeconds));
+            }
+            if (decision.kind === "cancelled") {
+              // Same semantics as every other cancellation on this route: a gone
+              // client gets no body, a shutdown keeps the existing `503`.
+              if (clientAbort.signal.aborted) {
+                reply.hijack();
+                return reply;
+              }
+              return sendError(SERVICE_UNAVAILABLE_ERROR);
+            }
+            return sendError(RATE_LIMIT_UNAVAILABLE_ERROR);
+          }
         }
 
         const setIgnoredHeader = (streamed: boolean): void => {

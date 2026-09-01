@@ -410,6 +410,167 @@ describe("loadConfig — optional Redis idempotency", () => {
   });
 });
 
+describe("loadConfig — optional cross-replica rate limiting", () => {
+  const VALID_KEY = randomBytes(32).toString("base64url");
+  /** The Redis settings that make enabling the limiter valid. */
+  const REDIS = {
+    REDIS_URL: "redis://127.0.0.1:6379",
+    IDEMPOTENCY_ENCRYPTION_KEY: VALID_KEY,
+  } as const;
+
+  function issuesFor(overrides: Record<string, string | undefined>): ConfigError["issues"] {
+    try {
+      loadConfig({ env: baseEnv(overrides) });
+      throw new Error("expected ConfigError");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfigError);
+      return (error as ConfigError).issues;
+    }
+  }
+
+  it("is DISABLED by default, with the documented defaults still validated", () => {
+    const config = loadConfig({ env: baseEnv() });
+    expect(config.RATE_LIMIT_ENABLED).toBe(false);
+    expect(config.RATE_LIMIT_REQUESTS).toBe(60);
+    expect(config.RATE_LIMIT_WINDOW_MS).toBe(60_000);
+    expect(config.RATE_LIMIT_BURST).toBe(8);
+  });
+
+  it("accepts only the strict boolean syntax", () => {
+    expect(loadConfig({ env: baseEnv({ RATE_LIMIT_ENABLED: "false" }) }).RATE_LIMIT_ENABLED).toBe(
+      false,
+    );
+    expect(
+      loadConfig({ env: baseEnv({ ...REDIS, RATE_LIMIT_ENABLED: "true" }) }).RATE_LIMIT_ENABLED,
+    ).toBe(true);
+    // Surrounding whitespace and case are tolerated exactly as for LOG_CONTENT.
+    expect(
+      loadConfig({ env: baseEnv({ ...REDIS, RATE_LIMIT_ENABLED: " TRUE " }) }).RATE_LIMIT_ENABLED,
+    ).toBe(true);
+    for (const value of ["1", "0", "yes", "no", "on", "enabled", "maybe"]) {
+      expect(issuesFor({ ...REDIS, RATE_LIMIT_ENABLED: value })).toContainEqual({
+        field: "RATE_LIMIT_ENABLED",
+        reason: 'must be "true" or "false"',
+      });
+    }
+  });
+
+  it("REQUIRES a Redis endpoint when explicitly enabled", () => {
+    // A shared quota cannot be enforced from process-local state, so enabling
+    // it without Redis is an error rather than a silent downgrade.
+    expect(issuesFor({ RATE_LIMIT_ENABLED: "true" })).toContainEqual({
+      field: "REDIS_URL",
+      reason: "is required when RATE_LIMIT_ENABLED is true",
+    });
+    for (const REDIS_URL of ["", "   "]) {
+      expect(issuesFor({ RATE_LIMIT_ENABLED: "true", REDIS_URL })).toContainEqual({
+        field: "REDIS_URL",
+        reason: "is required when RATE_LIMIT_ENABLED is true",
+      });
+    }
+  });
+
+  it("does not double-report a Redis URL that was supplied but rejected", () => {
+    const issues = issuesFor({ RATE_LIMIT_ENABLED: "true", REDIS_URL: "http://nope" });
+    expect(issues.filter((issue) => issue.field === "REDIS_URL")).toEqual([
+      { field: "REDIS_URL", reason: "must be a canonical redis:// or rediss:// URL" },
+    ]);
+  });
+
+  it("still requires the encryption key transitively when enabled", () => {
+    // Enabling the limiter requires Redis, and Redis already requires the
+    // master key the rate-limit subkey is derived from.
+    expect(
+      issuesFor({ RATE_LIMIT_ENABLED: "true", REDIS_URL: "redis://127.0.0.1:6379" }),
+    ).toContainEqual({ field: "IDEMPOTENCY_ENCRYPTION_KEY", reason: "is required" });
+  });
+
+  it("does not require Redis while the feature stays disabled", () => {
+    const config = loadConfig({
+      env: baseEnv({ RATE_LIMIT_ENABLED: "false", RATE_LIMIT_REQUESTS: "10" }),
+    });
+    expect(config.REDIS_URL).toBeUndefined();
+    expect(config.RATE_LIMIT_REQUESTS).toBe(10);
+  });
+
+  it("enforces each numeric range", () => {
+    for (const [field, invalid] of [
+      ["RATE_LIMIT_REQUESTS", ["0", "-1", "100001"]],
+      ["RATE_LIMIT_WINDOW_MS", ["0", "999", "3600001"]],
+      ["RATE_LIMIT_BURST", ["0", "-1", "10001"]],
+    ] as const) {
+      for (const value of invalid) {
+        expect(issuesFor({ [field]: value })).toContainEqual({
+          field,
+          reason: "is outside allowed range",
+        });
+      }
+      expect(issuesFor({ [field]: "not-an-int" })).toContainEqual({
+        field,
+        reason: "must be an integer",
+      });
+    }
+  });
+
+  it("accepts each boundary value", () => {
+    const config = loadConfig({
+      env: baseEnv({
+        RATE_LIMIT_REQUESTS: "100000",
+        RATE_LIMIT_WINDOW_MS: "3600000",
+        RATE_LIMIT_BURST: "10000",
+      }),
+    });
+    expect(config.RATE_LIMIT_REQUESTS).toBe(100_000);
+    expect(config.RATE_LIMIT_WINDOW_MS).toBe(3_600_000);
+    expect(config.RATE_LIMIT_BURST).toBe(10_000);
+    const minimal = loadConfig({
+      env: baseEnv({
+        RATE_LIMIT_REQUESTS: "1",
+        RATE_LIMIT_WINDOW_MS: "1000",
+        RATE_LIMIT_BURST: "1",
+      }),
+    });
+    expect(minimal.RATE_LIMIT_BURST).toBe(1);
+  });
+
+  it("rejects a burst larger than the window budget", () => {
+    // An immediate burst above the sustained budget would let one instant of
+    // traffic exceed the very limit the window exists to enforce.
+    expect(issuesFor({ RATE_LIMIT_REQUESTS: "10", RATE_LIMIT_BURST: "11" })).toContainEqual({
+      field: "RATE_LIMIT_BURST",
+      reason: "must not exceed RATE_LIMIT_REQUESTS",
+    });
+    // Exactly equal is allowed.
+    expect(
+      loadConfig({ env: baseEnv({ RATE_LIMIT_REQUESTS: "10", RATE_LIMIT_BURST: "10" }) })
+        .RATE_LIMIT_BURST,
+    ).toBe(10);
+  });
+
+  it("validates a PRESENT value even while the feature is disabled", () => {
+    // A deployment must not be able to carry a silently broken setting that
+    // only fails the day someone switches rate limiting on.
+    expect(issuesFor({ RATE_LIMIT_ENABLED: "false", RATE_LIMIT_REQUESTS: "0" })).toContainEqual({
+      field: "RATE_LIMIT_REQUESTS",
+      reason: "is outside allowed range",
+    });
+    expect(issuesFor({ RATE_LIMIT_ENABLED: "false", RATE_LIMIT_BURST: "99" })).toContainEqual({
+      field: "RATE_LIMIT_BURST",
+      reason: "must not exceed RATE_LIMIT_REQUESTS",
+    });
+  });
+
+  it("keeps every rate-limit failure value-free", () => {
+    const issues = issuesFor({
+      RATE_LIMIT_ENABLED: "SENSITIVE-VALUE",
+      RATE_LIMIT_REQUESTS: "SENSITIVE-REQUESTS",
+    });
+    const formatted = new ConfigError(issues).format();
+    expect(formatted).not.toContain("SENSITIVE-VALUE");
+    expect(formatted).not.toContain("SENSITIVE-REQUESTS");
+  });
+});
+
 describe("loadConfig — gateway keys", () => {
   /** Load with a raw gateway-key string, returning either config or issues. */
   function loadWithKeys(rawKeys: string): ReturnType<typeof loadConfig> {

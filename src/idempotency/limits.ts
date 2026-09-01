@@ -113,14 +113,8 @@ export const WAIT_POLL_JITTER = 0.25;
  */
 export const MAX_WAIT_POLLS = 10_000;
 
-/** Bounded deadline for a single Redis command, in ms. */
-export const REDIS_COMMAND_TIMEOUT_MS = 2_000;
-/** Bounded deadline for establishing the Redis connection, in ms. */
-export const REDIS_CONNECT_TIMEOUT_MS = 5_000;
-/** Maximum automatic reconnect backoff, in ms. */
-export const REDIS_RECONNECT_MAX_DELAY_MS = 5_000;
-/** Bounded graceful Redis close window before the socket is force-destroyed, in ms. */
-export const REDIS_CLOSE_TIMEOUT_MS = 2_000;
+// The Redis CONNECTION bounds (command/connect/reconnect/close deadlines) are
+// shared by every Redis-backed feature and live in `src/redis/limits.ts`.
 
 /** Owner-token size, in bytes (128 bits of randomness). */
 export const OWNER_TOKEN_BYTES = 16;

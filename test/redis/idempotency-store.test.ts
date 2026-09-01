@@ -20,7 +20,7 @@ import type { Clock, Sleeper } from "../../src/generation/types.js";
 import {
   buildStorageKey,
   createIdempotencyCoordinator,
-  createIdempotencyRuntime,
+  createRedisIdempotencyStore,
   deriveIdempotencyKeyring,
   type ActiveLeases,
   type IdempotencyCoordinator,
@@ -28,10 +28,31 @@ import {
 import { buildServer } from "../../src/server.js";
 import { RESERVED_LEASE_MS } from "../../src/idempotency/limits.js";
 import type { CachedResult } from "../../src/idempotency/payload.js";
-import {
-  createRedisIdempotencyConnection,
-  type RedisIdempotencyConnection,
-} from "../../src/idempotency/redis-store.js";
+import type { IdempotencyStore } from "../../src/idempotency/store.js";
+import { createRedisConnection } from "../../src/redis/index.js";
+import { createRedisRuntime } from "../../src/redis/runtime.js";
+
+/**
+ * One shared Redis connection plus the idempotency store it backs. The suite
+ * still drives `connection.store`; only the composition changed when the client
+ * moved into the shared substrate (`src/redis/`).
+ */
+interface RedisIdempotencyConnection {
+  readonly store: IdempotencyStore;
+  connect(): void;
+  close(): Promise<void>;
+  isReady(): boolean;
+}
+
+function openIdempotencyConnection(url: string): RedisIdempotencyConnection {
+  const connection = createRedisConnection({ url });
+  return {
+    store: createRedisIdempotencyStore(connection.substrate),
+    connect: () => connection.connect(),
+    close: () => connection.close(),
+    isReady: () => connection.isReady(),
+  };
+}
 
 const REDIS_URL = process.env["REDIS_TEST_URL"];
 
@@ -84,6 +105,10 @@ function appConfig(): AppConfig {
     IDEMPOTENCY_ENCRYPTION_KEY: MASTER_KEY,
     IDEMPOTENCY_TTL_MS: TTL_MS,
     REDIS_KEY_PREFIX: NAMESPACE,
+    RATE_LIMIT_ENABLED: false,
+    RATE_LIMIT_REQUESTS: 60,
+    RATE_LIMIT_WINDOW_MS: 60_000,
+    RATE_LIMIT_BURST: 8,
     models: [
       {
         id: "collectiviq-consensus",
@@ -123,7 +148,7 @@ async function waitReady(connection: RedisIdempotencyConnection, timeoutMs = 5_0
 
 /** Build a connected connection registered for teardown. */
 async function connected(): Promise<RedisIdempotencyConnection> {
-  const connection = createRedisIdempotencyConnection({ url: requireUrl() });
+  const connection = openIdempotencyConnection(requireUrl());
   connections.push(connection);
   connection.connect();
   await waitReady(connection);
@@ -632,7 +657,7 @@ describe("real Redis: corrupt and tampered records fail closed", () => {
 
 describe("real Redis: readiness and availability", () => {
   it("reports not-ready before connect and after close, failing commands closed", async () => {
-    const connection = createRedisIdempotencyConnection({ url: requireUrl() });
+    const connection = openIdempotencyConnection(requireUrl());
     expect(connection.isReady()).toBe(false);
     // Commands fail closed while disconnected (the offline queue is disabled).
     expect(await connection.store.read(`${NAMESPACE}:before-connect`)).toEqual({
@@ -656,7 +681,7 @@ describe("real Redis: readiness and availability", () => {
   it("never rejects or throws when the endpoint is unreachable", async () => {
     // Port 1 is reserved and refuses connections; the client must retry in the
     // background, stay not-ready, and never surface an unhandled error.
-    const connection = createRedisIdempotencyConnection({ url: "redis://127.0.0.1:1" });
+    const connection = openIdempotencyConnection("redis://127.0.0.1:1");
     expect(() => connection.connect()).not.toThrow();
     await new Promise((resolve) => setTimeout(resolve, 300));
     expect(connection.isReady()).toBe(false);
@@ -672,8 +697,10 @@ describe("real Redis: the full HTTP route against a real Redis", () => {
     // End to end through the REAL route, the REAL coordinator, and a REAL
     // Redis — the closest hermetic analogue of production, with a fake
     // completion service so no CollectivIQ call is made.
-    const runtime = createIdempotencyRuntime(appConfig());
-    if (runtime === null) throw new Error("expected an idempotency runtime");
+    const runtime = createRedisRuntime(appConfig());
+    if (runtime === null || runtime.idempotency === null) {
+      throw new Error("expected an idempotency coordinator");
+    }
     runtime.connect();
     const deadline = Date.now() + 5_000;
     while (!runtime.isReady() && Date.now() < deadline) {
@@ -708,7 +735,7 @@ describe("real Redis: the full HTTP route against a real Redis", () => {
         },
         shutdownSignal: new AbortController().signal,
       },
-      idempotency: runtime.coordinator,
+      idempotency: runtime.idempotency,
     });
 
     try {

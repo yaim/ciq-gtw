@@ -2,25 +2,27 @@
  * Idempotency runtime composition (Phase 4A).
  *
  * Wires validated configuration into the concrete idempotency layer: derive the
- * keyring, create the Redis connection, and build the coordinator. Redis stays
- * OPTIONAL — when `REDIS_URL` is blank/absent this module produces nothing at
- * all and the gateway behaves exactly as it did before Phase 4A for unkeyed
- * requests (a supplied `Idempotency-Key` then fails closed with `503`).
+ * keyring, build the store over the SHARED Redis substrate, and build the
+ * coordinator. Redis stays OPTIONAL — when `REDIS_URL` is blank/absent this
+ * module produces nothing at all and the gateway behaves exactly as it did
+ * before Phase 4A for unkeyed requests (a supplied `Idempotency-Key` then fails
+ * closed with `503`).
  *
- * Construction performs NO I/O: the client is created but never connected here,
- * so `buildServer`, every test suite, and the compiled-import smoke test stay
- * socket-free. Only the process composition root calls `connect()`.
+ * Construction performs NO I/O and creates no client: the connection is owned by
+ * the Redis composition root (`src/redis/runtime.ts`), so `buildServer`, every
+ * test suite, and the compiled-import smoke test stay socket-free.
  */
 import type { AppConfig } from "../config/schema.js";
 import { systemClock } from "../generation/seams.js";
 import type { Sleeper } from "../generation/types.js";
+import type { RedisSubstrate } from "../redis/index.js";
 import { createIdempotencyCoordinator, type IdempotencyCoordinator } from "./coordinator.js";
 import {
   deriveGatewayKeyScope,
   deriveIdempotencyKeyring,
   type IdempotencyKeyring,
 } from "./keyring.js";
-import { createRedisIdempotencyConnection } from "./redis-store.js";
+import { createRedisIdempotencyStore } from "./redis-store.js";
 
 /** Abort-aware sleep used by the waiter's bounded backoff. Clears its timer. */
 const systemSleeper: Sleeper = {
@@ -49,17 +51,6 @@ const systemSleeper: Sleeper = {
  */
 export type GatewayKeyScopeDeriver = (rawGatewayKey: string) => string;
 
-/** The composed idempotency layer owned by the process root. */
-export interface IdempotencyRuntime {
-  readonly coordinator: IdempotencyCoordinator;
-  /** Bounded, synchronous readiness probe (no I/O). */
-  isReady(): boolean;
-  /** Begin connecting in the background. Never throws, never blocks startup. */
-  connect(): void;
-  /** Bounded graceful close with force-destroy fallback. Never rejects. */
-  close(): Promise<void>;
-}
-
 /**
  * Build the per-gateway-key scope deriver from validated configuration, or
  * `null` when idempotency is disabled. Pure: HKDF only, no I/O, no socket — so
@@ -83,27 +74,22 @@ function buildKeyring(config: AppConfig): IdempotencyKeyring | null {
 }
 
 /**
- * Compose the idempotency runtime from validated configuration, or `null` when
- * Redis is disabled. Creates the client WITHOUT connecting.
+ * Compose the idempotency coordinator over the shared Redis substrate, or
+ * `null` when Redis is disabled. Performs no I/O.
  */
-export function createIdempotencyRuntime(config: AppConfig): IdempotencyRuntime | null {
+export function createIdempotencyCoordinatorFromConfig(
+  config: AppConfig,
+  substrate: RedisSubstrate,
+): IdempotencyCoordinator | null {
   const keyring = buildKeyring(config);
-  if (keyring === null || config.REDIS_URL === undefined) return null;
+  if (keyring === null) return null;
 
-  const connection = createRedisIdempotencyConnection({ url: config.REDIS_URL });
-  const coordinator = createIdempotencyCoordinator({
-    store: connection.store,
+  return createIdempotencyCoordinator({
+    store: createRedisIdempotencyStore(substrate),
     keyring,
     namespace: config.REDIS_KEY_PREFIX,
     ttlMs: config.IDEMPOTENCY_TTL_MS,
     clock: systemClock,
     sleeper: systemSleeper,
   });
-
-  return {
-    coordinator,
-    isReady: () => connection.isReady(),
-    connect: () => connection.connect(),
-    close: () => connection.close(),
-  };
 }

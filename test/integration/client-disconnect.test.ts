@@ -54,6 +54,10 @@ function configFor(baseUrl: string): AppConfig {
     SHUTDOWN_DRAIN_MS: 30_000,
     IDEMPOTENCY_TTL_MS: 600_000,
     REDIS_KEY_PREFIX: "collectiviq-gateway",
+    RATE_LIMIT_ENABLED: false,
+    RATE_LIMIT_REQUESTS: 60,
+    RATE_LIMIT_WINDOW_MS: 60_000,
+    RATE_LIMIT_BURST: 8,
     models: [MODEL],
   };
 }

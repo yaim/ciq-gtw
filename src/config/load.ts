@@ -19,6 +19,7 @@ import {
   MODEL_CONFIG_LIMITS,
   MODEL_PROPERTY_NAMES,
   ModelsFileShapeSchema,
+  RATE_LIMIT_LIMITS,
   REDIS_KEY_PREFIX_PATTERN,
   VirtualModelSchema,
   type AppConfig,
@@ -78,6 +79,10 @@ const KNOWN_ENV_KEYS = [
   "IDEMPOTENCY_ENCRYPTION_KEY",
   "IDEMPOTENCY_TTL_MS",
   "REDIS_KEY_PREFIX",
+  "RATE_LIMIT_ENABLED",
+  "RATE_LIMIT_REQUESTS",
+  "RATE_LIMIT_WINDOW_MS",
+  "RATE_LIMIT_BURST",
 ] as const;
 
 export interface LoadConfigOptions {
@@ -295,6 +300,18 @@ function loadEnvConfig(source: NodeJS.ProcessEnv): EnvConfig {
   const maxQueueWaitMs = coerceEnvInteger("MAX_QUEUE_WAIT_MS", ENV_DEFAULTS.MAX_QUEUE_WAIT_MS);
   const shutdownDrainMs = coerceEnvInteger("SHUTDOWN_DRAIN_MS", ENV_DEFAULTS.SHUTDOWN_DRAIN_MS);
   const idempotencyTtlMs = coerceEnvInteger("IDEMPOTENCY_TTL_MS", ENV_DEFAULTS.IDEMPOTENCY_TTL_MS);
+  // Optional cross-replica rate limiting (Phase 4B). A PRESENT value is always
+  // validated, even while the feature is disabled, so a deployment cannot carry
+  // a silently broken setting that only fails the day it is switched on.
+  const rateLimitRequests = coerceEnvInteger(
+    "RATE_LIMIT_REQUESTS",
+    ENV_DEFAULTS.RATE_LIMIT_REQUESTS,
+  );
+  const rateLimitWindowMs = coerceEnvInteger(
+    "RATE_LIMIT_WINDOW_MS",
+    ENV_DEFAULTS.RATE_LIMIT_WINDOW_MS,
+  );
+  const rateLimitBurst = coerceEnvInteger("RATE_LIMIT_BURST", ENV_DEFAULTS.RATE_LIMIT_BURST);
 
   // Optional Redis-backed idempotency (Phase 4A). A blank/absent REDIS_URL
   // disables Redis; the gateway then behaves exactly as before for unkeyed
@@ -338,6 +355,25 @@ function loadEnvConfig(source: NodeJS.ProcessEnv): EnvConfig {
     : ENV_DEFAULTS.REDIS_KEY_PREFIX;
   if (!REDIS_KEY_PREFIX_PATTERN.test(redisKeyPrefix)) {
     issues.push({ field: "REDIS_KEY_PREFIX", reason: "has unsupported value" });
+  }
+
+  let rateLimitEnabled: boolean = ENV_DEFAULTS.RATE_LIMIT_ENABLED;
+  if (present(raw.RATE_LIMIT_ENABLED)) {
+    const parsed = coerceBoolean(raw.RATE_LIMIT_ENABLED);
+    if (parsed === undefined) {
+      issues.push({ field: "RATE_LIMIT_ENABLED", reason: 'must be "true" or "false"' });
+    } else {
+      rateLimitEnabled = parsed;
+    }
+  }
+
+  // Cross-replica rate limiting is Redis-backed by definition: a shared quota
+  // cannot be enforced from process-local state. Explicitly enabling it without
+  // a usable endpoint is a configuration error rather than a silent downgrade to
+  // no limiting at all. A REDIS_URL that was supplied but rejected above already
+  // has its own issue, so this never double-reports the same field.
+  if (rateLimitEnabled && !redisEnabled) {
+    issues.push({ field: "REDIS_URL", reason: "is required when RATE_LIMIT_ENABLED is true" });
   }
 
   let logContent: boolean = ENV_DEFAULTS.LOG_CONTENT;
@@ -452,6 +488,10 @@ function loadEnvConfig(source: NodeJS.ProcessEnv): EnvConfig {
     REDIS_KEY_PREFIX: REDIS_KEY_PREFIX_PATTERN.test(redisKeyPrefix)
       ? redisKeyPrefix
       : ENV_DEFAULTS.REDIS_KEY_PREFIX,
+    RATE_LIMIT_ENABLED: rateLimitEnabled,
+    RATE_LIMIT_REQUESTS: rateLimitRequests,
+    RATE_LIMIT_WINDOW_MS: rateLimitWindowMs,
+    RATE_LIMIT_BURST: rateLimitBurst,
   };
 
   // Structural/enum/bounds validation. Reasons are generic; env keys are static.
@@ -470,6 +510,23 @@ function loadEnvConfig(source: NodeJS.ProcessEnv): EnvConfig {
     issues.push({
       field: "MAX_CONCURRENT_REQUESTS_PER_KEY",
       reason: "must not exceed MAX_CONCURRENT_REQUESTS",
+    });
+  }
+
+  // Cross-field: the immediate burst can never exceed the window's own budget,
+  // otherwise one instant of traffic could exceed the sustained limit the window
+  // exists to enforce. Only checked when both values are individually in range,
+  // so the reason is unambiguous.
+  if (
+    Number.isInteger(rateLimitRequests) &&
+    Number.isInteger(rateLimitBurst) &&
+    rateLimitRequests >= RATE_LIMIT_LIMITS.requests.min &&
+    rateLimitBurst >= RATE_LIMIT_LIMITS.burst.min &&
+    rateLimitBurst > rateLimitRequests
+  ) {
+    issues.push({
+      field: "RATE_LIMIT_BURST",
+      reason: "must not exceed RATE_LIMIT_REQUESTS",
     });
   }
 

@@ -1,35 +1,38 @@
 /**
  * Command-level contract for the Redis idempotency store (Phase 4A).
  *
- * These tests drive `createRedisIdempotencyConnection` through an INJECTED fake
- * client that records every command, so they assert what the gateway actually
- * puts on the wire without needing a Redis. Lua SEMANTICS are proven separately
- * against a real server by `test/redis/`; what matters here is the command
- * SHAPE — in particular that the record-read path is bounded server side and
- * never issues a direct unbounded `GET`.
+ * These tests drive the store over the shared Redis substrate with an INJECTED
+ * fake client that records every command, so they assert what the gateway
+ * actually puts on the wire without needing a Redis. Lua SEMANTICS are proven
+ * separately against a real server by `test/redis/`; what matters here is the
+ * command SHAPE — in particular that the record-read path is bounded server side
+ * and never issues a direct unbounded `GET`.
  */
 import { describe, expect, it } from "vitest";
 import { MAX_RECORD_BYTES, RESERVED_LEASE_MS } from "../../src/idempotency/limits.js";
 import { RECORD_VERSION } from "../../src/idempotency/records.js";
+import { createRedisIdempotencyStore } from "../../src/idempotency/redis-store.js";
+import type { IdempotencyStore } from "../../src/idempotency/store.js";
 import {
-  createRedisIdempotencyConnection,
+  createRedisConnection,
   type MinimalRedisClient,
   type RedisClientConfig,
-} from "../../src/idempotency/redis-store.js";
+} from "../../src/redis/index.js";
 
 const KEY = "ns:idem:AAAA";
 const OWNER = "b3duZXItdG9rZW4";
 
 interface FakeClient extends MinimalRedisClient {
   readonly commands: readonly (readonly string[])[];
+  isReady: boolean;
 }
 
 /**
- * Build a connection over a fake client that answers each command from a queue
- * of scripted replies. An exhausted queue is a test bug, so it throws.
+ * Build the store over a fake client that answers each command from a queue of
+ * scripted replies. An exhausted queue is a test bug, so it throws.
  */
 function harness(replies: readonly unknown[]): {
-  readonly store: ReturnType<typeof createRedisIdempotencyConnection>["store"];
+  readonly store: IdempotencyStore;
   readonly client: FakeClient;
   readonly config: RedisClientConfig;
 } {
@@ -52,14 +55,18 @@ function harness(replies: readonly unknown[]): {
     },
   };
 
-  const connection = createRedisIdempotencyConnection({
+  const connection = createRedisConnection({
     url: "redis://127.0.0.1:6379",
     createRedisClient: (config) => {
       captured = config;
       return client;
     },
   });
-  return { store: connection.store, client, config: captured as RedisClientConfig };
+  return {
+    store: createRedisIdempotencyStore(connection.substrate),
+    client,
+    config: captured as RedisClientConfig,
+  };
 }
 
 /** Every distinct command verb the fake observed. */
@@ -125,7 +132,7 @@ describe("redis store: bounded record reads", () => {
 
   it("reports unavailable rather than reading while disconnected", async () => {
     const h = harness([]);
-    (h.client as { isReady: boolean }).isReady = false;
+    h.client.isReady = false;
     expect(await h.store.read(KEY)).toEqual({ kind: "unavailable" });
     expect(h.client.commands).toHaveLength(0);
   });
@@ -225,13 +232,11 @@ describe("redis store: script argument order", () => {
     // A shared SHA would mean two operations executing the same body.
     const shas = new Set<string>();
     for (const run of [
-      async (s: ReturnType<typeof harness>["store"]) => s.read(KEY),
-      async (s: ReturnType<typeof harness>["store"]) => s.claim(KEY, "{}", 1),
-      async (s: ReturnType<typeof harness>["store"]) =>
-        s.renew(KEY, OWNER, { reserved: 1, processing: 2 }),
-      async (s: ReturnType<typeof harness>["store"]) => s.release(KEY, OWNER, "reserved"),
-      async (s: ReturnType<typeof harness>["store"]) =>
-        s.transition(KEY, OWNER, "reserved", "{}", 1),
+      async (s: IdempotencyStore) => s.read(KEY),
+      async (s: IdempotencyStore) => s.claim(KEY, "{}", 1),
+      async (s: IdempotencyStore) => s.renew(KEY, OWNER, { reserved: 1, processing: 2 }),
+      async (s: IdempotencyStore) => s.release(KEY, OWNER, "reserved"),
+      async (s: IdempotencyStore) => s.transition(KEY, OWNER, "reserved", "{}", 1),
     ]) {
       const h = harness([["missing"]]);
       await run(h.store);
