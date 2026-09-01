@@ -25,16 +25,19 @@ This repository is a **runnable foundation**, the Phase 1A authenticated public
 model surface, the Phase 1B non-streamed chat-completions path wired through the
 CollectivIQ adapter, Phase 2 text-only synthetic SSE streaming
 (`stream: true`), and Phase 3 **experimental, opt-in, non-default** emulated tool
-calling (implemented offline; its section-30 release gates are NOT met — the
-corrected report-v4 evaluator completed a full live campaign on 2026-08-31 in
-which six of eight gates passed while **tool-name accuracy and multi-step
-success failed**, remediation was deliberately **deferred**, and **no production
-security boundary, prompt, parser, selector, evaluator, threshold, model
-default, or model configuration changed in response**; every emitted report,
-diagnostic, and persisted checkpoint stayed value-free, all created threads were
-deleted with zero remaining and zero recovery-journal failures, and the
-checkpoint finalized. Specification section 30 owns the campaign and gate
-details). Redis, metrics/tracing, true upstream streaming, and
+calling (its numerical section-30 release gates are **met** — the state-aware
+report-v5 evaluator completed a full live campaign on 2026-09-01 in which all
+eight gates passed, including the security-relevant **no-silent-fallback**,
+**injection-resistance**, and **parser-determinism** invariants, and **no
+production security boundary, prompt, parser, selector, evaluator, threshold,
+model default, or model configuration changed to reach that result or in response
+to it**. Security-relevant operational outcome: every emitted report, diagnostic,
+and persisted checkpoint stayed value-free; the campaign's approved resume across
+two execution segments behaved as specified; all created threads were deleted
+with zero remaining and zero recovery-journal failures; and the checkpoint
+finalized. The feature nevertheless stays experimental, opt-in, and non-default
+by explicit product decision pending a separate graduation review. Specification
+section 30 owns the campaign and gate details). Redis, metrics/tracing, true upstream streaming, and
 native tool mode are not implemented. The completion path calls CollectivIQ only
 when a real request is served (never during import/construction/build smoke). A
 user-observed, sanitized live OpenCode/CollectivIQ foreground **transport** smoke
@@ -181,22 +184,28 @@ and any further live run is approval-gated. The controls that exist today are:
   serialized into the prompt sent to CollectivIQ (they are still never logged or
   retained); each tool-loop round creates a new upstream thread; and the gateway
   returns model-**proposed** calls but never executes, authorizes, or simulates a
-  tool (OpenCode owns permissions and execution). Emulated mode is experimental:
-  its section-30 release gates are **not met**. The approval-gated live evaluator
-  (`npm run eval:tools`) has been run in four authorized campaigns;
-  **specification section 30 owns the campaign and gate details.** The
-  security-relevant outcome of the latest (corrected report-v4) campaign,
-  completed live on 2026-08-31, is that **every emitted report, failure
-  diagnostic, and persisted checkpoint stayed value-free** (ordinals plus closed
-  enums only — no prompt, answer, argument, schema, tool/model name, id,
-  credential, title, or body), **cleanup completed with every created thread
-  deleted, zero remaining threads, and zero recovery-journal failures**, and the
-  **checkpoint finalized** with no final abort. Six of eight gates passed while
-  tool-name accuracy and multi-step success failed, so **section 30 remains
-  unmet**; remediation was deliberately **deferred** and **no production
-  security boundary, prompt, parser, selector, evaluator, threshold, model
-  default, or model configuration changed in response**. Any future live rerun
-  is separately approval-gated. Baseline evaluator hardening landed offline before the
+  tool (OpenCode owns permissions and execution). Emulated mode stays
+  experimental, opt-in, and non-default by explicit product decision pending a
+  separate graduation review, even though its numerical section-30 release gates
+  are now **met**. The approval-gated live evaluator (`npm run eval:tools`) has
+  been run in five authorized campaigns; **specification section 30 owns the
+  campaign and gate details.** The security-relevant outcome of the latest
+  (state-aware report-v5) campaign, completed live on 2026-09-01, is that **every
+  emitted report, failure diagnostic, and persisted checkpoint stayed value-free**
+  (ordinals plus closed enums only — no prompt, answer, argument, schema,
+  tool/model name, id, credential, title, or body); its **approved resume across
+  two execution segments behaved as specified**, with the interrupted attempt's
+  thread confirmed deleted before the abort was classified resumable and the
+  cursor advancing only over cleanup-confirmed cases; **cleanup completed with
+  every created thread deleted, zero remaining threads, zero cleanup failures,
+  and zero recovery-journal failures**; and the **checkpoint finalized** with no
+  final abort. All eight gates passed — including the security-relevant
+  **no-silent-fallback**, **injection-resistance**, and **parser-determinism**
+  invariants — and **no production security boundary, prompt, parser, selector,
+  evaluator, threshold, model default, or model configuration changed to reach
+  that result or in response to it**. One passing campaign is not production
+  readiness or a cross-account guarantee, and any future live rerun is separately
+  approval-gated. The 2026-08-31 report-v4 campaign is historical evidence. Baseline evaluator hardening landed offline before the
   2026-08-26 campaign (content-free resume checkpoint gated behind
   `--resume-approved`, versioned value-free output union, four-state gate
   status), and the on-disk report and checkpoint payloads are now bounded and
@@ -260,10 +269,11 @@ reasonCode]` ledger with fixed integer reason codes AND a compact per-committed-
   that a resume run rejects until an operator deliberately archives or
   removes it (no automatic destructive restart), and checkpoint files are
   accepted only at an exact `0600` mode with symlink-safe ancestry. That
-  corrected evaluator was first exercised live in the completed 2026-08-31
-  campaign summarized above; the subsequent state-aware report-v5 /
-  checkpoint-v4 correction is **offline only and has NOT been run live**.
-  Section-30 stays unmet and no production security boundary changed.
+  corrected evaluator was first exercised live in the historical 2026-08-31
+  campaign; the state-aware report-v5 / checkpoint-v4 correction was then
+  exercised live by the completed 2026-09-01 campaign summarized above, which
+  put both the resumable-interruption and finalization paths through a real run.
+  No production security boundary changed.
 - A separate approval-gated **multi-step transition diagnostic**
   (`npm run eval:tools:diagnose`) exists to explain those value-free
   `expected-tool-not-invoked` failures without weakening any privacy property.

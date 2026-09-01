@@ -1021,17 +1021,15 @@ Behavior:
 
 If a required tool call cannot be parsed, the gateway must not silently return ordinary text. It must return a structured gateway failure.
 
-**Implementation status.** Emulated tool calling (Phase 3) is implemented offline
-but **experimental, opt-in, and non-default**: only the `collectiviq-claude-tools`
-model / `collectiviq-tools-experimental` agent enable it, and its section-30
-release gates are not met. The corrected report-v4 / checkpoint-v3 evaluator
-completed a full live campaign on **2026-08-31**: six of the eight section-30
-gates passed, while **tool-name accuracy and multi-step success failed**.
-Section 30 therefore remains **unmet**, remediation was deliberately
-**deferred**, and Phase 3 stays experimental, opt-in, and non-default. The
-evaluator has since been corrected again — **report v5 / checkpoint v4**,
-state-aware multi-step scoring — but that correction is **offline only and has
-NOT been run live**, so it changes no recorded campaign result. **See
+**Implementation status.** Emulated tool calling (Phase 3) is implemented but
+**experimental, opt-in, and non-default**: only the `collectiviq-claude-tools`
+model / `collectiviq-tools-experimental` agent enable it. Its numerical
+section-30 release gates are **met**: the state-aware report-v5 / checkpoint-v4
+evaluator completed a full live campaign on **2026-09-01** in which all eight
+gates passed and overall `passed: true`. The earlier 2026-08-31 report-v4
+campaign (six of eight gates passing) is historical evidence. Phase 3 stays
+experimental, opt-in, and non-default **by explicit product decision pending a
+separate graduation review**, not because a gate failed. **See
 section 30** for the complete campaign evidence and accounting. Every committed
 default virtual model
 is `toolMode: "disabled"`, so the request boundary only
@@ -1526,8 +1524,10 @@ parsing algorithm (§12.2), candidate selection and consensus fallback (§12.3),
 final-answer fallback (§12.3.2), `call_ciq_<ULID>` ids (§12.4), the parallel-call
 policy (§12.5), and the tool-loop model (§12.6) are all implemented in `src/tools/`
 and wired into the `toolMode: "emulated"` completion path. The gateway returns
-model-PROPOSED calls only and never executes a tool. Release gates (§30) are not
-met; the feature is opt-in and non-default. See the Phase 3 status note in §32.
+model-PROPOSED calls only and never executes a tool. The numerical release gates
+(§30) are **met** by the completed 2026-09-01 report-v5 campaign; the feature
+nevertheless stays opt-in and non-default by explicit product decision. See the
+Phase 3 status note in §32.
 
 ### 12.2 Parsing algorithm
 
@@ -3131,9 +3131,15 @@ The approval-gated **live evaluator** that measures these numerical gates agains
 the real origin (`npm run eval:tools`, `src/eval/`) is implemented — preflight by
 default, password-only, fixed origin, 200 single-round + 20 three-step scenarios,
 hard cap 280 upstream completions, per-request immediate cleanup, ID-only recovery
-journal, abort-on-cleanup-failure, value-free output. Four authorized live
+journal, abort-on-cleanup-failure, value-free output. Five authorized live
 **campaigns** have been executed to date (a "campaign" scores at most one full
-corpus; a campaign may span multiple resumable "execution segments"):
+corpus; a campaign may span multiple resumable "execution segments"). **The
+operative evidence is the completed 2026-09-01 report-v5 campaign recorded last
+in this list: it scored the full corpus, ALL EIGHT gates passed, and overall
+`passed: true`, so the numerical section-30 release criteria above are MET.** The
+four earlier campaigns are historical; their `passed: false` results and their
+"section-30 remains unmet" language describe the state at the time each ran and
+must not be read as the current status.
 
 - **Partial 2026-08-24 campaign — historical, established NO gate.** A single
   approved run attempted 149 rounds (all 149 created threads confirmed deleted —
@@ -3192,9 +3198,13 @@ corpus; a campaign may span multiple resumable "execution segments"):
   selector, threshold, model default, or model-configuration change was
   made in response; only the evaluator itself was corrected. That
   correction was subsequently run live as the 2026-08-31 campaign below.
-- **Completed 2026-08-31 report-v4 campaign — the FOURTH authorized campaign
-  and the FIRST completed campaign on the corrected report-v4 / checkpoint-v3
-  evaluator; full corpus scored, overall `passed: false`.** The campaign ran
+- **Completed 2026-08-31 report-v4 campaign — HISTORICAL; the FOURTH authorized
+  campaign and the FIRST completed campaign on the corrected report-v4 /
+  checkpoint-v3 evaluator; full corpus scored, overall `passed: false`.** This
+  block records the state as of 2026-08-31. It is **no longer the operative
+  campaign** — the completed 2026-09-01 report-v5 campaign below supersedes it —
+  and its "unmet"/"deferred" statements are preserved only as the accurate
+  contemporaneous record. The campaign ran
   across two resumable execution segments. The first segment stopped on a
   cleaned, resumable `get-messages` failure (normalized code
   `upstream_authentication_failed`, HTTP `401`) after 159 attempted rounds and
@@ -3248,12 +3258,89 @@ corpus; a campaign may span multiple resumable "execution segments"):
   a definitive provider, model, prompt, parser, or selector root cause. The
   user reviewed this evidence and chose to **defer** Phase 3 remediation.
   Accordingly **no production prompt, parser, selector, evaluator, threshold,
-  model default, or model configuration is being changed in response**;
-  section-30 remains **unmet**; emulated tool mode stays experimental, opt-in,
-  and non-default; and any future live rerun or remediation is a separate,
-  approval-gated decision.
+  model default, or model configuration was changed in response**; section-30
+  was **unmet** as of that date. The subsequent live transition diagnostic
+  (section 30.1) and the state-aware report-v5 / checkpoint-v4 correction showed
+  that the multi-step failures recorded here were an ACCOUNTING artifact of
+  positional round expectations rather than a demonstrated production defect,
+  and the completed 2026-09-01 report-v5 campaign below rescored the same corpus
+  with all eight gates passing. Only the EVALUATOR changed between the two
+  campaigns.
 
-**Evaluator change timeline (do not conflate these three stages).** (1)
+- **Completed 2026-09-01 report-v5 campaign — the FIFTH authorized campaign, the
+  FIRST completed campaign on the state-aware report-v5 / checkpoint-v4
+  evaluator, and the CURRENT OPERATIVE EVIDENCE; full corpus scored, overall
+  `passed: true`.** The campaign ran across two resumable execution segments and
+  ALL EIGHT section-30 gates passed, so the numerical release criteria stated at
+  the top of this section are **met by this completed campaign**.
+
+  *Execution segment 1 — a successful live exercise of the cleaned resumable-
+  interruption path, NOT a failed campaign.* Against the `plannedUpstreamRounds`
+  upper bound of 280, the segment attempted **183** upstream rounds and completed
+  **182**, committing **182/200** single-round cases and **0/20** multi-step
+  scenarios. Cleanup was **183 attempted, 183 deleted, zero failed, zero
+  remaining, zero recovery-journal failures**. It then stopped on a structured,
+  value-free abort: reason `round-execution-failed`, stage `get-messages`,
+  normalized code `upstream_authentication_failed`, HTTP status `401`,
+  `resumable: true`. The checkpoint persisted successfully at next case index
+  **182** on run segment **1** and was correctly left unfinalized. Exactly one
+  already-committed value-free diagnostic existed at that point: phase `single`,
+  case ordinal **181**, round ordinal **1**, choice kind `auto`, reason
+  `expected-tool-unavailable`. Every documented guarantee held — the interrupted
+  attempt's thread was confirmed deleted before the abort was classified
+  resumable, the cursor advanced only over cleanup-confirmed cases, and the
+  durable checkpoint remained validator-acceptable.
+
+  *Approved resume and final result.* A resume was then explicitly approved and
+  began from case index **182**. Final cumulative accounting: **274 attempted
+  rounds, 273 completed rounds, 200/200 single-round cases, 20/20 multi-step
+  scenarios**, cleanup **274 attempted / 274 deleted / zero failed / zero
+  remaining / zero recovery-journal failures**, and a checkpoint that recorded
+  `resumed: true`, `runSegments: 2`, a final next case index of **220**,
+  `finalized: true`, and no persistence failure. There was **no final abort**.
+  The single segment-1 diagnostic above remained the campaign's **only**
+  diagnostic. Overall **`passed: true`**.
+
+  *Gate outcomes (all eight passed).*
+
+  | Gate | Result |
+  | --- | --- |
+  | Schema validity | 259/260, 99.6%, **passed** against 95% |
+  | Tool-name accuracy | 259/260, 99.6%, **passed** against 98% |
+  | Argument validity | 259/260, 99.6%, **passed** against 95% |
+  | Single-round success | 199/200, 99.5%, **passed** against 90% |
+  | Multi-step success | 20/20, 100%, **passed** against 85% |
+  | No silent fallback | **passed** |
+  | Injection resistance | **passed** |
+  | Parser determinism | **passed** |
+
+  *Round accounting.* `plannedUpstreamRounds: 280` remains the complete-corpus
+  UPPER BOUND, not the exact attempt count. The 273 completed rounds comprise the
+  200 single-round completions plus **73** multi-step rounds. All 20 multi-step
+  scenarios succeeded, and the state-aware engine's parallel transitions let
+  scenarios complete below the four-round-per-scenario upper bound, which is why
+  73 is fewer than 20·4. **The final report does not carry a per-scenario round
+  distribution, so none is documented or inferred here.** The difference between
+  the 274 attempted and 273 completed rounds is exactly the one cleaned,
+  resumable segment-1 `401` attempt.
+
+  *Interpretation.* Overall `passed: true` means the complete corpus was scored,
+  no abort remained, every gate passed, cleanup and recovery-journal accounting
+  were clean, and checkpoint finalization succeeded. The single value-free
+  diagnostic is **legitimate measured evidence, not an error** — a single-round
+  `expected-tool-unavailable` outcome that is fully accounted for inside the
+  reported numerators and leaves every gate within its threshold. This campaign
+  therefore satisfies the numerical section-30 release criteria. It does NOT by
+  itself establish production readiness, cross-account reliability, repeatability
+  across runs, or a general provider guarantee, and it introduces no new
+  threshold. **Phase 3 emulated tool calling remains experimental, opt-in, and
+  non-default by explicit product decision, pending a separate graduation
+  review** — that status is a policy choice, NOT a consequence of an unmet gate.
+  No production prompt, parser, selector, threshold, model default, model
+  configuration, OpenCode configuration, or public route was changed in response
+  to this campaign, and any further live run remains separately approval-gated.
+
+**Evaluator change timeline (do not conflate these four stages).** (1)
 *Baseline hardening* landed offline BEFORE the 2026-08-26 campaign and applied
 to the 2026-08-26, report-v3, and 2026-08-31 campaigns. (2) The *report-v4 /
 checkpoint-v3 corrections* (genuine one-user agent loop, deterministic
@@ -3261,6 +3348,11 @@ synthetic tool results, truthful early termination, executed-round ledger) were
 added LATER, after the report-v3 campaign, and therefore did NOT apply to the
 2026-08-24, 2026-08-26, or report-v3 campaigns. (3) The corrected evaluator was
 run live on **2026-08-31**. Attribute report-v4 behavior only to that campaign.
+(4) The *state-aware report-v5 / checkpoint-v4 correction* (shared transition
+engine, per-transition gate evidence, dynamic expectations, appended
+`scenario-round-budget-exhausted`) landed after the 2026-08-31 campaign and the
+live v2 transition diagnostic, and was run live on **2026-09-01**. Attribute
+report-v5 behavior — and the passing gate results — only to that campaign.
 
 The baseline hardening is described first. It emits a
 versioned, value-free **output union** (`preflight | progress | blocked` — a
@@ -3612,8 +3704,9 @@ with the case's score and cursor before progress is emitted. On a completed
 run, the final `executed` report re-emits every prior segment's committed
 diagnostics exactly once.
 
-**State-aware multi-step scoring (report v5 / checkpoint v4). Implemented
-offline; NOT yet run live.** The completed 2026-08-31 report-v4 campaign, and
+**State-aware multi-step scoring (report v5 / checkpoint v4). CURRENT, and
+successfully exercised live by the completed 2026-09-01 campaign recorded
+above.** The completed 2026-08-31 report-v4 campaign, and
 the subsequent live transition diagnostic recorded in section 30.1, showed that
 the evaluator's remaining multi-step defect was its own accounting, not
 necessarily the model's behavior. Report v4 expected exactly one named tool per
@@ -3760,13 +3853,18 @@ process stops before finalization succeeds, an approved resume safely replays
 exactly that one case, adds no duplicate committed diagnostic or evidence, and
 keeps cleanup accounting truthful.
 
-Report v5 and checkpoint v4 are implemented offline and covered by the hermetic
-suites. **They have NOT been run live.** No production prompt, parser, selector,
-threshold, corpus size, model default, or model configuration changed. Section
-30's release gates therefore remain **NOT met**, the last scored campaign
-remains the 2026-08-31 report-v4 campaign recorded above, and emulated tool mode
-stays **experimental, opt-in, and non-default**. Any live rerun under v5 is a
-separate, approval-gated decision.
+Report v5 and checkpoint v4 are covered by the hermetic suites AND have now been
+**successfully exercised live**: the completed **2026-09-01 campaign** recorded
+above is the first campaign scored under them, and it exercised both the cleaned
+resumable-interruption path (a checkpointed segment-1 abort) and successful
+checkpoint finalization. No production prompt, parser, selector, threshold,
+corpus size, model default, or model configuration changed in order to reach that
+result — only the evaluator's accounting did. Section 30's numerical release
+gates are therefore **met** by that campaign, the last scored campaign is the
+2026-09-01 report-v5 campaign, and emulated tool mode nevertheless stays
+**experimental, opt-in, and non-default by explicit product decision pending a
+separate graduation review**. Any further live run is a separate,
+approval-gated decision.
 
 ### 30.1 Multi-step transition diagnostic (`npm run eval:tools:diagnose`)
 
@@ -4034,37 +4132,35 @@ origin in the report, timestamps, or arbitrary exception text. Synthetic scenari
 definitions stay in source and are never emitted or persisted. The relation
 classifier reads tool names in-process and returns only a closed enum.
 
-These gates therefore remain **NOT met**. The corrected report-v4 /
-checkpoint-v3 evaluator described above (genuine agent loop, meaningful
-deterministic tool results, truthful early termination, executed-round ledger)
-passes its hermetic contract/adversarial/compatibility coverage AND **has now
-been run live**: the completed **2026-08-31 report-v4 campaign** (the fourth
-authorized campaign, recorded in detail above) scored the full corpus and
-produced complete evidence. **Six of the eight gates passed**, while
-**tool-name accuracy failed at 248/260 (95.4%) against the 98% minimum and
-multi-step success failed at 14/20 (70%) against the 85% minimum**, so overall
-`passed: false`. Its six value-free diagnostics are all
-`expected-tool-not-invoked` at multi-step round 2 under an `auto` choice, with
-truthful early termination and no fabricated cascades, so those numbers are
-free of the three ambiguities that clouded the 2026-08-26 and report-v3
-campaigns. They still do not identify a definitive provider, model, prompt,
-parser, or selector root cause, and the user reviewed the evidence and
-deliberately **deferred** Phase 3 remediation: no production prompt, parser,
-selector, threshold, model default, or model configuration is being changed in
-response. Emulated tool mode therefore stays experimental, opt-in, and
-non-default, and any future live rerun or remediation is a separate,
-approval-gated decision. Do not mark any gate passed without reproducible
-evidence from the required live suites.
+**Current release status (owned by section 30, restated here only as the
+section's closing status).** The numerical section-30 gates are **MET** by the
+completed **2026-09-01 report-v5 campaign** — the fifth authorized campaign and
+the first scored under the state-aware report-v5 / checkpoint-v4 evaluator — which
+scored the full corpus across two resumable execution segments with all eight
+gates passing and overall `passed: true`. Section 30 above owns the complete
+accounting; do not re-derive it here. The earlier **2026-08-31 report-v4
+campaign** (six of eight gates passing, `passed: false`, six
+`expected-tool-not-invoked` diagnostics at multi-step round 2 under an `auto`
+choice) is **historical evidence** and is no longer the operative campaign: the
+live v2 transition diagnostic recorded in this section, and the state-aware
+correction it motivated, showed those round-2 failures were scored against stale
+positional expectations. Only the EVALUATOR's accounting changed between the two
+campaigns — no production prompt, parser, selector, threshold, model default, or
+model configuration was altered to reach the passing result. Do not mark any gate
+passed without reproducible evidence from the required live suites, and do not
+present a single passing campaign as repeatability, production readiness, or a
+cross-account guarantee.
 
-The EVALUATOR itself has since been corrected once more — **report v5 /
-checkpoint v4** state-aware multi-step scoring in section 30, and diagnostic
-**report v3 / checkpoint v3** here — after the completed live transition
-diagnostic showed that the round-2 failures were being scored against stale
-positional expectations. Those corrections are implemented offline, pass their
-hermetic coverage, and have **NOT been run live**. They therefore supersede no
-recorded campaign number: the last scored campaign remains the 2026-08-31
-report-v4 campaign, the section-30 gates remain **NOT met**, and Phase 3 stays
-experimental, opt-in, and non-default.
+The diagnostic's own **report v3 / checkpoint v3** path, described above, is
+implemented offline, passes its hermetic coverage, and **has NOT been run live**;
+only the historical v2 run recorded in this section exists. It establishes **no**
+release gate either way.
+
+**Phase 3 nevertheless remains experimental, opt-in, and non-default by explicit
+product decision, pending a separate graduation review.** That posture is a
+policy choice made with the gates met — it is NOT a consequence of a failed or
+unmet gate, and enabling tool mode by default remains a separate, approved
+decision.
 
 If the thresholds are not met, the gateway may still expose:
 
@@ -4526,18 +4622,18 @@ opt-in `collectiviq-claude-tools` model + `collectiviq-tools-experimental` agent
 `toolMode: "disabled"`. Hermetic unit/integration/contract/compatibility/
 adversarial suites pass (see §29–30 status notes). The approval-gated live
 evaluator (`npm run eval:tools`, implemented under `src/eval/`) has been run in
-four authorized campaigns. The corrected report-v4 / checkpoint-v3 evaluator
-completed a full live campaign on **2026-08-31**: six of the eight gates
-passed, while **tool-name accuracy and multi-step success failed**, so overall
-`passed: false`. Section-30 release gates therefore remain **not met**,
-remediation was deliberately **deferred**, Phase 3 stays experimental, opt-in,
-and non-default, and any future live rerun or remediation is a separate
-approval-gated decision. The evaluator has since been corrected again to
-**report v5 / checkpoint v4** (state-aware multi-step scoring), and the
-approval-gated `npm run eval:tools:diagnose` transition diagnostic has completed
-ONE live run under its historical v2 classifier; both are recorded in sections
-30 and 30.1. The v5 evaluator and the v3 diagnostic are **offline only and have
-NOT been run live**. **See section 30** for the complete four-campaign
+five authorized campaigns. The state-aware report-v5 / checkpoint-v4 evaluator
+completed a full live campaign on **2026-09-01**: **all eight gates passed** and
+overall `passed: true`, so the numerical section-30 release gates are **met**.
+Phase 3 nevertheless stays experimental, opt-in, and non-default **by explicit
+product decision pending a separate graduation review**, and any further live
+run is a separate approval-gated decision. The earlier 2026-08-31 report-v4
+campaign (six of eight gates passing, `passed: false`) is historical evidence.
+The approval-gated `npm run eval:tools:diagnose` transition diagnostic has
+completed ONE live run under its historical v2 classifier; its current **v3**
+path is **offline only and has NOT been run live**, and it establishes no
+release gate. Both are recorded in sections 30 and 30.1. **See section 30** for
+the complete five-campaign
 record, gate evidence, and accounting. The draft-2020-12 dialect support closes the
 confirmed OpenCode 1.18.21 schema-compilation gap both **offline** (hermetic
 suites, including a pinned-SDK `read` tool declaring draft 2020-12) and in one
@@ -4614,7 +4710,7 @@ The initial gateway release is accepted when:
 17. Docker binds only to host loopback in the provided configuration.
 18. The OpenCode configuration in this specification passes an end-to-end smoke test. **Met for the tested account (2026-08-18):** the protocol-mode `collectiviq-claude` path had objected to the gateway's serialized protocol wrapper on 2026-08-15, but the committed-default `collectiviq-claude-direct` (`promptMode: "direct"`) profile was observed live on 2026-08-18 to return a relevant, correct answer to a natural coding request, complete synthetic streaming with no protocol objection / tool alert / tool call, and drive a valid `collectiviq-fast` title on its first attempt. This is a sanitized single-account observation, **not** production readiness or a repeatable upstream guarantee. Capability-aware and still not verified for the discovery account: a combined answer, long-duration streaming, and general non-Claude routing.
 19. The service recovers from a CollectivIQ outage without restart.
-20. Tool support is labeled experimental until its separate release gates are met.
+20. Tool support is labeled experimental until its separate release gates are met. **Numerical gates met (completed 2026-09-01 report-v5 campaign, §30);** tool support nevertheless stays labeled experimental, opt-in, and non-default by explicit product decision pending a separate graduation review.
 
 ---
 
@@ -4913,5 +5009,8 @@ toolMode: emulated
 ```
 
 and remain explicitly experimental until it satisfies the defined release gates.
+Those numerical gates are now **met** (§30); the feature nevertheless stays
+experimental, opt-in, and non-default by explicit product decision pending a
+separate graduation review.
 
 This architecture meets the central requirement that all model generation passes through CollectivIQ while minimizing changes to OpenCode and preserving a path toward native CollectivIQ capabilities.

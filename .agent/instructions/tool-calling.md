@@ -2,41 +2,46 @@
 
 ## Status and Trust Boundary
 
-Emulated tool calling is **implemented offline and EXPERIMENTAL** (Phase 3). It
-converts an upstream text response containing a strict protocol JSON object into
-OpenAI `tool_calls`. It does not make the response trusted and must not be enabled
-as the default production OpenCode model until every release gate in
-`.agent/docs/tech-software-spec.md` section 30 passes. Those gates are **not met**.
+Emulated tool calling is **implemented and EXPERIMENTAL** (Phase 3). It converts
+an upstream text response containing a strict protocol JSON object into OpenAI
+`tool_calls`. It does not make the response trusted. Every numerical release gate
+in `.agent/docs/tech-software-spec.md` section 30 is now **met**, but the feature
+is still **not** enabled as a default production OpenCode model: that is a
+separate, explicit product decision (see below).
 
-**Live evaluator status.** Four authorized live evaluator campaigns have been
+**Live evaluator status.** Five authorized live evaluator campaigns have been
 executed (a "campaign" scores at most one full corpus; a campaign may span
 multiple resumable "execution segments"). **The complete campaign record — every
 segment, gate numerator/denominator, cleanup and checkpoint result, diagnostic
-ordinal, and the early-termination accounting — is owned by
+ordinal, and the round accounting — is owned by
 `.agent/docs/tech-software-spec.md` section 30.** Do not restate or re-derive it
 here. What matters for tool-policy decisions:
 
-- The **completed 2026-08-31 report-v4 campaign** is the operative
-  corrected-evaluator evidence: the first completed campaign on the corrected
-  report-v4 / checkpoint-v3 evaluator, so it is the only campaign whose numbers
-  reflect the genuine one-user agent loop and truthful early termination. The
-  three earlier campaigns predate that correction and must not be read as
-  report-v4 results.
-- **Six of the eight gates passed.** **Tool-name accuracy (248/260, 95.4%
-  against the 98% minimum) and multi-step success (14/20, 70% against the 85%
-  minimum) failed**, so overall `passed: false`.
-- **All six recorded failures occurred at multi-step round 2** and carry the
-  single value-free reason `expected-tool-not-invoked` — a tool INSIDE the
-  request's allowlist that was not the tool that round expected. This is
-  DISTINCT from `unauthorized-tool-call`, which names a tool OUTSIDE the
-  allowlist and is what the injection-resistance gate measures; that gate
-  passed. The diagnostics name no tool, so they do not identify a definitive
-  provider, model, prompt, parser, or selector root cause.
-- **Section 30 remains unmet**, remediation was deliberately **deferred**, and
-  emulated tool mode stays **experimental, opt-in, and non-default**. **No
-  production prompt, parser, selector, evaluator, threshold, model default, or
-  model configuration is being changed in response**, and any future live rerun
-  or remediation is a separate approval-gated decision.
+- The **completed 2026-09-01 report-v5 campaign** is the operative evidence: the
+  first completed campaign on the state-aware report-v5 / checkpoint-v4
+  evaluator, so it is the only campaign whose multi-step numbers reflect
+  transition-based rather than positional expectations. The four earlier
+  campaigns predate that correction and must not be read as report-v5 results.
+- **All eight gates passed** and overall **`passed: true`**, so the numerical
+  section-30 release criteria are **met**. The campaign emitted exactly one
+  value-free diagnostic — a single-round `expected-tool-unavailable` — which is
+  legitimate measured evidence already accounted for inside the reported
+  numerators and leaves every gate within its threshold.
+- **Only the EVALUATOR changed** between the failing 2026-08-31 report-v4
+  campaign and this passing one. No production prompt, parser, selector,
+  threshold, model default, or model configuration was altered to reach the
+  passing result, and none is being changed in response to it either.
+- **Emulated tool mode nevertheless stays experimental, opt-in, and non-default
+  by explicit product decision, pending a separate graduation review.** Do not
+  describe that status as caused by a failed or unmet gate, and do not treat one
+  passing campaign as repeatability, production readiness, or a cross-account
+  guarantee. Enabling tool mode by default remains a separate approved decision,
+  and any further live run is separately approval-gated.
+- The **2026-08-31 report-v4 campaign** (six of eight gates passing; six
+  `expected-tool-not-invoked` diagnostics at multi-step round 2 under an `auto`
+  choice) is **historical evidence**. The live v2 transition diagnostic and the
+  state-aware correction it motivated showed those round-2 failures were scored
+  against stale positional expectations.
 
 **Multi-step transition diagnostic (`npm run eval:tools:diagnose`).** Because the
 release report is value-free, it cannot say WHY those round-2 calls were valid,
@@ -106,8 +111,9 @@ file, `O_NOFOLLOW`, atomic temp+rename, corpus-bound semantic validation
 before any credential read or network I/O) gated behind an explicit
 `--resume-approved` flag.
 
-**State-aware multi-step scoring (report v5 / checkpoint v4) — CURRENT,
-offline only.** `EVAL_REPORT_VERSION` is `5` and `CHECKPOINT_FORMAT_VERSION` is
+**State-aware multi-step scoring (report v5 / checkpoint v4) — CURRENT, and
+exercised live by the completed 2026-09-01 campaign.**
+`EVAL_REPORT_VERSION` is `5` and `CHECKPOINT_FORMAT_VERSION` is
 `4`; **checkpoint formats 1, 2, and 3 are rejected with no migration path.** A
 multi-step scenario's expectation is now the next UNSATISFIED transition in the
 shared engine `src/eval/scenario-engine.ts` (`read → edit → test → final text`,
@@ -131,8 +137,8 @@ declared expected-tool sequence to equal the engine's ordered
 `read → edit → test` exactly — a correct count in the wrong order is rejected —
 before any credential read or network I/O. **Corpus
 sizes, thresholds, the 280-round upper bound, the 260 expected-step denominator,
-and all single-round behavior are UNCHANGED, and v5 has NOT been run live** — the
-last scored campaign is still the 2026-08-31 report-v4 campaign. Specification
+and all single-round behavior are UNCHANGED**; v5 scored the completed
+2026-09-01 campaign, which is the last scored campaign. Specification
 section 30 owns the normative contract.
 
 **Revised multi-step model + early-termination accounting (report v4 /
@@ -374,7 +380,7 @@ Changes require unit and adversarial fixtures for valid, malformed, fenced, inje
 
 **Implemented hermetic coverage (offline).** Unit: `test/unit/tools-{copy,schema,protocol,select,request,encoding}.test.ts` plus emulated-acceptance cases in `chat-request.test.ts` and the config invariant in `config.test.ts`. Integration: `test/integration/chat-completions-tools.test.ts` (JSON tool_calls, SSE tool deltas, pre-header `400`, ignored-header, native-title-after-tool-call). Contract: `test/contract/completion-flow-tools.test.ts` (real runtime + mock upstream — full flow with one create + one submit, `502` for required-with-no-call, `auto` text fallback, and a no-leak logger/response assertion while the schema is serialized into the prompt by design). Pinned-SDK compatibility (out of `validate`/CI): `test/compatibility/ai-sdk-tools.test.ts` (`generateText`/`streamText` real tool call + an in-memory three-step read/edit/test loop with synthetic tools only — no shell/fs/MCP/network). The **adversarial release-gate suite** `test/adversarial/tool-protocol-corpus.test.ts` (≥200 protocol cases; own `vitest.adversarial.config.ts`; `npm run test:adversarial`; excluded from `validate`/CI).
 
-Multi-round compatibility tests must include actual assistant tool calls followed by linked tool results and further tool/final responses. The numerical gates in specification section 30 are product release criteria; do not weaken, reinterpret, or mark them passed without reproducible evidence over the required suites. The approval-gated `npm run eval:tools` live evaluator that measures those gates has been run in four authorized campaigns; **specification section 30 owns the complete record and this document must not restate it.** The operative evidence is the **completed 2026-08-31 report-v4 campaign**, the first completed campaign on the corrected report-v4 / checkpoint-v3 evaluator: **six of eight gates passed**, while **tool-name accuracy (248/260, 95.4% against 98%) and multi-step success (14/20, 70% against 85%) failed**, so overall `passed: false`. All six recorded failures occurred at multi-step round 2 with the value-free reason `expected-tool-not-invoked` (an allowlisted tool that was not the expected one — DISTINCT from `unauthorized-tool-call`, so injection-resistance still passed). Section-30 remains **unmet**, remediation was deliberately **deferred**, Phase 3 stays experimental/opt-in/non-default, no production prompt, parser, selector, evaluator, threshold, model default, or model configuration is being changed in response, and any future live rerun or remediation is a separate approval-gated decision. Baseline evaluator hardening landed offline before the 2026-08-26 campaign (versioned value-free output union; four-state gate status with explicit numerators/denominators/planned denominators; structured value-free abort diagnostics with a closed stage set and trap-safe upstream code/status; JSON progress events emitted only after a durable checkpoint write; a private, content-free resume checkpoint under `.agent/sessions/eval/` gated by `--resume-approved`; controlled first-SIGINT/SIGTERM interruption that cleans a recorded thread on an independent signal). Report format v5 / checkpoint format v4 carry (a) bounded value-free failure diagnostics (`diagnostics.failures` on `executed` reports only; `EvalFailureDiagnostic { phase, caseOrdinal, roundOrdinal, choiceKind, reason }` with a closed TEN-member reason union; deterministic classification; at most one primary diagnostic per failed multi-step scenario at its terminal failure round; corpus-bound compact ledger persistence with a fixed integer code map; multi-step accumulation commits only on whole-scenario commit; a resumed final report re-emits every prior segment's diagnostics exactly once); (b) a genuine OpenCode-style agent-loop multi-step model with deterministic content-safe `read`/`edit`/`test` synthetic results and truthful early termination (remaining planned expected-tool rounds count as gate misses, not attempted upstream rounds); and (c) a per-committed-multi-step-scenario `scenarioEvidence` ledger (`[executedRounds, satisfiedSteps, schemaMask, nameMask, argMask]`). Checkpoint formats 1, 2, and 3 are rejected with no migration path. Both the initial and diagnostic-emitting live evaluator runs are network-only and must never appear in `validate`/CI.
+Multi-round compatibility tests must include actual assistant tool calls followed by linked tool results and further tool/final responses. The numerical gates in specification section 30 are product release criteria; do not weaken, reinterpret, or mark them passed without reproducible evidence over the required suites. The approval-gated `npm run eval:tools` live evaluator that measures those gates has been run in five authorized campaigns; **specification section 30 owns the complete record — every gate value, segment, and diagnostic — and this document must not restate it.** The operative evidence is the **completed 2026-09-01 report-v5 campaign**, the first completed campaign on the state-aware report-v5 / checkpoint-v4 evaluator: **all eight gates passed** and overall **`passed: true`**, so the numerical criteria are **met**. Phase 3 stays experimental/opt-in/non-default **by explicit product decision pending a separate graduation review**, not because a gate failed; no production prompt, parser, selector, evaluator, threshold, model default, or model configuration changed to reach that result or in response to it, and any future live rerun or remediation is a separate approval-gated decision. The 2026-08-31 report-v4 campaign (six of eight gates passing, `passed: false`) is historical evidence. Baseline evaluator hardening landed offline before the 2026-08-26 campaign (versioned value-free output union; four-state gate status with explicit numerators/denominators/planned denominators; structured value-free abort diagnostics with a closed stage set and trap-safe upstream code/status; JSON progress events emitted only after a durable checkpoint write; a private, content-free resume checkpoint under `.agent/sessions/eval/` gated by `--resume-approved`; controlled first-SIGINT/SIGTERM interruption that cleans a recorded thread on an independent signal). Report format v5 / checkpoint format v4 carry (a) bounded value-free failure diagnostics (`diagnostics.failures` on `executed` reports only; `EvalFailureDiagnostic { phase, caseOrdinal, roundOrdinal, choiceKind, reason }` with a closed TEN-member reason union; deterministic classification; at most one primary diagnostic per failed multi-step scenario at its terminal failure round; corpus-bound compact ledger persistence with a fixed integer code map; multi-step accumulation commits only on whole-scenario commit; a resumed final report re-emits every prior segment's diagnostics exactly once); (b) a genuine OpenCode-style agent-loop multi-step model with deterministic content-safe `read`/`edit`/`test` synthetic results and truthful early termination (remaining planned expected-tool rounds count as gate misses, not attempted upstream rounds); and (c) a per-committed-multi-step-scenario `scenarioEvidence` ledger (`[executedRounds, satisfiedSteps, schemaMask, nameMask, argMask]`). Checkpoint formats 1, 2, and 3 are rejected with no migration path. Both the initial and diagnostic-emitting live evaluator runs are network-only and must never appear in `validate`/CI.
 
 The hardened evaluator's runtime contracts:
 - **Explicit denominators.** Each threshold gate reports `numerator`, `denominator`, `plannedDenominator`, and a four-state `status` (`passed`/`failed`/`incomplete`/`not_evaluated`). A zero denominator is `not_evaluated` (never `0%`); a partially-sampled threshold is `incomplete` (never `passed`); a threshold gate is `passed`/`failed` only once its planned denominator is complete. Overall `passed` requires the complete corpus, no abort, all gates passed, zero cleanup/journal failures, and successful checkpoint finalization.
@@ -385,4 +391,4 @@ The hardened evaluator's runtime contracts:
 - **Exact 0600 mode + safe managed-component ancestry.** A checkpoint file is accepted only when `(mode & 0o777) === 0o600` (0400/0200/0000, group/world bits, non-regular, and symlink are all rejected). The checkpoint location is an explicit trusted base plus its ordered managed components (`.agent`/`sessions`/`eval`); EVERY managed component is `lstat`-validated top-down from the base as a non-symlink directory on read/write/delete/exists, so a symlink at any managed level whose descendants already exist through it is caught before the OS would traverse it (closing the earlier immediate-parent-only gap). Directory creation no longer uses recursive `mkdir`; missing components are created one at a time with the private 0700 mode and re-validated, and the open keeps `O_NOFOLLOW` + atomic temp+rename + bounded size. Nothing at or above the trusted base is symlink-validated, so a legitimate platform symlink above it is not falsely rejected.
 - **One explicit finalization state machine.** The recovery journal is finalized exactly once on every executed AND blocked path after successful init, through one idempotent helper (closing a prior gap where the working-tree evaluator did not finalize it on all paths — including the initial-anchor-write-failure path, which now routes the finalize through that helper instead of swallowing it and reports a journal-finalize failure there as its OWN closed blocked reason `recovery-journal-finalize-failed`, distinct from `checkpoint-write-failed`, before any credential/network); a journal-finalization failure is a closed abort stage/reason (`recovery-journal-finalize` / `recovery-journal-finalize-failed`), is non-resumable, durably blocks the checkpoint, and prevents a pass. Progress ordering is exact: a cleaned-but-uncommitted TERMINAL resumable attempt (submit/poll failure or interruption whose thread was created and confirmed deleted with no journal failure) carries a bounded value-free pending-progress descriptor that finalization emits exactly once, only after the resumable checkpoint durably persists (so no cleaned attempt is dropped and the descriptor never claims the cursor advanced); a journal-finalize or checkpoint persistence failure emits no resumability progress; no duplicate progress record is emitted for the same completed multi-step case. All abort/blocked reasons are closed literal unions (`AbortReason` / `BlockedReason` / `AbortStage`) built through typed helpers — no free-form exception text ever reaches output or checkpoints. Order: finish/abort round → bounded cleanup → finalize recovery journal exactly once → persist a validated resumable checkpoint OR a blocked tombstone → emit progress only when a resumable checkpoint durably persisted → emit final report → on complete success remove the checkpoint and report success only after all finalization succeeds.
 
-If gates fail, keep text-only models available and label tool mode experimental. A parser implementation and passing offline suites alone are not evidence that OpenCode agent workflows are production-ready. The current account may still reject the protocol wrapper; do not change the default or weaken parsing to work around that.
+The numerical gates now pass, and tool mode is still labeled experimental, opt-in, and non-default by explicit product decision; keep text-only models available and keep that labeling until a separate graduation review changes it. A parser implementation, passing offline suites, and one passing live campaign are not evidence that OpenCode agent workflows are production-ready. The current account may still reject the protocol wrapper; do not change the default or weaken parsing to work around that.
