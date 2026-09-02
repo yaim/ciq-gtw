@@ -4,27 +4,73 @@
 // project-local discovery in one process share a single hooks instance (see the
 // singleton section at the bottom of this file).
 //
-// Purpose: OpenCode's hidden LLM `title` agent is DISABLED in opencode.jsonc so it
-// creates no separate title thread/completion. Instead, for the first ELIGIBLE
-// foreground request of a fresh top-level (parentless) session — the primary
-// `collectiviq-text` agent routed to the `collectiviq` provider, whose title is
-// still OpenCode's generated default — this plugin arms the session by attaching a
-// session-ID header, then (after the session goes idle) polls the gateway for the
-// native, server-generated CollectivIQ thread title and applies it to the OpenCode
-// session.
+// The plugin has TWO independent responsibilities that share one gate but nothing
+// else. Do not re-couple them.
+//
+//  1. SESSION IDENTITY (per request). Every matching completion — the primary
+//     `collectiviq-text` agent routed to the `collectiviq` provider, carrying a
+//     session id the gateway would accept — gets the
+//     `X-CollectivIQ-OpenCode-Session-ID` header. The gateway needs that identity
+//     on EVERY turn: optional Phase 5A thread reuse (specification §5.1.1) keys a
+//     session's CollectivIQ thread on it, so a follow-up turn that omits it silently
+//     falls back to a brand-new thread and loses the conversation. Attaching it is
+//     synchronous and unconditional once the gates pass; it never depends on
+//     session metadata, on title state, or on anything that can fail or time out.
+//
+//  2. NATIVE-TITLE PROPAGATION (one workflow per RETAINED session entry).
+//     OpenCode's hidden LLM `title` agent is DISABLED in opencode.jsonc so it
+//     creates no separate title thread/completion. Instead, for the first eligible
+//     request of a fresh top-level (parentless) session whose title is still
+//     OpenCode's generated default, this plugin arms the session, then (after the
+//     session goes idle) polls the gateway for the native, server-generated
+//     CollectivIQ thread title and applies it to the OpenCode session. Everything
+//     below that touches `sessions`, session metadata, the parent/default-title
+//     checks, polling, cancellation, or renaming belongs to THIS responsibility
+//     alone. Repeated and concurrent requests do not rearm a RETAINED entry, so the
+//     header repeating does not multiply title work — but the guarantee is scoped
+//     to that entry's retention, not to the session's whole lifetime: `sessions` is
+//     a bounded 256-entry INSERTION-ORDER map (see MAX_SESSIONS) that evicts the
+//     oldest inserted retained entry, and eviction may permit a later workflow.
+//     After eviction, UPDATED non-default metadata blocks rearming, but STALE
+//     cached default metadata may permit one more bounded arm+poll. What prevents
+//     an overwrite in that case is not the arming gate but the rename-side
+//     current-title recheck immediately before `session.update` (see applyTitle).
+//
+// Consequences of that split: a manual, renamed, already-propagated, or child
+// session still carries the reuse identity but arms nothing here, and a failed or
+// timed-out title-metadata lookup leaves the already-attached header in place. An
+// invalid session id, a different agent, or a different provider gets no header at
+// all — the gateway would reject or ignore the value, and a wrong-provider request
+// is not ours to identify.
+//
+// "Arms nothing" is local to this plugin, NOT to the gateway. The gateway registers
+// its own short-lived title correlation for any successful completion that carried a
+// valid session header and created a thread, so a session this plugin will never
+// poll for can still occupy one of those bounded entries until it expires. That is a
+// deliberate, accepted tradeoff of per-request identity (specification §§9.5 and
+// 25): it can suppress another session's best-effort title propagation but never
+// affects a completion. Do not "solve" it by making the header conditional again.
+//
+// Those are SEPARATE bounded stores and none governs the others: the gateway's
+// correlation registry lives in the gateway process under a 60 s TTL with 32-per-key
+// and 128-global caps, while this plugin owns two independent OpenCode-process maps
+// with no time-based expiry at all — `sessions` (256-entry insertion-order) and
+// `metaCache` (a separate 256-entry insertion-order map). Reasoning about one from
+// another's limits is a mistake.
 //
 // Design constraints (see AGENTS.md / .agent/instructions/security.md):
 //   * Best-effort and NON-BLOCKING: every hook catches all failures and never
-//     throws or alerts. `chat.headers` performs NO unbounded work — it reads
-//     in-memory session metadata captured from `session.created`/`session.updated`
-//     lifecycle events (zero async in the normal case); only when a session has
-//     not yet been observed does it fall back to a SMALL, bounded `session.get()`
-//     that fails open (attaches no header) on timeout. It therefore adds at most a
+//     throws or alerts. `chat.headers` performs NO unbounded work — the header is
+//     written synchronously, and the title check that follows reads in-memory
+//     session metadata captured from `session.created`/`session.updated` lifecycle
+//     events (zero async in the normal case); only when a session has not yet been
+//     observed does it fall back to a SMALL, bounded `session.get()` that fails
+//     open (arms nothing, keeps the header) on timeout. It therefore adds at most a
 //     bounded delay to the foreground request, never an indefinite one.
 //   * Atomic arming: the uncached fallback first inserts a `pending` RESERVATION
 //     synchronously (before awaiting `session.get()`), so two concurrent hooks for
-//     the same session issue ONE lookup and attach ONE header; a failed/ineligible
-//     lookup releases the reservation so a later request may retry.
+//     the same session issue ONE lookup and arm ONCE (both still get the header); a
+//     failed/ineligible lookup releases the reservation so a later request may retry.
 //   * EVERY plugin-owned await is lifecycle- and timeout-bounded: base-URL
 //     resolution (which may await `client.config.get()`), the session lookups, the
 //     inter-poll sleeps, the fetches, AND the terminal `session.update` rename all
@@ -187,8 +233,18 @@ export interface NativeTitleDeps {
 const SESSION_HEADER = "X-CollectivIQ-OpenCode-Session-ID";
 const ENDPOINT_PATH = "/opencode/session-title";
 const PROVIDER_ID = "collectiviq";
-/** Only the intended primary foreground agent may arm native-title propagation. */
+/** Only the intended primary foreground agent gets the header / arms propagation. */
 const FOREGROUND_AGENT = "collectiviq-text";
+
+// The gateway's accepted session-id shape, mirrored from
+// `src/opencode/session-header.ts`: an opaque token of 1–128 bytes drawn from
+// `[A-Za-z0-9_-]`. Every allowed character is single-byte UTF-8, so the 128
+// CHARACTER bound is exactly the 128 BYTE bound the gateway enforces. Validating
+// here keeps the plugin from ever sending a value the server would reject: with
+// Phase 5A thread reuse enabled, a present-but-invalid header on an otherwise
+// eligible request is a hard `400 invalid_opencode_session_id`, not a value the
+// gateway quietly ignores.
+const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
 // OpenCode v1.18.18's generated default parent-session title, e.g.
 // "New session - 2026-08-20T14:12:03.123Z". This mirrors OpenCode's own
@@ -236,7 +292,24 @@ const UNRESOLVED_PLACEHOLDER_RE = /\{(?:env|file):[^}]*\}/;
 const TITLE_MAX_CODE_POINTS = 100;
 const TITLE_KEEP_CODE_POINTS = 97; // + "..." == 100
 
-// Bounded plugin state (insertion-ordered LRU eviction).
+// Bounded plugin state. Both maps are INSERTION-ORDER, not LRU: eviction removes the
+// oldest INSERTED key (`keys().next().value`), and access does not refresh insertion
+// order — `chat.headers` returns early on `sessions.has(...)` so it never re-inserts,
+// and `Map.set` on an existing key keeps that key's original position, so
+// `rememberMeta` does not reorder either. A frequently used old session can therefore
+// be evicted after 256 newer insertions; do not describe these as "the 256 most
+// recent sessions".
+//
+// These bounds are what make every "one title workflow" statement about this plugin a
+// claim about a RETAINED entry rather than about a session's whole lifetime: once
+// `sessions` is full, `rememberSession` evicts (and cancels) the oldest inserted
+// entry, and a later matching request for that session may arm and poll AGAIN.
+// Whether it does depends on the metadata it then reads — updated non-default
+// metadata blocks rearming, stale cached default metadata may permit one more bounded
+// workflow — and an overwrite is prevented at the END by the rename-side current-title
+// recheck, not by the arming gate. This is pre-existing, bounded, and intentional; the
+// two maps are independent of each other and of the GATEWAY's correlation registry and
+// its separate 60 s TTL.
 const MAX_SESSIONS = 256;
 const MAX_META = 256;
 
@@ -245,18 +318,25 @@ const MAX_META = 256;
 // ---------------------------------------------------------------------------
 
 /**
- * State for a tracked session. A `chat.headers` fallback lookup first inserts a
- * `pending` RESERVATION (atomically, before it awaits `session.get()`) so a
- * concurrent hook for the same session cannot also lookup/arm. A successful,
- * eligible lookup transitions the SAME reservation to `armed`; a failed, timed-out,
- * ineligible, or cancelled lookup releases it so a later request may retry. The
- * cached path inserts an `armed` entry directly (fully synchronous, no race).
- * Both states share the one bounded `sessions` map, preserving the 256 bound.
+ * State for a tracked session. This map tracks NATIVE-TITLE propagation only; it
+ * never gates the session header, which every matching request receives. An entry
+ * is retained until the session is deleted or insertion-order eviction reclaims it
+ * (the oldest inserted entry goes first, regardless of how recently it was used),
+ * and every "already armed / already polling" guarantee below is scoped to that
+ * retention.
+ *
+ * A `chat.headers` fallback lookup first inserts a `pending` RESERVATION
+ * (atomically, before it awaits `session.get()`) so a concurrent hook for the same
+ * session cannot also lookup/arm. A successful, eligible lookup transitions the
+ * SAME reservation to `armed`; a failed, timed-out, ineligible, or cancelled lookup
+ * releases it so a later request may retry. The cached path inserts an `armed`
+ * entry directly (fully synchronous, no race). Both states share the one bounded
+ * `sessions` map, preserving the 256 bound.
  */
 export interface SessionEntry {
-  /** `pending` = arming reservation in flight; `armed` = eligible and header attached. */
+  /** `pending` = arming reservation in flight; `armed` = eligible for title propagation. */
   status: "pending" | "armed";
-  /** A poller has already been started for this session (one per session, ever). */
+  /** A poller has already been started for THIS entry (one per retained entry). */
   polling: boolean;
   /** Exact captured default title (set on arm; undefined while pending). */
   initialTitle: string | undefined;
@@ -561,7 +641,11 @@ export function createNativeTitleHooks(deps: NativeTitleDeps): NativeTitleHooks 
   const metaCache = new Map<string, SessionMeta>();
   const activePolls = new Set<Promise<void>>();
 
-  /** Insert an armed entry, evicting (and cancelling) the oldest when at capacity. */
+  /**
+   * Insert an armed entry, evicting (and cancelling) the OLDEST INSERTED entry when
+   * at capacity. Insertion-order, not LRU: an existing key is never re-inserted, so
+   * using a session does not protect it from eviction.
+   */
   function rememberSession(id: string, entry: SessionEntry): void {
     if (!sessions.has(id) && sessions.size >= MAX_SESSIONS) {
       const oldest = sessions.keys().next().value;
@@ -575,7 +659,11 @@ export function createNativeTitleHooks(deps: NativeTitleDeps): NativeTitleHooks 
     sessions.set(id, entry);
   }
 
-  /** Cache session metadata, evicting the oldest when at capacity (no cancellation needed). */
+  /**
+   * Cache session metadata, evicting the OLDEST INSERTED key when at capacity (no
+   * cancellation needed). Also insertion-order: updating an existing key replaces its
+   * value but keeps its original position, so refreshed metadata is not "recent".
+   */
   function rememberMeta(id: string, meta: SessionMeta): void {
     if (!metaCache.has(id) && metaCache.size >= MAX_META) {
       const oldest = metaCache.keys().next().value;
@@ -665,6 +753,16 @@ export function createNativeTitleHooks(deps: NativeTitleDeps): NativeTitleHooks 
     return { kind: "stop" };
   }
 
+  /**
+   * Apply the provider title, but only if the session is STILL on the exact title
+   * captured at arm time.
+   *
+   * This rename-side current-title recheck — not the arming gate — is the real
+   * overwrite protection. Arming reads possibly stale cached metadata, so a session
+   * whose title already changed can still reach this point after an eviction and
+   * re-arm; reading the LIVE title here and comparing it to `initialTitle` is what
+   * refuses to clobber a manual or already-propagated title.
+   */
   async function applyTitle(
     sessionId: string,
     initialTitle: string,
@@ -676,7 +774,8 @@ export function createNativeTitleHooks(deps: NativeTitleDeps): NativeTitleHooks 
     const current = await boundedSessionLookup(sessionId, signal);
     // Cancelled while the lookup was pending, or the lookup timed out.
     if (signal.aborted || !current) return;
-    // Guard against a manual rename or another integration during polling.
+    // Guard against a manual rename, another integration, or an earlier propagation
+    // this workflow could not see when it armed from cached metadata.
     const titleStillDefault = current.title === initialTitle;
     const normalized = normalizeTitle(providerTitle);
     if (!titleStillDefault) return;
@@ -814,19 +913,39 @@ export function createNativeTitleHooks(deps: NativeTitleDeps): NativeTitleHooks 
   const chatHeaders = async (input: ChatHeadersInput, output: ChatHeadersOutput): Promise<void> => {
     try {
       const sessionId = input.sessionID;
-      if (typeof sessionId !== "string" || sessionId.length === 0) return;
-      // Eligibility gate FIRST, so an ineligible agent/provider never consumes the
-      // session's one arming opportunity (and never triggers a session lookup).
+      // Shared gates. They decide BOTH responsibilities: a request that fails any
+      // of them gets no header and never consumes the session's pending arming
+      // opportunity (and never triggers a session lookup).
+      if (typeof sessionId !== "string" || !SESSION_ID_RE.test(sessionId)) return;
       if (input.agent !== FOREGROUND_AGENT) return;
       // Provider gate — tolerant of the flat runtime shape (`provider.id`) and the
       // nested SDK shape (`provider.info.id`); descriptor-safe, never invokes a
-      // getter, and fails closed on anything else (so no lookup/arm occurs).
+      // getter, and fails closed on anything else.
       if (readProviderId(input.provider) !== PROVIDER_ID) return;
-      // Already reserved (pending) or armed — do not lookup/arm/replace again.
+
+      // RESPONSIBILITY 1 — session identity, on EVERY matching request. Written
+      // first and unconditionally: the gateway needs it on every turn to keep an
+      // eligible session on one CollectivIQ thread (specification §5.1.1), so it
+      // must not depend on title state or on the bounded lookup below, either of
+      // which may legitimately decline or time out.
+      output.headers[SESSION_HEADER] = sessionId;
+
+      // RESPONSIBILITY 2 — native-title arming, one workflow per retained entry.
+      // Everything from here down only decides whether THIS session's title
+      // workflow starts; it never withdraws the header written above.
+      //
+      // Already reserved (pending) or armed — do not lookup/arm/replace again while
+      // that entry is retained. After insertion-order eviction (or deletion) this
+      // check no longer matches, and a later request may arm again: updated
+      // non-default metadata blocks it below, while stale cached default metadata
+      // permits one more bounded workflow whose rename is then refused by the
+      // rename-side current-title recheck.
       if (sessions.has(sessionId)) return;
 
       // Cached path: fully synchronous, so two concurrent hooks cannot race — the
       // first inserts the armed entry before the second reaches the `has` check.
+      // An ineligible session (child, manual/already-propagated title) simply arms
+      // nothing; it keeps its header and stays cheap to re-check on every turn.
       const cached = metaCache.get(sessionId);
       if (cached) {
         const title = eligibleTitle(cached);
@@ -837,16 +956,15 @@ export function createNativeTitleHooks(deps: NativeTitleDeps): NativeTitleHooks 
             initialTitle: title,
             cancel: new AbortController(),
           });
-          output.headers[SESSION_HEADER] = sessionId;
         }
         return;
       }
 
       // Uncached path: reserve SYNCHRONOUSLY (before the first await) so a
       // concurrent eligible hook sees the reservation via `sessions.has` and
-      // returns without a second `session.get()` or a second header. The
-      // reservation carries the lifecycle cancel used to abort the lookup and
-      // (later) the poller.
+      // returns without a second `session.get()` or a second arm. The reservation
+      // carries the lifecycle cancel used to abort the lookup and (later) the
+      // poller.
       const reservation: SessionEntry = {
         status: "pending",
         polling: false,
@@ -869,14 +987,14 @@ export function createNativeTitleHooks(deps: NativeTitleDeps): NativeTitleHooks 
         const title = looked ? eligibleTitle(looked) : undefined;
         if (title === undefined) {
           // Timed out / failed / child / non-default → release so a later
-          // eligible request may retry this session.
+          // eligible request may retry this session. The header stays attached:
+          // the request is still this session's turn regardless of its title.
           releaseIfCurrent();
           return;
         }
-        // Transition the SAME reservation to armed and attach the header once.
+        // Transition the SAME reservation to armed. The header was already written.
         reservation.status = "armed";
         reservation.initialTitle = title;
-        output.headers[SESSION_HEADER] = sessionId;
       } catch {
         releaseIfCurrent();
       }
@@ -900,7 +1018,8 @@ export function createNativeTitleHooks(deps: NativeTitleDeps): NativeTitleHooks 
         if (!sessionId) return;
         const entry = sessions.get(sessionId);
         // Only an ARMED entry (with a captured title) starts a poller; a pending
-        // reservation is skipped, and one poller runs per session at most.
+        // reservation is skipped, and at most one poller runs per RETAINED entry
+        // (an evicted/re-armed session gets a fresh entry and may poll again).
         if (!entry || entry.status !== "armed" || entry.polling) return;
         if (entry.initialTitle === undefined) return;
         entry.polling = true;
@@ -978,8 +1097,10 @@ function realSleep(ms: number, signal?: AbortSignal): Promise<void> {
 // `~/.config/opencode/plugins/` (see README). When the gateway repository is the
 // active project, OpenCode discovers BOTH paths and initializes the plugin twice
 // in the SAME process. To keep that harmless, the default plugin shares ONE hooks
-// instance (and therefore one state map, one arming opportunity per session, one
-// poller per session, one rename workflow) across duplicate initialization,
+// instance across duplicate initialization — and therefore ONE state map, so both
+// loads observe the same retained entries and cannot each arm, poll, or rename the
+// same session concurrently (the per-entry scoping described at MAX_SESSIONS still
+// applies; sharing removes duplication, it does not add a lifetime guarantee),
 // keyed on a stable `Symbol.for(...)` slot on `globalThis`. First initialization
 // wins and creates the hooks (lazily, so the second load's `input`/deps are never
 // used); later initialization returns the same instance. Process exit remains the

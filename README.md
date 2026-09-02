@@ -406,21 +406,69 @@ OpenCode's built-in **hidden LLM `title` agent is disabled** in the committed
 title thread or completion. As a result a first foreground message creates
 **exactly one** CollectivIQ thread — the earlier "two or more upstream threads per
 session" behavior no longer applies. In its place, a dependency-free plugin
-(`.opencode/plugins/collectiviq-native-title.ts`) propagates the
-CollectivIQ-generated **native** thread title to the OpenCode session
-asynchronously: it arms only a parentless top-level session still on OpenCode's
-default title, attaches an `X-CollectivIQ-OpenCode-Session-ID` header once, and
-after `session.idle` polls the authenticated `GET /v1/opencode/session-title`
-extension on a bounded, capped schedule (immediately, then 2/4/8/8/8 s), renaming
-the session only if its title is still the exact captured default. Arming reads
-session metadata from OpenCode lifecycle events (no async lookup in the normal
-case) and only for a not-yet-observed session falls back to a small, bounded,
-fail-open `session.get`, so it adds at most a bounded delay to the foreground
-request — never an indefinite one. It never overwrites a manual or
-already-propagated title and is best-effort — any failure leaves OpenCode's
-default/manual title. Native-title polling adds only bounded `GET` requests and creates no additional
-upstream thread. `collectiviq-fast` is no longer the title agent's model but
-remains declared for manual/other-account use.
+(`.opencode/plugins/collectiviq-native-title.ts`) does two separate things.
+
+**It identifies the session on every matching request.** A request routed to the
+`collectiviq-text` agent and the `collectiviq` provider, carrying a session id the
+gateway would accept (1–128 bytes of `[A-Za-z0-9_-]`), gets an
+`X-CollectivIQ-OpenCode-Session-ID` header — on **every** turn, not just the first.
+Optional [OpenCode thread reuse](#opencode-thread-reuse-optional-redis-off-by-default)
+keys a session's CollectivIQ thread on that header, so a follow-up turn without it
+would quietly start a new thread. The header is written synchronously before any
+title work, so nothing below can take it away. A request with an invalid session id,
+another agent, or another provider gets no header at all.
+
+Sending it more widely has one accepted cost, and it applies with reuse **off** as
+well. The gateway records a short-lived, process-local title correlation after any
+successful completion that carried a valid session header and created a thread, so
+sessions the plugin will never poll for — child, manual, already-titled — can now
+hold one of those entries until it expires after 60 s. That registry is capped (32
+entries per gateway key, 128 in total) and first-registration-wins, so repeated
+turns of one session cost nothing extra while its entry is live, and a reused turn
+records nothing because it created no thread. If the registry is full a registration
+is silently skipped, which can leave **another** session on OpenCode's default title.
+None of this ever fails, delays, or changes a completion, and no prompt, answer, or
+title is stored — only the same opaque ids described in the specification.
+
+**It propagates the native title once per tracked session.** It arms only a
+parentless top-level session still on OpenCode's default title, and after
+`session.idle` polls the authenticated `GET /v1/opencode/session-title` extension on
+a bounded, capped schedule (immediately, then 2/4/8/8/8 s), renaming the session
+only if its title is still the exact captured default. Arming reads session metadata
+from OpenCode lifecycle events (no async lookup in the normal case) and only for a
+not-yet-observed session falls back to a small, bounded, fail-open `session.get`, so
+it adds at most a bounded delay to the foreground request — never an indefinite one.
+A manual, renamed, already-propagated, or child session keeps the header but arms
+nothing, and a failed or timed-out metadata lookup likewise keeps the header and
+simply propagates no title. It never overwrites a manual or already-propagated title
+and is best-effort — any failure leaves OpenCode's default/manual title. Native-title
+polling adds only bounded `GET` requests and creates no additional upstream thread.
+`collectiviq-fast` is no longer the title agent's model but remains declared for
+manual/other-account use.
+
+"Once" here means once while the plugin is still tracking that session. It keeps
+title state for 256 sessions and, when that fills up, drops the **oldest one it
+started tracking** — not the least recently used. Using a session does not protect
+it, so a long-lived OpenCode process can forget an active session after 256 newer
+ones and, on a later message, start the workflow again.
+
+That retry is bounded and cannot damage your titles, but the reason is worth being
+precise about. If the plugin knows the session was renamed — it saw the rename, or
+it re-reads the session because its cached metadata was dropped too — it will not
+rearm. If its cached metadata is stale and still reports the default title, it may
+arm and run one more capped poll. Even then your title is safe: immediately before
+renaming, the plugin re-reads the session's **current** title and writes only if it
+still matches what it saw when it armed, so a manual or already-propagated title
+fails that check and nothing is written.
+
+These are three separate limits and none of them bounds the others: the gateway-side
+60 s correlation TTL described above (gateway process), the plugin's 256-session
+title state, and the plugin's separate 256-session metadata cache (both in the
+OpenCode process, neither with any time-based expiry).
+
+CollectivIQ's own title generation is unaffected by either behaviour: the provider
+produces that title asynchronously on its side and the plugin only reads one that
+already exists. Repeating the session header does not ask for a new one.
 
 To authenticate that lookup, the plugin **reuses the resolved CollectivIQ provider
 credential** — `provider.collectiviq.options.apiKey` from OpenCode's merged config
@@ -494,8 +542,10 @@ Operational notes:
   rather than embedded credentials.
 - When you open the `ciq-gateway` repository itself, OpenCode discovers **both**
   the global link and the project-local copy; the plugin de-duplicates itself into
-  one shared instance per process, so duplicate loading is harmless (one header,
-  one poller, one rename per session).
+  one shared instance per process, so duplicate loading is harmless — both loads
+  share one state map and cannot separately arm, poll, or rename a session the
+  other is already handling, while every matching request still gets its session
+  header.
 - The globally loaded plugin still gates on the exact `collectiviq-text` agent and
   `collectiviq` provider; it does nothing for any other agent or provider request.
 
@@ -759,7 +809,18 @@ A request is eligible only when **all** of the following hold:
 4. the resolved model uses `toolMode: disabled`.
 
 Everything else — no header, a protocol-mode model, a tool-enabled model, or the
-feature disabled — behaves exactly as before.
+feature disabled — is stateless: the request creates its own thread, exactly as it
+did before this feature existed. (Sending the header still has one small effect of
+its own, whatever reuse is set to: it makes the completion eligible to register a
+short-lived title correlation. See the plugin notes above.)
+
+The committed `collectiviq-native-title` OpenCode plugin supplies requirement 2 for
+you: it attaches the session header to every request routed to the
+`collectiviq-text` agent and the `collectiviq` provider. Any other client must send
+the header itself on **every** turn. Sending it only once gets you nothing: that
+first turn creates the thread and binds it to the session, and every later
+headerless turn is ineligible, so it never reaches that mapping and creates a fresh
+thread of its own.
 
 ```bash
 OPENCODE_THREAD_REUSE_ENABLED=true
@@ -857,16 +918,22 @@ closed, and that the raw stored values contain none of its synthetic sentinels.
 The rate-limit suite proves the atomic GCRA decision under concurrency against
 Redis's own clock, burst-then-steady-state admission, the replenishment TTL,
 `EVALSHA`→`EVAL` recovery after `SCRIPT FLUSH`, two limiter instances sharing one
-quota, and every corrupt-state class failing closed. Both use only synthetic
-values, randomize their key namespace per run, and delete every key they create.
+quota, and every corrupt-state class failing closed. The thread-reuse suite proves
+two independent coordinators serializing on one session, a concurrent same-session
+acquire admitting exactly one winner, reserved-versus-processing lease expiry,
+renewal from authoritative state, the sliding TTL reset, ambiguous expiry, script
+recovery, and corrupt or oversized state failing closed. All three use only
+synthetic values, randomize their key namespace per run, and delete every key they
+create.
+
 The command is excluded from `validate` and runs as its own required CI gate
 against the pinned `redis:8.8.2-alpine`; it **fails loudly** rather than skipping
-when `REDIS_TEST_URL` is unset. Never point it at a production Redis. The
-idempotency and rate-limit suites were last run together under explicit approval
-and passed (40 tests) against a disposable `redis:8.8.2-alpine`, with the
-randomized namespace verified empty afterwards. The thread-reuse suite was added
-with its implementation and has **not** been run. Those are standing results, not
-a rerun: starting Redis or Docker requires fresh approval every time.
+when `REDIS_TEST_URL` is unset. Never point it at a production Redis — every suite
+issues a server-wide `SCRIPT FLUSH`, so this must always be a disposable instance.
+All three suites were last run together under explicit approval on **2026-09-02**
+and passed (**59 tests**) against a disposable `redis:8.8.2-alpine`, with `DBSIZE`
+verified at zero and only that service removed afterwards. That is a standing
+result, not a rerun: starting Redis or Docker requires fresh approval every time.
 
 The suite runs natively, so start ONLY the `redis` service — naming it keeps the
 gateway container out of it (the gateway would also demand

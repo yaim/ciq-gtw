@@ -16,7 +16,7 @@
 | `npm run test:contract` | Upstream contract | Vitest `test/contract` only (hermetic mock HTTP server, no network) |
 | `npm run test:compatibility` | SDK compatibility | Standalone hermetic suite (`test/compatibility`, own `vitest.compatibility.config.ts`); pinned `ai`/`@ai-sdk/openai-compatible` SDK vs an ephemeral loopback gateway with a **fake** completion — no network/credentials/CollectivIQ. **Excluded from `validate`/CI** |
 | `npm run test:adversarial` | Tool release gate | Standalone hermetic suite (`test/adversarial`, own `vitest.adversarial.config.ts`); ≥200 deterministic tool-protocol cases against the pure engine — no network/credentials/CollectivIQ. **Excluded from `validate`/CI** |
-| `npm run test:redis` | Redis gate (idempotency + rate limiting + thread reuse) | Standalone suite directory (`test/redis`, own `vitest.redis.config.ts`) requiring a REAL Redis at `REDIS_TEST_URL`. Now covers THREE suites: `idempotency-store.test.ts` (Phase 4A), `rate-limit-store.test.ts` (Phase 4B), and `thread-reuse-store.test.ts` (Phase 5A). Synthetic credentials/content only, randomized key prefix per run, every key deleted. **Excluded from `validate`** (which stays hermetic and Redis-free) but run in CI as an **additional required gate** with the pinned `redis:8.8.2-alpine` service. Never point it at a production Redis. The first two suites were run together under explicit approval in the implementing Phase 4B change and passed (40 tests); the Phase 5A suite was ADDED with its implementation and **has NOT been run** — running it needs fresh approval to start Redis or Docker. |
+| `npm run test:redis` | Redis gate (idempotency + rate limiting + thread reuse) | Standalone suite directory (`test/redis`, own `vitest.redis.config.ts`) requiring a REAL Redis at `REDIS_TEST_URL`. Now covers THREE suites: `idempotency-store.test.ts` (Phase 4A), `rate-limit-store.test.ts` (Phase 4B), and `thread-reuse-store.test.ts` (Phase 5A). Synthetic credentials/content only, randomized key prefix per run, every key deleted. **Excluded from `validate`** (which stays hermetic and Redis-free) but run in CI as an **additional required gate** with the pinned `redis:8.8.2-alpine` service. Never point it at a production Redis. **All three suites have now been run and pass (59 tests, 2026-09-02).** Every execution is separately approval-gated: a past run authorizes no future Docker or Redis command. |
 | `npm run eval:tools` | Live tool gate | Approval-gated LIVE evaluator (`src/eval/`). Default is a credential-free/network-free preflight; the fully-approved path probes the fixed CollectivIQ origin. Network-only; **must NEVER be added to `validate`/CI**. Five authorized campaigns have run. The operative evidence is the **completed 2026-09-01 report-v5 campaign** (the first completed campaign on the state-aware report-v5 / checkpoint-v4 evaluator): it finished the full corpus across two resumable execution segments with cleanup and checkpoint finalization succeeding, **all eight gates passed**, and overall **`passed: true`**, so the numerical section-30 criteria are **met** and Phase 3 graduated to supported opt-in beta while staying non-default and permission-gated. Any future live run is separately approval-gated. The 2026-08-31 report-v4 campaign is historical evidence. See specification section 30 for the complete record and all gate values. |
 | `npm run eval:tools:diagnose` | Live tool diagnostic | Approval-gated LIVE **multi-step transition diagnostic** (`src/eval/tools-diagnostic-cli.ts`). Default is a credential-free/network-free preflight; the fully-approved path runs ONLY the 20 multi-step scenarios (global corpus ordinals 201–220, max 80 upstream rounds) against the fixed CollectivIQ origin in password mode. It **establishes no release gate** — its output has no gates and no `passed` field, only `completed` — and it uses a SEPARATE diagnostic checkpoint so it can never touch the release evaluator's. Network-only; **must NEVER be added to `validate`/CI**. **ONE live run has completed**, under the historical v2 classifier (20/20 scenarios, 54/54 threads deleted, zero cleanup/journal failures, finalized checkpoint, no abort; 7 scenarios followed the old static schedule and 13 failed at round 2 with `expected-already-invoked`). It showed the static round-2 expectation was stale but did NOT prove those edits succeeded. The current **v3** diagnostic has NOT been run live; every live invocation is separately approval-gated. See specification section 30.1. |
 | `npm run test:coverage` | Coverage | Vitest with V8 coverage |
@@ -499,6 +499,90 @@ readiness, a cross-account/cross-version guarantee, or a claim about which crede
 source was exercised. The provider-config/environment precedence and the lazy env
 fallback stay **hermetically verified**; live runs remain approval-gated and are
 never part of `validate`/CI.
+
+**Per-request session-header evidence (Phase 5A client remediation).** The plugin's
+`chat.headers` hook previously attached `X-CollectivIQ-OpenCode-Session-ID` only on
+the single turn that armed native-title propagation, which cannot satisfy thread
+reuse (spec §5.1.1 needs the identity on EVERY eligible turn). `chat.headers` now
+validates the session id against the gateway's own contract and attaches the header
+to every matching request BEFORE any title work, while arming, polling, and renaming
+remain one workflow per RETAINED session entry (spec §§9.5 and 25 own the contract).
+The hermetic regressions in
+`test/unit/opencode-title-plugin.test.ts` assert both halves and the boundary
+between them: repeated sequential turns of one session each carry the header without
+re-arming, re-looking-up, or replacing the entry; two concurrent first turns each
+carry it while issuing one lookup and one arm; duplicate project-local + global
+initialization repeats it on both references while running one poller and one
+rename; empty, space/dot/slash/colon/newline, non-ASCII, multibyte, and 129-byte ids
+get no header and trigger no lookup, while a single character, the full allowed
+alphabet, and the boundary-valid 128-byte id do; child, manual, and
+already-propagated sessions carry the header but arm nothing and start no poller;
+and a failed, ineligible, timed-out, or cancelled metadata lookup keeps the header
+while arming nothing. The pre-existing wrong-agent, wrong-provider,
+descriptor-safety, lifecycle-cancellation, singleton, credential-isolation,
+loader-contract, and manual-title-protection assertions are unchanged. This is
+offline evidence only: no live OpenCode or CollectivIQ run exercised it, and it
+neither tests nor alters CollectivIQ's provider-side title generation.
+
+The gateway side of that change is **behaviourally untouched and separately
+covered**: broadening the header means title-ineligible sessions can now occupy
+process-local title-correlation entries (spec §25 records the accepted tradeoff),
+and the properties that bound it — first-registration-wins, the 128 global and 32
+per-key caps skipping registration fail-open, and TTL expiry readmitting a swept
+registry — are already asserted by the unchanged `test/unit/title-bridge.test.ts`.
+No new gateway test was added because no gateway code changed; the plugin suite
+deliberately asserts nothing about registry occupancy, which is not observable from
+the plugin.
+
+**Scope of the plugin's "one workflow" assertions.** Every no-rearm case above is
+scoped to a RETAINED entry in the plugin's bounded 256-entry `sessions`
+**insertion-order** map — not an LRU; it evicts the oldest INSERTED entry and access
+does not refresh insertion order — and the suite states it that way.
+`test/unit/opencode-title-plugin.test.ts` proves that eviction cancels an evicted
+session's in-flight title work and that `$settle` still completes; it does NOT assert
+the converse — that a later request for an evicted session may arm and poll again —
+so treat re-arm-after-eviction as reasoned from the code (spec §25 documents it), not
+as covered behaviour. Do not upgrade the arming gate into an overwrite guarantee: a
+re-arm reads possibly stale cached metadata, so updated non-default metadata blocks
+rearming while stale cached default metadata may permit one more bounded workflow.
+The overwrite protection that IS asserted is the rename-side current-title recheck —
+covered by "does NOT update when the title changed during polling (manual rename)",
+which drives the pre-write `session.get` to a different title and asserts no
+`session.update`. Keep the three bounded stores separate when describing coverage:
+the gateway's 60 s correlation registry (its own `test/unit/title-bridge.test.ts`),
+the plugin's `sessions` map, and the plugin's separate `metaCache`.
+
+**Phase 5A real-Redis gate evidence (2026-09-02, two approved runs).** The
+`npm run test:redis` gate now passes in full — 3 files, 59 tests — and the route
+there is worth remembering, because the first run's failures were TEST defects and
+were correctly NOT treated as production defects.
+
+The first approved run on a disposable pinned `redis:8.8.2-alpine` (host loopback
+only) produced **57 passed / 2 failed**, both failures in
+`test/redis/thread-reuse-store.test.ts`; Phase 4A and 4B passed. Diagnosis found:
+(1) `serializes two INDEPENDENT coordinators on one session` awaited readiness on
+the module-level store instead of the two fresh stores it had just created, so a
+still-connecting store correctly returned `unavailable` and masked the
+serialization under test; and (2) the ambiguous-tombstone case asserted the TTL was
+BELOW `mappingTtlMs`, but ambiguous records take the FIXED ambiguous lifetime, so
+the observed ~899,999 ms against that fixture's 600,000 ms mapping TTL was correct
+and the assertion was wrong.
+
+The repair was confined to that one test file: await both new stores before either
+coordinator acquires, and replace the invalid magnitude check with the
+fixture-aware bracket `> mappingTtlMs` and `<= ambiguousTtlMs` (which still fails
+if the sliding mapping lifetime were ever applied, so the case is not weakened).
+**No production code, Lua, coordinator, runtime, configuration, dependency, or
+lockfile entry changed.** A second separately approved run then passed **59/59**,
+including both formerly failing cases, after which `DBSIZE` was **0** and only the
+Redis service was removed. Synthetic values under a per-run randomized namespace
+throughout; upstream and gateway credential variables unset; **no live CollectivIQ
+request and no real credential**.
+
+Two operational notes for anyone rerunning it. Every execution needs FRESH
+approval — the 2026-09-02 runs authorize nothing later. And all three suites call
+`SCRIPT FLUSH`, which clears the whole server's Lua script cache, so this gate must
+only ever target a disposable instance, never a shared or production Redis.
 
 **Phase 2 transport-remediation evidence (added by the streaming-review
 remediation).** New hermetic regressions in `test/unit/chat-stream-response.test.ts`

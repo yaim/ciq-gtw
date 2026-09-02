@@ -204,9 +204,17 @@ describe("real Redis — thread-reuse state machine", () => {
   it("serializes two INDEPENDENT coordinators on one session", async () => {
     // The property that makes the mapping cross-replica: two gateways, two
     // connections, one Redis, and only one of them may hold the session.
-    const a = newCoordinator(newStore());
-    const b = newCoordinator(newStore());
-    await waitReady(store);
+    //
+    // Both NEW connections must be ready before either coordinator acquires: a
+    // not-yet-connected store correctly reports `unavailable` (fail-closed), which
+    // would mask the serialization this case exists to prove. Waiting on the
+    // module-level `store` does not cover them.
+    const storeA = newStore();
+    const storeB = newStore();
+    await Promise.all([storeA, storeB].map(waitReady));
+
+    const a = newCoordinator(storeA);
+    const b = newCoordinator(storeB);
 
     const first = await a.acquire({
       gatewayKeyScope: identity().gatewayKeyScope,
@@ -373,12 +381,20 @@ describe("real Redis — thread-reuse state machine", () => {
     const decoded = decodeReuseRecord((await inspector.get(KEY)) ?? "");
     expect(decoded.ok && decoded.record.s).toBe("ambiguous");
     expect(decoded.ok && decoded.record.p).toBeUndefined();
-    // The SHORT TTL is the point: a restore would slide the mapping TTL forward
-    // on every retry and the broken mapping would never age out.
+    // The point is WHICH lifetime was applied: an ambiguous record always gets the
+    // FIXED ambiguous TTL, never the sliding mapping TTL that a restore would push
+    // forward on every retry (which would keep the broken mapping alive forever).
+    //
+    // This fixture deliberately configures a mapping TTL (600 s) SHORTER than the
+    // fixed ambiguous TTL (900 s), so landing above `mappingTtlMs` and at or below
+    // `ambiguousTtlMs` distinguishes the two lifetimes unambiguously. That bracket
+    // is fixture-specific, not a general rule: the ambiguous TTL is a constant and
+    // is NOT universally shorter than the mapping TTL — under the seven-day
+    // production default it is far shorter, and the same assertion would need the
+    // opposite inequality.
     const ttl = await inspector.pTTL(KEY);
-    expect(ttl).toBeGreaterThan(0);
-    expect(ttl).toBeLessThanOrEqual(REUSE_AMBIGUOUS_TTL_MS);
-    expect(ttl).toBeLessThan(TIMINGS.mappingTtlMs);
+    expect(ttl).toBeGreaterThan(TIMINGS.mappingTtlMs);
+    expect(ttl).toBeLessThanOrEqual(TIMINGS.ambiguousTtlMs);
   });
 
   it("guards every transition by owner AND expected state", async () => {

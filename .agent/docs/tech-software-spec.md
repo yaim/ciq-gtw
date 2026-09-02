@@ -244,9 +244,11 @@ tracing, shared cross-replica capacity accounting, load testing, a security
 review, dependency scanning, backup/release procedures, and runbooks) are still
 outstanding, and the upstream questions this feature is most sensitive to —
 message ordering and pagination (section 35, items 7 and 8), thread cleanup
-(item 9), and retention (items 22–25) — remain unanswered. Offline
-implementation and hermetic tests do NOT establish live correctness; no live
-CollectivIQ call was made or required.
+(item 9), and retention (items 22–25) — remain unanswered. The approval-gated
+real-Redis suite has now run and passes (section 29.8), so the nine Lua scripts
+are proven against a real Redis 8.8.2 — but hermetic tests plus that suite still
+do NOT establish live CollectivIQ correctness; no live CollectivIQ call was made
+or required, and the live two-turn OpenCode reuse smoke remains unrun.
 
 #### Eligibility
 
@@ -1696,6 +1698,21 @@ behaviour for every request that is not reuse eligible, including every request 
 all while the feature is disabled. Reuse also changes WHEN a correlation is
 registered: only the turn that CREATED the thread registers one, because the
 provider generates its native title once.
+
+**Client behaviour (the committed OpenCode plugin).** The plugin attaches this
+header to **every** matching completion, not only the first one, because reuse needs
+the session identity on every turn (section 25 owns that contract). The rules above
+are unchanged, but the population they apply to is not: per-request headers BROADEN
+which successful created-thread completions may register a correlation, so sessions
+the plugin will never poll for — child, manual, already-propagated — can now occupy
+entries until they expire. The bounds above absorb that: first-registration-wins
+means repeated turns of one session consume no additional entry while its entry is
+live; a reused turn registers nothing because it created no thread; and a full
+registry silently skips registration, which can suppress another session's
+best-effort title propagation but never fails or alters a completion. Section 25
+records this as an accepted residual tradeoff. The header stays OPTIONAL — any
+client may omit it, and the plugin itself omits it for a request whose session id
+the gateway would reject.
 
 **Process-local correlation service** (`src/opencode/title-bridge.ts`). Keyed by
 `gatewayKeyId + sessionId`, it stores **only** the two opaque ids plus the upstream
@@ -3721,8 +3738,9 @@ project-locally; operators may ALSO install it globally for cross-project use vi
 supported manual symlink under `~/.config/opencode/plugins/`. When the gateway
 repository is the active project, OpenCode discovers **both** paths and initializes
 the plugin twice in the same process; to keep that harmless the default plugin
-wrapper shares **one** hooks instance (and therefore one state map, one arming
-opportunity per session, one poller, one rename workflow) across duplicate
+wrapper shares **one** hooks instance — and therefore **one** state map, so both
+loads see the same retained entries and neither can independently arm, poll, or
+rename a session the other is already handling — across duplicate
 initialization, keyed on a stable `Symbol.for(...)` slot on `globalThis`
 (first-initialization-wins; process exit is the lifetime boundary). The isolated
 `createNativeTitleHooks` factory is unchanged and still used per-call by tests.
@@ -3743,19 +3761,61 @@ to the V2 `setup` API). With this fix and the connection-resolution fix below, a
 sanitized 2026-08-22 live smoke observed the complete propagation path succeed for
 the tested local configuration (see the **Live status** note below).
 
-It arms only a parentless top-level session
-whose title is still OpenCode's default `New session - <ISO>` form and whose
-request is routed to the `collectiviq` provider. Provider matching is
-**descriptor-safe and tolerant of both provider shapes**: OpenCode's SDK type
-declaration exposes the provider id at the nested `provider.info.id`, but the
-OpenCode runtime may pass a flat `provider.id`; the plugin reads a flat
-own `id` (authoritative when present) and otherwise the nested `info.id`, using own
-data-property descriptors only and never invoking a getter. This dual-shape support
-is implemented and hermetically tested as offline hardening, but it was **not** the
-proven cause of the 2026-08-21 live failure (the plugin never loaded, so provider
-matching never ran) and must not be described as that live root cause. On an eligible
-match it attaches the
-`X-CollectivIQ-OpenCode-Session-ID` header once, and after `session.idle` polls the
+**Two independent responsibilities.** The plugin's `chat.headers` hook does two
+separate things behind one shared gate, and they must not be re-coupled: it
+supplies the SESSION IDENTITY on **every** matching request, and it arms
+**one** NATIVE-TITLE workflow while the session's bounded state entry is retained.
+
+The shared gate is: the resolved `agent` is exactly `collectiviq-text`, the request
+is routed to the `collectiviq` provider, and `sessionID` is a value the gateway
+would accept — the same opaque 1–128 byte `[A-Za-z0-9_-]` token this specification
+defines in section 9.5, validated plugin-side so a value the gateway would reject is
+never sent (every allowed character is single-byte, so the character bound is the
+byte bound). Provider matching is **descriptor-safe and tolerant of both provider
+shapes**: OpenCode's SDK type declaration exposes the provider id at the nested
+`provider.info.id`, but the OpenCode runtime may pass a flat `provider.id`; the
+plugin reads a flat own `id` (authoritative when present) and otherwise the nested
+`info.id`, using own data-property descriptors only and never invoking a getter.
+This dual-shape support is implemented and hermetically tested as offline hardening,
+but it was **not** the proven cause of the 2026-08-21 live failure (the plugin never
+loaded, so provider matching never ran) and must not be described as that live root
+cause. A request failing any part of the gate — an invalid session id, another
+agent, another provider — receives no header and does not consume the session's
+pending arming opportunity.
+
+**1. Session identity (every matching request).** Once the gate passes, the plugin
+attaches `X-CollectivIQ-OpenCode-Session-ID` **synchronously and unconditionally**,
+before it consults any title state. Optional thread reuse (section 5.1.1) keys a
+session's CollectivIQ thread on that header, so a follow-up turn that omitted it
+would silently fall back to a new thread and lose the conversation; attaching it
+therefore must not depend on session metadata, on title state, or on anything that
+can decline or time out.
+
+**Accepted tradeoff: broader title-correlation occupancy.** Sending the header more
+widely is not free, and this holds whether or not reuse is enabled — do not describe
+the reuse-disabled path as completely unchanged. The gateway registers a
+process-local title correlation (section 9.5) after ANY successful completion that
+carried a valid session header AND created an upstream thread; it has no notion of
+which sessions the plugin intends to poll for. Since title-INELIGIBLE sessions
+(child, manual, already-propagated) now send the header too, they can occupy
+correlation entries that will never be looked up, until those entries expire at the
+60 s TTL. Three properties bound that cost: registration is
+first-registration-wins, so repeated turns of one session consume no additional
+entry while its entry is live (after expiry a later created-thread turn may register
+a fresh one); a REUSED turn registers nothing at all, because it created no thread;
+and the registry is capped at 32 entries per gateway key and 128 globally, silently
+skipping registration when full. The residual risk is therefore that a saturated
+registry suppresses ANOTHER session's best-effort title propagation, leaving that
+session on OpenCode's default title. It can never fail, delay, or alter a
+completion, and it stores nothing new — an entry still holds only the opaque ids and
+upstream thread id that section 9.5 already defines. This is an ACCEPTED residual
+tradeoff of per-request identity, deliberately not worked around with a separate
+title-intent header or a change to the completion route.
+
+**2. Native-title propagation (one workflow per retained session entry).**
+Everything that follows decides only whether THIS session's title workflow starts;
+none of it withdraws the header. The plugin arms only a parentless top-level session whose title is still
+OpenCode's default `New session - <ISO>` form, and after `session.idle` polls the
 authenticated `GET /v1/opencode/session-title` extension (section 9.5) on a
 bounded, capped schedule (immediately, then 2/4/8/8/8 s — six attempts). Only if
 the session title is still the exact captured default does it rename the session to
@@ -3765,10 +3825,68 @@ any failure leaves OpenCode's default/manual title and never raises an alert.
 Arming resolves the session's parent/title from OpenCode `session.created`/
 `session.updated` lifecycle events held in bounded in-memory state (no async
 lookup in the normal case); only for a session not yet observed does `chat.headers`
-fall back to a small, bounded, fail-open `session.get` (attaching no header on
-timeout). Arming therefore adds at most a bounded delay to the foreground request,
-never an indefinite one. Native-title polling adds only bounded `GET` requests
-to the gateway; it creates no additional upstream thread.
+fall back to a small, bounded, fail-open `session.get`. Arming therefore adds at
+most a bounded delay to the foreground request, never an indefinite one. Native-title
+polling adds only bounded `GET` requests to the gateway; it creates no additional
+upstream thread.
+
+The repeating header does not multiply title work. Repeated and concurrent requests
+do not rearm the RETAINED entry, so: a manual, renamed, already-propagated, or child
+session carries the identity but arms nothing; a failed, ineligible, or timed-out
+metadata lookup leaves the already-attached header in place and simply arms nothing
+(a released reservation lets a later eligible turn retry); concurrent first turns of
+one session each get the header but issue **one** lookup and **one** arm; and
+duplicate project-local + global discovery, sharing one hooks instance and therefore
+one state map, repeats the header without arming, polling, or renaming twice.
+
+**Scope of that guarantee: the retained entry, not the session's lifetime.** The
+plugin's title state is a bounded 256-entry **insertion-order** map (`MAX_SESSIONS`)
+— **not** an LRU. Eviction removes the oldest INSERTED entry, and access does not
+refresh insertion order: `chat.headers` returns early on `sessions.has(...)` so it
+never re-inserts. A frequently used old session can therefore be evicted after 256
+newer insertions, and it is wrong to describe the map as holding "the 256 most
+recent sessions". After eviction (which also cancels that entry's in-flight title
+work) a later matching request is no longer recognized as armed, so it may arm and
+poll AGAIN. This is pre-existing, bounded, and deliberately not fixed in code. Write
+"one workflow while the entry is retained", never "at most once per session" or
+"one poller per session, ever".
+
+**What actually prevents a duplicate or clobbered rename.** Not the arming gate. A
+re-arm reads the plugin's cached metadata, which can be STALE: if the cache still
+reports the OpenCode default title while the real title has already changed, the
+plugin may arm and run one more bounded poll. Stated precisely:
+
+* **Updated non-default metadata blocks rearming.** When the plugin observed the
+  rename (a `session.updated` lifecycle event) or falls back to a live `session.get`
+  because the metadata was evicted, `eligibleTitle` sees a non-default title and
+  refuses to arm.
+* **Stale cached default metadata may permit a later bounded workflow** — one arm
+  and one capped poll schedule, nothing more.
+* **The rename-side current-title recheck prevents the overwrite.** Immediately
+  before `session.update`, the plugin re-reads the LIVE session and applies the
+  provider title only if the title still equals the exact value captured at arm
+  time. A manual or already-propagated title fails that comparison and the write is
+  skipped. This recheck, not the default-title arming gate, is the guarantee that a
+  manual or already-propagated title is never overwritten. Do not claim that a
+  changed title makes a later workflow restart impossible; claim that it cannot
+  cause an overwrite.
+
+Three bounded stores are involved here and none governs another. The gateway's
+correlation registry (above, and section 9.5) lives in the GATEWAY process with a
+60 s TTL and 32-per-key / 128-global caps. The plugin's `sessions` title state lives
+in the OPENCODE process as a 256-entry insertion-order map with no time-based
+expiry. The plugin's `metaCache` is a SEPARATE 256-entry insertion-order map, also
+in the OpenCode process, with no time-based expiry (updating an existing key
+replaces its value but keeps its original position). The correlation TTL must never
+be described as controlling either plugin map.
+
+Neither responsibility touches CollectivIQ's **provider-side** title generation. That
+remains entirely provider-owned and asynchronous (section 10.1): the plugin only
+reads a title the provider already produced, through the section 9.5 extension.
+Repeating the session header does not request, re-trigger, or re-generate a provider
+title, and none of this has been observed or tested live — the plugin behaviour above
+is established by hermetic tests only, and the live evidence in this section predates
+the change.
 
 **Connection resolution (base URL + gateway key).** Before polling, the plugin
 performs ONE bounded connection resolution — base URL and gateway key together —
@@ -4378,10 +4496,54 @@ on one session, a same-session concurrent acquire admitting exactly one winner,
 reserved-versus-processing lease expiry, renewal from authoritative state, the
 sliding TTL reset, ambiguous expiry, `EVALSHA` → `EVAL` recovery after
 `SCRIPT FLUSH`, corrupt and oversized state failing closed without repair, and
-the absence of every synthetic sentinel from stored keys and values. This suite is
-approval-gated and **has NOT been run**: it was added alongside the
-implementation, and executing it requires fresh approval to start Redis or
-Docker. `npm run validate` stays hermetic and Redis-free.
+the absence of every synthetic sentinel from stored keys and values. `npm run
+validate` stays hermetic and Redis-free, and every execution of this suite is
+separately approval-gated: a past run authorizes no future Docker or Redis
+command.
+
+**Execution evidence (2026-09-02, two approved runs).** This suite **has now been
+run** and passes. It took two approved runs, and the difference between them was
+entirely in the TESTS.
+
+The first approved run executed all three real-Redis suites — 59 tests — against a
+disposable pinned `redis:8.8.2-alpine` on host loopback. **57 passed and 2 failed,
+both in this Phase 5A suite**; the Phase 4A and 4B suites passed. Diagnosis
+established that **both failures were test defects, and neither indicated a
+production or Lua defect**:
+
+1. *Waiting on the wrong connections.* `serializes two INDEPENDENT coordinators on
+   one session` built two fresh stores but awaited readiness on the unrelated
+   module-level store. Either new connection could still be connecting, and a
+   not-ready store correctly reports `unavailable` (the fail-closed behaviour of
+   section 5.1.1), which masked the serialization the case exists to prove. The
+   test now retains both stores and awaits readiness on both before either
+   coordinator acquires.
+2. *An assertion contradicting the fixed ambiguous TTL.* The ambiguous-tombstone
+   case asserted the stored TTL was BELOW `mappingTtlMs`. Ambiguous records take
+   the FIXED ambiguous lifetime, so Redis's observed ~899,999 ms against that
+   fixture's 600,000 ms mapping TTL was correct and the assertion was wrong. It is
+   now the fixture-aware bracket `> mappingTtlMs` and `<= ambiguousTtlMs`, which
+   still fails if the sliding mapping lifetime were ever applied. The ambiguous TTL
+   is a constant and is NOT universally shorter than the mapping TTL — under the
+   seven-day production default it is far shorter and the inequality would reverse.
+
+**No production code, Lua script, coordinator, runtime, configuration,
+dependency, or lockfile entry changed** in response to those failures; the only
+edit was to `test/redis/thread-reuse-store.test.ts`. After that correction, a
+second separately approved run executed the complete gate — **3 files, 59 tests,
+all passing**, including both formerly failing cases. Cleanup confirmed `DBSIZE`
+**0** and only the Redis service was removed (no `docker compose down`, no
+`FLUSHALL`, no volume or unrelated-container removal). Every value was synthetic
+under a per-run randomized key namespace, the upstream and gateway credential
+environment variables were unset, and **no live CollectivIQ request was made and
+no real credential was used**.
+
+This establishes that the nine Lua scripts execute correctly on a real Redis
+8.8.2. It does NOT establish live CollectivIQ correctness, production readiness,
+or a cross-version guarantee: the outstanding Phase 4 controls and the unanswered
+upstream ordering, pagination, cleanup, and retention questions of section 5.1.1
+are unaffected, and the live two-turn OpenCode reuse smoke remains unrun and
+separately approval-gated.
 
 ---
 
@@ -6173,10 +6335,12 @@ today's stateless one-thread-per-completion behaviour.
 Evidence is hermetic (`test/unit/thread-reuse-*.test.ts`,
 `test/integration/chat-completions-thread-reuse.test.ts`, plus additions to the
 config, polling, orchestration, authentication, and Redis-runtime suites) with a
-real-Redis contract suite (`test/redis/thread-reuse-store.test.ts`) that was ADDED
-but **has not been run** — executing it needs fresh approval. No live CollectivIQ
-call was made or required, no dependency or lockfile entry changed, and capacity
-remains PROCESS-LOCAL.
+real-Redis contract suite (`test/redis/thread-reuse-store.test.ts`) that **has now
+been run and passes**: the complete gate passed 59/59 across all three Redis
+suites, and section 29.8 owns the detailed execution evidence. Executing it again
+needs fresh approval. No live CollectivIQ call was made or required, no dependency
+or lockfile entry changed, and capacity remains PROCESS-LOCAL. The live two-turn
+OpenCode reuse smoke remains UNRUN and separately approval-gated.
 
 **Pulling it forward does not make it production ready.** The Phase 4 items listed
 above are still outstanding, and the upstream questions this feature is most

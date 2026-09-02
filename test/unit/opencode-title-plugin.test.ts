@@ -5,12 +5,30 @@
  * 0 ms macrotask so microtask-resolving fakes deterministically win any bound
  * race). No real network, no real 2/4/8 s waits.
  *
- * These cover the four behaviors the review required: `chat.headers` never
- * performs an unbounded await (it reads lifecycle-event metadata, or falls back
- * to a small bounded fail-open `session.get`); deletion/eviction cancels all
- * pending title work; only the intended first eligible foreground request
- * (agent `collectiviq-text`, provider `collectiviq`, parentless, exact default
- * title) arms; and the bridge remains best-effort.
+ * The plugin has two independent responsibilities and these tests keep them
+ * apart:
+ *
+ *  1. SESSION IDENTITY, on EVERY matching request. Agent `collectiviq-text`,
+ *     provider `collectiviq`, and a session id the gateway would accept (1–128
+ *     bytes of `[A-Za-z0-9_-]`) get the `X-CollectivIQ-OpenCode-Session-ID`
+ *     header — repeatedly, concurrently, and across duplicate plugin loads —
+ *     because optional Phase 5A thread reuse needs it on every turn.
+ *  2. NATIVE-TITLE PROPAGATION, one workflow per RETAINED session entry. Only a
+ *     parentless session still on OpenCode's exact default title arms, polls, and
+ *     renames; a manual, already-propagated, or child session, and a failed or
+ *     timed-out metadata lookup, keep the header but arm nothing. Every no-rearm
+ *     case below holds while the session's entry is retained in the plugin's
+ *     bounded 256-entry INSERTION-ORDER `sessions` map (it evicts the oldest
+ *     INSERTED entry; access does not refresh insertion order). Eviction may permit
+ *     a later workflow, which these tests do not assert either way. The arming gate
+ *     is NOT the overwrite guarantee — it can read stale cached metadata — so the
+ *     protection asserted here is the rename-side current-title recheck: see "does
+ *     NOT update when the title changed during polling (manual rename)".
+ *
+ * They also cover the original review findings: `chat.headers` never performs an
+ * unbounded await (it reads lifecycle-event metadata, or falls back to a small
+ * bounded fail-open `session.get`); deletion/eviction cancels all pending title
+ * work; and the bridge remains best-effort.
  */
 import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -185,36 +203,104 @@ async function idle(h: Harness, sessionId = "s1"): Promise<void> {
   await h.hooks.event({ event: { type: "session.idle", properties: { sessionID: sessionId } } });
 }
 
+/** UTF-8 byte length, used to pin the session-id bound to bytes rather than chars. */
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).length;
+}
+
 // ---------------------------------------------------------------------------
 
-describe("native-title plugin — arming eligibility (chat.headers)", () => {
-  it("arms an eligible parentless default session once, from cached metadata, with NO session.get", async () => {
+describe("native-title plugin — session identity on every matching request", () => {
+  it("repeats the header on consecutive turns of one session without re-arming", async () => {
     const h = makeHarness();
     const out1 = await armCached(h);
     expect(out1.headers[SESSION_HEADER]).toBe("s1");
     // Cached lifecycle metadata means chat.headers performs no async session lookup.
     expect(h.get).not.toHaveBeenCalled();
+    expect(h.hooks.$state.get("s1")?.status).toBe("armed");
+    const armedEntry = h.hooks.$state.get("s1");
 
-    // A later eligible request for the same session never re-arms / replaces it.
-    const out2 = freshOutput();
-    await h.hooks["chat.headers"](headersInput("s1"), out2);
-    expect(out2.headers[SESSION_HEADER]).toBeUndefined();
+    // Every later turn of the SAME session carries the identity again (Phase 5A
+    // reuse needs it per request), while the title state is neither replaced,
+    // re-armed, nor re-looked-up.
+    for (let turn = 0; turn < 3; turn++) {
+      const out = freshOutput();
+      await h.hooks["chat.headers"](headersInput("s1"), out);
+      expect(out.headers[SESSION_HEADER]).toBe("s1");
+    }
+    expect(h.get).not.toHaveBeenCalled();
+    expect(h.hooks.$state.size).toBe(1);
+    expect(h.hooks.$state.get("s1")).toBe(armedEntry);
+  });
+
+  it("gives each session its own identity and arms each exactly once", async () => {
+    const h = makeHarness();
+    const first = await armCached(h, "alpha");
+    const second = await armCached(h, "beta");
+    expect(first.headers[SESSION_HEADER]).toBe("alpha");
+    expect(second.headers[SESSION_HEADER]).toBe("beta");
+    expect(h.hooks.$state.size).toBe(2);
+
+    const repeat = freshOutput();
+    await h.hooks["chat.headers"](headersInput("alpha"), repeat);
+    expect(repeat.headers[SESSION_HEADER]).toBe("alpha");
+    expect(h.hooks.$state.size).toBe(2);
+  });
+
+  it("still arms and polls exactly once across many repeated turns", async () => {
+    const h = makeHarness({
+      fetchImpl: () =>
+        Promise.resolve(makeResponse(200, { status: "ready", title: "Native title" })),
+    });
+    for (let turn = 0; turn < 5; turn++) {
+      const out = freshOutput();
+      if (turn === 0) {
+        await emitSession(h, "session.created", { id: "s1", title: DEFAULT_TITLE });
+      }
+      await h.hooks["chat.headers"](headersInput("s1"), out);
+      expect(out.headers[SESSION_HEADER]).toBe("s1");
+      await idle(h);
+    }
+    await h.hooks.$settle();
+    expect(h.fetchImpl).toHaveBeenCalledTimes(1); // one poller, one ready fetch
+    expect(h.update).toHaveBeenCalledTimes(1); // one rename
+  });
+});
+
+describe("native-title plugin — arming eligibility (chat.headers)", () => {
+  it("arms an eligible parentless default session from cached metadata, with NO session.get", async () => {
+    const h = makeHarness();
+    const out = await armCached(h);
+    expect(out.headers[SESSION_HEADER]).toBe("s1");
+    expect(h.get).not.toHaveBeenCalled();
+    expect(h.hooks.$state.get("s1")?.status).toBe("armed");
   });
 
   it("does not arm a wrong AGENT on the collectiviq provider, and does not consume the opportunity", async () => {
     const h = makeHarness();
     await emitSession(h, "session.created", { id: "s1", title: DEFAULT_TITLE });
 
-    // Another agent using the collectiviq provider: ignored, no arm, no consume.
+    // Another agent using the collectiviq provider: no header, no arm, no consume.
     const wrongAgent = freshOutput();
     await h.hooks["chat.headers"](headersInput("s1", { agent: "build" }), wrongAgent);
     expect(wrongAgent.headers[SESSION_HEADER]).toBeUndefined();
     expect(h.hooks.$state.has("s1")).toBe(false);
+    expect(h.get).not.toHaveBeenCalled();
 
     // A subsequent eligible request can still arm.
     const eligible = freshOutput();
     await h.hooks["chat.headers"](headersInput("s1"), eligible);
     expect(eligible.headers[SESSION_HEADER]).toBe("s1");
+    expect(h.hooks.$state.get("s1")?.status).toBe("armed");
+  });
+
+  it("attaches no header when the agent is absent", async () => {
+    const h = makeHarness();
+    await emitSession(h, "session.created", { id: "s1", title: DEFAULT_TITLE });
+    const out = freshOutput();
+    await h.hooks["chat.headers"]({ sessionID: "s1", provider: { id: "collectiviq" } }, out);
+    expect(out.headers[SESSION_HEADER]).toBeUndefined();
+    expect(h.hooks.$state.has("s1")).toBe(false);
   });
 
   it("does not arm a non-collectiviq provider, and a later eligible request still arms", async () => {
@@ -234,22 +320,11 @@ describe("native-title plugin — arming eligibility (chat.headers)", () => {
     expect(eligible.headers[SESSION_HEADER]).toBe("s1");
   });
 
-  it("ignores a child (parentID) session", async () => {
-    const h = makeHarness();
-    const out = await armCached(h, "s1", { parentID: "parent" });
-    expect(out.headers[SESSION_HEADER]).toBeUndefined();
-  });
-
-  it("does not treat a manual `New session - roadmap` title as the generated default", async () => {
-    const h = makeHarness();
-    const out = await armCached(h, "s1", { title: "New session - roadmap" });
-    expect(out.headers[SESSION_HEADER]).toBeUndefined();
-  });
-
   it("arms on the exact ISO default title form", async () => {
     const h = makeHarness();
     const out = await armCached(h, "s1", { title: "New session - 2026-01-02T03:04:05.678Z" });
     expect(out.headers[SESSION_HEADER]).toBe("s1");
+    expect(h.hooks.$state.get("s1")?.status).toBe("armed");
   });
 
   it("does nothing without a session id", async () => {
@@ -261,17 +336,154 @@ describe("native-title plugin — arming eligibility (chat.headers)", () => {
   });
 });
 
+describe("native-title plugin — ineligible titles keep the identity but arm nothing", () => {
+  /** Header attached, no title state, and `session.idle` starts no poller. */
+  async function expectHeaderWithoutArm(
+    h: Harness,
+    sessionId: string,
+    info: { parentID?: string; title?: string },
+  ): Promise<void> {
+    const out = await armCached(h, sessionId, info);
+    expect(out.headers[SESSION_HEADER]).toBe(sessionId);
+    expect(h.hooks.$state.has(sessionId)).toBe(false);
+    await idle(h, sessionId);
+    await h.hooks.$settle();
+    expect(h.fetchImpl).not.toHaveBeenCalled();
+    expect(h.update).not.toHaveBeenCalled();
+  }
+
+  it("a child (parentID) session carries the header and arms nothing", async () => {
+    await expectHeaderWithoutArm(makeHarness(), "s1", { parentID: "parent" });
+  });
+
+  it("a manual `New session - roadmap` title is not the generated default", async () => {
+    await expectHeaderWithoutArm(makeHarness(), "s1", { title: "New session - roadmap" });
+  });
+
+  it("an already-propagated (renamed) session carries the header and arms nothing", async () => {
+    await expectHeaderWithoutArm(makeHarness(), "s1", { title: "Fix the parser bug" });
+  });
+
+  it("a renamed session still repeats its header on every later turn", async () => {
+    const h = makeHarness();
+    await armCached(h, "s1", { title: "Fix the parser bug" });
+    for (let turn = 0; turn < 3; turn++) {
+      const out = freshOutput();
+      await h.hooks["chat.headers"](headersInput("s1"), out);
+      expect(out.headers[SESSION_HEADER]).toBe("s1");
+    }
+    expect(h.hooks.$state.size).toBe(0); // never armed, never re-armed
+    expect(h.get).not.toHaveBeenCalled(); // cached metadata; no lookup per turn
+  });
+});
+
+describe("native-title plugin — session-id validation (gateway contract)", () => {
+  // Mirrors the gateway's `src/opencode/session-header.ts` contract: an opaque
+  // token of 1–128 bytes drawn from `[A-Za-z0-9_-]`. A value the gateway would
+  // reject is never sent, because with Phase 5A reuse enabled a present-but-invalid
+  // header on an eligible request is a hard `400 invalid_opencode_session_id`.
+  const invalid: Array<[string, string]> = [
+    ["empty", ""],
+    ["embedded space", "s 1"],
+    ["dot", "ses.sion"],
+    ["slash", "ses/sion"],
+    ["colon", "ses:sion"],
+    ["trailing newline", "s1\n"],
+    ["accented letter", "s\u00e91"],
+    ["multibyte emoji", "s\u{1F600}"],
+    ["129 characters", "a".repeat(129)],
+  ];
+  for (const [name, sessionId] of invalid) {
+    it(`attaches no header for an invalid session id: ${name}`, async () => {
+      const h = makeHarness();
+      await emitSession(h, "session.created", { id: sessionId, title: DEFAULT_TITLE });
+      const out = freshOutput();
+      await h.hooks["chat.headers"](headersInput(sessionId), out);
+      expect(out.headers[SESSION_HEADER]).toBeUndefined();
+      expect(h.hooks.$state.size).toBe(0);
+      expect(h.get).not.toHaveBeenCalled();
+    });
+  }
+
+  it("accepts a boundary-valid 128-byte id and rejects 129", async () => {
+    const at = "a".repeat(128);
+    expect(utf8Bytes(at)).toBe(128);
+    const h = makeHarness();
+    const out = await armCached(h, at);
+    expect(out.headers[SESSION_HEADER]).toBe(at);
+    expect(h.hooks.$state.get(at)?.status).toBe("armed");
+
+    const over = "a".repeat(129);
+    expect(utf8Bytes(over)).toBe(129);
+    const tooLong = await armCached(h, over);
+    expect(tooLong.headers[SESSION_HEADER]).toBeUndefined();
+    expect(h.hooks.$state.has(over)).toBe(false);
+  });
+
+  it("accepts a single character and the full allowed alphabet", async () => {
+    const alphabet =
+      "abcdefghijklmnopqrstuvwxyz" + "ABCDEFGHIJKLMNOPQRSTUVWXYZ" + "0123456789" + "_-";
+    expect(utf8Bytes(alphabet)).toBe(alphabet.length); // every allowed char is 1 byte
+    for (const sessionId of ["a", "_", "-", "7", alphabet]) {
+      const h = makeHarness();
+      const out = await armCached(h, sessionId);
+      expect(out.headers[SESSION_HEADER]).toBe(sessionId);
+    }
+  });
+
+  it("rejects an invalid id even when the session is otherwise armable and uncached", async () => {
+    const h = makeHarness(); // defaultGet would return an eligible session
+    const out = freshOutput();
+    await h.hooks["chat.headers"](headersInput("bad id"), out);
+    expect(out.headers[SESSION_HEADER]).toBeUndefined();
+    expect(h.get).not.toHaveBeenCalled(); // rejected before any lookup
+    expect(h.hooks.$state.size).toBe(0);
+  });
+});
+
 describe("native-title plugin — bounded, non-blocking arming fallback (finding 1)", () => {
   it("cannot hang the hook when an uncached session.get never settles (bounded fail-open)", async () => {
     // No lifecycle event was seen → chat.headers falls back to a bounded get.
     const neverSettles = (): Promise<unknown> => new Promise<unknown>(() => {});
     const h = makeHarness({ get: neverSettles });
     const output = freshOutput();
-    // Resolves (does not hang) and attaches no header; the bound is recorded.
+    // Resolves (does not hang); the bound is recorded.
     await h.hooks["chat.headers"](headersInput("s1"), output);
-    expect(output.headers[SESSION_HEADER]).toBeUndefined();
+    // The identity header is written BEFORE the lookup, so a timed-out title
+    // lookup cannot take it away...
+    expect(output.headers[SESSION_HEADER]).toBe("s1");
+    // ...while arming itself fails open: no retained state and no poller.
+    expect(h.hooks.$state.has("s1")).toBe(false);
     expect(h.get).toHaveBeenCalledTimes(1);
     expect(h.sleeps).toContain(1000); // the SESSION_LOOKUP_TIMEOUT_MS bound
+    await idle(h);
+    await h.hooks.$settle();
+    expect(h.fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it("keeps the header when the uncached session.get REJECTS, and starts no poller", async () => {
+    const h = makeHarness({ get: () => Promise.reject(new Error("boom")) });
+    const output = freshOutput();
+    await h.hooks["chat.headers"](headersInput("s1"), output);
+    expect(output.headers[SESSION_HEADER]).toBe("s1");
+    expect(h.hooks.$state.has("s1")).toBe(false);
+    await idle(h);
+    await h.hooks.$settle();
+    expect(h.fetchImpl).not.toHaveBeenCalled();
+    expect(h.update).not.toHaveBeenCalled();
+  });
+
+  it("keeps the header when the uncached lookup returns an INELIGIBLE session", async () => {
+    const h = makeHarness({
+      get: (args) => Promise.resolve({ id: args.path.id, parentID: "parent" }),
+    });
+    const output = freshOutput();
+    await h.hooks["chat.headers"](headersInput("s1"), output);
+    expect(output.headers[SESSION_HEADER]).toBe("s1");
+    expect(h.hooks.$state.has("s1")).toBe(false);
+    await idle(h);
+    await h.hooks.$settle();
+    expect(h.fetchImpl).not.toHaveBeenCalled();
   });
 
   it("arms via the bounded fallback when the uncached session.get returns an eligible session", async () => {
@@ -280,11 +492,12 @@ describe("native-title plugin — bounded, non-blocking arming fallback (finding
     await h.hooks["chat.headers"](headersInput("s1"), output);
     expect(h.get).toHaveBeenCalledTimes(1);
     expect(output.headers[SESSION_HEADER]).toBe("s1");
+    expect(h.hooks.$state.get("s1")?.status).toBe("armed");
   });
 });
 
 describe("native-title plugin — polling (event / session.idle)", () => {
-  it("starts exactly one poller per session on session.idle", async () => {
+  it("starts exactly one poller for a retained entry across repeated session.idle", async () => {
     let calls = 0;
     const h = makeHarness({
       fetchImpl: () => {
@@ -505,7 +718,9 @@ describe("native-title plugin — lifecycle cancellation (finding 2)", () => {
         return Promise.resolve(makeResponse(202, { status: "pending" }));
       },
     });
-    // Arm the victim first (oldest), then start its poller.
+    // Arm the victim FIRST (so it is the oldest INSERTED entry), then start its
+    // poller. It stays actively in use, which under insertion-order eviction does
+    // not protect it — an LRU would have spared it.
     await armCached(h, "victim");
     await idle(h, "victim");
     // Let the detached poller resolve config, run its immediate attempt, and park
@@ -515,7 +730,8 @@ describe("native-title plugin — lifecycle cancellation (finding 2)", () => {
     expect(calls).toBe(1);
     expect(pending).toBe(1);
 
-    // Fill to capacity so the victim (oldest) is evicted; each arm is cached (no sleep).
+    // Fill to capacity so the victim (oldest INSERTED) is evicted; each arm is
+    // cached (no sleep).
     for (let i = 0; i < 256; i++) await armCached(h, `s${i}`);
     expect(h.hooks.$state.has("victim")).toBe(false); // evicted
     expect(h.hooks.$state.size).toBe(256);
@@ -562,7 +778,7 @@ describe("native-title plugin — bounded resolver boundary (finding 1b)", () =>
 });
 
 describe("native-title plugin — atomic uncached arming (finding 2b)", () => {
-  it("deletion during the uncached lookup: resolves promptly, no header/state, late get is inert", async () => {
+  it("deletion during the uncached lookup: resolves promptly, header kept, no state, late get is inert", async () => {
     let resolveGet!: (v: unknown) => void;
     let rejectGet!: (e: unknown) => void;
     const get = vi.fn(
@@ -583,18 +799,19 @@ describe("native-title plugin — atomic uncached arming (finding 2b)", () => {
       event: { type: "session.deleted", properties: { info: { id: "s1" } } },
     });
     await p;
-    expect(output.headers[SESSION_HEADER]).toBeUndefined();
+    // The identity was written before the lookup and survives the cancellation;
+    // only the title state is discarded.
+    expect(output.headers[SESSION_HEADER]).toBe("s1");
     expect(h.hooks.$state.has("s1")).toBe(false);
     // A late SDK settle (resolve AND reject) must have no effect and not throw.
     resolveGet({ id: "s1", title: DEFAULT_TITLE });
     rejectGet(new Error("late"));
     await new Promise((r) => setTimeout(r, 0));
-    expect(output.headers[SESSION_HEADER]).toBeUndefined();
     expect(h.hooks.$state.has("s1")).toBe(false);
     expect(get).toHaveBeenCalledTimes(1);
   });
 
-  it("two concurrent uncached hooks issue one lookup and attach one header", async () => {
+  it("two concurrent uncached hooks: the header on BOTH outputs, one lookup, one arm", async () => {
     let resolveGet!: (v: unknown) => void;
     const get = vi.fn(
       () =>
@@ -610,16 +827,19 @@ describe("native-title plugin — atomic uncached arming (finding 2b)", () => {
     // Release the single lookup with an eligible session.
     resolveGet({ id: "s1", title: DEFAULT_TITLE });
     await Promise.all([pA, pB]);
+    // Both in-flight requests carry the identity...
+    expect(outA.headers[SESSION_HEADER]).toBe("s1");
+    expect(outB.headers[SESSION_HEADER]).toBe("s1");
+    // ...but the reservation kept arming to a single lookup and a single entry.
     expect(get).toHaveBeenCalledTimes(1);
-    const armedHeaders = [outA, outB].filter((o) => o.headers[SESSION_HEADER] === "s1");
-    expect(armedHeaders.length).toBe(1);
     expect(h.hooks.$state.size).toBe(1);
     expect(h.hooks.$state.get("s1")?.status).toBe("armed");
-    // A later eligible hook cannot replace the first correlation.
+    // A later eligible hook repeats the header but cannot replace the correlation.
     const outC = freshOutput();
     await h.hooks["chat.headers"](headersInput("s1"), outC);
-    expect(outC.headers[SESSION_HEADER]).toBeUndefined();
+    expect(outC.headers[SESSION_HEADER]).toBe("s1");
     expect(get).toHaveBeenCalledTimes(1);
+    expect(h.hooks.$state.get("s1")?.status).toBe("armed");
   });
 
   it("a failed reservation is released so a later eligible request can arm once", async () => {
@@ -633,7 +853,7 @@ describe("native-title plugin — atomic uncached arming (finding 2b)", () => {
     const h = makeHarness({ get });
     const out1 = freshOutput();
     await h.hooks["chat.headers"](headersInput("s1"), out1);
-    expect(out1.headers[SESSION_HEADER]).toBeUndefined(); // failed lookup → no header
+    expect(out1.headers[SESSION_HEADER]).toBe("s1"); // failed lookup keeps the header
     expect(h.hooks.$state.has("s1")).toBe(false); // reservation released
     const out2 = freshOutput();
     await h.hooks["chat.headers"](headersInput("s1"), out2);
@@ -657,10 +877,11 @@ describe("native-title plugin — exact default-title shape (finding 3)", () => 
     "New session - roadmap", // manual title
   ];
   for (const title of rejected) {
-    it(`does not arm: ${JSON.stringify(title)}`, async () => {
+    it(`keeps the header but does not arm: ${JSON.stringify(title)}`, async () => {
       const h = makeHarness();
       const out = await armCached(h, "s1", { title });
-      expect(out.headers[SESSION_HEADER]).toBeUndefined();
+      expect(out.headers[SESSION_HEADER]).toBe("s1");
+      expect(h.hooks.$state.has("s1")).toBe(false);
     });
   }
 });
@@ -935,7 +1156,7 @@ describe("native-title plugin — provider-shape compatibility (flat runtime vs 
     await h.hooks["chat.headers"](headersInput("s1", { provider: hostile }), out1);
     expect(out1.headers[SESSION_HEADER]).toBeUndefined();
     expect(h.hooks.$state.has("s1")).toBe(false);
-    // The failed inspection did NOT consume the session's one arming opportunity.
+    // The failed inspection did NOT consume the session's pending arming opportunity.
     const out2 = freshOutput();
     await h.hooks["chat.headers"](headersInput("s1"), out2);
     expect(out2.headers[SESSION_HEADER]).toBe("s1");
@@ -987,7 +1208,7 @@ describe("native-title plugin — process-wide duplicate-load idempotence", () =
     expect(created).toBe(1); // first-registration-wins; second load's deps unused
   });
 
-  it("duplicate registration is behaviorally idempotent: one header, one poller, one lookup, one update", async () => {
+  it("duplicate registration repeats the header on every reference but arms/polls/renames once", async () => {
     const registry = makeMapRegistry();
     const key = Symbol("dup-load-test");
     const sleeps: number[] = [];
@@ -1013,13 +1234,25 @@ describe("native-title plugin — process-wide duplicate-load idempotence", () =
       event: { type: "session.created", properties: { info: { id: "s1", title: DEFAULT_TITLE } } },
     });
 
-    // Invoke chat.headers on BOTH references for the same session: exactly one arms.
+    // Invoke chat.headers on BOTH references for the same session: each output
+    // carries the identity, and the shared state map arms exactly one entry.
     const outA = freshOutput();
     const outB = freshOutput();
     await a["chat.headers"](headersInput("s1"), outA);
     await b["chat.headers"](headersInput("s1"), outB);
-    const armed = [outA, outB].filter((o) => o.headers[SESSION_HEADER] === "s1");
-    expect(armed.length).toBe(1);
+    expect(outA.headers[SESSION_HEADER]).toBe("s1");
+    expect(outB.headers[SESSION_HEADER]).toBe("s1");
+    expect(a.$state.size).toBe(1);
+    expect(a.$state.get("s1")?.status).toBe("armed");
+
+    // Further turns on either reference keep repeating the identity.
+    const outC = freshOutput();
+    const outD = freshOutput();
+    await a["chat.headers"](headersInput("s1"), outC);
+    await b["chat.headers"](headersInput("s1"), outD);
+    expect(outC.headers[SESSION_HEADER]).toBe("s1");
+    expect(outD.headers[SESSION_HEADER]).toBe("s1");
+    expect(a.$state.size).toBe(1);
 
     // Idle on BOTH references: exactly one poller runs.
     await a.event({ event: { type: "session.idle", properties: { sessionID: "s1" } } });

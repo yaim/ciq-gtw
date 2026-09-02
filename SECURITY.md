@@ -837,7 +837,11 @@ deletes a provider thread. An evicted mapping (a `maxmemory-policy noeviction`
 violation) silently starts a new thread. All replicas must share the same Redis
 endpoint, encryption key, `REDIS_KEY_PREFIX`, gateway-key set, upstream
 credentials, origin, and model configuration. The real-Redis contract suite for
-this feature was added but **has not been run**.
+this feature **has now been run and passes** (2026-09-02, 59 tests across all
+three Redis suites, on a disposable instance left with zero keys and then
+removed), so the Lua scripts are proven against a real Redis 8.8.2 — but that
+changes none of the risks above, and the live two-turn OpenCode reuse smoke
+remains unrun.
 
 ## Remote deployment
 
