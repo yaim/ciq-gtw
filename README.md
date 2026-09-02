@@ -841,6 +841,15 @@ derived). It adds **no new secret** and **no new dependency**.
 | A second turn arrives while one is still running       | `409` `thread_reuse_busy` + `Retry-After: 2`                      |
 | Redis unavailable, or the mapping is corrupt/ambiguous | Fails closed: `503` `thread_reuse_unavailable` + `Retry-After: 2` |
 
+**Observed working once, on one setup.** A sanitized two-turn smoke on
+**2026-09-02** ran this path end to end for the tested local/account
+configuration: a new OpenCode session, two sequential messages, **one** upstream
+thread serving both, the second answer drawing on the first turn's content, title
+propagation still working, and the Redis mapping count steady at one. The single
+provider thread was deleted afterwards. Treat that as encouraging, not as a
+guarantee — it is one observation on one account and one version, and it says
+nothing about repeatability or long sessions.
+
 **Behaviour worth knowing before you turn it on.**
 
 - **Not production ready.** It was pulled forward ahead of the remaining

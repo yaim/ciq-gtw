@@ -239,16 +239,46 @@ for eligible sessions; a deployment that needs the client transcript to be the
 single source of truth must leave reuse off. This does not affect `protocol`
 models, which resubmit their full history every turn and stay stateless.
 
-**It is not production ready.** The outstanding Phase 4 controls (metrics,
-tracing, shared cross-replica capacity accounting, load testing, a security
-review, dependency scanning, backup/release procedures, and runbooks) are still
-outstanding, and the upstream questions this feature is most sensitive to —
-message ordering and pagination (section 35, items 7 and 8), thread cleanup
-(item 9), and retention (items 22–25) — remain unanswered. The approval-gated
-real-Redis suite has now run and passes (section 29.8), so the nine Lua scripts
-are proven against a real Redis 8.8.2 — but hermetic tests plus that suite still
-do NOT establish live CollectivIQ correctness; no live CollectivIQ call was made
-or required, and the live two-turn OpenCode reuse smoke remains unrun.
+**Live evidence (sanitized, 2026-09-02).** A user-guided two-turn smoke
+**observed end-to-end thread reuse work for the tested local/account
+configuration**, on the committed direct/text OpenCode default with reuse enabled
+against a disposable loopback Redis. It used a brand-new top-level OpenCode
+session, two sequential synthetic prompts containing no repository or customer
+content, and no tools, idempotency key, retries, or extra completions.
+
+Observed: readiness `200` and a Redis mapping count of `0` beforehand; turn one
+succeeded, propagated the OpenCode native title, produced **exactly one** new
+CollectivIQ thread, and left the mapping count at `1`; turn two, in the same
+session, succeeded, **recalled a synthetic value supplied only in turn one**, kept
+the new-thread total at `1`, kept the propagated title in place, kept the mapping
+count at `1`, and left readiness `200`. Cleanup was user-confirmed: the single
+provider thread was deleted manually in the CollectivIQ UI, the gateway was
+stopped, the disposable Redis service was removed with no Compose container left,
+and the repository stayed clean.
+
+What that supports, exactly: sequential direct-mode turns reused ONE upstream
+thread; provider-held history supplied the earlier turn's value even though direct
+mode sends only the latest user message (the memory relocation described above,
+observed); run correlation returned the CURRENT turn's answer rather than an
+earlier one; the plugin supplied session identity on BOTH turns (section 25); and
+hidden title generation stayed absent while native-title propagation still worked.
+
+**It is still not production ready, and one passing smoke does not change that.**
+The outstanding Phase 4 controls (metrics, tracing, shared cross-replica capacity
+accounting, load testing, a security review, dependency scanning, backup/release
+procedures, and runbooks) remain outstanding, and the upstream questions this
+feature is most sensitive to — message ordering and pagination (section 35, items
+7 and 8), thread cleanup (item 9), and retention (items 22–25) — remain
+unanswered. The approval-gated real-Redis suite also passes (section 29.8), so the
+nine Lua scripts are proven against a real Redis 8.8.2.
+
+The smoke is a SINGLE sanitized observation of one local/account configuration. It
+establishes no repeatability, no cross-account or cross-version behaviour, no
+general upstream ordering or pagination guarantee, no retention or deletion
+guarantee, no graceful-shutdown evidence (see `.agent/instructions/validation.md`
+for why), and nothing at all about protocol-mode or tool-mode reuse, which stay
+outside eligibility. The feature remains OFF by default, and every further live
+run requires fresh approval.
 
 #### Eligibility
 
@@ -4539,11 +4569,12 @@ environment variables were unset, and **no live CollectivIQ request was made and
 no real credential was used**.
 
 This establishes that the nine Lua scripts execute correctly on a real Redis
-8.8.2. It does NOT establish live CollectivIQ correctness, production readiness,
-or a cross-version guarantee: the outstanding Phase 4 controls and the unanswered
-upstream ordering, pagination, cleanup, and retention questions of section 5.1.1
-are unaffected, and the live two-turn OpenCode reuse smoke remains unrun and
-separately approval-gated.
+8.8.2. It does NOT by itself establish live CollectivIQ correctness, production
+readiness, or a cross-version guarantee: the outstanding Phase 4 controls and the
+unanswered upstream ordering, pagination, cleanup, and retention questions of
+section 5.1.1 are unaffected. The separate sanitized two-turn live smoke of
+2026-09-02 (section 5.1.1) covers the end-to-end path for one local/account
+configuration; every further live run requires fresh approval.
 
 ---
 
@@ -6338,16 +6369,21 @@ config, polling, orchestration, authentication, and Redis-runtime suites) with a
 real-Redis contract suite (`test/redis/thread-reuse-store.test.ts`) that **has now
 been run and passes**: the complete gate passed 59/59 across all three Redis
 suites, and section 29.8 owns the detailed execution evidence. Executing it again
-needs fresh approval. No live CollectivIQ call was made or required, no dependency
-or lockfile entry changed, and capacity remains PROCESS-LOCAL. The live two-turn
-OpenCode reuse smoke remains UNRUN and separately approval-gated.
+needs fresh approval. No dependency or lockfile entry changed and capacity remains
+PROCESS-LOCAL. A sanitized two-turn live smoke on 2026-09-02 additionally observed
+the END-TO-END path work for the tested local/account configuration — one upstream
+thread served both turns, title propagation kept working, the Redis mapping count
+stayed at one, and provider-thread cleanup was user-confirmed. Section 5.1.1 owns
+that evidence and its limits.
 
 **Pulling it forward does not make it production ready.** The Phase 4 items listed
 above are still outstanding, and the upstream questions this feature is most
 sensitive to — message ordering and pagination (section 35, items 7 and 8), thread
-cleanup (item 9), and retention (items 22–25) — remain unanswered. Offline
-implementation does not establish live correctness. Enabling it by default is a
-separate decision that requires those controls and live evidence.
+cleanup (item 9), and retention (items 22–25) — remain unanswered. One sanitized
+single-configuration smoke establishes neither repeatability nor cross-account or
+cross-version behaviour. Enabling it by default is a separate decision that
+requires those controls and broader live evidence; every further live run requires
+fresh approval.
 
 Still Phase 5 work and unaffected: native tools, true streaming, token accounting,
 thread deletion, and model metadata discovery.

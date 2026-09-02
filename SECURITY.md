@@ -839,9 +839,13 @@ endpoint, encryption key, `REDIS_KEY_PREFIX`, gateway-key set, upstream
 credentials, origin, and model configuration. The real-Redis contract suite for
 this feature **has now been run and passes** (2026-09-02, 59 tests across all
 three Redis suites, on a disposable instance left with zero keys and then
-removed), so the Lua scripts are proven against a real Redis 8.8.2 — but that
-changes none of the risks above, and the live two-turn OpenCode reuse smoke
-remains unrun.
+removed), so the Lua scripts are proven against a real Redis 8.8.2. A sanitized
+two-turn live smoke on 2026-09-02 also observed the end-to-end path work for one
+local/account configuration, with one upstream thread serving both turns and its
+provider thread deleted afterwards by the user. Neither result changes any risk
+above: the smoke is a single observation, not repeatability, cross-account or
+cross-version behaviour, or a retention or deletion guarantee, and further live
+runs need fresh approval.
 
 ## Remote deployment
 

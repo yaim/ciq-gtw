@@ -584,6 +584,34 @@ approval — the 2026-09-02 runs authorize nothing later. And all three suites c
 `SCRIPT FLUSH`, which clears the whole server's Lua script cache, so this gate must
 only ever target a disposable instance, never a shared or production Redis.
 
+**Phase 5A live two-turn reuse smoke (sanitized, 2026-09-02 — PASSED).** A
+user-guided smoke exercised the end-to-end path on the committed direct/text
+OpenCode default with reuse enabled against a disposable loopback Redis: a
+brand-new top-level OpenCode session, two sequential synthetic prompts with no
+repository or customer content, and no tools, idempotency key, retries, or extra
+completions. Readiness was `200` and the Redis mapping count `0` beforehand; turn
+one succeeded, propagated the native title, produced exactly one new CollectivIQ
+thread, and moved the mapping count to `1`; turn two in the same session succeeded,
+recalled a synthetic value supplied only in turn one, kept the new-thread total and
+the mapping count at `1`, kept the propagated title, and left readiness `200`.
+Cleanup was user-confirmed: the single provider thread deleted manually in the
+CollectivIQ UI, gateway stopped, disposable Redis removed, no Compose container
+left, repository clean. Specification section 5.1.1 owns the evidence and its
+limits — a single local/account observation, not repeatability, cross-account or
+cross-version behaviour, or production readiness. Every further live run needs
+fresh approval.
+
+**Cleanup artifact from that smoke — NOT a product finding.** The gateway had been
+started under `tsx watch`, so when the process GROUP received `SIGTERM` both the
+watcher and its gateway child were signalled; the gateway logged that shutdown had
+begun and the watcher then force-killed the still-exiting child. That is an
+artifact of signalling the whole watch-process group. It was not caused by closing
+OpenCode, and it does NOT indicate a gateway shutdown hang or defect — but it does
+mean this smoke contributes NO graceful-shutdown evidence, which stays covered only
+by the hermetic shutdown tests. For future smoke cleanup, run the gateway with
+`npm start`, or signal the gateway child directly and wait for it to exit before
+stopping the watcher.
+
 **Phase 2 transport-remediation evidence (added by the streaming-review
 remediation).** New hermetic regressions in `test/unit/chat-stream-response.test.ts`
 (a Node-faithful fake `ServerResponse` whose backpressured write callback settles
