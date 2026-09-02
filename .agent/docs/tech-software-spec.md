@@ -175,7 +175,7 @@ Every `/v1/chat/completions` request contains the conversation history required 
 
 The gateway must not depend on a prior gateway request being available.
 
-For the initial implementation, the gateway shall create a new CollectivIQ thread for every completion request. It will submit a serialized version of the full OpenAI message history as one CollectivIQ prompt.
+By default the gateway creates a new CollectivIQ thread for every completion request. It submits a serialized version of the full OpenAI message history as one CollectivIQ prompt.
 
 This design prevents synchronization errors between:
 
@@ -192,7 +192,477 @@ The costs are:
 * increased upstream token use;
 * additional entries in the CollectivIQ sidebar.
 
-Persistent thread reuse may be introduced later only if CollectivIQ exposes reliable message identifiers, thread cleanup, and request correlation.
+**One narrow, opt-in exception now exists.** Section 5.1.1 defines optional
+OpenCode thread reuse: when it is explicitly enabled, sequential ELIGIBLE
+messages from one OpenCode session reuse a single CollectivIQ thread instead of
+creating one per completion. It is OFF by default, is restricted to
+direct-prompt, tool-free text requests carrying a valid session header, and is
+fail-closed. Every other request — and every request at all with the feature
+disabled — keeps exactly the stateless behaviour described above. The upstream
+prerequisites that historically blocked thread reuse (reliable message
+identifiers, thread cleanup, and request correlation) are still NOT satisfied;
+section 5.1.1 documents what the implementation does instead and what remains
+unverified.
+
+### 5.1.1 Optional OpenCode thread reuse (Phase 5A, pulled forward — optional, off by default)
+
+Redis-backed, cross-replica OpenCode thread reuse for `POST /v1/chat/completions`
+is implemented in `src/thread-reuse/` and is **optional**. With
+`OPENCODE_THREAD_REUSE_ENABLED=false` (the default) no coordinator is built, no
+reuse scope is derived, and not a single Redis reuse operation occurs: every
+completion creates its own thread exactly as it did before Phase 5A.
+
+This subsection is the NORMATIVE owner of the reuse contract, its state machine,
+and its error surface. Other documents summarize it; none restates it.
+
+**Why it exists.** For a `promptMode: "direct"` model the gateway submits only
+the latest user message (section 8.4.1), so a one-thread-per-completion session
+gives the provider no conversational context at all and fills the CollectivIQ
+sidebar with one entry per turn (section 34.5). Keeping a session on one thread
+restores continuity for exactly that profile without changing what the gateway
+sends.
+
+**It changes where the conversation lives, and that is the point.** This is a
+deliberate semantic change to the `direct` profile, not a transparent
+optimization. Today a direct-mode completion submits only the latest user message
+into an EMPTY thread, so the provider sees no history at all and OpenCode's
+client-side transcript is the only conversation state. With reuse enabled the
+provider accumulates the session's turns on its side, and the model answers with
+that provider-side history in view.
+
+The two can DIVERGE. The gateway keeps sending only the latest user message, so
+it never reconciles the two views: if the client edits, truncates, retries, or
+reorders its own history, or inlines earlier turns into the latest user message,
+the provider thread still holds whatever it was told before. Nothing detects or
+repairs that. A deployment enabling reuse is choosing provider-thread-as-memory
+for eligible sessions; a deployment that needs the client transcript to be the
+single source of truth must leave reuse off. This does not affect `protocol`
+models, which resubmit their full history every turn and stay stateless.
+
+**It is not production ready.** The outstanding Phase 4 controls (metrics,
+tracing, shared cross-replica capacity accounting, load testing, a security
+review, dependency scanning, backup/release procedures, and runbooks) are still
+outstanding, and the upstream questions this feature is most sensitive to —
+message ordering and pagination (section 35, items 7 and 8), thread cleanup
+(item 9), and retention (items 22–25) — remain unanswered. Offline
+implementation and hermetic tests do NOT establish live correctness; no live
+CollectivIQ call was made or required.
+
+#### Eligibility
+
+A request is reuse ELIGIBLE only when ALL of the following hold:
+
+1. `OPENCODE_THREAD_REUSE_ENABLED=true`;
+2. the request carries a valid `X-CollectivIQ-OpenCode-Session-ID` header (the
+   existing opaque 1–128 byte `[A-Za-z0-9_-]` header from section 9.5);
+3. the resolved virtual model has `promptMode: "direct"`;
+4. the resolved virtual model has `toolMode: "disabled"`.
+
+Anything else — the feature disabled, no header, a `protocol` model, or a
+tool-enabled model — is byte-for-byte the stateless behaviour of section 5.1.
+Protocol models resubmit their whole history every turn and an emulated tool loop
+creates a thread per round (section 12.6); making either stateful would change
+its prompt semantics, which this phase deliberately does not do.
+
+#### Public contract
+
+| Condition | HTTP | Type | Code | `param` | `Retry-After` |
+| --- | ---: | --- | --- | --- | --- |
+| Reuse could apply and the session header is PRESENT but invalid | 400 | `invalid_request_error` | `invalid_opencode_session_id` | `X-CollectivIQ-OpenCode-Session-ID` | — |
+| An eligible request also supplies `Idempotency-Key` | 400 | `invalid_request_error` | `unsupported_parameter` | `Idempotency-Key` | — |
+| Another in-flight turn holds this session's thread | 409 | `invalid_request_error` | `thread_reuse_busy` | `null` | fixed `2` |
+| Redis missing/unhealthy, corrupt or ambiguous state, or a failed transition | 503 | `server_error` | `thread_reuse_unavailable` | `null` | fixed `2` |
+
+A malformed session header is an ERROR only when reuse could actually apply.
+With the feature disabled, or for an ineligible model, the same header keeps its
+long-standing best-effort behaviour of being ignored (section 9.5).
+
+Idempotency and reuse cannot be combined in this initial implementation. The two
+features have incompatible finalization semantics — idempotency caches and
+replays one answer for a key, while reuse advances a session's thread on every
+turn — and a coupled commit is deliberately not attempted. The combination is
+refused outright rather than honoured partially, before either feature touches
+Redis.
+
+Public JSON and SSE schemas are unchanged and remain OpenAI compatible. No
+response header or body exposes a session id, a mapping id, a storage key, or an
+upstream thread id.
+
+#### Mapping identity and storage
+
+The boundary lives in `src/thread-reuse/` and mirrors the Phase 4A/4B separation:
+limits, key derivation, record parsing, a narrow total store port, an atomic
+Redis implementation, the coordinator, and runtime composition. It uses the ONE
+shared Redis connection (`src/redis/`); no module outside `src/redis/client.ts`
+imports node-redis.
+
+The configured 32-byte `IDEMPOTENCY_ENCRYPTION_KEY` is expanded with HKDF-SHA-256
+under a salt and info labels DISTINCT from every Phase 4A and Phase 4B domain,
+into four subkeys: a gateway-key reuse scope HMAC key, a storage-key HMAC key, an
+AES-256-GCM key for the thread id, and a namespace HMAC key for the value-free
+fingerprints. No new secret is introduced, and no code is shared with
+`src/idempotency/keyring.ts` or `src/rate-limit/keyring.ts`, so a change here can
+never re-key existing records. A gateway key therefore has three unrelated
+scopes; gateway authentication exposes all three as opaque request identities and
+none is ever logged, reflected, or returned.
+
+A mapping's identity binds, with length framing so no boundary shift can make two
+identities collide:
+
+* the stable per-gateway-key reuse scope (an HMAC of the raw key, independent of
+  `COLLECTIVIQ_GATEWAY_KEYS` order);
+* the OpenCode session id;
+* a normalized model-policy fingerprint over model id, `selectedLlms` (order
+  significant), `generateCombined`, `answerSource`, `promptMode`, and `toolMode`;
+* the CollectivIQ origin (`COLLECTIVIQ_BASE_URL`);
+* an upstream-principal fingerprint: the auth mode plus the CONFIGURED bearer
+  token, or in password mode the configured username — never the transient
+  access token, which rotates on every login.
+
+A policy change, a model switch, an origin change, or a principal change
+therefore produces a SEPARATE mapping rather than continuing a thread generated
+under different routing or a different identity. Only HMAC outputs are stored;
+raw principal material is never stored or logged.
+
+The Redis key is `<REDIS_KEY_PREFIX>:reuse:<HMAC digest>` — a readable
+operational prefix and the fixed `reuse` category, which keeps mapping keys from
+colliding with the `idem` and `rate` keyspaces.
+
+**Stored state.** One versioned, bounded (≤4096 byte) JSON record per mapping,
+carrying only: the record version, the state, a random owner token, an absolute
+lease deadline in epoch ms (`0` when unleased), and — when a thread is bound —
+the AES-256-GCM sealed upstream thread id. Redis therefore never holds a raw
+session id, gateway key, upstream credential, prompt, answer, tool schema,
+argument, result, model-generated content, model id, origin, or plaintext thread
+id. The seal uses a fresh 96-bit nonce per write, and its associated data binds
+the record version, the storage key, and an INDEPENDENT mapping-identity digest
+derived under the namespace subkey, so a ciphertext relocated to another
+mapping's key fails authentication rather than decrypting into a thread another
+session would submit to. Decoding is strict: an unsupported version, an unknown
+key, a wrong type, an oversized document, or any state/field combination the
+state machine cannot produce is corrupt and fails the request closed.
+
+All reads and mutations are bounded server-side: the size is checked with
+`STRLEN` before any internal `GET`, and there is no direct unbounded client
+`GET` at all.
+
+#### State machine
+
+A single key, five states, and one atomic Lua script per mutation — never a
+GET-then-SET. Two replicas racing one session are serialized by Redis, not by any
+local lock.
+
+| State | Meaning | Acquirable |
+| --- | --- | :--- |
+| `reserved` | A request holds the lease but has not submitted. A thread may already be bound. | Only after its lease expires |
+| `processing` | `process_message` is about to run, is running, or may have run. A thread is always bound. | No — an expired lease becomes `ambiguous` |
+| `committed` | The commit mutation landed, but `committed → active` was not confirmed. A thread is always bound. The stored state does not imply an answer was emitted: emission is authorized only once the coordinator ACKNOWLEDGED the commit, so a reply-lost commit leaves `committed` with nothing emitted. | **No** |
+| `active` | Idle and reusable: a bound thread, no lease. The only state a later turn continues from. | Yes |
+| `ambiguous` | A failure occurred once a submit may have happened. Blocked for its TTL. Never carries a thread. | No |
+
+Timings: a 15 minute ambiguous TTL, the configured sliding idle mapping TTL
+(`OPENCODE_THREAD_REUSE_TTL_MS`, 7 days by default), a 10 s renewal cadence, and
+TWO different leases — for the same reason section 18.1 carries two.
+
+| Leased state | Lease | Why |
+| --- | --- | --- |
+| `reserved` | fixed 30 s | Losing it is SAFE: the owner-guarded `reserved → processing` transition means a starved owner that wakes after a takeover reports `lost` and aborts rather than submitting. No path submits without that transition succeeding first, so a short lease frees an orphaned claim quickly. |
+| `processing` | the model's `requestTimeoutMs` + 30 s, capped at 630 s | Losing it is NOT safe. The owner may legitimately be mid-completion for its whole deadline, and an expiry would tombstone the mapping underneath a healthy request — failing a completion that was about to succeed and blocking the session for the ambiguous TTL. Renewal alone cannot carry this, because the event-loop starvation that delays renewals is exactly when it matters. Deriving the lease from the request's own deadline means the owner's deadline always fires first, so the lease degenerates to a crash reaper. |
+
+Because the two differ, the RENEWAL must choose between them from the
+AUTHORITATIVE STORED STATE, atomically, and must never accept a duration the
+caller selected. A renewal races the `reserved → processing` transition: Redis
+can apply that transition while the transitioning caller is still awaiting its
+reply, so a caller-selected duration could carry the stale `reserved` view and
+shorten a live `processing` record's lease to 30 s — precisely the expiry the
+derived lease exists to prevent. Both leases are therefore shipped on every
+operation and the script picks one.
+
+**The lease deadline lives inside the record and is stamped and compared inside
+Lua against Redis's own `TIME`, never a Node clock.** Redis `PX` carries the
+record's LIFETIME, not its lease. That separation is load bearing: a record must
+SURVIVE its lease so an expired `processing` record can become `ambiguous`
+instead of silently vanishing and letting the next turn start a fresh thread
+while the previous submit may still be running upstream.
+
+**Redis lifetime is therefore chosen per state, server-side, from the state being
+written** — never by the caller, and never uniformly from the mapping TTL:
+
+| State written | Redis `PX` |
+| --- | --- |
+| `active` | the configured sliding mapping TTL |
+| `reserved` | `max(mappingTtl, reservedLease + ambiguousTtl)` |
+| `processing` | `max(mappingTtl, processingLease + ambiguousTtl)` |
+| `committed` | the bounded committed safety TTL (15 minutes) |
+| `ambiguous` | the ambiguous TTL (15 minutes) |
+
+The `max` matters because configuration genuinely permits a lease longer than the
+mapping TTL: the minimum `OPENCODE_THREAD_REUSE_TTL_MS` is 5 minutes while a
+processing lease can reach 10.5 minutes. Writing every record with the mapping
+TTL alone would let a live `processing` key expire mid-completion, and the added
+grace guarantees a competitor still has a full window in which to observe the
+expired lease and tombstone it.
+
+Transitions:
+
+1. An absent mapping becomes `reserved` with no thread.
+2. An `active` mapping becomes `reserved`, carrying the encrypted existing thread.
+3. An UNEXPIRED `reserved`/`processing` lease held by another request is busy
+   (`409`). The loser is told to retry; it is never queued and never given its
+   own thread.
+4. The first request acquires capacity, calls `create_thread`, and binds the
+   returned thread id while still `reserved`.
+5. Immediately before `process_message` the record moves to `processing`.
+6. The owner renews its lease while waiting for capacity, submitting, and
+   polling. The renewal takes the state from the AUTHORITATIVE stored record,
+   never from the caller, so a renewal that races a transition can neither revive
+   an `active`/`ambiguous` record, misapply a lease, nor shorten a live
+   `processing` lease. A lost renewal aborts the request.
+7. After a validated authoritative answer is ready the record is finalized
+   through the ACKNOWLEDGEMENT-SAFE two-step transition below. Step one MUST be
+   acknowledged BEFORE any JSON body and before any SSE content or terminal
+   frame. (SSE headers and the assistant-role opener precede it by design,
+   exactly as for idempotency, so a late failure there is an SSE error record
+   rather than an HTTP status.)
+8. A capacity rejection, a cancellation, or any failure BEFORE `process_message`
+   restores the previous `active` mapping, or deletes a reservation that never
+   bound a thread. A session loses nothing.
+9. Once `process_message` may have been attempted, any failure, timeout,
+   cancellation, lost transition, or crash leaves the mapping BLOCKED — normally
+   `ambiguous`. The one exception is finalization uncertainty after an
+   acknowledged commit: the mapping may remain bounded in `committed`, which is
+   equally non-acquirable, rather than being tombstoned (see the
+   acknowledgement-safe subsection below). Either way the session is blocked and
+   then starts cleanly; neither state is ever handed to a later turn.
+10. An expired PRE-SUBMIT reservation is recoverable: the next acquire takes it
+    over, keeping any bound thread.
+11. An expired `processing` lease becomes `ambiguous`, never `active`.
+12. After the ambiguous TTL expires the next request may reserve and create a new
+    thread.
+
+If the Redis bind fails AFTER a successful `create_thread`, the request fails
+closed WITHOUT calling `process_message`. The blank provider-side thread is an
+acknowledged residual orphan; it is never guess-deleted, because deletion
+semantics are credential/principal dependent and unproven (section 35, item 9).
+
+#### Acknowledgement-safe finalization
+
+A single-step `processing → active` transition is unsafe in one specific way: if
+Redis APPLIES the mutation but its reply is lost, the caller concludes "failed"
+and returns `503` while the mapping has silently become REUSABLE. A later turn
+then continues a thread whose last answer was never delivered — and the
+subsequent `abandon` cannot correct it, because the record is already `active`.
+
+The terminal step is therefore split, with a non-acquirable state in between:
+
+1. **`commit`** — atomic, owner-guarded `processing → committed`. It is
+   IDEMPOTENT for the same owner, so a bounded retry after a lost reply
+   acknowledges a mutation that already landed instead of misreporting failure.
+   `activate` is never invoked until `commit` is positively acknowledged.
+2. **`activate`** — atomic, owner-guarded `committed → active`. Also idempotent
+   for the same owner.
+
+Because `committed` is never acquirable, an unacknowledged commit can only ever
+BLOCK the session; it can never hand another owner a mapping with an
+unaccounted-for turn. That is what makes the intermediate state safe.
+
+Outcomes:
+
+- **Commit cannot be acknowledged** (both attempts undecided): the answer is NOT
+  emitted, the request returns `503`, and settlement tombstones the mapping.
+  `abandon` accepts `processing` AND `committed`, so it retires the record
+  whichever of the two the unacknowledged write actually reached.
+- **Commit acknowledged, activation undecided**: the answer IS emitted. An
+  unreachable Redis must not turn a completed, authorized answer into a `503`.
+  Settlement retries activation best-effort; if it still cannot be confirmed the
+  record stays `committed`, non-acquirable and bounded by its safety TTL, so the
+  session blocks and then starts cleanly.
+- **Activation returns a DEFINITIVE bad answer**: the mapping is not what this
+  request believes it is, so the request fails closed and performs no follow-up
+  write. Two cases differ in what the SCRIPT does:
+  - `missing` — the key genuinely vanished (eviction, operator delete, expiry).
+    Reporting it alone would leave the key ABSENT, and the session's next acquire
+    would see no mapping and silently create a REPLACEMENT thread, breaking
+    conversation continuity invisibly. The activation script therefore writes an
+    `ambiguous` tombstone for the current owner, under the ambiguous TTL, in the
+    SAME atomic script — so no competing acquire can observe the gap — and still
+    returns `missing`. The session is blocked, then starts cleanly.
+  - `lost`, `state`, `corrupt` — the record exists but belongs to another owner,
+    has advanced beyond `committed`, or is unreadable. It is reported UNTOUCHED:
+    something else owns the truth, and a corrupt record must never be rewritten.
+- **`acquire` encountering `committed`** returns the same fail-closed blocked
+  class as `ambiguous`.
+
+The public session API stays one `finalize()` call; the coordinator orchestrates
+both steps. The record format version is unchanged: Phase 5A has not been
+released, so `committed` is added to the existing version rather than migrated.
+
+#### Strict record validation
+
+Every mutating script validates the COMPLETE record before it changes anything,
+so a corrupt record can never be sanitized and rewritten into a valid-looking
+one. Validation rejects unknown top-level keys, an unsupported version, an
+invalid owner, a non-integral/negative/non-finite lease, an unknown state, a
+sealed payload with anything other than exactly `i`/`c`/`t` (each bounded
+base64url), and every impossible state/field combination:
+
+| State | Required |
+| --- | --- |
+| `reserved` | base fields, positive lease, optional valid sealed payload |
+| `processing` | base fields, positive lease, required valid sealed payload |
+| `committed` | base fields, zero lease, required valid sealed payload |
+| `active` | base fields, zero lease, required valid sealed payload |
+| `ambiguous` | base fields, zero lease, NO payload |
+
+A rejected record is reported `corrupt` and left BYTE-FOR-BYTE untouched.
+
+There is deliberately NO completed-turn cap and no rotation threshold. A mapping
+serves an unbounded number of sequential turns until it idles out, is
+invalidated by a policy/principal change, or is blocked as ambiguous.
+
+Mapping expiry only forgets the mapping. It NEVER deletes the CollectivIQ thread,
+which remains in the provider's sidebar under the provider's own retention
+policy.
+
+#### Run correlation: which message belongs to THIS submission
+
+A completion must return the answer its own submission produced. On a fresh
+thread that is nearly automatic; on a reused thread the thread already contains
+every earlier turn, and the ordinary selection policy (section 8.6) would return
+the PREVIOUS turn's answer the instant polling started.
+
+The gateway therefore correlates by RUN, not by history. Both halves of the
+correlation are verified-repeatable safe field names from the two authorized
+2026-08-11 password baselines (section 35, items 2 and 5; see also the upstream
+contract document):
+
+- a successful `process_message` `202` carries `combined_run_id`;
+- a `get_messages` entry carries `combined_run_id`.
+
+The contract is:
+
+1. `normalizeProcessMessage` REQUIRES a non-empty string `combined_run_id` on a
+   successful submission. Absent, empty, or wrongly typed is an upstream protocol
+   failure — the gateway will not proceed without knowing which run it started.
+   This tightening is shared, not reuse-specific: the operator-only discovery
+   tooling gates its submit stage on the same normalizer, so an account whose
+   `process_message` omits a run id now fails discovery as well as completions.
+2. Each message's `combined_run_id` normalizes to `string | null`: absent or
+   `null` is `null`; a non-empty string is that string; anything else makes the
+   entry malformed, which fails the whole response as an upstream protocol error.
+3. The submission's run id is carried into polling as a REQUIRED parameter.
+4. A desired-source or tool-consensus message is ELIGIBLE only when its
+   normalized run id EXACTLY equals the current submission's. A message with a
+   missing or different run id can never win.
+5. Eligibility is applied while SELECTING, never to an already-ranked winner: an
+   older message can outrank a newer one under the section 8.6 policy, so
+   filtering afterwards would reject the winner and time out with the real answer
+   sitting unselected. The deterministic timestamp → sortable-id →
+   array-position ordering then applies among same-run candidates only.
+6. If no correlated answer appears before the authoritative deadline, the
+   existing `504 completion_timeout` fires. The gateway NEVER falls back to an
+   older or uncorrelated answer.
+
+**This rule applies to every completion**, reused thread or not, so there is
+exactly one correctness rule rather than a stateless path and a special case.
+
+There is deliberately NO pre-submit history snapshot, NO baseline exclusion set,
+and therefore NO bound on retained message identities — and consequently no
+implicit cap on how many turns a session may accumulate. Correlation is a
+property of the submission, so it is unaffected by thread length, by message
+ordering, and by whether `get_messages` paginates: a truncated page cannot make
+an uncorrelated message eligible, it can only delay or time out the correct one.
+That removes the two residual risks the earlier snapshot design carried.
+
+The documented optional `since_id` query parameter (section 10.3) remains
+unused: run correlation already establishes which message belongs to this
+submission, and `since_id`'s semantics have never been exercised live. Existing
+bounded response validation is unchanged.
+
+#### Admission order
+
+For `POST /v1/chat/completions`, on both transports:
+
+```text
+gateway authentication (the /v1 onRequest hook)
+  -> request validation, model resolution, tool normalization
+  -> Idempotency-Key header validation
+  -> thread-reuse eligibility        -> 400 invalid_opencode_session_id
+                                     -> 400 unsupported_parameter
+  -> keyed request whose idempotency cannot be honoured -> 503
+  -> prompt preparation
+  -> cross-replica rate limit        -> 429 / 503 (section 19.1)
+  -> OpenCode thread-reuse lease     -> 409 / 503
+  -> idempotency claim, wait, replay  (unreachable for an eligible reuse request)
+  -> process-local capacity          -> 429 gateway_capacity_exceeded
+  -> create-and-bind, or reuse the leased thread
+  -> mark processing
+  -> process_message (exactly once)
+  -> authoritative get_messages polling
+  -> mark active
+  -> encode JSON or synthetic SSE
+```
+
+Consequences that follow from that order:
+
+* A busy or unavailable reuse attempt happens AFTER the rate-limit gate and
+  therefore consumes one quota unit, consistent with every other
+  otherwise-valid attempt (section 19.1). A request the limiter itself rejects
+  never acquires a lease.
+* Holding a session's lease while waiting for bounded process-local capacity is
+  intentional — the alternative is to create a thread the request may not be able
+  to use — and the lease is renewed throughout the wait. Two consequences follow
+  for operators: while one turn queues, another turn of the SAME session gets
+  `409` even though no upstream work is happening; and because the queue wait can
+  be configured as high as `MAX_QUEUE_WAIT_MS` (600 s) while a queued turn still
+  holds only the short 30 s `reserved` lease, a sufficiently long stall can lose
+  the lease and fail that turn with `503`. Both are fail-closed outcomes, but a
+  deployment that raises `MAX_QUEUE_WAIT_MS` well above the reserved lease should
+  expect them.
+* A capacity failure releases the lease without any upstream work.
+* No `create_thread` or `process_message` retry was introduced (section 17.1).
+* The adapter already accepts a thread id for `process_message`; no upstream
+  endpoint was added and no OpenAPI snapshot was refetched.
+* Native-title propagation (section 9.5) is registered ONLY for the turn that
+  CREATED the thread. The provider generates its title once, so a later turn has
+  nothing new to propagate. The correlation keeps its existing 60 s process-local
+  TTL, so a session whose plugin polls later, or whose gateway restarts, loses
+  propagation for the whole session rather than only for one turn — the same
+  best-effort, non-fatal outcome as before, just with fewer chances to succeed.
+* Capacity remains PROCESS-LOCAL.
+
+#### Residual limits
+
+* **Not production ready.** See the Phase 4 gaps listed above.
+* **Ordering, pagination, cleanup, and retention are unverified**, but run
+  correlation does not depend on any of them. A truncated or reordered
+  `get_messages` page cannot make an uncorrelated message eligible; it can only
+  delay the correct one, and a thread that outgrows a single bounded read
+  degrades to `504 completion_timeout` rather than to a wrong answer.
+* **Correlation requires `combined_run_id`.** It is verified-repeatable in both
+  the submission response and message entries, but it is not an upstream
+  GUARANTEE. An account whose `process_message` omits it fails the submission as
+  an upstream protocol error; one whose messages omit it times out. Both are
+  fail-closed, and both are visible immediately rather than as a silent wrong
+  answer.
+* **Provider-side history becomes part of the answer** for eligible sessions and
+  can diverge from the client transcript, as described above.
+* **A reused thread concentrates a whole conversation in one provider thread.**
+  That reduces sidebar entries (section 34.5) but increases how much of a session
+  sits in one place under an unknown retention policy.
+* **A post-create Redis failure can leave a blank orphan thread** in the
+  provider's sidebar. It is never guess-deleted.
+* **A hard replica kill mid-submit blocks that session for the ambiguous TTL**,
+  which is deliberately preferred over risking a stale answer or a silent
+  replacement thread.
+* **All replicas must share** the same Redis endpoint, encryption key,
+  `REDIS_KEY_PREFIX`, gateway-key set, upstream credentials, origin, and model
+  configuration, or a session will not resolve to the same mapping everywhere.
+* The `maxmemory-policy noeviction` requirement of section 18.1 applies here too:
+  an evicted mapping silently starts a new thread.
+* Enabling this feature trades availability for correctness on the completion
+  path for eligible requests, exactly as rate limiting does.
+* No dependency was added and the lockfile is unchanged.
 
 ### 5.2 OpenCode remains the agent runtime
 
@@ -637,6 +1107,13 @@ The adapter must:
 
 The polling coordinator waits for a usable CollectivIQ message.
 
+The coordinator receives the CURRENT submission's `combined_run_id` and considers
+only messages whose own `combined_run_id` matches it exactly (section 5.1.1). The
+policy below then ranks those same-run candidates. This applies to every
+completion, not only to a reused thread: correlating by run rather than by thread
+history means a thread that already contains earlier turns cannot yield one of
+them, and no assumption about message ordering or pagination is required.
+
 Default policy:
 
 ```text
@@ -684,7 +1161,7 @@ the request completes when a non-empty message with:
 
 is available.
 
-Because each gateway request creates a new CollectivIQ thread, stale-message filtering is not required in the initial implementation.
+Stale-message filtering is not a separate concern: every completion selects only messages whose `combined_run_id` matches its own submission (sections 5.1.1, 8.6). A thread that already holds earlier turns — the reuse case (section 5.1.1, off by default) — therefore cannot yield one of them, and no ordering or pagination assumption is involved.
 
 The coordinator must distinguish:
 
@@ -1208,6 +1685,18 @@ internally): an opaque ASCII token, 1–128 bytes, characters `[A-Za-z0-9_-]` on
 The session id is never logged, hashed into logs, reflected in an error, or
 exposed in any completion response body.
 
+**Since Phase 5A this header has a second, independent role.** When optional
+OpenCode thread reuse is enabled (section 5.1.1) and the resolved model is
+eligible, the same header additionally identifies the session-to-thread mapping,
+and a PRESENT-but-malformed value is then rejected with
+`400 invalid_opencode_session_id` instead of being ignored — a caller that asked
+for a session-scoped conversation and got the header wrong must not be silently
+downgraded to one thread per turn. The three bullets above remain exactly the
+behaviour for every request that is not reuse eligible, including every request at
+all while the feature is disabled. Reuse also changes WHEN a correlation is
+registered: only the turn that CREATED the thread registers one, because the
+provider generates its native title once.
+
 **Process-local correlation service** (`src/opencode/title-bridge.ts`). Keyed by
 `gatewayKeyId + sessionId`, it stores **only** the two opaque ids plus the upstream
 thread id created for that completion — **never** a title, prompt, or answer.
@@ -1248,7 +1737,10 @@ store holds only opaque ids, never the title).
 
 ### 10.1 Thread creation
 
-For each completion:
+For each completion, unless the request is continuing a thread an earlier turn of
+the same OpenCode session already created (optional thread reuse, section 5.1.1;
+off by default). A reusing turn issues no `create_thread` at all and submits into
+the leased thread instead.
 
 ```http
 POST {COLLECTIVIQ_BASE_URL}/create_thread
@@ -1930,7 +2422,13 @@ Until then, polling is authoritative.
 
 ## 15. Request State Machine
 
-Each completion shall follow:
+Each completion shall follow the sequence below. A completion that is CONTINUING
+an OpenCode session's existing thread (optional thread reuse, section 5.1.1; off
+by default) skips `THREAD_CREATING`/`THREAD_CREATED` and submits into the leased
+thread; every other state is identical. That feature's own cross-replica mapping
+states — `reserved`, `processing`, `committed`, `active`, `ambiguous` — are a
+SEPARATE machine owned by section 5.1.1 and are not part of this per-request
+sequence.
 
 ```text
 RECEIVED
@@ -2126,6 +2624,15 @@ request deadline receives the existing `504 completion_timeout`; client
 disconnect and shutdown keep their existing behaviour (no body, and `503
 service_unavailable` respectively). A supplied key **requires** configured,
 healthy Redis: otherwise the request fails closed **before** any completion work.
+
+Since Phase 5A a supplied key on a request that is ALSO eligible for OpenCode
+thread reuse (section 5.1.1) is rejected with `400 unsupported_parameter` before
+either feature touches Redis. The two have incompatible finalization semantics —
+this one caches and replays a single answer for a key, while reuse advances a
+session's upstream thread on every turn — so the combination is refused rather
+than honoured partially. Nothing in this section changes for any other request:
+the derivation constants, record format, Lua scripts, and reply semantics are
+byte-for-byte unchanged, and existing records stay readable.
 
 **"Same body" is the canonical full parsed JSON.** JSON whitespace and object-key
 order are insignificant; array order is significant; and EVERY submitted field
@@ -2418,9 +2925,11 @@ the caller can always fail closed without inspecting a thrown value.
 gateway authentication (the /v1 onRequest hook)
   -> request validation, model resolution, tool normalization
   -> Idempotency-Key validation and canonical body fingerprinting (when supplied)
+  -> thread-reuse eligibility (section 5.1.1)          -> 400 (invalid session id / key+reuse)
   -> keyed request whose idempotency cannot be honoured -> 503 idempotency_unavailable
   -> prompt preparation
   -> cross-replica rate limit                          -> 429 / 503
+  -> OpenCode thread-reuse lease (section 5.1.1)       -> 409 / 503
   -> idempotency claim, wait, or replay                -> 409 / 503 / cached result
   -> process-local capacity                            -> 429 gateway_capacity_exceeded
   -> upstream work
@@ -2430,7 +2939,11 @@ The idempotency header and fingerprint steps precede prompt preparation because
 that is the pre-existing Phase 4A order (section 18.1), deliberately preserved so
 no Phase 4A behaviour changed. What Phase 4B requires is that the rate-limit gate
 sits after ALL input validation and preparation and before the claim, capacity,
-any SSE header, and any upstream call.
+any SSE header, and any upstream call. The Phase 5A reuse steps slot around it
+without moving anything: eligibility is decided before either Redis feature
+engages, and the lease is taken after the rate-limit decision. Reuse and
+idempotency are mutually exclusive, so the claim step is unreachable for an
+eligible reuse request.
 
 **What consumes quota.** Exactly one unit per otherwise-valid attempt, and quota
 is NEVER refunded — a later capacity rejection or completion failure keeps its
@@ -2440,13 +2953,15 @@ already-spent unit.
 | --- | :--- |
 | A normal completion | one unit |
 | An idempotency owner, a waiter, a cached replay, and a different-body `409` conflict | one unit EACH |
+| A thread-reuse attempt that is busy (`409`) or unavailable (`503`) | one unit EACH |
 | Invalid authentication, an invalid request, or a preparation failure | nothing |
 | An invalid `Idempotency-Key`, an unfingerprintable body, or a keyed request whose idempotency is unavailable | nothing |
+| An invalid OpenCode session header, or an `Idempotency-Key` combined with reuse | nothing |
 | A request the limiter itself rejects | nothing (the stored TAT is not mutated) |
 
-A limited request creates no idempotency claim, takes no capacity permit, commits
-no SSE header, registers no native-title correlation (section 9.5), and makes no
-upstream call. A **streamed** request rejected at this gate therefore receives an
+A limited request creates no idempotency claim, acquires no thread-reuse lease,
+takes no capacity permit, commits no SSE header, registers no native-title
+correlation (section 9.5), and makes no upstream call. A **streamed** request rejected at this gate therefore receives an
 ordinary JSON `429`/`503`, never an SSE error record. Only
 `POST /v1/chat/completions` is metered: `/healthz`, `/readyz`,
 `GET /v1/models`, `GET /v1/models/:model`, and `GET /v1/opencode/session-title`
@@ -2547,6 +3062,10 @@ exactly once. CollectivIQ readiness semantics are unchanged (still not a probe).
 | Gateway capacity            |  429 | `rate_limit_error`        | `gateway_capacity_exceeded`      |
 | Gateway rate limit          |  429 | `rate_limit_error`        | `gateway_rate_limit_exceeded`    |
 | Rate limiting unavailable   |  503 | `server_error`            | `rate_limit_unavailable`         |
+| Invalid OpenCode session id |  400 | `invalid_request_error`   | `invalid_opencode_session_id`    |
+| Idempotency-Key with reuse  |  400 | `invalid_request_error`   | `unsupported_parameter`          |
+| Session thread already busy |  409 | `invalid_request_error`   | `thread_reuse_busy`              |
+| Thread reuse unavailable    |  503 | `server_error`            | `thread_reuse_unavailable`       |
 | CollectivIQ quota           |  429 | `rate_limit_error`        | `upstream_quota_exceeded`        |
 | CollectivIQ authentication  |  502 | `upstream_error`          | `upstream_authentication_failed` |
 | Malformed upstream response |  502 | `upstream_protocol_error` | `invalid_upstream_response`      |
@@ -2839,6 +3358,22 @@ the no-content-retention posture, does not require persistence or backups, and
 the "concurrency counters are NOT stored" statement above still holds: capacity
 remains process-local.
 
+**Implementation status (Phase 5A, implemented — optional).** When OpenCode
+thread reuse is enabled (section 5.1.1), Redis additionally holds ONE bounded
+(≤4096 byte) record per session mapping under a separate `:reuse:` key category.
+It carries only a record version, a state, a random owner token, an integer lease
+deadline, and — when a thread is bound — the AES-256-GCM sealed upstream thread
+id. This is the FIRST upstream identifier the gateway persists, and it is
+persisted encrypted: the seal uses a fresh nonce per write and its associated data
+binds the record version, the storage key, and an independent mapping-identity
+digest, so a relocated ciphertext fails authentication instead of decrypting. No
+session id, gateway key, upstream credential, prompt, answer, tool schema,
+argument, result, model-generated content, model id, or origin is stored, and the
+key itself is an HMAC. Records are bounded by the sliding
+`OPENCODE_THREAD_REUSE_TTL_MS` (7 days by default) or, for an `ambiguous`
+tombstone, by a 15 minute TTL. The no-content-retention posture is unchanged, and
+capacity remains process-local.
+
 ### 22.3 CollectivIQ-side retention
 
 The gateway cannot control CollectivIQ’s thread retention based on the supplied endpoints.
@@ -3044,6 +3579,21 @@ All four produce value-free `ConfigError` issues. Every replica must be
 configured with the SAME Redis endpoint, encryption key, `REDIS_KEY_PREFIX`,
 gateway-key set, AND rate-limit settings, or the quota is not the single shared
 quota it appears to be.
+
+**Implementation status (Phase 5A, implemented).** Optional OpenCode thread reuse
+(section 5.1.1) adds two more validated environment variables. The feature is OFF
+by default; a PRESENT TTL is validated even while it is disabled, for the same
+reason as the rate-limit settings. The bounds live in `THREAD_REUSE_LIMITS` in
+`src/config/schema.ts`.
+
+| Variable | Default | Rule |
+| --- | --- | :--- |
+| `OPENCODE_THREAD_REUSE_ENABLED` | `false` | Strictly `"true"` or `"false"`. Enabling it **requires** a valid `REDIS_URL`, which already requires `IDEMPOTENCY_ENCRYPTION_KEY`. No new secret is introduced. |
+| `OPENCODE_THREAD_REUSE_TTL_MS` | 604800000 (7 days) | Integer, 300000–2592000000. The SLIDING idle lifetime of a session-to-thread mapping; every completion that uses the mapping resets it. Expiry forgets the mapping only — it never deletes the CollectivIQ thread. |
+
+Both produce value-free `ConfigError` issues. Every replica must additionally
+share the same upstream credentials, origin, and model configuration, or one
+OpenCode session will not resolve to the same mapping everywhere.
 
 Gateway client keys (`COLLECTIVIQ_GATEWAY_KEYS`) are bounded by conservative,
 non-overridable initial limits: at most **64** configured keys, and at most
@@ -3260,10 +3810,13 @@ leaves the OpenCode default or manual title), and further live runs remain
 approval-gated.
 
 This OpenCode session title is **distinct** from the CollectivIQ upstream thread
-title. The gateway still performs exactly one `create_thread` per completion
-request using the fixed, content-free placeholder `THREAD_TITLE` (exactly
-`New Thread`, section 10.1), and **no** OpenCode-generated title is ever forwarded
-into `create_thread`. CollectivIQ may **asynchronously** replace `New Thread` with
+title. The gateway performs at most one `create_thread` per completion request
+using the fixed, content-free placeholder `THREAD_TITLE` (exactly `New Thread`,
+section 10.1), and **no** OpenCode-generated title is ever forwarded into
+`create_thread`. With optional thread reuse enabled (section 5.1.1) a turn that
+CONTINUES a session's thread performs none at all, and it deliberately registers
+no correlation here: the provider generates its title once, for the turn that
+created the thread, so a later turn has nothing new to propagate. CollectivIQ may **asynchronously** replace `New Thread` with
 its own prompt-related, server-generated thread title (observed 2026-08-18); that
 provider title is prompt-derived provider metadata, produced and persisted
 provider-side (and, after propagation, stored by OpenCode as the session title).
@@ -3351,6 +3904,10 @@ collectiviq-gateway/
 │   │   ├── validator.ts
 │   │   ├── canonicalize.ts
 │   │   └── candidate-selector.ts
+│   ├── redis/
+│   │   ├── client.ts
+│   │   ├── limits.ts
+│   │   └── runtime.ts
 │   ├── idempotency/
 │   │   ├── header.ts
 │   │   ├── fingerprint.ts
@@ -3361,6 +3918,19 @@ collectiviq-gateway/
 │   │   ├── store.ts
 │   │   ├── redis-store.ts
 │   │   └── coordinator.ts
+│   ├── rate-limit/
+│   │   ├── gcra.ts
+│   │   ├── keyring.ts
+│   │   ├── redis-limiter.ts
+│   │   └── runtime.ts
+│   ├── thread-reuse/
+│   │   ├── keyring.ts
+│   │   ├── crypto.ts
+│   │   ├── records.ts
+│   │   ├── store.ts
+│   │   ├── redis-store.ts
+│   │   ├── coordinator.ts
+│   │   └── runtime.ts
 │   ├── observability/
 │   │   ├── logger.ts
 │   │   ├── metrics.ts
@@ -3524,6 +4094,13 @@ covering every enabled Redis-backed feature — idempotency, rate limiting, or
 both. "Redis is ready" therefore means the same thing regardless of which
 features are enabled, and enabling rate limiting adds no second probe, no second
 connection, and no additional readiness state.
+
+**Implementation status (Phase 5A, implemented).** Unchanged again. Optional
+OpenCode thread reuse (section 5.1.1) composes over that same single client, so
+it adds no probe, no connection, and no readiness state; a disconnected Redis
+degrades reuse exactly as it degrades the other two. Shutdown ordering is also
+unchanged: the application drains first, so an in-flight completion can still
+finalize or settle its mapping, and the one connection closes last, exactly once.
 
 ---
 
@@ -3743,6 +4320,68 @@ namespace was verified empty afterwards, and the container was removed. That is 
 standing result rather than a rerun, and it authorizes no future Docker or Redis
 command — each run needs fresh approval. `npm run validate` stays hermetic and
 Redis-free.
+
+### 29.8 OpenCode thread-reuse tests (Phase 5A, implemented)
+
+Coverage for optional thread reuse (section 5.1.1). Every hermetic suite runs
+inside `npm run validate`; the real-Redis suite does not.
+
+**Unit** (`test/unit/thread-reuse-keyring.test.ts`, `-crypto`, `-records`,
+`-coordinator`, `-redis-store`, plus additions to `config.test.ts`,
+`polling.test.ts`, `chat-completion.test.ts`, `gateway-auth.test.ts`, and
+`redis-runtime.test.ts`): the four HKDF subkeys, each distinct from every Phase
+4A and Phase 4B subkey and from each other; deterministic, order-independent
+scopes and deterministic policy/principal fingerprints, including which model
+fields are and are not part of the policy; collision-free length framing for both
+the storage key and the associated data; an AEAD round trip with a fresh nonce per
+write, full binding to the record version, storage key, and identity digest, and
+rejection of a wrong key, a tampered envelope, a rebound ciphertext, and every
+size violation; strict record parsing including every state/field combination the
+machine cannot produce, including the `committed` state's zero-lease and
+required-payload invariants; every state transition, owner mismatch, renewal from
+authoritative state, lease expiry recovery, ambiguity, and non-throwing store
+failure; the ACKNOWLEDGEMENT-SAFE terminal transition — an applied-but-lost
+commit reply acknowledged by the idempotent retry, two undecided commits leaving
+a non-acquirable tombstone and never an active mapping, an applied-but-lost
+activation still succeeding, an undecided activation succeeding and being retried
+at settlement, and a `committed` record refusing acquisition by any owner; the
+state-specific Redis lifetime, proven at the minimum mapping TTL against the
+maximum model deadline; the wire shape of all nine scripts, their reply
+vocabulary, the `EVALSHA` → `EVAL` fallback, and the `STRLEN`-before-`GET`
+ordering; the two configuration variables, their bounds, validation while
+disabled, and the `REDIS_URL` requirement when enabled; run-correlated selection
+including a differing run id, a `null` run id, and ranking restricted to same-run
+candidates; and an assertion that no synthetic session, gateway-key, upstream
+credential, thread, run, model, or origin sentinel appears in any Redis key or
+record.
+
+**Integration with an injected fake store**
+(`test/integration/chat-completions-thread-reuse.test.ts` over
+`test/support/fake-thread-reuse-store.ts`), covering both JSON and SSE: disabled
+reuse, an absent header, a protocol model, and a tool model each perform ZERO
+reuse operations; the first eligible turn creates and binds while the second
+reuses and creates nothing; 25 sequential turns keep one thread, proving there is
+no hidden turn cap; a different session, gateway key, or model policy gets its own
+mapping; an invalid session header and an `Idempotency-Key` combination both fail
+before rate limiting, capacity, and upstream work; a rate-limited request never
+acquires a lease while a busy or unavailable reuse attempt still spends its unit;
+busy, unavailable, corrupt, and ambiguous outcomes map to their documented
+statuses; a capacity-style pre-submit failure restores the mapping; a post-submit
+failure leaves it ambiguous; a failed finalization emits no answer on either
+transport; native-title correlation registers once, on creation only; and no
+mapping, session, or thread value reaches a response header or body.
+
+**Real Redis** (`npm run test:redis`, `test/redis/thread-reuse-store.test.ts`):
+runs against `REDIS_TEST_URL` with synthetic values only, a randomized key prefix
+per run, and full key cleanup. It covers two independent coordinators serializing
+on one session, a same-session concurrent acquire admitting exactly one winner,
+reserved-versus-processing lease expiry, renewal from authoritative state, the
+sliding TTL reset, ambiguous expiry, `EVALSHA` → `EVAL` recovery after
+`SCRIPT FLUSH`, corrupt and oversized state failing closed without repair, and
+the absence of every synthetic sentinel from stored keys and values. This suite is
+approval-gated and **has NOT been run**: it was added alongside the
+implementation, and executing it requires fresh approval to start Redis or
+Docker. `npm run validate` stays hermetic and Redis-free.
 
 ---
 
@@ -4891,6 +5530,12 @@ services:
 
 The container may listen on `0.0.0.0` internally because Docker publishes it only to host loopback.
 
+The committed `compose.yaml` additionally passes `OPENCODE_THREAD_REUSE_ENABLED`
+(default `false`) and `OPENCODE_THREAD_REUSE_TTL_MS` (default 7 days) for optional
+thread reuse (section 5.1.1). Enabling reuse requires the same `redis` profile and
+`REDIS_URL`/`IDEMPOTENCY_ENCRYPTION_KEY` as the other Redis-backed features, and
+reuses that one connection under a `:reuse:` key category.
+
 **Implementation status (Phase 4A, implemented).** The committed `compose.yaml`
 adds an **opt-in** `redis` profile running
 the pinned image `redis:8.8.2-alpine`, published only on `127.0.0.1:6379`, with
@@ -4922,7 +5567,13 @@ Required controls:
 * at least two replicas if availability is required;
 * Redis for cross-replica idempotency and concurrency accounting.
 
-Sticky sessions are not required because requests are stateless.
+Sticky sessions are not required. Requests are stateless by default, and the one
+exception — optional OpenCode thread reuse (section 5.1.1) — keeps its
+session-to-thread mapping in the SHARED Redis rather than in a replica, which is
+exactly why enabling it requires a Redis endpoint. Any replica can therefore serve
+any turn of a session, provided every replica shares the same Redis endpoint,
+encryption key, `REDIS_KEY_PREFIX`, gateway-key set, upstream credentials, origin,
+and model configuration.
 
 **Redis requirements when idempotency is enabled (Phase 4A).** Beyond the
 application-layer `IDEMPOTENCY_ENCRYPTION_KEY`, a hosted Redis must have:
@@ -5095,7 +5746,10 @@ Phase 1 safeguards:
   unresolved POST idempotency cannot silently duplicate upstream work.
 * Each public completion uses a **fresh** upstream thread, so correct operation
   does not rely on unverified thread reuse, and Phase 1 request execution
-  requires no thread-deletion call. This does **not** reduce provider-side data
+  requires no thread-deletion call. (Phase 5A later added OPTIONAL, off-by-default
+  reuse for eligible direct-prompt requests — section 5.1.1 — which still requires
+  no deletion call and still does not rely on the unresolved ordering/pagination
+  questions.) This does **not** reduce provider-side data
   exposure: prompts and answers still cross into CollectivIQ-managed threads, and
   provider retention, training, deletion guarantees, and regional controls remain
   **unknown** — they are production/provider-confirmation gates, not request-path
@@ -5104,7 +5758,10 @@ Phase 1 safeguards:
   use the documented deterministic timestamp → sortable-id → array-position
   fallback (section 8.6/8.7).
 * Pagination is not required while each request uses a new thread and retrieves
-  full history.
+  full history. This safeguard covers the DEFAULT stateless path only: the
+  optional reuse path of section 5.1.1 reads a thread that grows with the
+  session, so pagination becomes material there and is called out as that
+  feature's weakest residual risk.
 * Prompt-size limits remain a conservative **gateway** configuration bound
   (`maximumPromptBytes`), not a claimed upstream maximum.
 * Password-token `401` invalidation plus next-request re-login allow correct
@@ -5112,8 +5769,10 @@ Phase 1 safeguards:
 
 Still **not** declared fully complete: idempotency and `process_message`
 `status` semantics still prohibit retries and stronger status interpretation;
-message ordering/pagination still gate any thread reuse or pagination
-optimization; rate/quota limits, retention/training/regional controls, and token
+message ordering/pagination still gate any UNCONDITIONAL reliance on thread reuse
+or on pagination (the optional Phase 5A reuse in section 5.1.1 ships without those
+answers only because it refuses to depend on them, and degrades to a `504`
+instead); rate/quota limits, retention/training/regional controls, and token
 lifetime/refresh remain **production-hardening / provider-confirmation** gates;
 native tools and structured tool results remain **Phase 3/5 capability** gates;
 and SSE scope remains a **future true-streaming** gate. See the section 35 gap
@@ -5231,13 +5890,15 @@ routing. Any further live run still requires separate explicit approval before l
 CollectivIQ traffic. `stream:true` synthetic SSE is
 implemented (Phase 2, below); tools stay in Phase 3; optional Redis-backed
 idempotency is Phase 4A (section 18.1); metrics/tracing remain unimplemented;
-thread reuse and upstream deletion are not performed.
+upstream deletion is not performed, and Phase 1 itself performs no thread reuse
+(the optional, off-by-default Phase 5A reuse in section 5.1.1 came later and
+changes nothing here unless it is explicitly enabled).
 
 Deliverables:
 
 * `/v1/models`;
 * non-streamed `/v1/chat/completions`;
-* one thread per request;
+* one thread per request (Phase 1 creates one unconditionally; the optional Phase 5A reuse of section 5.1.1 came later and may continue a session's thread instead);
 * virtual-model configuration;
 * polling;
 * OpenAI error envelopes;
@@ -5477,12 +6138,15 @@ remains PROCESS-LOCAL.
 
 * shared cross-replica capacity accounting — capacity stays PROCESS-LOCAL;
 * metrics and tracing;
-* load testing and a security review of the idempotency and rate-limiting layers;
+* load testing and a security review of the idempotency, rate-limiting, and
+  thread-reuse layers;
 * dependency scanning;
 * backup and release procedures, and runbooks.
 
 Native tool mode (section 13) and true upstream streaming (section 14.5) remain
-Phase 5 work and are unaffected.
+Phase 5 work and are unaffected. Phase 5A (thread reuse) has been pulled forward
+ahead of these controls and is therefore explicitly NOT production ready; see
+below.
 
 ### Phase 5 — Native CollectivIQ capabilities
 
@@ -5491,9 +6155,38 @@ Possible work:
 * true request-scoped streaming;
 * native structured tool calls;
 * token accounting;
-* persistent thread reuse;
 * thread deletion;
 * model metadata discovery.
+
+**Phase 5A — OpenCode thread reuse: implemented, PULLED FORWARD (optional, off by
+default).** One item from this phase was delivered ahead of the remaining Phase 4
+controls and is documented in sections 5.1, 5.1.1, 8.6, 10.1, 18.1, 19.1, 20,
+22.2, 24, 26, 28.2, 29.8, 31.1, and 34.5. Section 5.1.1 owns the normative
+contract.
+
+It is OPTIONAL: with `OPENCODE_THREAD_REUSE_ENABLED=false` the gateway performs no
+reuse or Redis reuse operation at all, and every completion creates its own
+thread. When enabled it applies ONLY to direct-prompt, tool-free requests carrying
+a valid OpenCode session header; protocol-mode models and emulated tool loops keep
+today's stateless one-thread-per-completion behaviour.
+
+Evidence is hermetic (`test/unit/thread-reuse-*.test.ts`,
+`test/integration/chat-completions-thread-reuse.test.ts`, plus additions to the
+config, polling, orchestration, authentication, and Redis-runtime suites) with a
+real-Redis contract suite (`test/redis/thread-reuse-store.test.ts`) that was ADDED
+but **has not been run** — executing it needs fresh approval. No live CollectivIQ
+call was made or required, no dependency or lockfile entry changed, and capacity
+remains PROCESS-LOCAL.
+
+**Pulling it forward does not make it production ready.** The Phase 4 items listed
+above are still outstanding, and the upstream questions this feature is most
+sensitive to — message ordering and pagination (section 35, items 7 and 8), thread
+cleanup (item 9), and retention (items 22–25) — remain unanswered. Offline
+implementation does not establish live correctness. Enabling it by default is a
+separate decision that requires those controls and live evidence.
+
+Still Phase 5 work and unaffected: native tools, true streaming, token accounting,
+thread deletion, and model metadata discovery.
 
 ---
 
@@ -5504,7 +6197,7 @@ The initial gateway release is accepted when:
 1. OpenCode lists all configured CollectivIQ virtual models.
 2. OpenCode can select the committed default `collectiviq/collectiviq-claude-direct` (a Claude source using `promptMode: "direct"`; Claude is the only source currently observed to answer for the discovery account, and the direct profile drops the protocol wrapper the account objected to — see sections 8.4 and 34.7).
 3. A plain user prompt produces the configured CollectivIQ answer.
-4. The gateway creates exactly one upstream thread per request.
+4. The gateway creates exactly one upstream thread per request. (With optional OpenCode thread reuse enabled — section 5.1.1, off by default — an eligible request that CONTINUES a session's existing thread creates none; it still submits exactly once, and every ineligible request keeps creating exactly one.)
 5. The gateway sends the correct `selected_llms` value.
 6. The gateway waits for the configured answer source.
 7. `stream: false` returns a valid Chat Completions object.
@@ -5592,7 +6285,17 @@ Mitigation:
 * generic thread names;
 * request-level statelessness;
 * investigate thread deletion;
-* investigate persistent mapping only after API guarantees are available.
+* **optional OpenCode thread reuse (section 5.1.1), off by default.** For
+  eligible direct-prompt, tool-free sessions it collapses a whole conversation
+  onto one thread, which is the largest available reduction in sidebar entries.
+  It was pulled forward ahead of the API guarantees this risk originally waited
+  for, so it is fail-closed rather than optimistic: message ordering, pagination,
+  cleanup, and retention remain unverified, a post-create Redis failure can leave
+  one blank orphan thread, and mapping expiry deletes nothing provider-side.
+  It therefore only PARTLY addresses this risk, and trades one shape of exposure
+  for another: fewer threads, but each holding a whole conversation for as long
+  as the provider retains it. Thread deletion (section 35, item 9) remains the
+  missing piece, and this feature does not supply it.
 
 ### 34.6 Unknown upstream limits
 
@@ -5671,7 +6374,13 @@ a later gate already classified in section 32:
   production/provider gate;
 - `process_message` idempotency and `status` semantics (#4, #6) — **open** →
   retry and stronger status-semantics gate;
-- message ordering/pagination (#7, #8) — **open** → thread reuse/pagination gate;
+- message ordering/pagination (#7, #8) — **open** → thread reuse/pagination gate.
+  Phase 5A shipped optional thread reuse (section 5.1.1) WITHOUT these answers by
+  refusing to depend on them: a reused thread's poll accepts only a message whose
+  run id matches its own submission's `combined_run_id`, and times out rather
+  than returning older content. Correlation is a property of the submission, so
+  neither ordering nor pagination can produce a wrong answer — a long thread
+  whose `get_messages` paginates merely degrades to a `504`;
 - native tools / structured tool results (#14, #15) — **open** → Phase 3/5
   capability gate;
 - retention/training/zero-retention/regional (#22–#25) — **open** →
@@ -5700,12 +6409,21 @@ a later gate already classified in section 32:
 4. Is `process_message` idempotent? (**Unresolved.**)
 5. Is there a job or message identifier in its response? (**Presence repeated:** a
    run identifier `combined_run_id` appears in the `202` across the two password
-   runs; its semantics remain unknown.)
+   runs, and the same safe field name appears on `get_messages` entries. Phase 5A
+   uses that pairing as the authoritative run correlation (section 5.1.1): a
+   message is eligible only when its run id equals the current submission's. The
+   gateway relies only on the PRESENCE and EQUALITY of the two values; the
+   field's wider semantics remain unknown, and an account that omits it fails
+   closed rather than degrading silently.)
 6. How can the gateway distinguish accepted work from failed work? (**Presence
    repeated:** a `status` field appears in the `202` across the two password runs,
    but its meaning and any accepted-versus-failed semantics remain **unknown**.)
-7. Does `get_messages` return messages in chronological order? (**Unresolved.**)
-8. Can it paginate? (**Unresolved.**)
+7. Does `get_messages` return messages in chronological order? (**Unresolved**,
+   and no longer load bearing: run correlation (section 5.1.1) selects by
+   `combined_run_id`, so ordering cannot produce a wrong answer.)
+8. Can it paginate? (**Unresolved.** Likewise not load bearing for correctness — a
+   truncated page can only delay or time out the correct answer, never surface an
+   uncorrelated one.)
 9. Can a thread be deleted? (**Credential/principal-dependent behavior
    observed**, cause not established. Value-free outcomes: the password/member
    principal deleting its own newly created thread → `200` (repeated: both
@@ -5764,6 +6482,8 @@ OpenCode
   → @ai-sdk/openai-compatible
   → CollectivIQ Gateway /v1/chat/completions
   → new CollectivIQ thread for each request
+      (unless optional OpenCode thread reuse is enabled for an eligible
+       direct-prompt, tool-free session — section 5.1.1, off by default)
   → prompt selected from the resolved model's validated promptMode
       (protocol → full ordered conversation in the versioned gateway envelope;
        direct → latest normalized user-message content only, no wrapper)

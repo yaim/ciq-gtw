@@ -149,9 +149,58 @@ contract — do not restate it here. Operationally:
   remaining-quota headers exist.
 - **One connection.** `src/redis/client.ts` is the ONLY module importing
   node-redis, and `src/redis/runtime.ts` creates exactly one client per process
-  shared by idempotency and rate limiting. Readiness is one probe over that one
-  connection, and shutdown closes it last, exactly once. Do not add a second
-  client.
+  shared by idempotency, rate limiting, and thread reuse. Readiness is one probe
+  over that one connection, and shutdown closes it last, exactly once. Do not add
+  a second client.
+
+**Implementation status (Phase 5A, implemented — OPTIONAL, off by default).**
+Cross-replica OpenCode thread reuse for `POST /v1/chat/completions` lives in
+`src/thread-reuse/` and is enabled only by `OPENCODE_THREAD_REUSE_ENABLED=true`,
+which requires `REDIS_URL`. Specification section 5.1.1 owns the normative
+contract and the state machine — do not restate them here. Operationally:
+
+- **Optional and fail-closed.** Disabled, nothing changes and Redis is never
+  contacted for reuse. Enabled, only direct-prompt (`promptMode: "direct"`),
+  tool-free (`toolMode: "disabled"`) requests carrying a valid
+  `X-CollectivIQ-OpenCode-Session-ID` are eligible; everything else stays
+  stateless. A live competing turn is `409 thread_reuse_busy` + `Retry-After: 2`;
+  an unusable Redis, corrupt/ambiguous state, or a failed transition is
+  `503 thread_reuse_unavailable` + `Retry-After: 2`. Never downgrade a failure to
+  a silently created replacement thread.
+- **Not production ready.** It was pulled forward ahead of the remaining Phase 4
+  controls (metrics, tracing, shared capacity accounting, load and security
+  review, dependency scanning, backup/release procedures, runbooks), and upstream
+  ordering, pagination, cleanup, and retention remain unverified. Do not describe
+  it as production ready or make it a default.
+- **Mapping lifetime and leases.** `OPENCODE_THREAD_REUSE_TTL_MS` (7 days by
+  default) is a SLIDING idle TTL reset by every turn; there is deliberately no
+  turn cap. Expiry forgets the mapping only — it never deletes the provider
+  thread. A `reserved` mapping carries a short fixed lease; a `processing` one
+  carries a lease derived from the model's own deadline so a live completion
+  cannot be tombstoned underneath it. Both the lease AND each record's Redis
+  lifetime are chosen server-side from the state being written, never by the
+  caller, and a leased record always outlives its own lease — which matters
+  because the minimum mapping TTL is shorter than the maximum processing lease.
+- **Interaction with the admission queue.** A queued turn holds its session lease
+  while it waits, so another turn of the same session gets `409` meanwhile, and a
+  `MAX_QUEUE_WAIT_MS` well above the reserved lease can lose the lease and fail
+  that turn with `503`. Both are fail-closed; size the two settings together.
+- **Pre-enablement check.** Every completion matches answers by the
+  `combined_run_id` its submission returned. Verify the account's
+  `process_message` returns one and that `get_messages` entries carry it, or
+  submissions fail as upstream protocol errors and turns time out.
+- **Terminal transition.** Finalization is the acknowledgement-safe pair
+  `processing → committed → active`. `committed` is never acquirable, so an
+  unacknowledged commit blocks the session rather than exposing a reusable
+  mapping; an undecided ACTIVATION is not a client-visible failure and is retried
+  at settlement.
+- **Never combined with idempotency.** An eligible request supplying
+  `Idempotency-Key` is rejected with `400 unsupported_parameter` before either
+  feature touches Redis.
+- **Operator note.** The `maxmemory-policy noeviction` requirement applies: an
+  evicted mapping silently starts a new thread. Every replica must share the same
+  Redis endpoint, encryption key, `REDIS_KEY_PREFIX`, gateway-key set, upstream
+  credentials, origin, and model configuration.
 
 - Acquire a global/per-key permit before creating an upstream thread.
 - Bound the queue and queue duration; reject overflow with documented OpenAI-shaped `429` and `Retry-After`.
@@ -159,6 +208,7 @@ contract — do not restate it here. Operationally:
 - Redis-backed idempotency uses the client key, request-body hash, processing/final state, and short expiration.
 - Same key/body may await or replay the existing result; same key/different body returns `409`.
 - Cross-replica capacity/idempotency requires shared state; do not imply process-local coordination is global.
+- Optional thread reuse takes its session lease after the rate-limit decision and before capacity; renew the lease while waiting for capacity, and release it on every exit path.
 
 ## Observability
 
@@ -208,7 +258,7 @@ remains authoritative; `/user/events` is not used.
 
 Local native execution binds to loopback. Local Docker may bind the process to all container interfaces only when compose publishes `127.0.0.1:8787:8787` on the host.
 
-Hosted deployments require the controls in specification section 31.2. Requests are stateless, so sticky sessions are unnecessary; Redis is required when idempotency and concurrency semantics must span replicas.
+Hosted deployments require the controls in specification section 31.2. Sticky sessions are unnecessary: requests are stateless by default, and the one exception — optional OpenCode thread reuse — keeps its mapping in the shared Redis rather than in a replica, so any replica can serve any turn. Redis is required when idempotency, rate-limit, or thread-reuse semantics must span replicas.
 
 **Redis in Compose (Phase 4A/4B, implemented).** `compose.yaml` carries an OPT-IN
 `redis` profile using the pinned

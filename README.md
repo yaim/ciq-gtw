@@ -11,7 +11,9 @@ CollectivIQ, exposing a bounded OpenAI Chat Completions-compatible profile.
 > authenticated public model endpoints (`GET /v1/models`,
 > `GET /v1/models/:model`), and an authenticated, text-only
 > `POST /v1/chat/completions` wired through the adapter (one new CollectivIQ
-> thread per request) that serves both the non-streamed JSON path and (Phase 2)
+> thread per request by default; optional off-by-default OpenCode thread reuse
+> may continue a session's thread instead) that serves both the non-streamed
+> JSON path and (Phase 2)
 > buffered synthetic SSE for `stream: true`. The completion path calls
 > CollectivIQ **only when a real request is served** — never during import,
 > construction, or the build smoke test. A user-observed, sanitized live
@@ -99,7 +101,9 @@ direct` (latest-user-only prompt, no protocol wrapper) — is the committed Open
   requires or names a tool (Phase 2.1; see below),
   serializes a deterministic versioned prompt, enforces process-local global +
   per-key capacity with a bounded queue (`429` + `Retry-After: 5` when at
-  capacity), creates one new CollectivIQ thread, submits once (no `create_thread`/
+  capacity), creates one new CollectivIQ thread (or continues the session's
+  leased one when thread reuse is enabled and the request is eligible), submits
+  once (no `create_thread`/
   `process_message` retries), and polls `get_messages` under a total deadline with
   GET-only retry and desired-source selection. The non-streamed path encodes a
   JSON response with zero (unavailable) usage. Client disconnect, the total
@@ -298,8 +302,9 @@ curl -i http://127.0.0.1:8787/v1/models
 profile: text-only `system`/`developer`/`user`/`assistant` messages with string
 or `{ "type": "text", "text": … }` content, `n` absent or `1`, and `stream`
 absent, exactly `false` (non-streamed JSON), or exactly `true` (synthetic SSE).
-Each request creates one new CollectivIQ thread, so a live request needs a real
-`COLLECTIVIQ_*` upstream credential.
+By default each request creates one new CollectivIQ thread (optional OpenCode
+thread reuse, off by default, may continue a session's existing thread), so a
+live request needs a real `COLLECTIVIQ_*` upstream credential.
 
 ```bash
 # Non-streamed JSON (stream absent or false)
@@ -495,8 +500,9 @@ Operational notes:
   `collectiviq` provider; it does nothing for any other agent or provider request.
 
 The OpenCode session title is **distinct** from the CollectivIQ upstream thread
-title: the gateway still performs exactly one `create_thread` per completion using
-the fixed, content-free placeholder `New Thread`, and never forwards any
+title: the gateway performs at most one `create_thread` per completion using
+the fixed, content-free placeholder `New Thread` (none at all when an eligible
+reuse turn continues a leased thread), and never forwards any
 prompt-derived or OpenCode-generated title upstream. A sanitized 2026-08-18
 observation found that CollectivIQ may **asynchronously** replace `New Thread` with
 its own prompt-related, server-generated thread title after `process_message`; that
@@ -737,6 +743,86 @@ and the exact admission order) is in
 [`.agent/docs/tech-software-spec.md`](.agent/docs/tech-software-spec.md)
 section 19.1.
 
+### OpenCode thread reuse (optional Redis; off by default)
+
+By default every completion creates its own CollectivIQ thread. With
+`OPENCODE_THREAD_REUSE_ENABLED=true`, sequential **eligible** messages from one
+OpenCode session instead reuse a single thread, which restores conversational
+continuity for the direct-prompt profile and collapses a whole session into one
+sidebar entry.
+
+A request is eligible only when **all** of the following hold:
+
+1. the feature is enabled;
+2. it carries a valid `X-CollectivIQ-OpenCode-Session-ID` header;
+3. the resolved model uses `promptMode: direct`;
+4. the resolved model uses `toolMode: disabled`.
+
+Everything else — no header, a protocol-mode model, a tool-enabled model, or the
+feature disabled — behaves exactly as before.
+
+```bash
+OPENCODE_THREAD_REUSE_ENABLED=true
+OPENCODE_THREAD_REUSE_TTL_MS=604800000   # 7 days, sliding idle TTL
+```
+
+Enabling it **requires** `REDIS_URL` (and therefore
+`IDEMPOTENCY_ENCRYPTION_KEY`, from which separate thread-reuse subkeys are
+derived). It adds **no new secret** and **no new dependency**.
+
+| Situation                                              | Result                                                            |
+| ------------------------------------------------------ | ----------------------------------------------------------------- |
+| Feature disabled (default)                             | Unchanged; one new thread per completion, no Redis reuse traffic  |
+| First eligible turn of a session                       | Creates one thread and binds it to the session                    |
+| Later eligible turns                                   | Reuse that thread; no `create_thread` at all                      |
+| Session header present but malformed (eligible model)  | `400` `invalid_opencode_session_id`                               |
+| Eligible request that also sends `Idempotency-Key`     | `400` `unsupported_parameter` (the two cannot be combined)        |
+| A second turn arrives while one is still running       | `409` `thread_reuse_busy` + `Retry-After: 2`                      |
+| Redis unavailable, or the mapping is corrupt/ambiguous | Fails closed: `503` `thread_reuse_unavailable` + `Retry-After: 2` |
+
+**Behaviour worth knowing before you turn it on.**
+
+- **Not production ready.** It was pulled forward ahead of the remaining
+  production-hardening work (metrics, tracing, shared capacity accounting, load
+  and security review, dependency scanning, runbooks), and upstream message
+  ordering, pagination, thread cleanup, and retention are still unverified.
+- **Answers are matched by run id, not by thread history.** Every completion
+  records the `combined_run_id` its submission returned and accepts only messages
+  carrying that same id. A reused thread therefore cannot yield an earlier turn's
+  answer, and no assumption about message ordering or pagination is involved. If
+  your account's `process_message` omits `combined_run_id` the submission fails
+  as an upstream protocol error; if its message entries omit it, every turn times
+  out with `504`. Both are fail-closed and immediately visible.
+- **The provider now holds the conversation for eligible sessions.** In direct
+  mode the gateway sends only the latest user message, so before reuse the
+  provider had no history and OpenCode's transcript was the only conversation
+  state. With reuse the provider accumulates the session's turns and answers with
+  them in view. The gateway never reconciles the two, so an edited or truncated
+  client transcript can diverge from what the provider remembers. Leave reuse off
+  if the client transcript must remain the single source of truth.
+- **Fail-closed, never a silent replacement.** If the mapping cannot be read or
+  written, the request errors instead of quietly starting a new thread and losing
+  the conversation.
+- **No turn cap.** A mapping serves an unbounded number of sequential turns until
+  it idles out after `OPENCODE_THREAD_REUSE_TTL_MS` (reset by every turn).
+- **Expiry deletes nothing upstream.** Forgetting the mapping leaves the
+  CollectivIQ thread exactly where it is, under the provider's retention policy.
+- **A separate mapping per identity.** Changing the gateway key, the model policy,
+  the CollectivIQ origin, or the upstream credential starts a new thread rather
+  than continuing one created under different routing.
+- **What Redis stores:** a version, a state, a random owner token, a lease
+  deadline, and the AES-256-GCM **encrypted** thread id — under an HMAC key in a
+  separate `:reuse:` category. No session id, gateway key, upstream credential,
+  prompt, answer, model id, or origin.
+- **Residual risk:** if Redis fails immediately after a thread is created, that
+  blank thread is left in the sidebar rather than guess-deleted.
+
+The full contract (mapping identity, the five-state machine including the
+acknowledgement-safe `committed` step, the state-specific lease and TTL policy,
+and run correlation) is in
+[`.agent/docs/tech-software-spec.md`](.agent/docs/tech-software-spec.md)
+section 5.1.1.
+
 ## Validation
 
 ```bash
@@ -745,19 +831,19 @@ npm run validate        # format check, lint, typecheck, tests, build, build smo
 
 Individual checks:
 
-| Command                    | Purpose                                                                                                       |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| `npm run format:check`     | Prettier formatting check                                                                                     |
-| `npm run lint`             | ESLint (typed rules)                                                                                          |
-| `npm run typecheck`        | Strict `tsc --noEmit` over sources and tests                                                                  |
-| `npm test`                 | Vitest unit + integration + contract suites                                                                   |
-| `npm run test:unit`        | Unit tests only                                                                                               |
-| `npm run test:integration` | Server integration tests only                                                                                 |
-| `npm run test:contract`    | Hermetic upstream contract tests (mock HTTP)                                                                  |
-| `npm run test:coverage`    | Tests with V8 coverage                                                                                        |
-| `npm run build`            | Compile to `dist/`                                                                                            |
-| `npm run test:build`       | Import compiled output; assert no open socket                                                                 |
-| `npm run test:redis`       | Real-Redis contract suites — idempotency and rate limiting (needs `REDIS_TEST_URL`; excluded from `validate`) |
+| Command                    | Purpose                                                                                                                      |
+| -------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `npm run format:check`     | Prettier formatting check                                                                                                    |
+| `npm run lint`             | ESLint (typed rules)                                                                                                         |
+| `npm run typecheck`        | Strict `tsc --noEmit` over sources and tests                                                                                 |
+| `npm test`                 | Vitest unit + integration + contract suites                                                                                  |
+| `npm run test:unit`        | Unit tests only                                                                                                              |
+| `npm run test:integration` | Server integration tests only                                                                                                |
+| `npm run test:contract`    | Hermetic upstream contract tests (mock HTTP)                                                                                 |
+| `npm run test:coverage`    | Tests with V8 coverage                                                                                                       |
+| `npm run build`            | Compile to `dist/`                                                                                                           |
+| `npm run test:build`       | Import compiled output; assert no open socket                                                                                |
+| `npm run test:redis`       | Real-Redis contract suites — idempotency, rate limiting, and thread reuse (needs `REDIS_TEST_URL`; excluded from `validate`) |
 
 `validate` is hermetic: it makes no network, live-upstream, Docker, Redis, or
 load checks. The contract suite runs against a local mock HTTP server.
@@ -775,11 +861,12 @@ quota, and every corrupt-state class failing closed. Both use only synthetic
 values, randomize their key namespace per run, and delete every key they create.
 The command is excluded from `validate` and runs as its own required CI gate
 against the pinned `redis:8.8.2-alpine`; it **fails loudly** rather than skipping
-when `REDIS_TEST_URL` is unset. Never point it at a production Redis. Both
-suites were last run together under explicit approval and passed (40 tests)
-against a disposable `redis:8.8.2-alpine`, with the randomized namespace verified
-empty afterwards. That is a standing result, not a rerun: starting Redis or
-Docker requires fresh approval every time.
+when `REDIS_TEST_URL` is unset. Never point it at a production Redis. The
+idempotency and rate-limit suites were last run together under explicit approval
+and passed (40 tests) against a disposable `redis:8.8.2-alpine`, with the
+randomized namespace verified empty afterwards. The thread-reuse suite was added
+with its implementation and has **not** been run. Those are standing results, not
+a rerun: starting Redis or Docker requires fresh approval every time.
 
 The suite runs natively, so start ONLY the `redis` service — naming it keeps the
 gateway container out of it (the gateway would also demand
@@ -1209,8 +1296,9 @@ export COLLECTIVIQ_GATEWAY_KEYS=gw-fake-key-change-me
 docker compose up --build
 ```
 
-An **opt-in** Redis profile is available for idempotency and rate-limit
-development. One Redis backs both features and the gateway opens one connection.
+An **opt-in** Redis profile is available for idempotency, rate-limit, and
+thread-reuse development. One Redis backs every enabled Redis-backed feature and
+the gateway opens one connection.
 It is not started by default and the gateway has no `depends_on` on it, so the
 gateway starts and serves `/healthz` whether or not Redis is running:
 
@@ -1268,6 +1356,8 @@ gateway validates the mode-appropriate credential at startup. Only
 | `RATE_LIMIT_REQUESTS`             | no         | `60`                              | Sustained requests per window, per gateway key; 1–100000. Validated even while disabled                                 |
 | `RATE_LIMIT_WINDOW_MS`            | no         | `60000`                           | Window the sustained rate is expressed over, in ms; 1000–3600000. Validated even while disabled                         |
 | `RATE_LIMIT_BURST`                | no         | `8`                               | Requests admitted immediately from an idle key; 1–10000 and ≤ `RATE_LIMIT_REQUESTS`                                     |
+| `OPENCODE_THREAD_REUSE_ENABLED`   | no         | `false`                           | OpenCode thread reuse; exactly `"true"`/`"false"`. `true` **requires** `REDIS_URL`. Adds no new secret                  |
+| `OPENCODE_THREAD_REUSE_TTL_MS`    | no         | `604800000`                       | Sliding idle lifetime of a session-to-thread mapping; 300000–2592000000. Validated even while disabled                  |
 
 The upstream credential authenticates the gateway to CollectivIQ: in `bearer`
 mode `COLLECTIVIQ_API_KEY` is sent as a static bearer token; in `password` mode

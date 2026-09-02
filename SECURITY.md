@@ -404,7 +404,9 @@ reasonCode]` ledger with fixed integer reason codes AND a compact per-committed-
   thread id for a bounded TTL (60 s) under per-key (32) and global (128) caps —
   **never** a title, prompt, or answer — and a restart safely discards it. The
   session id is never logged, hashed into logs, or reflected in an error.
-  The gateway performs exactly **one** `create_thread` per completion request. The
+  The gateway performs at most **one** `create_thread` per completion request —
+  none when an eligible OpenCode thread-reuse turn continues a leased thread
+  (off by default; see the Phase 5A section below). The
   OpenCode hidden LLM `title` agent is **disabled** in the committed
   configuration, so it creates **no** separate title thread; a first foreground
   message therefore creates exactly one upstream thread and native-title
@@ -766,6 +768,76 @@ Redis endpoint, encryption key, `REDIS_KEY_PREFIX`, gateway-key set, and
 to be. Capacity accounting is still process-local. The real-Redis contract suite
 for this feature has been run once under explicit approval, alongside the
 Phase 4A suite, against a disposable pinned Redis.
+
+## Optional Redis-backed OpenCode thread reuse (Phase 5A)
+
+**Off by default.** With `OPENCODE_THREAD_REUSE_ENABLED=false` no reuse scope is
+derived, no coordinator is built, and no reuse Redis operation ever runs. Turning
+it on requires `REDIS_URL` (and therefore `IDEMPOTENCY_ENCRYPTION_KEY`) and
+introduces **no new secret**: the four thread-reuse subkeys are HKDF-expanded from
+that same master key under a salt and labels distinct from every idempotency and
+rate-limit domain, sharing no code with either, so a change here cannot re-key
+existing records. A gateway key therefore carries three unrelated opaque scopes,
+none of which is ever logged, reflected, or returned.
+
+**This is the first upstream identifier the gateway persists — and it is
+encrypted.** A mapping record holds only a version, a state, a random owner token,
+an integer lease deadline, and the AES-256-GCM sealed CollectivIQ thread id, under
+an HMAC key in a separate `:reuse:` category. The seal uses a fresh nonce per
+write, and its associated data binds the record version, the storage key, and an
+independent mapping-identity digest, so a ciphertext relocated to another
+mapping's key fails authentication rather than decrypting. Redis never receives a
+session id, gateway key, upstream credential, prompt, answer, tool schema,
+argument, result, model-generated content, model id, or origin.
+
+**Mapping identity is a privacy boundary.** It binds the gateway-key reuse scope,
+the OpenCode session id, the normalized model policy, the CollectivIQ origin, and
+an upstream-principal fingerprint (auth mode plus the CONFIGURED bearer token or
+username — never the transient access token), each length-framed so no boundary
+shift can make two identities collide. One session can never reach another's
+thread, and a change of key, policy, origin, or principal starts a separate
+mapping.
+
+**Fail-closed.** An unavailable Redis, corrupt or ambiguous state, an
+unauthenticatable ciphertext, or an unacknowledgeable commit returns
+`503 thread_reuse_unavailable`; a concurrent turn for the same session returns
+`409 thread_reuse_busy`. Two request-shaping rejections complete the public
+surface: a present-but-malformed session header on an otherwise eligible request
+is `400 invalid_opencode_session_id`, and combining an eligible reuse request
+with `Idempotency-Key` is `400 unsupported_parameter`. All four bodies are fixed
+and content-free (specification section 20). Corrupt state is never repaired or deleted, because
+deleting it would silently start a replacement thread and lose the conversation.
+No answer is emitted on either transport before the mapping's commit is durably
+ACKNOWLEDGED. The terminal transition is deliberately two steps
+(`processing → committed → active`) with a non-acquirable state in between, so a
+reply lost after Redis applied the write can only block the session — it can
+never expose a reusable mapping whose last turn was never delivered. Every
+mutating script also validates the COMPLETE record before touching it and leaves
+a rejected one byte-for-byte untouched, so a forged or corrupt record cannot be
+sanitized into a real mapping.
+
+**Threat model change worth stating explicitly.** Before this feature, an actor
+holding BOTH Redis read access and `IDEMPOTENCY_ENCRYPTION_KEY` could recover
+cached completion content but no upstream thread identifier. That actor can now
+also decrypt session-to-thread mappings and, with provider access, correlate a
+gateway session to a specific CollectivIQ thread. The AEAD binding prevents
+relocating or rebinding a ciphertext, but it does not defend against an actor
+authorized to decrypt. Treat Redis read access plus the master key as thread-id
+disclosure, and keep the same isolation and secret-handling controls the Phase 4A
+section already requires.
+
+**Known residual risks.** It is **not production ready**: the remaining Phase 4
+controls (metrics, tracing, shared capacity accounting, load and security review,
+dependency scanning, runbooks) are outstanding, and upstream message ordering,
+pagination, thread cleanup, and retention remain unverified. A Redis failure
+immediately after `create_thread` can leave one blank orphan thread, which is
+deliberately never guess-deleted. A hard replica kill mid-submit blocks that
+session for 15 minutes rather than risking a stale answer. Mapping expiry never
+deletes a provider thread. An evicted mapping (a `maxmemory-policy noeviction`
+violation) silently starts a new thread. All replicas must share the same Redis
+endpoint, encryption key, `REDIS_KEY_PREFIX`, gateway-key set, upstream
+credentials, origin, and model configuration. The real-Redis contract suite for
+this feature was added but **has not been run**.
 
 ## Remote deployment
 

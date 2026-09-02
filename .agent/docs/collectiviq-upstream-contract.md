@@ -43,7 +43,9 @@ observed to be credential/principal-dependent (cause not established).
 **Phase 1B now consumes this contract (implemented, offline).** The production
 adapter is wired into `POST /v1/chat/completions` via
 `src/generation/runtime.ts`/`chat-completion.ts`: each completion creates one
-**new** thread, submits once (never retrying `create_thread`/`process_message`),
+**new** thread (unless optional OpenCode thread reuse is enabled and the request
+is eligible — spec §5.1.1, off by default, see the reuse section at the end of
+this document), submits once (never retrying `create_thread`/`process_message`),
 and polls `get_messages` under the model's total deadline with GET-only retry and
 the timestamp → sortable-id → array-position selection above. Normalized
 `UpstreamError`s map to public OpenAI envelopes by closed category only (spec
@@ -65,8 +67,9 @@ semantic / OpenCode smoke criterion **for the tested account**, but is an observ
 single-account result — **not** production readiness or a repeatable upstream
 guarantee, and it does not establish combined answers, long-duration streaming, or
 generic non-Claude routing. No live CollectivIQ request is made from this
-repository except when a real completion is served. Because each completion sends
-the prompt into a new CollectivIQ-managed thread, provider-side
+repository except when a real completion is served. Because a completion sends
+the prompt into a CollectivIQ-managed thread — a new one by default, or a reused
+one under §5.1.1 — provider-side
 retention/training/deletion/regional behavior remains a
 **production/provider-confirmation gate**, unchanged by this phase; the gateway
 itself retains no prompt/answer content after the request.
@@ -77,10 +80,13 @@ conservative text development** (spec section 32). This is a scoped entry gate,
 not a claim that every upstream question is resolved or that the gateway is
 production-ready, and it asserts **no new live evidence**. The remaining open
 questions are non-blocking under the Phase 1 safeguards: `create_thread` and
-`process_message` are never auto-retried; each completion uses a fresh thread; no
-message ordering is assumed (duplicate desired-source messages fall back to
-timestamp → sortable-id → array-position); pagination is unneeded with a fresh
-thread and full-history read; prompt limits are a conservative gateway bound, not
+`process_message` are never auto-retried; each completion uses a fresh thread on
+the DEFAULT stateless path; no message ordering is assumed (duplicate
+desired-source messages fall back to timestamp → sortable-id → array-position);
+pagination is unneeded for a fresh thread with a full-history read — but NOT for
+the optional reuse path added later, where a long thread makes it material (see
+the reuse section at the end of this document); prompt limits are a conservative
+gateway bound, not
 a verified upstream maximum; and password-token `401` invalidation plus
 next-request re-login cover the absence of a refresh endpoint. Phase 0 is
 therefore **not** auto-declared fully complete: idempotency and `status`
@@ -199,8 +205,9 @@ unverified, as is token lifetime/refresh.
   minimal gateway-compatible trigger that caused CollectivIQ to natively generate
   a server-side, prompt-related thread title after `process_message`. The
   URL-encoded request is otherwise unchanged (`is_title_from_user=false`, current
-  `process_message` fields including `llms_explicitly_set=true`); still exactly
-  one thread per completion, capacity acquired before create, and no
+  `process_message` fields including `llms_explicitly_set=true`); still at most
+  one thread per completion (none when an eligible §5.1.1 reuse turn continues a
+  leased thread), capacity acquired before create, and no
   `create_thread`/`process_message` retry. The gateway never derives, logs,
   caches, or retains the provider-generated title. It reads that title only
   **transiently** via the observed-only `get_threads` lookup (below) to serve the
@@ -271,7 +278,8 @@ unverified, as is token lifetime/refresh.
   OpenAPI document marking it optional, and **intentionally omits `since_id`** in
   this phase so full thread history is returned.
 - Success shape: a top-level object with a `messages` array. Each message is
-  normalized to `{ source, content, percentUsage, createdAt, id }`. `source`
+  normalized to
+  `{ source, content, percentUsage, createdAt, id, combinedRunId }`. `source`
   (string) and `percentUsage` (from `percent_usage`) and `id` are
   verified-repeatable safe fields.
 - **`createdAt` mapping reconciled (verified-repeatable):** both 2026-08-11
@@ -803,6 +811,45 @@ repeatable sanitized evidence proves otherwise (`DEFAULT_UPSTREAM_CAPABILITIES`)
   unknown; the gateway must not promise end-to-end zero retention.
 - The gateway enforces its own bounds: per-operation header/body deadlines,
   incremental response-size caps, and strict UTF-8 (`DEFAULT_OPERATION_TIMEOUTS`).
+
+### What optional thread reuse depends on (and refuses to depend on)
+
+Optional OpenCode thread reuse (spec §5.1.1, off by default) is the first gateway
+feature that submits into a thread it did not create in the same request. It was
+built so that NONE of the open questions above has to be answered first:
+
+- **Run correlation (#5) — the primitive reuse is built on.** `combined_run_id`
+  is a verified-repeatable safe field name in BOTH places it is needed: the
+  `process_message` `202` body and each `get_messages` entry. The production path
+  therefore requires a non-empty run id on a successful submission and accepts a
+  message only when its own `combined_run_id` equals it exactly. The gateway
+  relies solely on PRESENCE and EQUALITY — the field's wider meaning is still
+  unknown, and nothing here assumes one.
+- **Message ordering (#7) — still unresolved, and no longer load bearing.**
+  Selection is by run, so ordering cannot produce a wrong answer; it can only
+  affect which same-run candidate ranks first, which the existing deterministic
+  policy already settles.
+- **Pagination (#8) — still unresolved, and no longer a correctness risk.** A
+  truncated page cannot make an uncorrelated message eligible. The worst case is
+  that the correct answer has not arrived in the returned window yet, which
+  simply delays the poll or ends in the existing `504`.
+- **Presence is not a guarantee.** An account whose `process_message` omits
+  `combined_run_id` fails the submission as an upstream protocol error; one whose
+  message entries omit it can never produce an eligible candidate and times out.
+  Both are fail-closed and immediately visible, rather than a silent wrong
+  answer, but both would make reuse unusable for that account.
+- **`since_id` — documented and still unused.** `GET /get_messages` declares an
+  optional `since_id` (`string | null`) that the gateway does not send. Run
+  correlation already establishes which message belongs to the current
+  submission, so there is no need to depend on `since_id`'s unverified
+  semantics.
+- **Thread deletion (#9) — still credential/principal dependent.** Reuse issues
+  no deletion call. A Redis failure after a successful `create_thread` can leave
+  one blank orphan thread, which is deliberately never guess-deleted.
+- **Retention (#22–#25) — still unknown.** A reused thread accumulates a whole
+  conversation upstream instead of spreading it over many threads. That changes
+  the shape of provider-side retention, not the gateway's guarantees; it neither
+  reduces nor increases what the provider was already given.
 
 ## Fixture references
 

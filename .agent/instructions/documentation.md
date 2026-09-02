@@ -17,6 +17,7 @@ Documentation is part of the product contract. Update it in the same change as b
 | Tool protocol and release policy | `.agent/docs/tech-software-spec.md` sections 11.2, 12, 21.4–21.5, and 30 | `.agent/instructions/tool-calling.md` |
 | Security, privacy, retention, and deployment controls | `.agent/docs/tech-software-spec.md` sections 21–22 and 31 | `.agent/instructions/security.md` |
 | Runtime config, observability, health, and lifecycle | `.agent/docs/tech-software-spec.md` sections 15–19, 23–24, 28, and 31 | `.agent/instructions/operations.md` |
+| OpenCode thread reuse (session-to-thread mappings, its state machine, and its error surface) | `.agent/docs/tech-software-spec.md` section 5.1.1 | `.agent/instructions/operations.md`, `.agent/instructions/security.md`, `.agent/instructions/upstream-integration.md` |
 | Test strategy and release evidence | `.agent/docs/tech-software-spec.md` sections 29–30 | `.agent/instructions/validation.md` |
 | Operator setup, supported scope, local run, configuration, Docker usage | `README.md` | `.agent/instructions/operations.md`, `.agent/instructions/project-initialization.md` |
 | Vulnerability reporting and supported security/deployment posture | `SECURITY.md` | `.agent/instructions/security.md` |

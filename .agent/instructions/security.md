@@ -71,14 +71,14 @@ Acquire capacity before upstream thread creation. Return the documented `429` pl
 
 - Default mode retains no content after request completion.
 - Keep only transient in-memory values needed for the active request and release references promptly.
-- Redis is optional and limited to short-lived idempotency/status/final-response state plus, when Phase 4B is enabled, one bounded per-scope rate-limit timestamp. It holds no concurrency counters: capacity is process-local.
+- Redis is optional and limited to short-lived idempotency/status/final-response state, one bounded per-scope rate-limit timestamp when Phase 4B is enabled, and one bounded encrypted session-to-thread mapping when Phase 5A thread reuse is enabled. It holds no concurrency counters: capacity is process-local.
 - Do not persist prompt content by default. Cached final responses require an explicit TTL, encryption-at-rest expectations, access controls, and documentation.
 - Same idempotency key with a different body returns `409`; do not use a permanent prompt hash as an implicit key across trust boundaries.
 - CollectivIQ-side retention/training/deletion/regional behavior is unknown until verified; do not promise zero retention end to end.
 
 **Implementation status (Phase 4A, implemented — OPTIONAL, off by default).**
 `src/idempotency/` owns every idempotency record written to Redis (since Phase 4B
-it is one of exactly two features permitted to store state there, and it writes
+it is one of exactly three features permitted to store state there, and it writes
 nothing outside its own `:idem:` keyspace). Specification section
 18.1 owns the normative contract; the security-relevant guarantees are:
 
@@ -130,7 +130,7 @@ nothing outside its own `:idem:` keyspace). Specification section
   unsupported).
 
 **Implementation status (Phase 4B, implemented — OPTIONAL, off by default).**
-`src/rate-limit/` is the second — and only other — feature allowed to know its
+`src/rate-limit/` is the second of the three features allowed to know its
 state lives in Redis, and `src/redis/client.ts` is the only module that imports
 node-redis. Specification section 19.1 owns the normative contract; the
 security-relevant guarantees are:
@@ -176,6 +176,49 @@ security-relevant guarantees are:
   key's allowance to a full burst undetectably; capacity accounting is still
   process-local; and all replicas must share the endpoint, key, prefix,
   gateway-key set, and `RATE_LIMIT_*` settings.
+
+**Implementation status (Phase 5A, implemented — OPTIONAL, off by default).**
+`src/thread-reuse/` owns the session-to-thread mapping, the third and last
+feature permitted to write Redis state, and it writes nothing outside its own
+`:reuse:` keyspace. Specification section 5.1.1 owns the normative contract; the
+security-relevant guarantees are:
+
+- **Off unless configured.** `OPENCODE_THREAD_REUSE_ENABLED=false` (the default)
+  means no scope is derived and no reuse operation ever runs. Enabling it requires
+  `REDIS_URL` and adds NO new secret: the four subkeys are HKDF-expanded from the
+  existing `IDEMPOTENCY_ENCRYPTION_KEY` under a salt and info labels distinct from
+  every Phase 4A and Phase 4B domain, with no shared code, so a change here can
+  never re-key existing records.
+- **This is the first upstream identifier the gateway persists, and it is
+  encrypted.** The record holds only a version, a state, a random owner token, an
+  integer lease deadline, and the AES-256-GCM sealed upstream thread id (fresh
+  nonce per write; associated data binds the record version, the storage key, and
+  an independent mapping-identity digest, so a relocated ciphertext fails
+  authentication). No session id, gateway key, upstream credential, prompt,
+  answer, tool schema, argument, result, model-generated content, model id, or
+  origin is stored, and the key itself is an HMAC.
+- **Identity binding is a privacy control, not just correctness.** The mapping
+  binds the gateway-key reuse scope, the session id, the model-policy
+  fingerprint, the origin, and an upstream-principal fingerprint — all
+  length-framed so no boundary shift can make two identities collide. A different
+  gateway key, session, policy, origin, or upstream principal can never reach
+  another mapping's thread.
+- **The principal fingerprint uses CONFIGURED credential material** (the bearer
+  token, or the username in password mode), never the transient access token, and
+  only its HMAC is ever stored or compared.
+- **Fail closed, never fail open.** An unusable Redis, corrupt or ambiguous
+  state, an unauthenticatable ciphertext, or a failed transition returns
+  `503 thread_reuse_unavailable`; a live competing turn returns `409`. Corrupt
+  state is never repaired or deleted, because deleting it would silently start a
+  replacement thread. No answer is emitted before the mapping is durably recorded.
+- **Residual risks to state honestly.** It is NOT production ready (the Phase 4
+  controls are outstanding); upstream ordering, pagination, cleanup, and retention
+  are unverified; a post-`create_thread` Redis failure can leave one blank orphan
+  thread that is deliberately never guess-deleted; a hard replica kill mid-submit
+  blocks that session for the 15-minute ambiguous TTL; mapping expiry never
+  deletes a provider thread; an evicted mapping (a `noeviction` violation)
+  silently starts a new one; and all replicas must share the endpoint, key,
+  prefix, gateway-key set, upstream credentials, origin, and model configuration.
 
 ## Network and Deployment
 

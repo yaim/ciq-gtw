@@ -185,6 +185,27 @@ Never expose or log the authorization header, the upstream credentials (API key,
 
 Do not assume upstream message ordering, a completion state not evidenced by the contract, or exact meaning for `percent_usage`.
 
+**Run correlation is mandatory on EVERY completion.** A successful
+`process_message` must yield a non-empty `combined_run_id` (absent, empty, or
+wrongly typed is an upstream protocol failure — note this tightening also gates
+the discovery tooling's submit stage, which shares the production normalizer),
+that id is carried into polling,
+and a message is eligible in steps 5–6 only when its own `combined_run_id`
+matches it exactly. Apply the filter while SELECTING, never to an already-ranked
+winner: an older message can outrank a newer one, so filtering afterwards would
+time out with the correct answer unselected. Never fall back to an uncorrelated
+message; the existing deadline and `504` handle "not yet available".
+
+**Reusing a thread (optional; spec §5.1.1, off by default).** When a completion
+continues an OpenCode session's existing thread, step 1 is skipped entirely — no
+`create_thread` is issued. Nothing else about the workflow changes: run
+correlation already prevents an earlier turn's answer from winning, so there is
+no pre-submit history snapshot, no exclusion set, and no implicit cap on how many
+turns a session may accumulate. Do not reintroduce one. Ordering and pagination
+remain unverified but are not load bearing; a truncated page can only delay the
+correct answer, never surface an uncorrelated one. The documented optional
+`since_id` stays unused.
+
 ## Timeouts, Retry, and Cancellation
 
 - Apply separate connect, create, submit, poll-request, total-upstream, and client-request deadlines.
@@ -213,7 +234,7 @@ Represent native tools, request-scoped streaming, cancellation, and token usage 
 
 The Phase 2 `stream: true` support is **synthetic** SSE encoded from a fully polled answer; it does not consume upstream events, so it does not change any of this. Polling remains authoritative, `/user/events` is still unused, request-scoped upstream streaming stays a false capability, and no upstream cancellation endpoint is verified (a submitted generation may continue after a client disconnect).
 
-Do not use account-wide `/user/events`, persistent thread reuse, thread deletion, native tools, or POST retry/idempotency merely because a field or endpoint appears to exist.
+Do not use account-wide `/user/events`, thread deletion, native tools, or POST retry/idempotency merely because a field or endpoint appears to exist, and do not invent a thread-reuse mechanism from an undocumented or unverified upstream field. (Gateway-side OpenCode thread reuse IS implemented — optional and off by default, spec §5.1.1 — and deliberately depends on no unverified upstream behaviour; that is a different thing from trusting an upstream field because it exists.)
 
 ## Review Checklist
 
