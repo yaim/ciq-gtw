@@ -146,7 +146,12 @@ describe("streamChatCompletion — ordering and success", () => {
     expect(deltasOf(res)).toEqual([{ role: "assistant" }]);
     expect(seenSignal).toBe(clientAbort.signal);
 
-    resolveRun({ kind: "text", upstreamThreadId: "thread-test", content: "Hello world" });
+    resolveRun({
+      kind: "text",
+      upstreamThreadId: "thread-test",
+      upstreamThreadCreated: true,
+      content: "Hello world",
+    });
     await p;
 
     expect(deltasOf(res)).toEqual([{ role: "assistant" }, { content: "Hello world" }, {}]);
@@ -169,7 +174,13 @@ describe("streamChatCompletion — ordering and success", () => {
     await streamChatCompletion({
       reply: fakeReply(res),
       meta: META,
-      run: () => Promise.resolve({ kind: "text", upstreamThreadId: "thread-test", content: "" }),
+      run: () =>
+        Promise.resolve({
+          kind: "text",
+          upstreamThreadId: "thread-test",
+          upstreamThreadCreated: true,
+          content: "",
+        }),
       runSignal: clientAbort.signal,
       clientAbort,
       keepAliveMs: 100_000,
@@ -203,7 +214,12 @@ describe("streamChatCompletion — keep-alives", () => {
     await vi.advanceTimersByTimeAsync(30_000);
     expect(keepAlives(res)).toHaveLength(3);
 
-    resolveRun({ kind: "text", upstreamThreadId: "thread-test", content: "done" });
+    resolveRun({
+      kind: "text",
+      upstreamThreadId: "thread-test",
+      upstreamThreadCreated: true,
+      content: "done",
+    });
     await p;
     const keepAliveCount = keepAlives(res).length;
 
@@ -227,7 +243,12 @@ describe("streamChatCompletion — backpressure", () => {
       reply: fakeReply(res),
       meta: META,
       run: () =>
-        Promise.resolve({ kind: "text", upstreamThreadId: "thread-test", content: answer }),
+        Promise.resolve({
+          kind: "text",
+          upstreamThreadId: "thread-test",
+          upstreamThreadCreated: true,
+          content: answer,
+        }),
       runSignal: clientAbort.signal,
       clientAbort,
       keepAliveMs: 100_000,
@@ -322,6 +343,7 @@ describe("streamChatCompletion — bounded write failures never reject", () => {
           return Promise.resolve({
             kind: "text",
             upstreamThreadId: "thread-test",
+            upstreamThreadCreated: true,
             content: "unreachable",
           });
         },
@@ -352,6 +374,7 @@ describe("streamChatCompletion — bounded write failures never reject", () => {
         return Promise.resolve({
           kind: "text",
           upstreamThreadId: "thread-test",
+          upstreamThreadCreated: true,
           content: "unreachable",
         });
       },
@@ -383,6 +406,7 @@ describe("streamChatCompletion — bounded write failures never reject", () => {
         return Promise.resolve({
           kind: "text",
           upstreamThreadId: "thread-test",
+          upstreamThreadCreated: true,
           content: "unreachable",
         });
       },
@@ -464,7 +488,12 @@ describe("streamChatCompletion — bounded write failures never reject", () => {
       reply: fakeReply(res),
       meta: META,
       run: () =>
-        Promise.resolve({ kind: "text", upstreamThreadId: "thread-test", content: "unreachable" }),
+        Promise.resolve({
+          kind: "text",
+          upstreamThreadId: "thread-test",
+          upstreamThreadCreated: true,
+          content: "unreachable",
+        }),
       runSignal: clientAbort.signal,
       clientAbort,
       keepAliveMs: 100_000,
@@ -600,14 +629,22 @@ describe("streamChatCompletion — onCompleted (native-title registration hook)"
     await streamChatCompletion({
       reply: fakeReply(res),
       meta: META,
-      run: () => Promise.resolve({ kind: "text", upstreamThreadId: "T-42", content: "hello" }),
+      run: () =>
+        Promise.resolve({
+          kind: "text",
+          upstreamThreadId: "T-42",
+          upstreamThreadCreated: true,
+          content: "hello",
+        }),
       runSignal: clientAbort.signal,
       clientAbort,
       keepAliveMs: 100_000,
       onCompleted: (r) => void completed.push(r),
     });
     expect(hasDone(res)).toBe(true);
-    expect(completed).toEqual([{ kind: "text", upstreamThreadId: "T-42", content: "hello" }]);
+    expect(completed).toEqual([
+      { kind: "text", upstreamThreadId: "T-42", upstreamThreadCreated: true, content: "hello" },
+    ]);
   });
 
   it("does NOT invoke onCompleted when the transport closes before [DONE]", async () => {
@@ -619,7 +656,13 @@ describe("streamChatCompletion — onCompleted (native-title registration hook)"
     const p = streamChatCompletion({
       reply: fakeReply(res),
       meta: META,
-      run: () => Promise.resolve({ kind: "text", upstreamThreadId: "T-42", content: answer }),
+      run: () =>
+        Promise.resolve({
+          kind: "text",
+          upstreamThreadId: "T-42",
+          upstreamThreadCreated: true,
+          content: answer,
+        }),
       runSignal: clientAbort.signal,
       clientAbort,
       keepAliveMs: 100_000,

@@ -108,6 +108,23 @@ export const RATE_LIMIT_LIMITS = {
   burst: { min: 1, max: 10_000 },
 } as const;
 
+/**
+ * Conservative, non-overridable bounds for the OPTIONAL Redis-backed OpenCode
+ * thread reuse layer (Phase 5A; specification sections 5.1.1, 24). The feature
+ * is disabled entirely unless `OPENCODE_THREAD_REUSE_ENABLED=true`, which
+ * additionally requires a valid `REDIS_URL`. Relaxing any bound is a
+ * configuration-contract/security change, not a runtime override.
+ */
+export const THREAD_REUSE_LIMITS = {
+  /**
+   * Sliding idle lifetime of an `active` mapping, in ms. Every completion that
+   * uses the mapping resets it. The lower bound keeps a mapping alive across at
+   * least one long completion plus a user pause; the upper bound (30 days)
+   * caps how long a session may keep addressing one upstream thread.
+   */
+  ttlMs: { min: 300_000, max: 2_592_000_000 },
+} as const;
+
 /** Allowed characters for `REDIS_KEY_PREFIX` (a value-free operational namespace). */
 export const REDIS_KEY_PREFIX_PATTERN = /^[A-Za-z0-9_-]+$/;
 
@@ -172,6 +189,11 @@ export const ENV_DEFAULTS = {
   RATE_LIMIT_REQUESTS: 60,
   RATE_LIMIT_WINDOW_MS: 60_000,
   RATE_LIMIT_BURST: 8,
+  // Optional Redis-backed OpenCode thread reuse (Phase 5A, specification
+  // section 5.1.1). OFF by default; the TTL is validated regardless so the
+  // configuration shape is stable whether or not the feature is enabled.
+  OPENCODE_THREAD_REUSE_ENABLED: false,
+  OPENCODE_THREAD_REUSE_TTL_MS: 604_800_000, // 7 days
 } as const;
 
 /**
@@ -266,6 +288,15 @@ export const EnvConfigSchema = Type.Object(
     RATE_LIMIT_BURST: Type.Integer({
       minimum: RATE_LIMIT_LIMITS.burst.min,
       maximum: RATE_LIMIT_LIMITS.burst.max,
+    }),
+    // Optional Redis-backed OpenCode thread reuse (Phase 5A). Disabled by
+    // default; enabling it requires a valid REDIS_URL (enforced by the loader).
+    // The TTL always carries a validated value so the shape is stable whether
+    // or not the feature is enabled.
+    OPENCODE_THREAD_REUSE_ENABLED: Type.Boolean(),
+    OPENCODE_THREAD_REUSE_TTL_MS: Type.Integer({
+      minimum: THREAD_REUSE_LIMITS.ttlMs.min,
+      maximum: THREAD_REUSE_LIMITS.ttlMs.max,
     }),
   },
   { additionalProperties: false },

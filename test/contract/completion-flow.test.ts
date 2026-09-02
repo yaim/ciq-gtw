@@ -83,6 +83,8 @@ function configFor(baseUrl: string): AppConfig {
     RATE_LIMIT_REQUESTS: 60,
     RATE_LIMIT_WINDOW_MS: 60_000,
     RATE_LIMIT_BURST: 8,
+    OPENCODE_THREAD_REUSE_ENABLED: false,
+    OPENCODE_THREAD_REUSE_TTL_MS: 604_800_000,
     models: [MODEL, DIRECT_MODEL],
   };
 }
@@ -109,8 +111,26 @@ async function startWith(routes: Routes): Promise<GatewayServer> {
   return app;
 }
 
+/**
+ * The synthetic run id the mock upstream reports from `process_message` and
+ * echoes on the entries it returns from `get_messages`. Answer selection is
+ * correlated to the run this completion submitted, so an entry must carry the
+ * same id to be eligible at all.
+ */
+const RUN_ID = "synthetic-run-completion-flow";
+
 const createOk = (res: ServerResponse): void => void replyJson(res, { thread_id: 42 });
-const processOk = (res: ServerResponse): void => void replyJson(res, { status: "ok" }, 202);
+const processOk = (res: ServerResponse): void =>
+  void replyJson(res, { status: "ok", combined_run_id: RUN_ID }, 202);
+
+/** A `get_messages` entry produced by the current run. */
+function entry(
+  source: string,
+  content: string,
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return { source, content, combined_run_id: RUN_ID, ...extra };
+}
 
 describe("completion flow — success", () => {
   it("creates a thread, submits once, polls, and returns the combined answer", async () => {
@@ -118,7 +138,7 @@ describe("completion flow — success", () => {
       "/create_thread": (_req, res) => createOk(res),
       "/process_message": (_req, res) => processOk(res),
       "/get_messages": (_req, res) =>
-        replyJson(res, { messages: [{ source: "combined", content: "the combined answer" }] }),
+        replyJson(res, { messages: [entry("combined", "the combined answer")] }),
     });
     const response = await server.inject({ method: "POST", url, headers: auth, payload: okBody });
     expect(response.statusCode).toBe(200);
@@ -157,9 +177,8 @@ describe("completion flow — success", () => {
       "/process_message": (_req, res) => processOk(res),
       "/get_messages": (_req, res) => {
         polls += 1;
-        if (polls < 2)
-          return void replyJson(res, { messages: [{ source: "gpt", content: "partial" }] });
-        return void replyJson(res, { messages: [{ source: "combined", content: "final" }] });
+        if (polls < 2) return void replyJson(res, { messages: [entry("gpt", "partial")] });
+        return void replyJson(res, { messages: [entry("combined", "final")] });
       },
     });
     const response = await server.inject({ method: "POST", url, headers: auth, payload: okBody });
@@ -175,13 +194,68 @@ describe("completion flow — success", () => {
       "/get_messages": (_req, res) =>
         replyJson(res, {
           messages: [
-            { source: "combined", content: "older", create_time: "2026-08-11T10:00:00Z" },
-            { source: "combined", content: "newer", create_time: "2026-08-11T10:05:00Z" },
+            entry("combined", "older", { create_time: "2026-08-11T10:00:00Z" }),
+            entry("combined", "newer", { create_time: "2026-08-11T10:05:00Z" }),
           ],
         }),
     });
     const response = await server.inject({ method: "POST", url, headers: auth, payload: okBody });
     expect(response.json()).toMatchObject({ choices: [{ message: { content: "newer" } }] });
+  });
+
+  it("ignores a message that does not belong to this run, even when it outranks", async () => {
+    // MUTATION GUARD, end to end over the real runtime. A thread may already hold
+    // an earlier turn's answer (reuse) or unrelated content, and the ordering
+    // policy prefers a dated message over an undated one — so the stale entry
+    // would win outright if selection were not correlated to this submission.
+    const server = await startWith({
+      "/create_thread": (_req, res) => createOk(res),
+      "/process_message": (_req, res) => processOk(res),
+      "/get_messages": (_req, res) =>
+        replyJson(res, {
+          messages: [
+            {
+              source: "combined",
+              content: "the PREVIOUS answer",
+              create_time: "2026-08-11T10:00:00Z",
+              combined_run_id: "synthetic-run-earlier-turn",
+            },
+            entry("combined", "this run's answer"),
+          ],
+        }),
+    });
+    const response = await server.inject({ method: "POST", url, headers: auth, payload: okBody });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      choices: [{ message: { content: "this run's answer" } }],
+    });
+    expect(response.body).not.toContain("the PREVIOUS answer");
+  });
+
+  it("times out rather than returning an answer from another run", async () => {
+    // Never a fallback to older or uncorrelated content: with nothing from this
+    // run, the request must reach the authoritative deadline and fail with 504.
+    const server = await startWith({
+      "/create_thread": (_req, res) => createOk(res),
+      "/process_message": (_req, res) => processOk(res),
+      "/get_messages": (_req, res) =>
+        replyJson(res, {
+          messages: [
+            {
+              source: "combined",
+              content: "the PREVIOUS answer",
+              create_time: "2026-08-11T10:00:00Z",
+              combined_run_id: "synthetic-run-earlier-turn",
+            },
+            // An entry naming no run is just as ineligible as a foreign one.
+            { source: "combined", content: "an unattributable answer" },
+          ],
+        }),
+    });
+    const response = await server.inject({ method: "POST", url, headers: auth, payload: okBody });
+    expect(response.statusCode).toBe(504);
+    expect(response.json()).toMatchObject({ error: { code: "completion_timeout" } });
+    expect(response.body).not.toContain("the PREVIOUS answer");
   });
 
   it("retries a transient (503) polling read and then succeeds", async () => {
@@ -192,7 +266,7 @@ describe("completion flow — success", () => {
       "/get_messages": (_req, res) => {
         polls += 1;
         if (polls < 2) return void replyRaw(res, "upstream busy", 503, "text/plain");
-        return void replyJson(res, { messages: [{ source: "combined", content: "recovered" }] });
+        return void replyJson(res, { messages: [entry("combined", "recovered")] });
       },
     });
     const response = await server.inject({ method: "POST", url, headers: auth, payload: okBody });
@@ -220,7 +294,7 @@ describe("completion flow — direct prompt mode", () => {
       "/process_message": (_req, res) => processOk(res),
       "/get_messages": (req, res) => {
         polledThreadId = req.query.get("thread_id");
-        return void replyJson(res, { messages: [{ source: "claude", content: "direct answer" }] });
+        return void replyJson(res, { messages: [entry("claude", "direct answer")] });
       },
     });
     const response = await server.inject({
@@ -270,10 +344,7 @@ describe("completion flow — direct prompt mode", () => {
       "/process_message": (_req, res) => processOk(res),
       "/get_messages": (_req, res) =>
         replyJson(res, {
-          messages: [
-            { source: "gpt", content: "wrong source" },
-            { source: "claude", content: "direct streamed answer" },
-          ],
+          messages: [entry("gpt", "wrong source"), entry("claude", "direct streamed answer")],
         }),
     });
     const response = await server.inject({
@@ -323,7 +394,7 @@ describe("completion flow — tool metadata is discarded before upstream", () =>
       "/create_thread": (_req, res) => createOk(res),
       "/process_message": (_req, res) => processOk(res),
       "/get_messages": (_req, res) =>
-        replyJson(res, { messages: [{ source: "combined", content: "ordinary text answer" }] }),
+        replyJson(res, { messages: [entry("combined", "ordinary text answer")] }),
     });
     const payload = {
       ...okBody,
@@ -428,7 +499,7 @@ describe("completion flow — cancellation", () => {
   it("aborts polling and raises RequestCancelledError on client cancellation", async () => {
     mock = await startMockServer((req, res) => {
       if (req.path === "/create_thread") return void replyJson(res, { thread_id: 7 });
-      if (req.path === "/process_message") return void replyJson(res, { status: "ok" }, 202);
+      if (req.path === "/process_message") return void processOk(res);
       if (req.path === "/get_messages") return void replyJson(res, { messages: [] });
       res.writeHead(404).end();
     });
@@ -473,12 +544,10 @@ describe("completion flow — capacity lifecycle hook", () => {
   async function startHappyMock(): Promise<string> {
     const started = await startMockServer((req, res) => {
       if (req.path === "/create_thread") return void replyJson(res, { thread_id: 7 });
-      if (req.path === "/process_message") return void replyJson(res, { status: "ok" }, 202);
+      if (req.path === "/process_message") return void processOk(res);
       if (req.path === "/get_messages") {
         return void replyJson(res, {
-          messages: [
-            { source: "combined", content: "answer", create_time: "2026-01-01T00:00:00Z" },
-          ],
+          messages: [entry("combined", "answer", { create_time: "2026-01-01T00:00:00Z" })],
         });
       }
       res.writeHead(404).end();
@@ -513,7 +582,12 @@ describe("completion flow — capacity lifecycle hook", () => {
       },
     );
 
-    expect(result).toEqual({ kind: "text", content: "answer", upstreamThreadId: "7" });
+    expect(result).toEqual({
+      kind: "text",
+      content: "answer",
+      upstreamThreadId: "7",
+      upstreamThreadCreated: true,
+    });
     expect(observed.active).toBe(1);
     expect(observed.creates).toBe(0);
     // The permit is released once the completion finishes.

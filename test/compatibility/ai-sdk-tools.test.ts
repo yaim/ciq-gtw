@@ -69,6 +69,8 @@ function config(): AppConfig {
     RATE_LIMIT_REQUESTS: 60,
     RATE_LIMIT_WINDOW_MS: 60_000,
     RATE_LIMIT_BURST: 8,
+    OPENCODE_THREAD_REUSE_ENABLED: false,
+    OPENCODE_THREAD_REUSE_TTL_MS: 604_800_000,
     models: [MODEL],
   };
 }
@@ -77,11 +79,13 @@ const textResult = (content: string): CompletionResult => ({
   kind: "text",
   content,
   upstreamThreadId: "t",
+  upstreamThreadCreated: true,
 });
 const toolResult = (calls: ParsedToolCall[]): CompletionResult => ({
   kind: "tool_calls",
   toolCalls: calls,
   upstreamThreadId: "t",
+  upstreamThreadCreated: true,
 });
 
 /**

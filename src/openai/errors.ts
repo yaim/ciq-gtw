@@ -329,6 +329,77 @@ export const RATE_LIMIT_UNAVAILABLE_ERROR: OpenAIApiError = apiError(
   2,
 );
 
+// --- Phase 5A: optional OpenCode thread reuse (specification §5.1.1) --------
+
+/** The public parameter name reported for a rejected session-correlation header. */
+export const OPENCODE_SESSION_ID_PARAM = "X-CollectivIQ-OpenCode-Session-ID";
+
+/**
+ * `400` — thread reuse is active for this model, the session-correlation header
+ * was PRESENT, and its value is not a valid opaque session id (wrong length,
+ * disallowed character, or supplied more than once).
+ *
+ * It is deliberately an error only when reuse could actually apply: with reuse
+ * disabled, or for a model that is not reuse eligible, the same malformed header
+ * keeps its long-standing best-effort behaviour of being ignored. The submitted
+ * value is never reflected.
+ */
+export const INVALID_OPENCODE_SESSION_ID_ERROR: OpenAIApiError = apiError(
+  400,
+  "The OpenCode session header is invalid for this request.",
+  "invalid_request_error",
+  "invalid_opencode_session_id",
+  OPENCODE_SESSION_ID_PARAM,
+);
+
+/**
+ * `400` — an eligible thread-reuse request also supplied an `Idempotency-Key`.
+ *
+ * The two features have incompatible finalization semantics: idempotency caches
+ * and replays one answer for a key, while reuse advances a session's upstream
+ * thread on every turn. Combining them would require a coupled commit the
+ * initial implementation deliberately does not attempt, so the combination is
+ * refused outright rather than honoured partially.
+ */
+export const IDEMPOTENCY_WITH_THREAD_REUSE_ERROR: OpenAIApiError = apiError(
+  400,
+  "Idempotency-Key is not supported for OpenCode thread-reuse requests.",
+  "invalid_request_error",
+  "unsupported_parameter",
+  IDEMPOTENCY_KEY_PARAM,
+);
+
+/**
+ * `409` — another in-flight request already holds this OpenCode session's
+ * thread. Sequential turns share one upstream thread, so a concurrent second
+ * turn is told to retry rather than queued or silently given its own thread.
+ * The body reveals no session, mapping, or thread identifier.
+ */
+export const THREAD_REUSE_BUSY_ERROR: OpenAIApiError = apiError(
+  409,
+  "Another request is already using this OpenCode session's CollectivIQ thread.",
+  "invalid_request_error",
+  "thread_reuse_busy",
+  null,
+  2,
+);
+
+/**
+ * `503` — thread reuse was required for this request but cannot be honoured:
+ * Redis is disabled for this instance, unavailable, or holding corrupt or
+ * ambiguous state, or a mapping transition failed. The gateway fails CLOSED
+ * rather than silently creating a replacement thread and losing the session's
+ * conversation continuity. Always paired with `Retry-After: 2`.
+ */
+export const THREAD_REUSE_UNAVAILABLE_ERROR: OpenAIApiError = apiError(
+  503,
+  "OpenCode thread reuse is currently unavailable.",
+  "server_error",
+  "thread_reuse_unavailable",
+  null,
+  2,
+);
+
 /**
  * Map a normalized {@link UpstreamError} to its public OpenAI envelope
  * (specification section 20). Only the closed `category` drives the mapping;

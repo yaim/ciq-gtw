@@ -61,6 +61,14 @@ const CRED_SENTINEL = "SECRET-EVAL-PASSWORD-9c1f";
 const OK: DeleteDiagnostics = { ok: true, status: 200, errorCode: null };
 
 /**
+ * The synthetic run id every fake upstream below reports from `process_message`
+ * and echoes on its message entries. Each round runs against its own fresh
+ * thread, so one shared invented value is enough for the real poller to correlate
+ * the reply to its submission.
+ */
+const EVAL_RUN_ID = "synthetic-eval-run";
+
+/**
  * Count the number of assistant `tool_calls` messages already present in the
  * serialized conversation envelope. A multi-step scenario accumulates history
  * through prior assistant tool_calls + linked tool-result messages (never a
@@ -166,7 +174,7 @@ function scenarioAdapter(
     createThread: () => Promise.resolve({ threadId: `t${(n += 1)}`, rawStatus: 200 }),
     processMessage: (input) => {
       lastPrompt = input.prompt;
-      return Promise.resolve({ accepted: true, rawStatus: 202 });
+      return Promise.resolve({ accepted: true, combinedRunId: EVAL_RUN_ID, rawStatus: 202 });
     },
     getMessages: () =>
       Promise.resolve({
@@ -177,6 +185,7 @@ function scenarioAdapter(
             percentUsage: null,
             createdAt: 1,
             id: 1,
+            combinedRunId: EVAL_RUN_ID,
           },
         ],
         rawStatus: 200,
@@ -805,7 +814,7 @@ describe("eval:tools — structured, value-free abort diagnostics", () => {
             // Deliberately reject a hostile NON-Error value to prove it is never inspected.
             // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors
             if (created === 1) return Promise.reject(hostile);
-            return Promise.resolve({ accepted: true, rawStatus: 202 });
+            return Promise.resolve({ accepted: true, combinedRunId: EVAL_RUN_ID, rawStatus: 202 });
           },
           getMessages: (id, signal) => base.getMessages(id, signal),
           getThreadTitle: (id, signal) => base.getThreadTitle(id, signal),
@@ -1012,7 +1021,8 @@ describe("eval:tools — gate metrics give no false credit / no false pass", () 
         let tid = 0;
         return {
           createThread: () => Promise.resolve({ threadId: `t${(tid += 1)}`, rawStatus: 200 }),
-          processMessage: () => Promise.resolve({ accepted: true, rawStatus: 202 }),
+          processMessage: () =>
+            Promise.resolve({ accepted: true, combinedRunId: EVAL_RUN_ID, rawStatus: 202 }),
           getMessages: () =>
             Promise.resolve({
               messages: [
@@ -1026,6 +1036,7 @@ describe("eval:tools — gate metrics give no false credit / no false pass", () 
                   percentUsage: null,
                   createdAt: 1,
                   id: 1,
+                  combinedRunId: EVAL_RUN_ID,
                 },
               ],
               rawStatus: 200,
@@ -1162,7 +1173,8 @@ describe("eval:tools — corpus fingerprint is deterministic and content-free", 
 function createFailingAdapter(): CollectivIQAdapter {
   return {
     createThread: () => Promise.reject(new Error("create boom")),
-    processMessage: () => Promise.resolve({ accepted: true, rawStatus: 202 }),
+    processMessage: () =>
+      Promise.resolve({ accepted: true, combinedRunId: EVAL_RUN_ID, rawStatus: 202 }),
     getMessages: () => Promise.resolve({ messages: [], rawStatus: 200 }),
     getThreadTitle: () => Promise.resolve({ kind: "pending" as const }),
   };
@@ -1674,6 +1686,7 @@ function claudeMessage(envelope: string) {
         percentUsage: null,
         createdAt: 1,
         id: 1,
+        combinedRunId: EVAL_RUN_ID,
       },
     ],
     rawStatus: 200,
@@ -1700,7 +1713,7 @@ function ordinalAdapter(
     },
     processMessage: (input) => {
       lastPrompt = input.prompt;
-      return Promise.resolve({ accepted: true, rawStatus: 202 });
+      return Promise.resolve({ accepted: true, combinedRunId: EVAL_RUN_ID, rawStatus: 202 });
     },
     getMessages: () => Promise.resolve(claudeMessage(envelopePerOrdinal(created, lastPrompt))),
     getThreadTitle: () => Promise.resolve({ kind: "pending" as const }),
@@ -2590,7 +2603,7 @@ describe("eval:tools — resume persists diagnostics exactly once", () => {
       },
       processMessage: () => {
         if (created === 100) return Promise.reject(new UpstreamError("network", undefined, "POST"));
-        return Promise.resolve({ accepted: true, rawStatus: 202 });
+        return Promise.resolve({ accepted: true, combinedRunId: EVAL_RUN_ID, rawStatus: 202 });
       },
       getMessages: () => Promise.resolve(claudeMessage(finalEnvelope)),
       getThreadTitle: () => Promise.resolve({ kind: "pending" as const }),

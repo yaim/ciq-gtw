@@ -105,10 +105,10 @@ export async function main(): Promise<void> {
   emitContentLoggingWarning(config);
   const logger = createLogger(config);
 
-  // Optional Redis-backed services: idempotency (Phase 4A) and cross-replica
-  // rate limiting (Phase 4B). `null` when REDIS_URL is blank/absent; either way
-  // construction creates no socket, and both services share the ONE client this
-  // runtime owns.
+  // Optional Redis-backed services: idempotency (Phase 4A), cross-replica rate
+  // limiting (Phase 4B), and OpenCode thread reuse (Phase 5A). `null` when
+  // REDIS_URL is blank/absent; either way construction creates no socket, and
+  // every service shares the ONE client this runtime owns.
   const redis = createRedisRuntime(config);
 
   // Readiness is dependency aware: when Redis is CONFIGURED the instance is
@@ -136,6 +136,7 @@ export async function main(): Promise<void> {
     },
     ...(redis?.idempotency != null ? { idempotency: redis.idempotency } : {}),
     ...(redis?.rateLimiter != null ? { rateLimiter: redis.rateLimiter } : {}),
+    ...(redis?.threadReuse != null ? { threadReuse: redis.threadReuse } : {}),
   });
 
   let shuttingDown = false;

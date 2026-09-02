@@ -64,6 +64,8 @@ function makeConfig(over: Partial<AppConfig> = {}): AppConfig {
     RATE_LIMIT_REQUESTS: 60,
     RATE_LIMIT_WINDOW_MS: 60_000,
     RATE_LIMIT_BURST: 8,
+    OPENCODE_THREAD_REUSE_ENABLED: false,
+    OPENCODE_THREAD_REUSE_TTL_MS: 604_800_000,
     models: [model("collectiviq-consensus"), model("collectiviq-fast")],
     ...over,
   };
@@ -88,7 +90,12 @@ function fakeService(run: RunFn): ChatCompletionService {
 }
 
 const okAnswer: RunFn = () =>
-  Promise.resolve({ kind: "text", upstreamThreadId: "thread-test", content: "hello answer" });
+  Promise.resolve({
+    kind: "text",
+    upstreamThreadId: "thread-test",
+    upstreamThreadCreated: true,
+    content: "hello answer",
+  });
 
 /** A no-op title bridge: these tests do not exercise native-title correlation. */
 const noopTitleBridge: TitleBridge = {
@@ -205,6 +212,7 @@ describe("POST /v1/chat/completions — request rejections", () => {
       return Promise.resolve({
         kind: "text",
         upstreamThreadId: "thread-test",
+        upstreamThreadCreated: true,
         content: "unreachable",
       });
     });
@@ -337,6 +345,7 @@ describe("POST /v1/chat/completions — tool-metadata compatibility (disabled mo
       return Promise.resolve({
         kind: "text",
         upstreamThreadId: "thread-test",
+        upstreamThreadCreated: true,
         content: "unreachable",
       });
     });
@@ -600,6 +609,7 @@ describe("POST /v1/chat/completions — direct prompt mode", () => {
       return Promise.resolve({
         kind: "text",
         upstreamThreadId: "thread-test",
+        upstreamThreadCreated: true,
         content: "should not happen",
       });
     };

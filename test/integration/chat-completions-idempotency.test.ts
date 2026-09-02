@@ -16,7 +16,7 @@ import {
   type ChatCompletionRequestContext,
   type ChatCompletionService,
   type CompletionResult,
-  type CompletionRunHooks,
+  type CompletionRunOptions,
   type PreparedCompletion,
 } from "../../src/generation/chat-completion.js";
 import type { Clock, Sleeper } from "../../src/generation/types.js";
@@ -93,6 +93,8 @@ function makeConfig(over: Partial<AppConfig> = {}): AppConfig {
     RATE_LIMIT_REQUESTS: 60,
     RATE_LIMIT_WINDOW_MS: 60_000,
     RATE_LIMIT_BURST: 8,
+    OPENCODE_THREAD_REUSE_ENABLED: false,
+    OPENCODE_THREAD_REUSE_TTL_MS: 604_800_000,
     models: [model("collectiviq-consensus")],
     ...over,
   };
@@ -101,7 +103,7 @@ function makeConfig(over: Partial<AppConfig> = {}): AppConfig {
 type RunFn = (
   prepared: PreparedCompletion,
   signal: AbortSignal,
-  hooks?: CompletionRunHooks,
+  hooks?: CompletionRunOptions,
 ) => Promise<CompletionResult>;
 
 interface Harness {
@@ -204,7 +206,12 @@ function use(harness: Harness): Harness {
 /** A completion that succeeds immediately, honouring any lifecycle hook. */
 const succeeds: RunFn = async (_prepared, signal, hooks) => {
   await hooks?.onCapacityAcquired?.(signal);
-  return { kind: "text", content: ANSWER, upstreamThreadId: THREAD_ID };
+  return {
+    kind: "text",
+    content: ANSWER,
+    upstreamThreadId: THREAD_ID,
+    upstreamThreadCreated: true,
+  };
 };
 
 function body(over: Record<string, unknown> = {}): Record<string, unknown> {
@@ -361,7 +368,12 @@ describe("idempotency: single execution, replay, and conflict", () => {
       build(async (_prepared, signal, hooks) => {
         await hooks?.onCapacityAcquired?.(signal);
         await gate;
-        return { kind: "text", content: ANSWER, upstreamThreadId: THREAD_ID };
+        return {
+          kind: "text",
+          content: ANSWER,
+          upstreamThreadId: THREAD_ID,
+          upstreamThreadCreated: true,
+        };
       }),
     );
 
@@ -419,6 +431,7 @@ describe("idempotency: single execution, replay, and conflict", () => {
           kind: "tool_calls",
           toolCalls: [{ id: "call_ciq_01", name: "read", argumentsJson: '{"path":"a.txt"}' }],
           upstreamThreadId: THREAD_ID,
+          upstreamThreadCreated: true,
         };
       }),
     );
@@ -662,7 +675,12 @@ describe("idempotency: failure handling", () => {
       build(async (_p, signal, hooks) => {
         await hooks?.onCapacityAcquired?.(signal);
         upstreamCalls += 1;
-        return { kind: "text", content: ANSWER, upstreamThreadId: THREAD_ID };
+        return {
+          kind: "text",
+          content: ANSWER,
+          upstreamThreadId: THREAD_ID,
+          upstreamThreadCreated: true,
+        };
       }),
     );
     h.store.failNext("transition", "unavailable");

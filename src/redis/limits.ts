@@ -1,11 +1,12 @@
 /**
  * Conservative, non-overridable bounds for the shared Redis client substrate
- * (specification sections 18.1, 19.1, 31.2).
+ * (specification sections 5.1.1, 18.1, 19.1, 31.2).
  *
  * These bound the CONNECTION, not any feature that uses it, so idempotency
- * (section 18.1) and rate limiting (section 19.1) share exactly one set of
- * deadlines and one reconnect policy. Relaxing a bound is a
- * configuration-contract/security change, not a runtime override.
+ * (section 18.1), rate limiting (section 19.1), and OpenCode thread reuse
+ * (section 5.1.1) share exactly one set of deadlines and one reconnect policy.
+ * Relaxing a bound is a configuration-contract/security change, not a runtime
+ * override.
  */
 
 /** Bounded deadline for a single Redis command, in ms. */

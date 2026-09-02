@@ -2,11 +2,12 @@
  * The shared internal Redis substrate.
  *
  * This is the ONLY module that imports node-redis. Every optional Redis-backed
- * feature — idempotency (`src/idempotency/`, specification section 18.1) and
- * cross-replica rate limiting (`src/rate-limit/`, section 19.1) — runs its
- * server-side Lua through the narrow {@link RedisSubstrate} port below, so the
- * gateway process holds exactly ONE client and ONE connection lifecycle no
- * matter how many features are enabled.
+ * feature — idempotency (`src/idempotency/`, specification section 18.1),
+ * cross-replica rate limiting (`src/rate-limit/`, section 19.1), and OpenCode
+ * thread reuse (`src/thread-reuse/`, section 5.1.1) — runs its server-side Lua
+ * through the narrow {@link RedisSubstrate} port below, so the gateway process
+ * holds exactly ONE client and ONE connection lifecycle no matter how many
+ * features are enabled.
  *
  * Client configuration (specification section 31.2):
  *  - a MANDATORY content-free `error` listener, so a transport error can never

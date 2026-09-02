@@ -37,7 +37,7 @@ function sha256(value: string): Buffer {
 /**
  * The result of authenticating a presented credential.
  *
- * Success carries THREE separate opaque identities for the matched key, and none
+ * Success carries FOUR separate opaque identities for the matched key, and none
  * of them is the raw key or its digest:
  *
  *  - `keyId` — the PROCESS-LOCAL identity (`k<index>`), derived from the key's
@@ -52,6 +52,9 @@ function sha256(value: string): Buffer {
  *    way but under a SEPARATE HKDF salt/label, so it is a different value from
  *    `scopeId` for the same key and the two features can never share, correlate,
  *    or collide on a Redis key. It is `null` when rate limiting is disabled.
+ *  - `reuseScopeId` — the CROSS-REPLICA OpenCode thread-reuse scope, derived the
+ *    same way under a THIRD independent HKDF salt/label. It is `null` when
+ *    thread reuse is disabled.
  *
  * No identity is ever logged, reflected, or returned to a client.
  */
@@ -61,6 +64,7 @@ export type AuthResult =
       readonly keyId: string;
       readonly scopeId: string | null;
       readonly rateLimitScopeId: string | null;
+      readonly reuseScopeId: string | null;
     }
   | { readonly ok: false };
 
@@ -121,6 +125,14 @@ export interface GatewayAuthenticatorOptions {
    * reason. Omitted means `rateLimitScopeId` is always `null`.
    */
   readonly rateLimitScopeDeriver?: (rawGatewayKey: string) => string;
+  /**
+   * Derives the stable cross-replica OpenCode THREAD-REUSE scope for a
+   * configured key. Supplied only when thread reuse is enabled, and independent
+   * of the other two derivers — all three produce different values for the same
+   * key. Precomputed once at construction for the same reason. Omitted means
+   * `reuseScopeId` is always `null`.
+   */
+  readonly reuseScopeDeriver?: (rawGatewayKey: string) => string;
 }
 
 /**
@@ -136,14 +148,15 @@ export function createGatewayAuthenticator(
   const compare = options.compare ?? timingSafeEqual;
   // Precompute one fixed-length digest per configured key.
   const digests = keys.map((key) => sha256(key));
-  // Precompute both opaque cross-replica scopes per configured key so the raw
-  // key material is used exactly once, at construction, and never again per
+  // Precompute all three opaque cross-replica scopes per configured key so the
+  // raw key material is used exactly once, at construction, and never again per
   // request. They are derived under different HKDF domains, so a key's
-  // idempotency scope and its rate-limit scope are unrelated values.
+  // idempotency, rate-limit, and thread-reuse scopes are unrelated values.
   const derive = (deriver: ((key: string) => string) | undefined): (string | null)[] =>
     deriver === undefined ? keys.map(() => null) : keys.map((key) => deriver(key));
   const scopes = derive(options.scopeDeriver);
   const rateLimitScopes = derive(options.rateLimitScopeDeriver);
+  const reuseScopes = derive(options.reuseScopeDeriver);
 
   return {
     authenticate(header: string | undefined): AuthResult {
@@ -171,6 +184,7 @@ export function createGatewayAuthenticator(
         keyId: keyIdForIndex(matchedIndex),
         scopeId: scopes[matchedIndex] ?? null,
         rateLimitScopeId: rateLimitScopes[matchedIndex] ?? null,
+        reuseScopeId: reuseScopes[matchedIndex] ?? null,
       };
     },
   };

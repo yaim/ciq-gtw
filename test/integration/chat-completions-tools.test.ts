@@ -54,6 +54,8 @@ function makeConfig(): AppConfig {
     RATE_LIMIT_REQUESTS: 60,
     RATE_LIMIT_WINDOW_MS: 60_000,
     RATE_LIMIT_BURST: 8,
+    OPENCODE_THREAD_REUSE_ENABLED: false,
+    OPENCODE_THREAD_REUSE_TTL_MS: 604_800_000,
     models: [model("collectiviq-claude-tools", { toolMode: "emulated" })],
   };
 }
@@ -80,7 +82,12 @@ function fakeService(run: RunFn): ChatCompletionService {
 }
 
 const toolResult: RunFn = () =>
-  Promise.resolve({ kind: "tool_calls", toolCalls: TOOL_CALLS, upstreamThreadId: "t1" });
+  Promise.resolve({
+    kind: "tool_calls",
+    toolCalls: TOOL_CALLS,
+    upstreamThreadId: "t1",
+    upstreamThreadCreated: true,
+  });
 
 const noopTitleBridge: TitleBridge = {
   register: () => {},

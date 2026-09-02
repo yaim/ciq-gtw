@@ -58,6 +58,8 @@ function configFor(baseUrl: string): AppConfig {
     RATE_LIMIT_REQUESTS: 60,
     RATE_LIMIT_WINDOW_MS: 60_000,
     RATE_LIMIT_BURST: 8,
+    OPENCODE_THREAD_REUSE_ENABLED: false,
+    OPENCODE_THREAD_REUSE_TTL_MS: 604_800_000,
     models: [MODEL],
   };
 }
@@ -88,7 +90,8 @@ describe("real client disconnect", () => {
     // get_messages hangs forever; the disconnect is the only way work stops.
     mock = await startMockServer((req, res: ServerResponse) => {
       if (req.path === "/create_thread") return void replyJson(res, { thread_id: 7 });
-      if (req.path === "/process_message") return void replyJson(res, { status: "ok" }, 202);
+      if (req.path === "/process_message")
+        return void replyJson(res, { status: "ok", combined_run_id: "synthetic-run" }, 202);
       // /get_messages: never respond.
     });
 

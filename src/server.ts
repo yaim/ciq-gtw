@@ -16,6 +16,7 @@ import type { ChatCompletionService } from "./generation/chat-completion.js";
 import type { TitleBridge } from "./opencode/title-bridge.js";
 import { buildGatewayScopeDeriver, type IdempotencyCoordinator } from "./idempotency/index.js";
 import { buildRateLimitScopeDeriver, type RateLimiter } from "./rate-limit/index.js";
+import { buildThreadReuseScopeDeriver, type ThreadReuseCoordinator } from "./thread-reuse/index.js";
 import type { AppConfig } from "./config/schema.js";
 
 /** The chat-completions wiring the `/v1` scope needs. */
@@ -90,6 +91,19 @@ export interface BuildServerOptions {
    * dependency and every completion fails closed with `503`.
    */
   readonly rateLimiter?: RateLimiter;
+  /**
+   * The cross-replica OpenCode thread-reuse coordinator (Phase 5A).
+   *
+   * Like the two fields above it is deliberately NOT built here: it rides the
+   * same process-owned Redis connection.
+   *
+   * Whether the feature is ON comes from `config.OPENCODE_THREAD_REUSE_ENABLED`,
+   * never from this field. Omitting it is safe only when configuration also has
+   * the feature disabled; omitting it while reuse is enabled makes every
+   * ELIGIBLE completion fail closed with `503`, while every other completion is
+   * unaffected.
+   */
+  readonly threadReuse?: ThreadReuseCoordinator;
 }
 
 /**
@@ -117,17 +131,19 @@ export function buildServer(options: BuildServerOptions): GatewayServer {
   // timestamp at construction and reuses it for every model object it serves.
   const now = options.now ?? (() => Math.floor(Date.now() / 1000));
   const catalog = options.catalog ?? createModelCatalog(config.models, now());
-  // Both scope derivers are pure HKDF/HMAC over already-validated config: no
-  // socket, no Redis client, no I/O. Each is `null` (so the matching identity is
-  // always `null`) when its feature is not configured, and they derive under
-  // different HKDF domains so a key's two scopes never coincide.
+  // All three scope derivers are pure HKDF/HMAC over already-validated config:
+  // no socket, no Redis client, no I/O. Each is `null` (so the matching identity
+  // is always `null`) when its feature is not configured, and they derive under
+  // different HKDF domains so a key's three scopes never coincide.
   const scopeDeriver = buildGatewayScopeDeriver(config);
   const rateLimitScopeDeriver = buildRateLimitScopeDeriver(config);
+  const reuseScopeDeriver = buildThreadReuseScopeDeriver(config);
   const authenticator =
     options.authenticator ??
     createGatewayAuthenticator(config.COLLECTIVIQ_GATEWAY_KEYS, {
       ...(scopeDeriver !== null ? { scopeDeriver } : {}),
       ...(rateLimitScopeDeriver !== null ? { rateLimitScopeDeriver } : {}),
+      ...(reuseScopeDeriver !== null ? { reuseScopeDeriver } : {}),
     });
 
   // A default completion runtime is built from config when none is injected
@@ -155,6 +171,9 @@ export function buildServer(options: BuildServerOptions): GatewayServer {
     // closed instead of serving unmetered traffic.
     rateLimitEnabled: config.RATE_LIMIT_ENABLED,
     ...(options.rateLimiter !== undefined ? { rateLimiter: options.rateLimiter } : {}),
+    // Same rule for thread reuse: configuration decides whether the gate runs.
+    threadReuseEnabled: config.OPENCODE_THREAD_REUSE_ENABLED,
+    ...(options.threadReuse !== undefined ? { threadReuse: options.threadReuse } : {}),
   });
 
   return app;

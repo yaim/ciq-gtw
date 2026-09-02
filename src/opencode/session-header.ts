@@ -33,3 +33,18 @@ export function normalizeSessionId(raw: string | string[] | undefined): string |
   if (!SESSION_ID_PATTERN.test(raw)) return null;
   return raw;
 }
+
+/**
+ * Whether the header was SUPPLIED at all, regardless of whether its value is
+ * usable. A duplicated header (which Fastify surfaces as an array) counts as
+ * present.
+ *
+ * Presence and validity have to be distinguished for OpenCode thread reuse
+ * (specification section 5.1.1): an absent header simply means the request is
+ * stateless, whereas a present-but-malformed header on an otherwise
+ * reuse-eligible request is a caller mistake that must fail loudly rather than
+ * silently downgrade the session to one-thread-per-completion.
+ */
+export function hasSessionIdHeader(raw: string | string[] | undefined): boolean {
+  return raw !== undefined;
+}

@@ -88,9 +88,12 @@ function baselineHandler(options: { deleteStatus?: number } = {}): MockHandler {
       return replyJson(res, { thread_id: nextThread });
     }
     if (req.path === "/process_message" && req.method === "POST") {
-      // The raw response carries a run id that discovery must capture structurally
-      // (never by value) rather than discard during normalization.
-      return replyJson(res, { run_id: 5000 });
+      // The raw response carries run ids that discovery must capture structurally
+      // (never by value) rather than discard during normalization. A successful
+      // submission must carry a string `combined_run_id`: the production
+      // normalizer that gates this stage requires one, because it is the key the
+      // completion path uses to correlate a message to its own run.
+      return replyJson(res, { run_id: 5000, combined_run_id: "synthetic-combined-run" });
     }
     if (req.path.startsWith("/delete_thread/") && req.method === "DELETE") {
       if (options.deleteStatus !== undefined) return replyJson(res, {}, options.deleteStatus);
@@ -273,7 +276,7 @@ describe("discovery baseline execution", () => {
     expect(report.evidenceFormatVersion).toBe(2);
   });
 
-  it("captures raw process_message run_id structurally (name kept, value gone)", async () => {
+  it("captures raw process_message run ids structurally (names kept, values gone)", async () => {
     server = await startMockServer(baselineHandler());
     const runner = new DiscoverySessionRunner(testTransportConfig(server.baseUrl));
     const report = await baseline(runner, {
@@ -283,9 +286,10 @@ describe("discovery baseline execution", () => {
     });
     const submit = report.observations.find((o) => o.stage === "single_submit");
     expect(submit?.ok).toBe(true);
-    // The safe field name survives as a structural marker; the value does not.
-    expect(submit?.structure).toEqual({ run_id: "<number>" });
+    // The safe field names survive as structural markers; the values do not.
+    expect(submit?.structure).toEqual({ run_id: "<number>", combined_run_id: "<string>" });
     expect(JSON.stringify(submit)).not.toContain("5000");
+    expect(JSON.stringify(submit)).not.toContain("synthetic-combined-run");
   });
 
   it("captures raw auth and validation error bodies structurally", async () => {
@@ -1366,10 +1370,17 @@ describe("discovery production-normalization gate", () => {
 // --- Regression: SSE correlates the combined-stage pair ----------------------
 
 describe("discovery combined-stage SSE correlation", () => {
+  // A submission the production normalizer ACCEPTS must carry a string
+  // `combined_run_id` — that is the completion path's run-correlation key, and
+  // discovery gates each submit stage on the same rule. Correlation itself
+  // normalizes a positive integer and a non-empty string to the same decimal
+  // form, so a numeric SSE echo still matches a string body id.
   it("matches when SSE echoes the combined thread + run (distinct stage ids)", async () => {
     server = await startMockServer(
       regressionHandler({
-        process: (n) => ({ body: n === 1 ? { run_id: 7001 } : { combined_run_id: 7002 } }),
+        process: (n) => ({
+          body: n === 1 ? { run_id: 7001, combined_run_id: "7001" } : { combined_run_id: "7002" },
+        }),
         sse: 'data: {"thread_id":1002,"combined_run_id":7002}\n\n',
       }),
     );
@@ -1389,7 +1400,9 @@ describe("discovery combined-stage SSE correlation", () => {
   it("does not match when SSE echoes only the single-stage pair", async () => {
     server = await startMockServer(
       regressionHandler({
-        process: (n) => ({ body: n === 1 ? { run_id: 7001 } : { combined_run_id: 7002 } }),
+        process: (n) => ({
+          body: n === 1 ? { run_id: 7001, combined_run_id: "7001" } : { combined_run_id: "7002" },
+        }),
         sse: 'data: {"thread_id":1001,"run_id":7001}\n\n',
       }),
     );
@@ -1406,8 +1419,11 @@ describe("discovery combined-stage SSE correlation", () => {
   it("reports run not-observed when the combined submission exposes no run id, without single fallback", async () => {
     server = await startMockServer(
       regressionHandler({
-        // Single stage has a run id; combined stage exposes none.
-        process: (n) => ({ body: n === 1 ? { run_id: 7001 } : {} }),
+        // Single stage submits successfully; the combined stage exposes no run id
+        // at all, which the production normalizer now rejects outright — so no
+        // combined candidate exists to correlate against, by an even stricter
+        // route than "extraction found nothing".
+        process: (n) => ({ body: n === 1 ? { run_id: 7001, combined_run_id: "7001" } : {} }),
         // SSE even echoes the SINGLE run id — it must not be treated as the target.
         sse: 'data: {"thread_id":1002,"run_id":7001}\n\n',
       }),
@@ -1444,7 +1460,10 @@ describe("discovery combined-stage SSE correlation", () => {
       regressionHandler({
         // Single stage: run 7001; combined stage: BOTH run ids.
         process: (n) => ({
-          body: n === 1 ? { run_id: 7001 } : { run_id: 7101, combined_run_id: 7102 },
+          body:
+            n === 1
+              ? { run_id: 7001, combined_run_id: "7001" }
+              : { run_id: 7101, combined_run_id: "7102" },
         }),
         sse: 'data: {"thread_id":1002,"run_id":7101}\n\n',
       }),
@@ -1466,7 +1485,10 @@ describe("discovery combined-stage SSE correlation", () => {
     server = await startMockServer(
       regressionHandler({
         process: (n) => ({
-          body: n === 1 ? { run_id: 7001 } : { run_id: 7101, combined_run_id: 7102 },
+          body:
+            n === 1
+              ? { run_id: 7001, combined_run_id: "7001" }
+              : { run_id: 7101, combined_run_id: "7102" },
         }),
         sse: 'data: {"thread_id":1002,"combined_run_id":7102}\n\n',
       }),

@@ -61,6 +61,8 @@ function configFor(baseUrl: string, model = modelWith()): AppConfig {
     RATE_LIMIT_REQUESTS: 60,
     RATE_LIMIT_WINDOW_MS: 60_000,
     RATE_LIMIT_BURST: 8,
+    OPENCODE_THREAD_REUSE_ENABLED: false,
+    OPENCODE_THREAD_REUSE_TTL_MS: 604_800_000,
     models: [model],
   };
 }
@@ -103,6 +105,12 @@ function post(port: number, payload: unknown): Promise<StreamedResponse> {
     req.end();
   });
 }
+
+/**
+ * The synthetic run id the mock upstream reports from `process_message` and
+ * echoes on the entries it returns; answer selection is correlated to it.
+ */
+const RUN_ID = "synthetic-run-loopback";
 
 function dataPayloads(body: string): string[] {
   return body
@@ -153,9 +161,12 @@ describe("synthetic SSE over a real socket", () => {
   it("delivers an event-stream and creates exactly one thread and one submit", async () => {
     mock = await startMockServer((req, res: ServerResponse) => {
       if (req.path === "/create_thread") return void replyJson(res, { thread_id: 7 });
-      if (req.path === "/process_message") return void replyJson(res, { status: "ok" }, 202);
+      if (req.path === "/process_message")
+        return void replyJson(res, { status: "ok", combined_run_id: RUN_ID }, 202);
       if (req.path === "/get_messages")
-        return void replyJson(res, { messages: [{ source: "gpt", content: "streamed answer" }] });
+        return void replyJson(res, {
+          messages: [{ source: "gpt", content: "streamed answer", combined_run_id: RUN_ID }],
+        });
       res.writeHead(404).end();
     });
     const { port } = await listen(configFor(mock.baseUrl));
@@ -188,7 +199,8 @@ describe("synthetic SSE over a real socket", () => {
   it("aborts polling and releases capacity when a streaming client disconnects", async () => {
     mock = await startMockServer((req, res: ServerResponse) => {
       if (req.path === "/create_thread") return void replyJson(res, { thread_id: 7 });
-      if (req.path === "/process_message") return void replyJson(res, { status: "ok" }, 202);
+      if (req.path === "/process_message")
+        return void replyJson(res, { status: "ok", combined_run_id: RUN_ID }, 202);
       // /get_messages: never respond, so only a disconnect stops the work.
     });
     const { port, runtime } = await listen(configFor(mock.baseUrl));
@@ -259,7 +271,8 @@ describe("synthetic SSE over a real socket", () => {
     // the safe 503 SSE error record must still be delivered.
     mock = await startMockServer((req, res: ServerResponse) => {
       if (req.path === "/create_thread") return void replyJson(res, { thread_id: 7 });
-      if (req.path === "/process_message") return void replyJson(res, { status: "ok" }, 202);
+      if (req.path === "/process_message")
+        return void replyJson(res, { status: "ok", combined_run_id: RUN_ID }, 202);
       // /get_messages: never respond.
     });
     const shutdown = new AbortController();

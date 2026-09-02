@@ -26,12 +26,14 @@ jobs:
         run: npm run validate
 
   redis-contract:
-    name: Redis idempotency and rate-limit contracts (Node 24)
+    name: Redis idempotency, rate-limit, and thread-reuse contracts (Node 24)
     runs-on: ubuntu-latest
     # The only job that needs an external service. `npm run validate` stays
     # hermetic and Redis-free; these suites are an ADDITIONAL required gate.
-    # `npm run test:redis` runs BOTH real-Redis suites: Phase 4A idempotency and
-    # Phase 4B cross-replica rate limiting.
+    # `npm run test:redis` runs all THREE real-Redis suites: Phase 4A
+    # idempotency, Phase 4B cross-replica rate limiting, and Phase 5A OpenCode
+    # thread reuse. The thread-reuse suite was added with its implementation and
+    # has not yet been run outside CI.
     services:
       redis:
         image: redis:8.8.2-alpine
@@ -52,7 +54,7 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci
-      - name: Run Redis contract suites (idempotency and rate limiting)
+      - name: Run Redis contract suites (idempotency, rate limiting, thread reuse)
         # Synthetic content and credentials only; each suite randomizes its key
         # prefix per run and deletes every key it creates.
         env:

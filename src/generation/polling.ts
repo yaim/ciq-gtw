@@ -6,7 +6,9 @@
  * threads, never processes messages, and never uses upstream event streams.
  * Selection is a single deterministic policy so duplicate/racing upstream
  * messages always resolve to one stable answer, and malformed metadata can never
- * throw or win by accident.
+ * throw or win by accident. Every candidate must first be correlated to the run
+ * this completion's `process_message` started, so the policy only ever orders
+ * messages that provably belong to the caller's own submission.
  */
 import { UpstreamError, isUpstreamError } from "../collectiviq/errors.js";
 import type { CollectivIQAdapter, UpstreamMessage } from "../collectiviq/types.js";
@@ -88,16 +90,33 @@ function outranks(a: Candidate, b: Candidate): boolean {
  * `null` when no usable candidate exists, under the deterministic ordering
  * policy. Exposed so the tool engine can read per-source content AND metadata
  * (e.g. `percentUsage`) for consensus voting.
+ *
+ * `combinedRunId` is the run this completion's `process_message` returned, and a
+ * message is a candidate ONLY when its own normalized `combinedRunId` is exactly
+ * equal to it. This is the authoritative correlation rule and applies to every
+ * completion, not just a reused thread: upstream message ORDERING and PAGINATION
+ * are unverified (specification section 35, items 7 and 8), so position, recency,
+ * and snapshot completeness prove nothing about which run produced an entry —
+ * only the run id does. A message whose run id is `null` (the entry named no run)
+ * or different can therefore never win, and a thread that produces no correlated
+ * message simply yields no answer and the caller times out.
+ *
+ * The filter is applied while COLLECTING candidates rather than to an already
+ * chosen winner. Ranking first would let a foreign-run message that outranks this
+ * run's answer take the top slot, be rejected, and starve a perfectly good answer
+ * sitting in the same snapshot.
  */
 export function selectWinningMessage(
   messages: readonly UpstreamMessage[],
   source: string,
+  combinedRunId: string,
 ): UpstreamMessage | null {
   let best: Candidate | null = null;
   for (let index = 0; index < messages.length; index += 1) {
     const message = messages[index];
     if (message === undefined) continue;
     if (message.source !== source) continue;
+    if (message.combinedRunId !== combinedRunId) continue;
     const content = message.content;
     if (typeof content !== "string" || content.trim().length === 0) continue;
     const candidate: Candidate = {
@@ -113,14 +132,16 @@ export function selectWinningMessage(
 }
 
 /**
- * Select the single answer for `answerSource`, or `null` when no usable candidate
- * exists. Returns the original (untrimmed) content of the winning candidate.
+ * Select the single answer for `answerSource` produced by run `combinedRunId`, or
+ * `null` when no usable candidate exists. Returns the original (untrimmed)
+ * content of the winning candidate.
  */
 export function selectAnswer(
   messages: readonly UpstreamMessage[],
   answerSource: string,
+  combinedRunId: string,
 ): string | null {
-  const winner = selectWinningMessage(messages, answerSource);
+  const winner = selectWinningMessage(messages, answerSource, combinedRunId);
   return winner === null ? null : winner.content;
 }
 
@@ -210,7 +231,9 @@ export function createPoller(adapter: CollectivIQAdapter, seams: PollerSeams = {
         // result: a response that arrived at or after the deadline is a timeout,
         // never a successful completion.
         if (clock.nowMs() >= params.deadlineMs) return { kind: "timeout" };
-        const answer = selectAnswer(messages, params.answerSource);
+        // Only a message this run produced may be selected, so an earlier turn's
+        // answer in a reused thread — or any unrelated entry — can never win.
+        const answer = selectAnswer(messages, params.answerSource, params.combinedRunId);
         // Return the full validated snapshot alongside the selected desired-source
         // answer so the tool engine can parse/vote over per-source candidates.
         if (answer !== null) return { kind: "answer", content: answer, messages };

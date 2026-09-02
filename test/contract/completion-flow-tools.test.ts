@@ -23,6 +23,13 @@ const auth = { authorization: `Bearer ${GATEWAY_KEY}` };
 const url = "/v1/chat/completions";
 const SENTINEL = "SENTINEL_TOOL_SCHEMA_7f3a";
 
+/**
+ * The synthetic run id the mock upstream reports from `process_message` and
+ * echoes on the entries it returns. Both the desired-source answer and the
+ * per-source consensus candidates are correlated to this run.
+ */
+const RUN_ID = "synthetic-run-tools-flow";
+
 const TOOLS_MODEL: VirtualModel = {
   id: "collectiviq-claude-tools",
   displayName: "Tools",
@@ -61,6 +68,8 @@ function configFor(baseUrl: string): AppConfig {
     RATE_LIMIT_REQUESTS: 60,
     RATE_LIMIT_WINDOW_MS: 60_000,
     RATE_LIMIT_BURST: 8,
+    OPENCODE_THREAD_REUSE_ENABLED: false,
+    OPENCODE_THREAD_REUSE_TTL_MS: 604_800_000,
     models: [TOOLS_MODEL],
   };
 }
@@ -127,9 +136,12 @@ describe("completion flow — emulated tool calls", () => {
   it("parses an upstream tool envelope into OpenAI tool_calls with one create + one submit", async () => {
     const server = await startWith({
       "/create_thread": (_req, res) => void replyJson(res, { thread_id: 7 }),
-      "/process_message": (_req, res) => void replyJson(res, { status: "ok" }, 202),
+      "/process_message": (_req, res) =>
+        void replyJson(res, { status: "ok", combined_run_id: RUN_ID }, 202),
       "/get_messages": (_req, res) =>
-        void replyJson(res, { messages: [{ source: "claude", content: envelope }] }),
+        void replyJson(res, {
+          messages: [{ source: "claude", content: envelope, combined_run_id: RUN_ID }],
+        }),
     });
     const response = await server.inject({ method: "POST", url, headers: auth, payload: toolBody });
 
@@ -179,9 +191,12 @@ describe("completion flow — emulated tool calls", () => {
     });
     const server = await startWith({
       "/create_thread": (_req, res) => void replyJson(res, { thread_id: 8 }),
-      "/process_message": (_req, res) => void replyJson(res, { status: "ok" }, 202),
+      "/process_message": (_req, res) =>
+        void replyJson(res, { status: "ok", combined_run_id: RUN_ID }, 202),
       "/get_messages": (_req, res) =>
-        void replyJson(res, { messages: [{ source: "claude", content: finalEnvelope }] }),
+        void replyJson(res, {
+          messages: [{ source: "claude", content: finalEnvelope, combined_run_id: RUN_ID }],
+        }),
     });
     const response = await server.inject({
       method: "POST",
@@ -207,14 +222,58 @@ describe("completion flow — emulated tool calls", () => {
     });
     const server = await startWith({
       "/create_thread": (_req, res) => void replyJson(res, { thread_id: 9 }),
-      "/process_message": (_req, res) => void replyJson(res, { status: "ok" }, 202),
+      "/process_message": (_req, res) =>
+        void replyJson(res, { status: "ok", combined_run_id: RUN_ID }, 202),
       "/get_messages": (_req, res) =>
-        void replyJson(res, { messages: [{ source: "claude", content: finalEnvelope }] }),
+        void replyJson(res, {
+          messages: [{ source: "claude", content: finalEnvelope, combined_run_id: RUN_ID }],
+        }),
     });
     const response = await server.inject({ method: "POST", url, headers: auth, payload: toolBody });
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({
       choices: [{ message: { content: "here is the answer" }, finish_reason: "stop" }],
     });
+  });
+
+  it("ignores a tool envelope left over from an earlier run of the same thread", async () => {
+    // The tool path reads the SAME snapshot the poller ranked, so a stale
+    // envelope — here a syntactically perfect tool call from a previous turn —
+    // must be ineligible for both the desired answer and consensus voting.
+    const staleEnvelope = JSON.stringify({
+      gateway_protocol: "1.0",
+      type: "tool_calls",
+      calls: [{ name: "read", arguments: { path: "STALE_PATH_FROM_EARLIER_RUN" } }],
+    });
+    const server = await startWith({
+      "/create_thread": (_req, res) => void replyJson(res, { thread_id: 10 }),
+      "/process_message": (_req, res) =>
+        void replyJson(res, { status: "ok", combined_run_id: RUN_ID }, 202),
+      "/get_messages": (_req, res) =>
+        void replyJson(res, {
+          messages: [
+            {
+              source: "claude",
+              content: staleEnvelope,
+              create_time: "2026-08-11T10:00:00Z",
+              combined_run_id: "synthetic-run-earlier-turn",
+            },
+            { source: "claude", content: envelope, combined_run_id: RUN_ID },
+          ],
+        }),
+    });
+    const response = await server.inject({ method: "POST", url, headers: auth, payload: toolBody });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      choices: [
+        {
+          message: {
+            tool_calls: [{ function: { name: "read", arguments: '{"path":"src/index.ts"}' } }],
+          },
+          finish_reason: "tool_calls",
+        },
+      ],
+    });
+    expect(response.body).not.toContain("STALE_PATH_FROM_EARLIER_RUN");
   });
 });

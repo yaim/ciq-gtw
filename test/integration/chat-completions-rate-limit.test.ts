@@ -22,7 +22,7 @@ import {
   type ChatCompletionRequestContext,
   type ChatCompletionService,
   type CompletionResult,
-  type CompletionRunHooks,
+  type CompletionRunOptions,
   type PreparedCompletion,
 } from "../../src/generation/chat-completion.js";
 import type { Clock, Sleeper } from "../../src/generation/types.js";
@@ -116,6 +116,8 @@ function makeConfig(over: Partial<AppConfig> = {}): AppConfig {
     RATE_LIMIT_REQUESTS: 60,
     RATE_LIMIT_WINDOW_MS: 60_000,
     RATE_LIMIT_BURST: 8,
+    OPENCODE_THREAD_REUSE_ENABLED: false,
+    OPENCODE_THREAD_REUSE_TTL_MS: 604_800_000,
     models: [model("collectiviq-consensus")],
     ...over,
   };
@@ -124,7 +126,7 @@ function makeConfig(over: Partial<AppConfig> = {}): AppConfig {
 type RunFn = (
   prepared: PreparedCompletion,
   signal: AbortSignal,
-  hooks?: CompletionRunHooks,
+  hooks?: CompletionRunOptions,
 ) => Promise<CompletionResult>;
 
 interface Harness {
@@ -235,7 +237,12 @@ function use(harness: Harness): Harness {
 
 const succeeds: RunFn = async (_prepared, signal, hooks) => {
   await hooks?.onCapacityAcquired?.(signal);
-  return { kind: "text", content: ANSWER, upstreamThreadId: THREAD_ID };
+  return {
+    kind: "text",
+    content: ANSWER,
+    upstreamThreadId: THREAD_ID,
+    upstreamThreadCreated: true,
+  };
 };
 
 function body(over: Record<string, unknown> = {}): Record<string, unknown> {
@@ -693,7 +700,12 @@ describe("rate limiting: what does and does not consume quota", () => {
       build(async (_prepared, signal, hooks) => {
         await hooks?.onCapacityAcquired?.(signal);
         await gate;
-        return { kind: "text", content: ANSWER, upstreamThreadId: THREAD_ID };
+        return {
+          kind: "text",
+          content: ANSWER,
+          upstreamThreadId: THREAD_ID,
+          upstreamThreadCreated: true,
+        };
       }),
     );
     const headers = { ...authA, "idempotency-key": IDEMPOTENCY_KEY };

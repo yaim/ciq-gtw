@@ -10,10 +10,19 @@
  *    no upstream call and takes no capacity. A prepare failure (e.g. an
  *    oversized prompt) throws a {@link ChatCompletionError} and therefore keeps a
  *    normal JSON error status — SSE headers are never committed for it.
- *  - `run` executes the stateless per-completion flow: acquire capacity → create
- *    exactly one thread → submit exactly once → poll → select text. Capacity is
- *    acquired BEFORE thread creation and released on every exit path.
+ *  - `run` executes the per-completion flow: acquire capacity → obtain exactly
+ *    one thread → submit exactly once → poll → select text. Capacity is acquired
+ *    BEFORE thread creation and released on every exit path.
  *    `create_thread`/`process_message` are never retried.
+ *
+ * The default is STATELESS: every completion creates its own thread. A caller
+ * that has already leased an OpenCode session's thread (Phase 5A, specification
+ * section 5.1.1) may instead supply it through
+ * {@link CompletionRunOptions.leasedThreadId}, in which case no thread is
+ * created. Either way the poll accepts only messages carrying the run id this
+ * completion's `process_message` returned, so a thread holding earlier turns is
+ * no less safe than a fresh one. Nothing in this module knows how that lease is
+ * stored or coordinated.
  *
  * `run` returns only TRUSTED completed text (a {@link CompletionResult}); the
  * caller owns JSON versus SSE encoding. The service depends only on normalized
@@ -36,6 +45,7 @@ import {
   GATEWAY_CAPACITY_EXCEEDED_ERROR,
   INVALID_TOOL_RESPONSE_ERROR,
   openAIErrorForUpstream,
+  THREAD_REUSE_UNAVAILABLE_ERROR,
   type OpenAIApiError,
 } from "../openai/errors.js";
 import {
@@ -173,27 +183,44 @@ export interface PreparedCompletion {
 }
 
 /**
- * The trusted result of a completed generation: either parsed assistant text or
- * validated tool calls (specification section 8.7). Both variants carry the
- * upstream thread id used ONLY for process-local native-title correlation (see
- * `src/opencode/title-bridge.ts`); it is NEVER exposed in the OpenAI JSON/SSE.
+ * Trusted internal metadata about the upstream thread a completion used. It is
+ * consumed ONLY inside the process — by native-title correlation and by the
+ * thread-reuse coordinator — and is NEVER exposed in the OpenAI JSON/SSE.
  */
-export type CompletionResult =
-  | { readonly kind: "text"; readonly content: string; readonly upstreamThreadId: string }
-  | {
-      readonly kind: "tool_calls";
-      readonly toolCalls: readonly ParsedToolCall[];
-      readonly upstreamThreadId: string;
-    };
+interface UpstreamThreadInfo {
+  /** The normalized upstream thread id (see `src/opencode/title-bridge.ts`). */
+  readonly upstreamThreadId: string;
+  /**
+   * Whether THIS completion created that thread (Phase 5A). `false` means the
+   * completion continued a thread an earlier turn of the same OpenCode session
+   * created, in which case native-title propagation must not be registered
+   * again — the provider generates its title once, for the first turn.
+   */
+  readonly upstreamThreadCreated: boolean;
+}
 
 /**
- * Optional lifecycle hooks observed by {@link ChatCompletionService.run}.
- *
- * They exist so a cross-cutting concern (currently only Redis-backed
- * idempotency, specification section 18) can interpose at an exact point in the
- * flow WITHOUT the generation layer learning anything about that concern.
+ * The trusted result of a completed generation: either parsed assistant text or
+ * validated tool calls (specification section 8.7). Both variants carry the
+ * internal upstream-thread metadata described by {@link UpstreamThreadInfo}.
  */
-export interface CompletionRunHooks {
+export type CompletionResult =
+  | ({ readonly kind: "text"; readonly content: string } & UpstreamThreadInfo)
+  | ({
+      readonly kind: "tool_calls";
+      readonly toolCalls: readonly ParsedToolCall[];
+    } & UpstreamThreadInfo);
+
+/**
+ * Optional per-run inputs observed by {@link ChatCompletionService.run}.
+ *
+ * The lifecycle hooks exist so a cross-cutting concern — Redis-backed
+ * idempotency (specification section 18) and OpenCode thread reuse (section
+ * 5.1.1) — can interpose at an exact point in the flow WITHOUT the generation
+ * layer learning anything about that concern. Omitting the whole object keeps
+ * the stateless one-thread-per-completion default byte-for-byte unchanged.
+ */
+export interface CompletionRunOptions {
   /**
    * Invoked once, AFTER the capacity permit is acquired and BEFORE
    * `create_thread`. A rejection aborts the completion: the permit is released
@@ -202,6 +229,31 @@ export interface CompletionRunHooks {
    * propagates to the route's fixed `500`.
    */
   readonly onCapacityAcquired?: (signal: AbortSignal) => Promise<void>;
+  /**
+   * Invoked once, immediately AFTER a successful `create_thread` and BEFORE any
+   * other upstream call, with the normalized thread id. A rejection aborts the
+   * completion before `process_message`, so the newly created thread is left
+   * blank and is deliberately not deleted (its id has no proven-safe deletion
+   * semantics — specification section 35, item 9). Never invoked when
+   * {@link CompletionRunOptions.leasedThreadId} supplied a thread.
+   */
+  readonly onThreadCreated?: (threadId: string, signal: AbortSignal) => Promise<void>;
+  /**
+   * Invoked once, immediately BEFORE `process_message` — after the thread
+   * exists. A rejection aborts the completion with no submit having been
+   * attempted, which is what lets the caller distinguish a provably-not-submitted
+   * failure from an ambiguous one.
+   */
+  readonly onBeforeSubmit?: (signal: AbortSignal) => Promise<void>;
+  /**
+   * An already-leased upstream thread to CONTINUE instead of creating one
+   * (Phase 5A). When present, `create_thread` is not called and the result
+   * reports `upstreamThreadCreated: false`. A reused thread needs no special
+   * read of its earlier turns: selection is correlated to the run this
+   * completion's `process_message` returns, so a previous turn's answer is
+   * ineligible by construction.
+   */
+  readonly leasedThreadId?: string;
 }
 
 /** The narrow completion use case consumed by the route (prepare then run). */
@@ -215,16 +267,18 @@ export interface ChatCompletionService {
   prepare(ctx: ChatCompletionRequestContext): PreparedCompletion;
   /**
    * Execute the prepared completion: acquire capacity, run any
-   * {@link CompletionRunHooks.onCapacityAcquired} hook, create exactly one
-   * thread, submit once, poll under the model's total deadline, and return the
-   * trusted answer text. Throws a {@link ChatCompletionError} (public envelope)
-   * or {@link RequestCancelledError} (client/shutdown abort); an unexpected
-   * error propagates unmapped.
+   * {@link CompletionRunOptions.onCapacityAcquired} hook, obtain exactly one
+   * thread (created, or continued from
+   * {@link CompletionRunOptions.leasedThreadId}), submit once, poll under the
+   * model's total deadline, and return the trusted answer text. Throws a
+   * {@link ChatCompletionError} (public envelope) or
+   * {@link RequestCancelledError} (client/shutdown abort); an unexpected error
+   * propagates unmapped.
    */
   run(
     prepared: PreparedCompletion,
     signal: AbortSignal,
-    hooks?: CompletionRunHooks,
+    options?: CompletionRunOptions,
   ): Promise<CompletionResult>;
 }
 
@@ -274,7 +328,7 @@ export function createChatCompletionService(deps: ChatCompletionDeps): ChatCompl
     async run(
       prepared: PreparedCompletion,
       signal: AbortSignal,
-      hooks: CompletionRunHooks = {},
+      options: CompletionRunOptions = {},
     ): Promise<CompletionResult> {
       const model = prepared.policy;
 
@@ -308,46 +362,93 @@ export function createChatCompletionService(deps: ChatCompletionDeps): ChatCompl
           // Capacity is held. Any lifecycle hook runs HERE — before the first
           // upstream call — so a hook failure releases the permit on the normal
           // exit path below and no thread is ever created.
-          if (hooks.onCapacityAcquired !== undefined) {
-            await hooks.onCapacityAcquired(combined);
+          if (options.onCapacityAcquired !== undefined) {
+            await options.onCapacityAcquired(combined);
           }
-          // Create exactly one thread, submit exactly once, then poll.
-          const thread = await deps.adapter.createThread({
-            title: THREAD_TITLE,
-            signal: combined,
-          });
-          await deps.adapter.processMessage({
-            threadId: thread.threadId,
+
+          // Obtain exactly one thread: continue the leased one (Phase 5A) or
+          // create a new one. Either way `create_thread` runs at most once and
+          // is never retried.
+          const leasedThreadId = options.leasedThreadId;
+          const reused = leasedThreadId !== undefined;
+          // Structural guard for the invariant below: a caller that manages a
+          // mapping (it leased a thread, or wants to bind a created one) must
+          // also own the pre-submit transition. Refuse to submit otherwise
+          // rather than leave the mapping in a state another owner can take.
+          if (
+            (reused || options.onThreadCreated !== undefined) &&
+            options.onBeforeSubmit === undefined
+          ) {
+            throw new ChatCompletionError(THREAD_REUSE_UNAVAILABLE_ERROR);
+          }
+          let threadId: string;
+          if (leasedThreadId !== undefined) {
+            threadId = leasedThreadId;
+          } else {
+            const thread = await deps.adapter.createThread({
+              title: THREAD_TITLE,
+              signal: combined,
+            });
+            threadId = thread.threadId;
+            // The caller binds the new thread to its mapping BEFORE any submit,
+            // so a failure here leaves a blank thread rather than an untracked
+            // conversation.
+            if (options.onThreadCreated !== undefined) {
+              await options.onThreadCreated(threadId, combined);
+            }
+          }
+
+          // A leased thread MUST pass through the caller's pre-submit
+          // transition. Without it the mapping would still read `reserved`
+          // while this request submits, and an expired reserved lease is
+          // takeable — so a second owner could submit into the same thread.
+          if (options.onBeforeSubmit !== undefined) {
+            await options.onBeforeSubmit(combined);
+          }
+
+          // The submit answers with the run it started. That id is the ONLY
+          // thing that later proves a polled message belongs to this completion,
+          // so it is carried straight into the poll and into tool-consensus
+          // selection; it is never logged, retained, or exposed.
+          const submitted = await deps.adapter.processMessage({
+            threadId,
             prompt: prepared.prompt,
             selectedLlms: model.selectedLlms,
             generateCombined: model.generateCombined,
             signal: combined,
           });
           const outcome = await deps.poller.poll({
-            threadId: thread.threadId,
+            threadId,
             answerSource: model.answerSource,
             pollIntervalMs: model.pollIntervalMs,
             maxPollIntervalMs: model.maxPollIntervalMs,
             deadlineMs,
             signal: combined,
+            combinedRunId: submitted.combinedRunId,
           });
           if (outcome.kind === "timeout") {
             throw new ChatCompletionError(COMPLETION_TIMEOUT_ERROR);
           }
           // The thread id is carried out ONLY for process-local native-title
-          // correlation; it never enters the public JSON/SSE response.
-          const threadId = thread.threadId;
+          // correlation and thread reuse; it never enters the public JSON/SSE.
+          const threadInfo = {
+            upstreamThreadId: threadId,
+            upstreamThreadCreated: !reused,
+          } as const;
 
           // Text mode (no active tools): return the desired-source answer.
           const toolContext = prepared.toolContext;
           if (toolContext === undefined) {
-            return { kind: "text", content: outcome.content, upstreamThreadId: threadId };
+            return { kind: "text", content: outcome.content, ...threadInfo };
           }
 
           // Emulated tool mode: parse/vote over the validated message snapshot.
           const individuals: SourceCandidate[] = [];
           for (const source of prepared.selectedLlms) {
-            const message = selectWinningMessage(outcome.messages, source);
+            // Consensus reads the same snapshot the poller ranked, so it applies
+            // the same run correlation: a stale individual from an earlier turn
+            // must never get a vote.
+            const message = selectWinningMessage(outcome.messages, source, submitted.combinedRunId);
             if (message !== null && typeof message.content === "string") {
               individuals.push({
                 source,
@@ -374,13 +475,13 @@ export function createChatCompletionService(deps: ChatCompletionDeps): ChatCompl
             return {
               kind: "tool_calls",
               toolCalls: selection.generation.calls,
-              upstreamThreadId: threadId,
+              ...threadInfo,
             };
           }
           return {
             kind: "text",
             content: selection.generation.content,
-            upstreamThreadId: threadId,
+            ...threadInfo,
           };
         } finally {
           acquisition.permit.release();

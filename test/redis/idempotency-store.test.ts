@@ -109,6 +109,8 @@ function appConfig(): AppConfig {
     RATE_LIMIT_REQUESTS: 60,
     RATE_LIMIT_WINDOW_MS: 60_000,
     RATE_LIMIT_BURST: 8,
+    OPENCODE_THREAD_REUSE_ENABLED: false,
+    OPENCODE_THREAD_REUSE_TTL_MS: 604_800_000,
     models: [
       {
         id: "collectiviq-consensus",
@@ -726,7 +728,12 @@ describe("real Redis: the full HTTP route against a real Redis", () => {
           run: async (_prepared, signal, hooks) => {
             runs += 1;
             await hooks?.onCapacityAcquired?.(signal);
-            return { kind: "text", content: ANSWER_SENTINEL, upstreamThreadId: THREAD_SENTINEL };
+            return {
+              kind: "text",
+              content: ANSWER_SENTINEL,
+              upstreamThreadId: THREAD_SENTINEL,
+              upstreamThreadCreated: true,
+            };
           },
         },
         titleBridge: {

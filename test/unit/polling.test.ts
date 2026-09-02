@@ -8,6 +8,12 @@ import type {
 } from "../../src/collectiviq/types.js";
 import type { Clock, PollParams, Sleeper } from "../../src/generation/types.js";
 
+/** The run id THIS completion's `process_message` returned. */
+const RUN = "run-current";
+/** Any other run: an earlier turn of the same thread, or unrelated content. */
+const OTHER_RUN = "run-earlier";
+
+/** A message from the CURRENT run unless `extra` overrides `combinedRunId`. */
 function msg(
   source: string,
   content: string | null,
@@ -19,6 +25,7 @@ function msg(
     percentUsage: null,
     createdAt: null,
     id: null,
+    combinedRunId: RUN,
     ...extra,
   };
 }
@@ -78,23 +85,24 @@ function params(overrides: Partial<PollParams> = {}): PollParams {
     maxPollIntervalMs: 500,
     deadlineMs: 10_000,
     signal: new AbortController().signal,
+    combinedRunId: RUN,
     ...overrides,
   };
 }
 
 describe("selectAnswer", () => {
   it("returns null when no message matches the exact source", () => {
-    expect(selectAnswer([msg("other", "hi")], "gpt")).toBeNull();
-    expect(selectAnswer([], "gpt")).toBeNull();
+    expect(selectAnswer([msg("other", "hi")], "gpt", RUN)).toBeNull();
+    expect(selectAnswer([], "gpt", RUN)).toBeNull();
   });
 
   it("ignores wrong-source and empty-content messages", () => {
     const messages = [msg("other", "wrong"), msg("gpt", "   "), msg("gpt", null), msg("gpt", "ok")];
-    expect(selectAnswer(messages, "gpt")).toBe("ok");
+    expect(selectAnswer(messages, "gpt", RUN)).toBe("ok");
   });
 
   it("returns the original untrimmed content", () => {
-    expect(selectAnswer([msg("gpt", "  padded  ")], "gpt")).toBe("  padded  ");
+    expect(selectAnswer([msg("gpt", "  padded  ")], "gpt", RUN)).toBe("  padded  ");
   });
 
   it("selects the latest valid timestamp", () => {
@@ -103,12 +111,12 @@ describe("selectAnswer", () => {
       msg("gpt", "new", { createdAt: 300 }),
       msg("gpt", "mid", { createdAt: "1970-01-01T00:00:00.200Z" }),
     ];
-    expect(selectAnswer(messages, "gpt")).toBe("new");
+    expect(selectAnswer(messages, "gpt", RUN)).toBe("new");
   });
 
   it("prefers a candidate with a valid timestamp over one without", () => {
     const messages = [msg("gpt", "no-ts", { id: 999 }), msg("gpt", "has-ts", { createdAt: 5 })];
-    expect(selectAnswer(messages, "gpt")).toBe("has-ts");
+    expect(selectAnswer(messages, "gpt", RUN)).toBe("has-ts");
   });
 
   it("breaks timestamp ties by highest sortable id", () => {
@@ -117,12 +125,12 @@ describe("selectAnswer", () => {
       msg("gpt", "b", { createdAt: 100, id: "42" }),
       msg("gpt", "c", { createdAt: 100, id: 7 }),
     ];
-    expect(selectAnswer(messages, "gpt")).toBe("b");
+    expect(selectAnswer(messages, "gpt", RUN)).toBe("b");
   });
 
   it("breaks full ties by last occurrence", () => {
     const messages = [msg("gpt", "first"), msg("gpt", "second"), msg("gpt", "third")];
-    expect(selectAnswer(messages, "gpt")).toBe("third");
+    expect(selectAnswer(messages, "gpt", RUN)).toBe("third");
   });
 
   it("does not throw or let invalid metadata win by accident", () => {
@@ -133,7 +141,7 @@ describe("selectAnswer", () => {
       msg("gpt", "huge-id", { id: "999999999999999999999999" }),
     ];
     // Only the candidate with a valid timestamp should win.
-    expect(selectAnswer(messages, "gpt")).toBe("valid");
+    expect(selectAnswer(messages, "gpt", RUN)).toBe("valid");
   });
 });
 
@@ -374,5 +382,88 @@ describe("createPoller", () => {
     expect(outcome).toEqual({ kind: "timeout" });
     // First sleep 100 (now=100), second clamped to remaining 50 (now=150), then timeout.
     expect(sleeps).toEqual([100, 50]);
+  });
+});
+
+describe("run correlation (specification §8.6)", () => {
+  it("never returns a message produced by a different run", () => {
+    // A reused thread still holds every earlier turn, and the ordinary policy
+    // would happily return the previous turn's answer the instant polling starts.
+    const previousTurn = msg("gpt", "the PREVIOUS answer", {
+      id: 1,
+      createdAt: 100,
+      combinedRunId: OTHER_RUN,
+    });
+    const thisTurn = msg("gpt", "the new answer", { id: 2, createdAt: 200 });
+    expect(selectAnswer([previousTurn], "gpt", RUN)).toBeNull();
+    expect(selectAnswer([previousTurn, thisTurn], "gpt", RUN)).toBe("the new answer");
+    // The same snapshot read as the EARLIER run resolves to the earlier answer,
+    // proving the rule is the run id itself and not position or recency.
+    expect(selectAnswer([previousTurn, thisTurn], "gpt", OTHER_RUN)).toBe("the PREVIOUS answer");
+  });
+
+  it("never returns a message that names no run", () => {
+    // Null is not "unknown, probably ours": an entry that cannot name its run is
+    // indistinguishable from an earlier turn's, so it is never gambled on.
+    const unnamed = msg("gpt", "unattributable", { id: 9, combinedRunId: null });
+    expect(selectAnswer([unnamed], "gpt", RUN)).toBeNull();
+  });
+
+  it("compares the run id by exact equality", () => {
+    // No prefix, substring, or loose comparison: a near-miss id names a different
+    // run, and treating it as this one would reintroduce exactly the stale-answer
+    // bug correlation exists to prevent.
+    const longer = msg("gpt", "suffixed", { id: 1, combinedRunId: `${RUN}-2` });
+    const shorter = msg("gpt", "truncated", { id: 2, combinedRunId: RUN.slice(0, 4) });
+    expect(selectAnswer([longer, shorter], "gpt", RUN)).toBeNull();
+  });
+
+  it("filters CANDIDATES, not just the winner", () => {
+    // MUTATION GUARD. Ranking first and then rejecting a foreign-run winner would
+    // look equivalent but is not: a stale message that OUTRANKS this run's answer
+    // would take the top slot, be rejected, and the run would time out forever
+    // even though the answer was sitting right there in the same snapshot.
+    // `outranks` prefers a valid timestamp over none, so a dated OLD message
+    // beats an undated NEW one — exactly the case that breaks winner-filtering.
+    const oldDated = msg("gpt", "the PREVIOUS answer", {
+      id: 1,
+      createdAt: 100,
+      combinedRunId: OTHER_RUN,
+    });
+    const newUndated = msg("gpt", "the new answer", { id: 2 });
+    // Confirm the trap is real: judged by the ordering policy alone, the stale
+    // message wins.
+    expect(selectAnswer([oldDated, newUndated], "gpt", OTHER_RUN)).toBe("the PREVIOUS answer");
+    expect(selectAnswer([oldDated, newUndated], "gpt", RUN)).toBe("the new answer");
+  });
+
+  it("still applies the deterministic ordering policy among same-run candidates", () => {
+    const messages = [
+      msg("gpt", "another run", { id: 9, createdAt: 900, combinedRunId: OTHER_RUN }),
+      msg("gpt", "no run", { id: 8, createdAt: 800, combinedRunId: null }),
+      msg("gpt", "earlier", { id: 2, createdAt: 200 }),
+      msg("gpt", "latest", { id: 3, createdAt: 300 }),
+      msg("claude", "other source", { id: 4, createdAt: 400 }),
+    ];
+    expect(selectAnswer(messages, "gpt", RUN)).toBe("latest");
+  });
+
+  it("times out rather than returning a prior turn's answer", async () => {
+    const stale = msg("gpt", "the PREVIOUS answer", { id: 1, combinedRunId: OTHER_RUN });
+    const { adapter } = makeAdapter([[stale], [stale], [stale]]);
+    const { clock, sleep } = timeSeam();
+    const poller = createPoller(adapter, { clock, sleep, random: () => 0.5 });
+    const outcome = await poller.poll(params({ deadlineMs: 1_200 }));
+    expect(outcome).toEqual({ kind: "timeout" });
+  });
+
+  it("returns this run's answer as soon as it appears", async () => {
+    const stale = msg("gpt", "the PREVIOUS answer", { id: 1, combinedRunId: OTHER_RUN });
+    const fresh = msg("gpt", "the new answer", { id: 2 });
+    const { adapter } = makeAdapter([[stale], [stale, fresh]]);
+    const { clock, sleep } = timeSeam();
+    const poller = createPoller(adapter, { clock, sleep, random: () => 0.5 });
+    const outcome = await poller.poll(params());
+    expect(outcome).toMatchObject({ kind: "answer", content: "the new answer" });
   });
 });

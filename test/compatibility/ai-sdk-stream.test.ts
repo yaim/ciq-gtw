@@ -71,6 +71,8 @@ function config(): AppConfig {
     RATE_LIMIT_REQUESTS: 60,
     RATE_LIMIT_WINDOW_MS: 60_000,
     RATE_LIMIT_BURST: 8,
+    OPENCODE_THREAD_REUSE_ENABLED: false,
+    OPENCODE_THREAD_REUSE_TTL_MS: 604_800_000,
     models: [MODEL],
   };
 }
@@ -87,7 +89,12 @@ const fakeService: ChatCompletionService = {
     keyId: ctx.keyId,
   }),
   run: (): Promise<CompletionResult> =>
-    Promise.resolve({ kind: "text", upstreamThreadId: "thread-test", content: ANSWER }),
+    Promise.resolve({
+      kind: "text",
+      upstreamThreadId: "thread-test",
+      upstreamThreadCreated: true,
+      content: ANSWER,
+    }),
 };
 
 /** A no-op title bridge: the compatibility suite does not exercise native titles. */

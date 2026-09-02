@@ -61,6 +61,8 @@ function makeConfig(): AppConfig {
     RATE_LIMIT_REQUESTS: 60,
     RATE_LIMIT_WINDOW_MS: 60_000,
     RATE_LIMIT_BURST: 8,
+    OPENCODE_THREAD_REUSE_ENABLED: false,
+    OPENCODE_THREAD_REUSE_TTL_MS: 604_800_000,
     models: [
       model("collectiviq-consensus"),
       model("collectiviq-claude-direct", { promptMode: "direct" }),
@@ -139,7 +141,12 @@ function jsonEvents(body: string): unknown[] {
 describe("POST /v1/chat/completions — synthetic SSE success", () => {
   it("streams role → content → terminal → [DONE] with a stable identity", async () => {
     app = build(() =>
-      Promise.resolve({ kind: "text", upstreamThreadId: "thread-test", content: "Hello, world" }),
+      Promise.resolve({
+        kind: "text",
+        upstreamThreadId: "thread-test",
+        upstreamThreadCreated: true,
+        content: "Hello, world",
+      }),
     );
     const res = await app.inject({ method: "POST", url, headers: auth, payload: streamBody });
 
@@ -183,7 +190,12 @@ describe("POST /v1/chat/completions — synthetic SSE success", () => {
 
   it("emits role, terminal, and [DONE] but no content frame for an empty answer", async () => {
     app = build(() =>
-      Promise.resolve({ kind: "text", upstreamThreadId: "thread-test", content: "" }),
+      Promise.resolve({
+        kind: "text",
+        upstreamThreadId: "thread-test",
+        upstreamThreadCreated: true,
+        content: "",
+      }),
     );
     const res = await app.inject({ method: "POST", url, headers: auth, payload: streamBody });
     expect(res.statusCode).toBe(200);
@@ -198,7 +210,12 @@ describe("POST /v1/chat/completions — synthetic SSE success", () => {
 
   it("emits the ignored-parameters header on the streamed response", async () => {
     app = build(() =>
-      Promise.resolve({ kind: "text", upstreamThreadId: "thread-test", content: "hi" }),
+      Promise.resolve({
+        kind: "text",
+        upstreamThreadId: "thread-test",
+        upstreamThreadCreated: true,
+        content: "hi",
+      }),
     );
     const res = await app.inject({
       method: "POST",
@@ -224,7 +241,12 @@ describe("POST /v1/chat/completions — tool metadata on the stream path", () =>
 
   it("tolerates tool metadata and streams ordinary text with the ignored header", async () => {
     app = build(() =>
-      Promise.resolve({ kind: "text", upstreamThreadId: "thread-test", content: "Hello, world" }),
+      Promise.resolve({
+        kind: "text",
+        upstreamThreadId: "thread-test",
+        upstreamThreadCreated: true,
+        content: "Hello, world",
+      }),
     );
     const res = await app.inject({
       method: "POST",
@@ -253,6 +275,7 @@ describe("POST /v1/chat/completions — tool metadata on the stream path", () =>
       return Promise.resolve({
         kind: "text",
         upstreamThreadId: "thread-test",
+        upstreamThreadCreated: true,
         content: "unreachable",
       });
     });
@@ -346,7 +369,12 @@ describe("POST /v1/chat/completions — preparation errors stay pre-header JSON 
   it("returns a JSON 400 (not SSE) when prepare rejects an oversized prompt", async () => {
     app = build(
       () =>
-        Promise.resolve({ kind: "text", upstreamThreadId: "thread-test", content: "unreachable" }),
+        Promise.resolve({
+          kind: "text",
+          upstreamThreadId: "thread-test",
+          upstreamThreadCreated: true,
+          content: "unreachable",
+        }),
       () => {
         throw new ChatCompletionError(CONTEXT_LENGTH_EXCEEDED_ERROR);
       },
@@ -365,6 +393,7 @@ describe("POST /v1/chat/completions — preparation errors stay pre-header JSON 
       return Promise.resolve({
         kind: "text",
         upstreamThreadId: "thread-test",
+        upstreamThreadCreated: true,
         content: "unreachable",
       });
     });

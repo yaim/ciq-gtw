@@ -11,7 +11,10 @@
  *  - Stores ONLY the two opaque ids plus the upstream thread id — never a title,
  *    prompt, or answer. A fetched title is returned to the caller and never cached.
  *  - Keyed by `gatewayKeyId + sessionId`; first registration wins (a later
- *    completion for the same session never replaces the mapping).
+ *    completion for the same session never replaces the mapping). With optional
+ *    thread reuse enabled (specification §5.1.1) the route registers ONLY for the
+ *    turn that CREATED the upstream thread, since the provider generates its
+ *    native title once and a continuing turn has nothing new to propagate.
  *  - TTL 60 s with lazy expiry (a bounded sweep on registration; no per-entry
  *    timer). Global cap 128 entries, per-key cap 32; when full, registration is
  *    silently skipped and the completion still succeeds.

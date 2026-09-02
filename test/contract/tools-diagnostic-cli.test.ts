@@ -67,6 +67,13 @@ import type { Poller } from "../../src/generation/types.js";
 const CRED_SENTINEL = "SECRET-DIAGNOSTIC-PASSWORD-4a7e";
 const OK: DeleteDiagnostics = { ok: true, status: 200, errorCode: null };
 
+/**
+ * The synthetic run id the fake upstream reports from `process_message` and
+ * echoes on every message entry, so the real poller can correlate a reply to its
+ * submission. Each round runs against its own fresh thread.
+ */
+const DIAGNOSTIC_RUN_ID = "synthetic-diagnostic-run";
+
 /** Synthetic tool names; the corpus's toolset is exactly these three. */
 const READ = "read";
 const EDIT = "edit";
@@ -203,7 +210,7 @@ function smartAdapter(opts: AdapterOptions = {}): CountingAdapter {
       counts.submits += 1;
       lastPrompt = input.prompt;
       prompts.push(input.prompt);
-      return Promise.resolve({ accepted: true, rawStatus: 202 });
+      return Promise.resolve({ accepted: true, combinedRunId: DIAGNOSTIC_RUN_ID, rawStatus: 202 });
     },
     getMessages: () => {
       counts.polls += 1;
@@ -222,10 +229,18 @@ function smartAdapter(opts: AdapterOptions = {}): CountingAdapter {
           percentUsage: null,
           createdAt: 1,
           id: 1,
+          combinedRunId: DIAGNOSTIC_RUN_ID,
         });
         let id = 2;
         for (const source of opts.round2Individuals) {
-          messages.push({ source, content: envelope, percentUsage: null, createdAt: 1, id });
+          messages.push({
+            source,
+            content: envelope,
+            percentUsage: null,
+            createdAt: 1,
+            id,
+            combinedRunId: DIAGNOSTIC_RUN_ID,
+          });
           id += 1;
         }
       } else {
@@ -235,6 +250,7 @@ function smartAdapter(opts: AdapterOptions = {}): CountingAdapter {
           percentUsage: null,
           createdAt: 1,
           id: 1,
+          combinedRunId: DIAGNOSTIC_RUN_ID,
         });
       }
       return Promise.resolve({ messages, rawStatus: 200 });

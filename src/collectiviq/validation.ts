@@ -87,6 +87,16 @@ export function normalizeCreateThread(json: unknown, rawStatus: number): CreateT
  * success — regardless of the property's value (`null`, `undefined`, empty
  * string, object, or array all count as failure). The raw value is never read
  * or exposed. Unknown fields are otherwise ignored.
+ *
+ * A success additionally REQUIRES a non-empty string `combined_run_id`. That is
+ * the identifier the poller matches against each message entry to prove the
+ * answer it selects was produced by THIS submission; without it a reused thread
+ * would happily return a previous turn's answer, and even a fresh thread would
+ * have no way to reject unrelated content. Failing closed here — before any
+ * polling — is therefore strictly safer than continuing without a correlation
+ * key, and the absent/empty/wrong-typed cases are indistinguishable from the
+ * gateway's side, so all three are one upstream protocol failure. The value
+ * itself is never logged, retained, or surfaced in an error.
  */
 export function normalizeProcessMessage(json: unknown, rawStatus: number): ProcessMessageResult {
   if (!isRecord(json)) throw new UpstreamError("upstream_protocol", rawStatus);
@@ -95,7 +105,11 @@ export function normalizeProcessMessage(json: unknown, rawStatus: number): Proce
     // is not auto-retried, so this is a terminal unexpected upstream failure.
     throw new UpstreamError("unexpected_upstream", rawStatus);
   }
-  return { accepted: true, rawStatus };
+  const combinedRunId = json["combined_run_id"];
+  if (typeof combinedRunId !== "string" || combinedRunId === "") {
+    throw new UpstreamError("upstream_protocol", rawStatus);
+  }
+  return { accepted: true, combinedRunId, rawStatus };
 }
 
 /** Normalize one message entry; returns null when the entry is not an object. */
@@ -138,7 +152,21 @@ function normalizeMessage(raw: unknown): UpstreamMessage | null {
   else if (typeof rawId === "number" && Number.isFinite(rawId)) id = rawId;
   else return null;
 
-  return { source, content, percentUsage, createdAt, id };
+  // The run that produced this entry, observed as `combined_run_id` on message
+  // entries in both 2026-08-11 password baselines — the same safe field name the
+  // `process_message` 202 carries, which is what makes run correlation possible.
+  // Absent/null normalizes to null (an entry that cannot name its run simply
+  // never wins). An EMPTY string is rejected rather than normalized to null: it
+  // is a structurally broken entry, and silently downgrading it would let a
+  // malformed snapshot look like an ordinary un-correlatable one.
+  const rawCombinedRunId = raw["combined_run_id"];
+  let combinedRunId: string | null;
+  if (rawCombinedRunId === undefined || rawCombinedRunId === null) combinedRunId = null;
+  else if (typeof rawCombinedRunId === "string" && rawCombinedRunId !== "")
+    combinedRunId = rawCombinedRunId;
+  else return null;
+
+  return { source, content, percentUsage, createdAt, id, combinedRunId };
 }
 
 /**

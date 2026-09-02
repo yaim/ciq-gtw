@@ -88,6 +88,21 @@ export interface PollParams {
   readonly deadlineMs: number;
   /** Combined client-disconnect + total-deadline + shutdown abort signal. */
   readonly signal: AbortSignal;
+  /**
+   * The `combined_run_id` this completion's `process_message` returned.
+   *
+   * REQUIRED for every poll, not only for a reused thread, so there is exactly
+   * one correctness rule: a message may be selected only when it names this same
+   * run. Upstream message ORDERING and PAGINATION are unverified (specification
+   * section 35, items 7 and 8), so nothing about a message's position or recency
+   * can establish that it belongs to this submission — only the run id can. A
+   * reused thread that still holds every earlier turn is the sharpest case, but
+   * an uncorrelated answer would be just as wrong on a fresh thread.
+   *
+   * When no correlated message arrives before the deadline the run times out
+   * rather than returning older or unrelated thread content.
+   */
+  readonly combinedRunId: string;
 }
 
 /**

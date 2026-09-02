@@ -68,12 +68,23 @@ services:
       RATE_LIMIT_REQUESTS: "${RATE_LIMIT_REQUESTS:-60}"
       RATE_LIMIT_WINDOW_MS: "${RATE_LIMIT_WINDOW_MS:-60000}"
       RATE_LIMIT_BURST: "${RATE_LIMIT_BURST:-8}"
+      # OPTIONAL Redis-backed OpenCode thread reuse (Phase 5A, pulled forward).
+      # Disabled by default, in which case every completion creates its own
+      # CollectivIQ thread and no reuse Redis operation runs at all. Enabling it
+      # REQUIRES REDIS_URL (and therefore IDEMPOTENCY_ENCRYPTION_KEY) above; it
+      # shares that one Redis connection under a separate `:reuse:` key
+      # category. Only direct-prompt, tool-free models with a valid
+      # X-CollectivIQ-OpenCode-Session-ID header are eligible; it is fail-closed
+      # and is NOT production ready (see .env.example).
+      OPENCODE_THREAD_REUSE_ENABLED: "${OPENCODE_THREAD_REUSE_ENABLED:-false}"
+      OPENCODE_THREAD_REUSE_TTL_MS: "${OPENCODE_THREAD_REUSE_TTL_MS:-604800000}"
     volumes:
       # Provide your own model file (copied from config/models.example.yaml).
       - "./config/models.yaml:/app/config/models.yaml:ro"
 
-  # OPT-IN local Redis for idempotency and rate-limit development and manual
-  # testing. One Redis backs both features; the gateway opens ONE connection.
+  # OPT-IN local Redis for idempotency, rate-limit, and thread-reuse development
+  # and manual testing. One Redis backs every enabled Redis-backed feature; the
+  # gateway opens ONE connection.
   #
   # The correct REDIS_URL depends on where the GATEWAY PROCESS runs, so the two
   # local setups must not be mixed:

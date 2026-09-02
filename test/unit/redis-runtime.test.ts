@@ -58,6 +58,8 @@ function config(over: Partial<AppConfig> = {}): AppConfig {
     RATE_LIMIT_REQUESTS: 60,
     RATE_LIMIT_WINDOW_MS: 60_000,
     RATE_LIMIT_BURST: 8,
+    OPENCODE_THREAD_REUSE_ENABLED: false,
+    OPENCODE_THREAD_REUSE_TTL_MS: 604_800_000,
     models: [MODEL],
     ...over,
   };
@@ -122,17 +124,20 @@ describe("redis runtime composition", () => {
     expect(t.configs).toHaveLength(1);
     expect(runtime?.idempotency).not.toBeNull();
     expect(runtime?.rateLimiter).toBeNull();
+    expect(runtime?.threadReuse).toBeNull();
   });
 
-  it("creates EXACTLY ONE client with BOTH features enabled", () => {
+  it("creates EXACTLY ONE client with ALL features enabled", () => {
     const t = tracker();
-    const runtime = createRedisRuntime(config({ RATE_LIMIT_ENABLED: true }), {
-      createRedisClient: t.createRedisClient,
-    });
-    // MUTATION GUARD: giving each feature its own connection would make this 2.
+    const runtime = createRedisRuntime(
+      config({ RATE_LIMIT_ENABLED: true, OPENCODE_THREAD_REUSE_ENABLED: true }),
+      { createRedisClient: t.createRedisClient },
+    );
+    // MUTATION GUARD: giving each feature its own connection would make this 3.
     expect(t.configs).toHaveLength(1);
     expect(runtime?.idempotency).not.toBeNull();
     expect(runtime?.rateLimiter).not.toBeNull();
+    expect(runtime?.threadReuse).not.toBeNull();
   });
 
   it("opens no socket at construction and connects exactly once", () => {
@@ -155,27 +160,31 @@ describe("redis runtime composition", () => {
     expect(t.clients[0]?.closeCalls).toBe(1);
   });
 
-  it("gives both features ONE shared readiness view", () => {
+  it("gives every feature ONE shared readiness view", () => {
     const t = tracker();
-    const runtime = createRedisRuntime(config({ RATE_LIMIT_ENABLED: true }), {
-      createRedisClient: t.createRedisClient,
-    });
+    const runtime = createRedisRuntime(
+      config({ RATE_LIMIT_ENABLED: true, OPENCODE_THREAD_REUSE_ENABLED: true }),
+      { createRedisClient: t.createRedisClient },
+    );
     expect(runtime?.isReady()).toBe(true);
     expect(runtime?.idempotency?.isAvailable()).toBe(true);
     expect(runtime?.rateLimiter?.isReady()).toBe(true);
+    expect(runtime?.threadReuse?.isAvailable()).toBe(true);
 
-    // One disconnect degrades BOTH, because there is one connection to degrade.
+    // One disconnect degrades ALL of them, because there is one connection.
     const state = t.clients[0];
     if (state === undefined) throw new Error("expected a client");
     state.isReady = false;
     expect(runtime?.isReady()).toBe(false);
     expect(runtime?.idempotency?.isAvailable()).toBe(false);
     expect(runtime?.rateLimiter?.isReady()).toBe(false);
+    expect(runtime?.threadReuse?.isAvailable()).toBe(false);
 
-    // ...and recovery restores both without a restart.
+    // ...and recovery restores them all without a restart.
     state.isReady = true;
     expect(runtime?.isReady()).toBe(true);
     expect(runtime?.rateLimiter?.isReady()).toBe(true);
+    expect(runtime?.threadReuse?.isAvailable()).toBe(true);
   });
 
   it("routes both features' commands over the same client", async () => {
@@ -189,11 +198,29 @@ describe("redis runtime composition", () => {
     expect(t.commands[0]?.[0]).toBe("EVALSHA");
   });
 
-  it("leaves rate limiting off unless it is explicitly enabled", () => {
+  it("leaves rate limiting and thread reuse off unless explicitly enabled", () => {
     const t = tracker();
-    const runtime = createRedisRuntime(config({ RATE_LIMIT_ENABLED: false }), {
+    const runtime = createRedisRuntime(
+      config({ RATE_LIMIT_ENABLED: false, OPENCODE_THREAD_REUSE_ENABLED: false }),
+      { createRedisClient: t.createRedisClient },
+    );
+    expect(runtime?.rateLimiter).toBeNull();
+    expect(runtime?.threadReuse).toBeNull();
+  });
+
+  it("leaves thread reuse unwired when the active auth mode has no credential", () => {
+    // Unreachable through validated configuration, but the route treats an
+    // unwired coordinator as an unavailable dependency, so even this impossible
+    // state fails closed rather than silently serving eligible requests
+    // statelessly.
+    const t = tracker();
+    const { COLLECTIVIQ_API_KEY: _omitted, ...withoutCredential } = config({
+      OPENCODE_THREAD_REUSE_ENABLED: true,
+    });
+    const runtime = createRedisRuntime(withoutCredential, {
       createRedisClient: t.createRedisClient,
     });
-    expect(runtime?.rateLimiter).toBeNull();
+    expect(runtime?.threadReuse).toBeNull();
+    expect(runtime?.idempotency).not.toBeNull();
   });
 });

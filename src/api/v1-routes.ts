@@ -6,6 +6,7 @@ import type { ChatCompletionService } from "../generation/chat-completion.js";
 import type { TitleBridge } from "../opencode/title-bridge.js";
 import type { IdempotencyCoordinator } from "../idempotency/index.js";
 import type { RateLimiter } from "../rate-limit/index.js";
+import type { ThreadReuseCoordinator } from "../thread-reuse/index.js";
 import { registerModelRoutes } from "./models-route.js";
 import { registerChatCompletionsRoute } from "./chat-completions-route.js";
 import { registerOpenCodeTitleRoute } from "./opencode-title-route.js";
@@ -35,6 +36,14 @@ declare module "fastify" {
      * `null` when rate limiting is disabled.
      */
     gatewayRateLimitScopeId: string | null;
+    /**
+     * Opaque, stable CROSS-REPLICA OpenCode thread-reuse scope for the matched
+     * key (never the raw key), derived under a THIRD independent HKDF domain so
+     * it shares no value with {@link FastifyRequest.gatewayScopeId} or
+     * {@link FastifyRequest.gatewayRateLimitScopeId}. Never logged or reflected.
+     * `null` until authenticated, and also `null` when thread reuse is disabled.
+     */
+    gatewayReuseScopeId: string | null;
   }
 }
 
@@ -66,6 +75,19 @@ export interface V1RouteDeps {
    * feature is enabled makes every completion fail closed with `503`.
    */
   readonly rateLimiter?: RateLimiter;
+  /**
+   * Whether validated configuration turned OpenCode thread reuse ON
+   * (`OPENCODE_THREAD_REUSE_ENABLED`). REQUIRED and authoritative — see
+   * {@link ChatCompletionsRouteDeps.threadReuseEnabled}.
+   */
+  readonly threadReuseEnabled: boolean;
+  /**
+   * The cross-replica thread-reuse coordinator (Phase 5A). Omitting it is safe
+   * ONLY when {@link V1RouteDeps.threadReuseEnabled} is `false`; omitting it
+   * while the feature is enabled makes every ELIGIBLE completion fail closed
+   * with `503` (ineligible completions are unaffected).
+   */
+  readonly threadReuse?: ThreadReuseCoordinator;
 }
 
 /**
@@ -93,6 +115,7 @@ export function registerV1Routes(app: GatewayServer, deps: V1RouteDeps): void {
       scope.decorateRequest("gatewayKeyId", null);
       scope.decorateRequest("gatewayScopeId", null);
       scope.decorateRequest("gatewayRateLimitScopeId", null);
+      scope.decorateRequest("gatewayReuseScopeId", null);
 
       // Any unexpected failure inside the group becomes the fixed internal
       // envelope. The thrown value's message/stack/cause/body is never read.
@@ -112,6 +135,7 @@ export function registerV1Routes(app: GatewayServer, deps: V1RouteDeps): void {
         request.gatewayKeyId = result.keyId;
         request.gatewayScopeId = result.scopeId;
         request.gatewayRateLimitScopeId = result.rateLimitScopeId;
+        request.gatewayReuseScopeId = result.reuseScopeId;
         // Trusted provenance marker: authentication completed normally. The chat
         // route's error boundary uses this (plus the not-yet-in-handler marker)
         // to prove a subsequent throw came from Fastify's parser phase — the only
@@ -129,6 +153,8 @@ export function registerV1Routes(app: GatewayServer, deps: V1RouteDeps): void {
         ...(deps.idempotency !== undefined ? { idempotency: deps.idempotency } : {}),
         rateLimitEnabled: deps.rateLimitEnabled,
         ...(deps.rateLimiter !== undefined ? { rateLimiter: deps.rateLimiter } : {}),
+        threadReuseEnabled: deps.threadReuseEnabled,
+        ...(deps.threadReuse !== undefined ? { threadReuse: deps.threadReuse } : {}),
       });
       // Rate limiting is scoped to the completion route ONLY: model metadata and
       // the session-title extension are cheap, non-generative reads that must

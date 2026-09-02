@@ -8,14 +8,15 @@ import {
 const KEY_A = "gw-fake-key-alpha";
 const KEY_B = "gw-fake-key-bravo-longer-than-alpha";
 
-/** A success with both cross-replica scopes absent (neither feature enabled). */
+/** A success with every cross-replica scope absent (no feature enabled). */
 function unscoped(keyId: string): {
   ok: true;
   keyId: string;
   scopeId: null;
   rateLimitScopeId: null;
+  reuseScopeId: null;
 } {
-  return { ok: true, keyId, scopeId: null, rateLimitScopeId: null };
+  return { ok: true, keyId, scopeId: null, rateLimitScopeId: null, reuseScopeId: null };
 }
 
 describe("createGatewayAuthenticator", () => {
@@ -83,6 +84,7 @@ describe("createGatewayAuthenticator", () => {
       keyId: "k0",
       scopeId: "scope(gw-fake-key-alpha)",
       rateLimitScopeId: null,
+      reuseScopeId: null,
     });
     // Same scope, DIFFERENT capacity identity, after reordering.
     expect(reordered.authenticate(`Bearer ${KEY_A}`)).toEqual({
@@ -90,6 +92,7 @@ describe("createGatewayAuthenticator", () => {
       keyId: "k2",
       scopeId: "scope(gw-fake-key-alpha)",
       rateLimitScopeId: null,
+      reuseScopeId: null,
     });
     // Distinct keys never share a scope.
     expect(first.authenticate(`Bearer ${KEY_B}`)).toEqual({
@@ -97,44 +100,84 @@ describe("createGatewayAuthenticator", () => {
       keyId: "k1",
       scopeId: "scope(gw-fake-key-bravo-longer-than-alpha)",
       rateLimitScopeId: null,
+      reuseScopeId: null,
     });
   });
 
   it("derives each scope exactly once, at construction", () => {
     const scopeDeriver = vi.fn((key: string) => `scope(${key})`);
     const rateLimitScopeDeriver = vi.fn((key: string) => `rate(${key})`);
+    const reuseScopeDeriver = vi.fn((key: string) => `reuse(${key})`);
     const auth = createGatewayAuthenticator([KEY_A, KEY_B], {
       scopeDeriver,
       rateLimitScopeDeriver,
+      reuseScopeDeriver,
     });
     expect(scopeDeriver).toHaveBeenCalledTimes(2);
     expect(rateLimitScopeDeriver).toHaveBeenCalledTimes(2);
+    expect(reuseScopeDeriver).toHaveBeenCalledTimes(2);
     for (let i = 0; i < 5; i += 1) auth.authenticate(`Bearer ${KEY_A}`);
-    // The raw key material is never re-read per request, by either deriver.
+    // The raw key material is never re-read per request, by any deriver.
     expect(scopeDeriver).toHaveBeenCalledTimes(2);
     expect(rateLimitScopeDeriver).toHaveBeenCalledTimes(2);
+    expect(reuseScopeDeriver).toHaveBeenCalledTimes(2);
   });
 
   it("reports a null scope for a failed authentication", () => {
     const auth = createGatewayAuthenticator([KEY_A], {
       scopeDeriver: (k) => `scope(${k})`,
       rateLimitScopeDeriver: (k) => `rate(${k})`,
+      reuseScopeDeriver: (k) => `reuse(${k})`,
     });
     expect(auth.authenticate("Bearer gw-wrong")).toEqual({ ok: false });
   });
 
-  it("carries INDEPENDENT idempotency and rate-limit scopes", () => {
-    // Each feature gets its own identity for the same key, so one boundary can
-    // be enabled without the other and neither can be mistaken for the other.
+  it("carries INDEPENDENT idempotency, rate-limit, and thread-reuse scopes", () => {
+    // Each feature gets its own identity for the same key, so any one boundary
+    // can be enabled without the others and none can be mistaken for another.
     const auth = createGatewayAuthenticator([KEY_A, KEY_B], {
       scopeDeriver: (k) => `scope(${k})`,
       rateLimitScopeDeriver: (k) => `rate(${k})`,
+      reuseScopeDeriver: (k) => `reuse(${k})`,
     });
     expect(auth.authenticate(`Bearer ${KEY_B}`)).toEqual({
       ok: true,
       keyId: "k1",
       scopeId: "scope(gw-fake-key-bravo-longer-than-alpha)",
       rateLimitScopeId: "rate(gw-fake-key-bravo-longer-than-alpha)",
+      reuseScopeId: "reuse(gw-fake-key-bravo-longer-than-alpha)",
+    });
+  });
+
+  it("exposes a thread-reuse scope independent of key ORDER, with the others disabled", () => {
+    // Thread reuse must be usable on its own, and reordering or adding gateway
+    // keys must never re-partition an existing session-to-thread mapping.
+    const reuseScopeDeriver = (key: string): string => `reuse(${key})`;
+    const first = createGatewayAuthenticator([KEY_A, KEY_B], { reuseScopeDeriver });
+    const reordered = createGatewayAuthenticator(["gw-fake-key-charlie", KEY_B, KEY_A], {
+      reuseScopeDeriver,
+    });
+    expect(first.authenticate(`Bearer ${KEY_A}`)).toEqual({
+      ok: true,
+      keyId: "k0",
+      scopeId: null,
+      rateLimitScopeId: null,
+      reuseScopeId: "reuse(gw-fake-key-alpha)",
+    });
+    expect(reordered.authenticate(`Bearer ${KEY_A}`)).toEqual({
+      ok: true,
+      keyId: "k2",
+      scopeId: null,
+      rateLimitScopeId: null,
+      reuseScopeId: "reuse(gw-fake-key-alpha)",
+    });
+    // Distinct keys never share a mapping scope.
+    expect(reordered.authenticate(`Bearer ${KEY_B}`)).toEqual({
+      ok: true,
+      keyId: "k1",
+      scopeId: null,
+      rateLimitScopeId: null,
+      reuseScopeId: "reuse(gw-fake-key-bravo-longer-than-alpha)",
     });
   });
 
@@ -151,12 +194,14 @@ describe("createGatewayAuthenticator", () => {
       keyId: "k0",
       scopeId: null,
       rateLimitScopeId: "rate(gw-fake-key-alpha)",
+      reuseScopeId: null,
     });
     expect(reordered.authenticate(`Bearer ${KEY_A}`)).toEqual({
       ok: true,
       keyId: "k2",
       scopeId: null,
       rateLimitScopeId: "rate(gw-fake-key-alpha)",
+      reuseScopeId: null,
     });
     // Distinct keys never share a quota.
     expect(reordered.authenticate(`Bearer ${KEY_B}`)).toEqual({
@@ -164,6 +209,7 @@ describe("createGatewayAuthenticator", () => {
       keyId: "k1",
       scopeId: null,
       rateLimitScopeId: "rate(gw-fake-key-bravo-longer-than-alpha)",
+      reuseScopeId: null,
     });
   });
 

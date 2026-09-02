@@ -123,6 +123,17 @@ export interface ProcessMessageResult {
    * `202` implies accepted-versus-failed work.
    */
   readonly accepted: boolean;
+  /**
+   * The run this submission started, from the verified-repeatable safe field
+   * `combined_run_id` (observed in both 2026-08-11 password baselines).
+   *
+   * REQUIRED, not optional: it is the only value that lets the poller prove a
+   * later message belongs to THIS submission rather than to an earlier turn of
+   * the same thread. A submission whose response carries no usable run id is
+   * therefore treated as an upstream protocol failure, so no completion can ever
+   * run without a correlation key.
+   */
+  readonly combinedRunId: string;
   readonly rawStatus: number;
 }
 
@@ -140,6 +151,16 @@ export interface UpstreamMessage {
   readonly createdAt: string | number | null;
   /** Safe field name `id` observed repeatably; its selection semantics are unverified. */
   readonly id: string | number | null;
+  /**
+   * The run that produced this entry, from the verified-repeatable safe field
+   * `combined_run_id` (observed on message entries in both 2026-08-11 password
+   * baselines), or null when the entry carries none.
+   *
+   * Null is not "unknown, probably ours": an entry that cannot name its run can
+   * never be selected as a completion's answer, because the gateway would have
+   * no way to distinguish it from a previous turn's message in the same thread.
+   */
+  readonly combinedRunId: string | null;
 }
 
 export interface GetMessagesResult {

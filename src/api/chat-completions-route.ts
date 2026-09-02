@@ -26,13 +26,20 @@
  * gateway authentication (the /v1 onRequest hook)
  *   -> request validation, model resolution, tool normalization
  *   -> Idempotency-Key validation and canonical body fingerprinting
+ *   -> thread-reuse eligibility                 -> 400 invalid_opencode_session_id
+ *                                               -> 400 unsupported_parameter
  *   -> keyed request with unusable idempotency  -> 503 idempotency_unavailable
  *   -> prompt preparation
  *   -> cross-replica rate limit                 -> 429 / 503 (§19.1)
+ *   -> OpenCode thread-reuse lease              -> 409 / 503 (§5.1.1)
  *   -> idempotency claim, wait, or replay       -> 409 / 503 / cached result
  *   -> process-local capacity                   -> 429 gateway_capacity_exceeded
  *   -> upstream work
  * ```
+ *
+ * Thread reuse and idempotency are mutually exclusive by construction: an
+ * eligible reuse request carrying an `Idempotency-Key` is rejected above, before
+ * either feature touches Redis, so the claim and the lease can never both exist.
  */
 import { Type } from "@fastify/type-provider-typebox";
 import type { FastifyError } from "fastify";
@@ -45,11 +52,15 @@ import {
   isRequestCancelledError,
   type ChatCompletionService,
   type CompletionResult,
-  type CompletionRunHooks,
+  type CompletionRunOptions,
   type PreparedCompletion,
 } from "../generation/chat-completion.js";
 import type { TitleBridge } from "../opencode/title-bridge.js";
-import { SESSION_ID_HEADER, normalizeSessionId } from "../opencode/session-header.js";
+import {
+  SESSION_ID_HEADER,
+  hasSessionIdHeader,
+  normalizeSessionId,
+} from "../opencode/session-header.js";
 import {
   IDEMPOTENCY_KEY_HEADER,
   readIdempotencyKeyHeader,
@@ -62,18 +73,23 @@ import { validateChatRequest } from "../openai/chat-request.js";
 import { ChatCompletionSchema, encodeChatCompletion } from "../openai/chat-response.js";
 import { streamChatCompletion } from "./chat-stream-response.js";
 import type { RateLimiter } from "../rate-limit/index.js";
+import type { ThreadReuseCoordinator, ThreadReuseSession } from "../thread-reuse/index.js";
 import {
   COMPLETION_TIMEOUT_ERROR,
   gatewayRateLimitExceeded,
   IDEMPOTENCY_KEY_CONFLICT_ERROR,
   IDEMPOTENCY_UNAVAILABLE_ERROR,
+  IDEMPOTENCY_WITH_THREAD_REUSE_ERROR,
   INTERNAL_ERROR,
   INVALID_IDEMPOTENCY_KEY_ERROR,
+  INVALID_OPENCODE_SESSION_ID_ERROR,
   INVALID_REQUEST_ERROR,
   OpenAIErrorSchema,
   RATE_LIMIT_UNAVAILABLE_ERROR,
   REQUEST_BODY_TOO_LARGE_ERROR,
   SERVICE_UNAVAILABLE_ERROR,
+  THREAD_REUSE_BUSY_ERROR,
+  THREAD_REUSE_UNAVAILABLE_ERROR,
   type OpenAIApiError,
 } from "../openai/errors.js";
 
@@ -116,6 +132,24 @@ export interface ChatCompletionsRouteDeps {
    * not a disabled feature, and every completion then fails closed with `503`.
    */
   readonly rateLimiter?: RateLimiter;
+  /**
+   * Whether validated configuration turned OpenCode thread reuse ON
+   * (`OPENCODE_THREAD_REUSE_ENABLED`, specification §5.1.1). REQUIRED and
+   * authoritative for exactly the same reason as {@link rateLimitEnabled}: an
+   * enabled-but-unwired instance must fail closed on eligible requests rather
+   * than silently serve them statelessly, which would break the session
+   * continuity the feature exists to provide.
+   */
+  readonly threadReuseEnabled: boolean;
+  /**
+   * The cross-replica thread-reuse coordinator (Phase 5A).
+   *
+   * Omitting it is safe ONLY when {@link threadReuseEnabled} is `false`.
+   * Omitting it while the feature is ENABLED is an unavailable dependency, so
+   * every ELIGIBLE completion fails closed with `503`; requests that are not
+   * reuse eligible are entirely unaffected.
+   */
+  readonly threadReuse?: ThreadReuseCoordinator;
 }
 
 /**
@@ -258,6 +292,37 @@ export function registerChatCompletionsRoute(
         );
         if (header.kind === "invalid") return sendError(INVALID_IDEMPOTENCY_KEY_ERROR);
 
+        // --- OpenCode thread-reuse eligibility (specification §5.1.1) --------
+        // Decided here, before ANY Redis operation, capacity, or upstream work,
+        // and before the keyed-idempotency availability check below, so the two
+        // mutually exclusive features can never both engage.
+        //
+        // Eligibility is narrow on purpose: reuse only applies to the
+        // direct-prompt, tool-free profile whose turns are plain text. A
+        // protocol-mode model resubmits its whole history every turn and an
+        // emulated tool loop creates a thread per round; making either stateful
+        // would change their prompt semantics, which this phase does not do.
+        const rawSessionHeader = request.headers[SESSION_ID_HEADER];
+        const sessionId = normalizeSessionId(rawSessionHeader);
+        const reuseCandidate =
+          deps.threadReuseEnabled &&
+          model.promptMode === "direct" &&
+          model.toolMode === "disabled" &&
+          hasSessionIdHeader(rawSessionHeader);
+        if (reuseCandidate && sessionId === null) {
+          // The caller asked for a session-scoped conversation and got the
+          // header wrong. Silently ignoring it (the pre-Phase-5A behaviour, kept
+          // for every ineligible request) would strand each turn in its own
+          // thread with no signal, so an eligible model reports it.
+          return sendError(INVALID_OPENCODE_SESSION_ID_ERROR);
+        }
+        const reuseSessionId = reuseCandidate ? sessionId : null;
+        if (reuseSessionId !== null && header.kind === "key") {
+          // Rejected BEFORE rate limiting, any reuse Redis operation, capacity,
+          // and any upstream call.
+          return sendError(IDEMPOTENCY_WITH_THREAD_REUSE_ERROR);
+        }
+
         let claim: {
           readonly coordinator: IdempotencyCoordinator;
           readonly clientKey: string;
@@ -288,9 +353,14 @@ export function registerChatCompletionsRoute(
         // it and the completion behaves normally. The header value is never logged
         // or reflected. Registration happens ONLY after a confirmed success and is
         // synchronous, bounded, and non-throwing, so it cannot alter the response.
-        const sessionId = normalizeSessionId(request.headers[SESSION_ID_HEADER]);
+        //
+        // A REUSED thread registers nothing: the provider generates its native
+        // title once, for the turn that created the thread, so a later turn has
+        // no new title to propagate and re-registering would only spend the
+        // bridge's bounded lookup budget.
         const registerTitleCorrelation = (result: CompletionResult): void => {
           if (sessionId === null) return;
+          if (!result.upstreamThreadCreated) return;
           deps.titleBridge.register({
             keyId,
             sessionId,
@@ -488,6 +558,13 @@ export function registerChatCompletionsRoute(
         // --- Live completion (owner, or no idempotency at all) ---------------
         const session = owner;
 
+        /**
+         * The reuse lease, assigned as the FIRST statement inside the settled
+         * region below. It is a mutable binding only so the `finally` can settle
+         * whatever was acquired; nothing else reassigns it.
+         */
+        let acquiredLease: ThreadReuseSession | null = null;
+
         /** Settle the claim (`ambiguous` / compare-and-delete) before responding. */
         const finishClaim = async (): Promise<void> => {
           if (session === null) return;
@@ -498,48 +575,139 @@ export function registerChatCompletionsRoute(
           }
         };
 
-        // ONE try/finally covers every remaining statement, so no path can leave
-        // the claim unsettled. That matters more than a bounded leak would: an
-        // unsettled owner session keeps renewing its own lease, so a leaked claim
-        // would block the key until process exit rather than until the lease
-        // elapsed.
+        /** Settle the reuse mapping (restore, or tombstone) before responding. */
+        const finishLease = async (): Promise<void> => {
+          if (acquiredLease === null) return;
+          try {
+            await acquiredLease.finish();
+          } catch {
+            // Best effort only; it can never change the response.
+          }
+        };
+
+        // ONE try/finally covers the lease acquisition and every statement after
+        // it, so no path — including the reuse gate's own rejections — can leave
+        // the claim or the lease unsettled. That matters more than a bounded leak
+        // would: an unsettled session keeps renewing its own lease, so a leak
+        // would block the key (or the OpenCode session) until process exit rather
+        // than until the lease elapsed.
         try {
-          // A lost claim aborts the run, so upstream work stops promptly and no
-          // other replica can proceed while this one is still working.
-          const runSignal = session === null ? signal : AbortSignal.any([signal, session.signal]);
-          const hooks: CompletionRunHooks | undefined =
-            session === null
-              ? undefined
-              : {
-                  // Runs after capacity is acquired and BEFORE `create_thread`. A
-                  // failure here releases capacity and performs no upstream call.
-                  onCapacityAcquired: async (): Promise<void> => {
-                    if ((await session.markProcessing()) !== "ok") {
-                      throw new ChatCompletionError(IDEMPOTENCY_UNAVAILABLE_ERROR);
-                    }
-                  },
-                };
+          // --- OpenCode thread-reuse lease (specification §5.1.1) ------------
+          // Logically this gate sits immediately after the rate limit and before
+          // the idempotency claim. It runs here because the two features are
+          // MUTUALLY EXCLUSIVE — an eligible reuse request carrying an
+          // `Idempotency-Key` was already rejected above, so for such a request
+          // the whole idempotency block above is a no-op and nothing observable
+          // happens between the rate-limit decision and this point.
+          if (reuseSessionId !== null) {
+            const coordinator = deps.threadReuse;
+            const reuseScopeId = request.gatewayReuseScopeId;
+            // Enabled but unwired, or wired without a derived scope: an
+            // unavailable dependency, never a silent downgrade to a fresh thread.
+            if (coordinator === undefined || reuseScopeId === null || !coordinator.isAvailable()) {
+              return sendError(THREAD_REUSE_UNAVAILABLE_ERROR);
+            }
+            const leaseOutcome = await coordinator
+              .acquire({ gatewayKeyScope: reuseScopeId, sessionId: reuseSessionId, model })
+              .catch(() => ({ kind: "unavailable" }) as const);
+            if (leaseOutcome.kind !== "leased") {
+              // A live competing turn is a caller-resolvable conflict; everything
+              // else (disconnected Redis, corrupt or ambiguous state, a mapping
+              // this gateway cannot authenticate) fails closed.
+              return sendError(
+                leaseOutcome.kind === "busy"
+                  ? THREAD_REUSE_BUSY_ERROR
+                  : THREAD_REUSE_UNAVAILABLE_ERROR,
+              );
+            }
+            acquiredLease = leaseOutcome.session;
+          }
+          /** Narrowed for the closures below; never reassigned past this point. */
+          const lease = acquiredLease;
+
+          // A lost claim or a lost reuse lease aborts the run, so upstream work
+          // stops promptly and no other replica can proceed while this one is
+          // still working.
+          const ownedSignals: AbortSignal[] = [];
+          if (session !== null) ownedSignals.push(session.signal);
+          if (lease !== null) ownedSignals.push(lease.signal);
+          const runSignal =
+            ownedSignals.length === 0 ? signal : AbortSignal.any([signal, ...ownedSignals]);
+
+          let runOptions: CompletionRunOptions | undefined;
+          if (session !== null) {
+            runOptions = {
+              // Runs after capacity is acquired and BEFORE `create_thread`. A
+              // failure here releases capacity and performs no upstream call.
+              onCapacityAcquired: async (): Promise<void> => {
+                if ((await session.markProcessing()) !== "ok") {
+                  throw new ChatCompletionError(IDEMPOTENCY_UNAVAILABLE_ERROR);
+                }
+              },
+            };
+          } else if (lease !== null) {
+            const leasedThreadId = lease.existingThreadId;
+            runOptions = {
+              ...(leasedThreadId !== null ? { leasedThreadId } : {}),
+              // Binds a freshly created thread to the mapping while the record
+              // is still `reserved`. On failure no submit happens; the blank
+              // upstream thread is deliberately not deleted.
+              onThreadCreated: async (threadId: string): Promise<void> => {
+                if ((await lease.bindThread(threadId)) !== "ok") {
+                  throw new ChatCompletionError(THREAD_REUSE_UNAVAILABLE_ERROR);
+                }
+              },
+              // The last point at which a failure is provably pre-submit.
+              onBeforeSubmit: async (): Promise<void> => {
+                if ((await lease.markProcessing()) !== "ok") {
+                  throw new ChatCompletionError(THREAD_REUSE_UNAVAILABLE_ERROR);
+                }
+              },
+            };
+          }
 
           const execute = async (innerSignal: AbortSignal): Promise<CompletionResult> => {
-            if (session === null) return deps.service.run(prepared, innerSignal);
-            try {
-              const result = await deps.service.run(prepared, innerSignal, hooks);
-              // Durably committed before the JSON body and before any SSE
-              // content/terminal frame (§18.1). The SSE headers and role opener
-              // were already written by design, so a failure here surfaces as an
-              // SSE error record on that path.
-              if ((await session.commit(toCachedResult(result))) !== "ok") {
-                throw new ChatCompletionError(IDEMPOTENCY_UNAVAILABLE_ERROR);
+            if (session !== null) {
+              try {
+                const result = await deps.service.run(prepared, innerSignal, runOptions);
+                // Durably committed before the JSON body and before any SSE
+                // content/terminal frame (§18.1). The SSE headers and role opener
+                // were already written by design, so a failure here surfaces as an
+                // SSE error record on that path.
+                if ((await session.commit(toCachedResult(result))) !== "ok") {
+                  throw new ChatCompletionError(IDEMPOTENCY_UNAVAILABLE_ERROR);
+                }
+                return result;
+              } catch (error) {
+                // A cancellation caused by a LOST CLAIM is an idempotency failure,
+                // not a client disconnect or a shutdown.
+                if (session.ownershipLost && isRequestCancelledError(error)) {
+                  throw new ChatCompletionError(IDEMPOTENCY_UNAVAILABLE_ERROR);
+                }
+                throw error;
               }
-              return result;
-            } catch (error) {
-              // A cancellation caused by a LOST CLAIM is an idempotency failure,
-              // not a client disconnect or a shutdown.
-              if (session.ownershipLost && isRequestCancelledError(error)) {
-                throw new ChatCompletionError(IDEMPOTENCY_UNAVAILABLE_ERROR);
-              }
-              throw error;
             }
+            if (lease !== null) {
+              try {
+                const result = await deps.service.run(prepared, innerSignal, runOptions);
+                // The mapping must record this turn's thread BEFORE the answer is
+                // emitted (§5.1.1), on exactly the same terms as the idempotency
+                // commit above: on the SSE path the headers and role opener were
+                // already written, so a failure here is an SSE error record.
+                if ((await lease.finalize()) !== "ok") {
+                  throw new ChatCompletionError(THREAD_REUSE_UNAVAILABLE_ERROR);
+                }
+                return result;
+              } catch (error) {
+                // A cancellation caused by a LOST LEASE is a reuse failure, not a
+                // client disconnect or a shutdown.
+                if (lease.leaseLost && isRequestCancelledError(error)) {
+                  throw new ChatCompletionError(THREAD_REUSE_UNAVAILABLE_ERROR);
+                }
+                throw error;
+              }
+            }
+            return deps.service.run(prepared, innerSignal);
           };
 
           // Synthetic-SSE path: authenticate/validate/resolve/prepare/claim all
@@ -594,6 +762,7 @@ export function registerChatCompletionsRoute(
           }
         } finally {
           await finishClaim();
+          await finishLease();
           reply.raw.removeListener("close", onClose);
         }
       },

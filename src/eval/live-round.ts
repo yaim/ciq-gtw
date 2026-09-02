@@ -32,7 +32,7 @@
  */
 import type { DeleteDiagnostics } from "../collectiviq/cleanup.js";
 import { isUpstreamError, type UpstreamErrorCode } from "../collectiviq/errors.js";
-import type { CollectivIQAdapter } from "../collectiviq/types.js";
+import type { CollectivIQAdapter, ProcessMessageResult } from "../collectiviq/types.js";
 import type { RecoveryJournalSink } from "../collectiviq/recovery-journal.js";
 import type { PollOutcome, Poller } from "../generation/types.js";
 import { serializeConversationPrompt } from "../prompts/conversation.js";
@@ -171,8 +171,11 @@ export async function runLiveRound(
   let failureCode: UpstreamErrorCode | null = null;
   let failureStatus: number | null = null;
   if (!recordCreatedFailed) {
+    // The submit result is retained ONLY for its run id, which the poll needs to
+    // correlate a message to this round's submission; it is never reported.
+    let submitted: ProcessMessageResult | null = null;
     try {
-      await adapter.processMessage({
+      submitted = await adapter.processMessage({
         threadId,
         prompt,
         selectedLlms,
@@ -185,7 +188,7 @@ export async function runLiveRound(
       failureCode = u.code;
       failureStatus = u.status;
     }
-    if (failureStage === null) {
+    if (submitted !== null) {
       try {
         outcome = await poller.poll({
           threadId,
@@ -194,6 +197,7 @@ export async function runLiveRound(
           maxPollIntervalMs: MAX_POLL_INTERVAL_MS,
           deadlineMs: Date.now() + REQUEST_TIMEOUT_MS,
           signal: workSignal,
+          combinedRunId: submitted.combinedRunId,
         });
       } catch (error) {
         const u = safeUpstream(error);

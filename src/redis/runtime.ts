@@ -3,10 +3,11 @@
  *
  * This is the only place that turns validated configuration into live
  * Redis-backed services, and it creates EXACTLY ONE client for the process no
- * matter how many of them are enabled. Phase 4A idempotency and Phase 4B rate
- * limiting therefore share one connection, one reconnect policy, one readiness
- * probe, and one shutdown close — a second client would double the socket
- * budget, split readiness, and make "Redis is up" mean two different things.
+ * matter how many of them are enabled. Phase 4A idempotency, Phase 4B rate
+ * limiting, and Phase 5A OpenCode thread reuse therefore share one connection,
+ * one reconnect policy, one readiness probe, and one shutdown close — a second
+ * client would double the socket budget, split readiness, and make "Redis is
+ * up" mean two different things.
  *
  * It is deliberately NOT exported from `src/redis/index.ts`: the substrate
  * barrel must stay dependency-free so features can import it without a cycle.
@@ -22,6 +23,10 @@ import {
   type IdempotencyCoordinator,
 } from "../idempotency/index.js";
 import { createRateLimiterFromConfig, type RateLimiter } from "../rate-limit/index.js";
+import {
+  createThreadReuseCoordinatorFromConfig,
+  type ThreadReuseCoordinator,
+} from "../thread-reuse/index.js";
 import { createRedisConnection, type RedisConnectionOptions } from "./client.js";
 
 /** The composed Redis-backed services owned by the process root. */
@@ -34,6 +39,8 @@ export interface RedisRuntime {
   readonly idempotency: IdempotencyCoordinator | null;
   /** Cross-replica rate limiting (Phase 4B). `null` unless explicitly enabled. */
   readonly rateLimiter: RateLimiter | null;
+  /** Cross-replica OpenCode thread reuse (Phase 5A). `null` unless explicitly enabled. */
+  readonly threadReuse: ThreadReuseCoordinator | null;
   /** Bounded, synchronous readiness probe over the ONE shared connection (no I/O). */
   isReady(): boolean;
   /** Begin connecting in the background. Never throws, never blocks startup. */
@@ -47,9 +54,9 @@ export type RedisRuntimeOptions = Omit<RedisConnectionOptions, "url">;
 /**
  * Compose every enabled Redis-backed service over one connection, or `null` when
  * `REDIS_URL` is blank/absent — in which case the gateway never contacts Redis,
- * a supplied `Idempotency-Key` fails closed with `503`, and rate limiting is
- * necessarily disabled too (configuration validation rejects enabling it without
- * a Redis endpoint).
+ * a supplied `Idempotency-Key` fails closed with `503`, and both rate limiting
+ * and thread reuse are necessarily disabled too (configuration validation
+ * rejects enabling either without a Redis endpoint).
  */
 export function createRedisRuntime(
   config: AppConfig,
@@ -63,6 +70,7 @@ export function createRedisRuntime(
   return {
     idempotency: createIdempotencyCoordinatorFromConfig(config, substrate),
     rateLimiter: createRateLimiterFromConfig(config, substrate),
+    threadReuse: createThreadReuseCoordinatorFromConfig(config, substrate),
     isReady: () => connection.isReady(),
     connect: () => connection.connect(),
     close: () => connection.close(),

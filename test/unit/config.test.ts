@@ -571,6 +571,143 @@ describe("loadConfig — optional cross-replica rate limiting", () => {
   });
 });
 
+describe("loadConfig — optional OpenCode thread reuse", () => {
+  const VALID_KEY = randomBytes(32).toString("base64url");
+  /** The Redis settings that make enabling thread reuse valid. */
+  const REDIS = {
+    REDIS_URL: "redis://127.0.0.1:6379",
+    IDEMPOTENCY_ENCRYPTION_KEY: VALID_KEY,
+  } as const;
+
+  function issuesFor(overrides: Record<string, string | undefined>): ConfigError["issues"] {
+    try {
+      loadConfig({ env: baseEnv(overrides) });
+      throw new Error("expected ConfigError");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfigError);
+      return (error as ConfigError).issues;
+    }
+  }
+
+  it("is DISABLED by default, with a seven-day mapping TTL", () => {
+    const config = loadConfig({ env: baseEnv() });
+    expect(config.OPENCODE_THREAD_REUSE_ENABLED).toBe(false);
+    expect(config.OPENCODE_THREAD_REUSE_TTL_MS).toBe(604_800_000);
+  });
+
+  it("accepts only the strict boolean syntax", () => {
+    expect(
+      loadConfig({ env: baseEnv({ OPENCODE_THREAD_REUSE_ENABLED: "false" }) })
+        .OPENCODE_THREAD_REUSE_ENABLED,
+    ).toBe(false);
+    expect(
+      loadConfig({ env: baseEnv({ ...REDIS, OPENCODE_THREAD_REUSE_ENABLED: "true" }) })
+        .OPENCODE_THREAD_REUSE_ENABLED,
+    ).toBe(true);
+    for (const value of ["1", "0", "yes", "no", "on", "enabled"]) {
+      expect(issuesFor({ ...REDIS, OPENCODE_THREAD_REUSE_ENABLED: value })).toContainEqual({
+        field: "OPENCODE_THREAD_REUSE_ENABLED",
+        reason: 'must be "true" or "false"',
+      });
+    }
+  });
+
+  it("REQUIRES a Redis endpoint when explicitly enabled", () => {
+    // A session-to-thread mapping must be visible to every replica and leased
+    // atomically, so enabling reuse without Redis is an error rather than a
+    // silent downgrade to one thread per completion.
+    expect(issuesFor({ OPENCODE_THREAD_REUSE_ENABLED: "true" })).toContainEqual({
+      field: "REDIS_URL",
+      reason: "is required when OPENCODE_THREAD_REUSE_ENABLED is true",
+    });
+    for (const REDIS_URL of ["", "   "]) {
+      expect(issuesFor({ OPENCODE_THREAD_REUSE_ENABLED: "true", REDIS_URL })).toContainEqual({
+        field: "REDIS_URL",
+        reason: "is required when OPENCODE_THREAD_REUSE_ENABLED is true",
+      });
+    }
+  });
+
+  it("still requires the encryption key transitively when enabled", () => {
+    // Enabling reuse requires Redis, and Redis already requires the master key
+    // the four thread-reuse subkeys are derived from. No new secret is added.
+    expect(
+      issuesFor({
+        OPENCODE_THREAD_REUSE_ENABLED: "true",
+        REDIS_URL: "redis://127.0.0.1:6379",
+      }),
+    ).toContainEqual({ field: "IDEMPOTENCY_ENCRYPTION_KEY", reason: "is required" });
+  });
+
+  it("enforces the TTL range and accepts each boundary", () => {
+    for (const value of ["0", "-1", "299999", "2592000001"]) {
+      expect(issuesFor({ OPENCODE_THREAD_REUSE_TTL_MS: value })).toContainEqual({
+        field: "OPENCODE_THREAD_REUSE_TTL_MS",
+        reason: "is outside allowed range",
+      });
+    }
+    expect(issuesFor({ OPENCODE_THREAD_REUSE_TTL_MS: "not-an-int" })).toContainEqual({
+      field: "OPENCODE_THREAD_REUSE_TTL_MS",
+      reason: "must be an integer",
+    });
+    expect(
+      loadConfig({ env: baseEnv({ OPENCODE_THREAD_REUSE_TTL_MS: "300000" }) })
+        .OPENCODE_THREAD_REUSE_TTL_MS,
+    ).toBe(300_000);
+    expect(
+      loadConfig({ env: baseEnv({ OPENCODE_THREAD_REUSE_TTL_MS: "2592000000" }) })
+        .OPENCODE_THREAD_REUSE_TTL_MS,
+    ).toBe(2_592_000_000);
+  });
+
+  it("validates a PRESENT TTL even while the feature is disabled", () => {
+    // A deployment must not be able to carry a silently broken setting that
+    // only fails the day someone switches reuse on.
+    expect(
+      issuesFor({
+        OPENCODE_THREAD_REUSE_ENABLED: "false",
+        OPENCODE_THREAD_REUSE_TTL_MS: "1000",
+      }),
+    ).toContainEqual({
+      field: "OPENCODE_THREAD_REUSE_TTL_MS",
+      reason: "is outside allowed range",
+    });
+  });
+
+  it("does not require Redis while the feature stays disabled", () => {
+    const config = loadConfig({
+      env: baseEnv({
+        OPENCODE_THREAD_REUSE_ENABLED: "false",
+        OPENCODE_THREAD_REUSE_TTL_MS: "300000",
+      }),
+    });
+    expect(config.REDIS_URL).toBeUndefined();
+    expect(config.OPENCODE_THREAD_REUSE_TTL_MS).toBe(300_000);
+  });
+
+  it("composes with rate limiting over the same Redis endpoint", () => {
+    const config = loadConfig({
+      env: baseEnv({
+        ...REDIS,
+        RATE_LIMIT_ENABLED: "true",
+        OPENCODE_THREAD_REUSE_ENABLED: "true",
+      }),
+    });
+    expect(config.RATE_LIMIT_ENABLED).toBe(true);
+    expect(config.OPENCODE_THREAD_REUSE_ENABLED).toBe(true);
+  });
+
+  it("keeps every thread-reuse failure value-free", () => {
+    const issues = issuesFor({
+      OPENCODE_THREAD_REUSE_ENABLED: "SENSITIVE-VALUE",
+      OPENCODE_THREAD_REUSE_TTL_MS: "SENSITIVE-TTL",
+    });
+    const formatted = new ConfigError(issues).format();
+    expect(formatted).not.toContain("SENSITIVE-VALUE");
+    expect(formatted).not.toContain("SENSITIVE-TTL");
+  });
+});
+
 describe("loadConfig — gateway keys", () => {
   /** Load with a raw gateway-key string, returning either config or issues. */
   function loadWithKeys(rawKeys: string): ReturnType<typeof loadConfig> {

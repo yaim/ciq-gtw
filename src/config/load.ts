@@ -83,6 +83,8 @@ const KNOWN_ENV_KEYS = [
   "RATE_LIMIT_REQUESTS",
   "RATE_LIMIT_WINDOW_MS",
   "RATE_LIMIT_BURST",
+  "OPENCODE_THREAD_REUSE_ENABLED",
+  "OPENCODE_THREAD_REUSE_TTL_MS",
 ] as const;
 
 export interface LoadConfigOptions {
@@ -312,6 +314,13 @@ function loadEnvConfig(source: NodeJS.ProcessEnv): EnvConfig {
     ENV_DEFAULTS.RATE_LIMIT_WINDOW_MS,
   );
   const rateLimitBurst = coerceEnvInteger("RATE_LIMIT_BURST", ENV_DEFAULTS.RATE_LIMIT_BURST);
+  // Optional OpenCode thread reuse (Phase 5A). The TTL is validated whenever it
+  // is PRESENT, for the same reason as the rate-limit settings above: a broken
+  // value must fail at deploy time, not on the day the feature is switched on.
+  const threadReuseTtlMs = coerceEnvInteger(
+    "OPENCODE_THREAD_REUSE_TTL_MS",
+    ENV_DEFAULTS.OPENCODE_THREAD_REUSE_TTL_MS,
+  );
 
   // Optional Redis-backed idempotency (Phase 4A). A blank/absent REDIS_URL
   // disables Redis; the gateway then behaves exactly as before for unkeyed
@@ -374,6 +383,30 @@ function loadEnvConfig(source: NodeJS.ProcessEnv): EnvConfig {
   // has its own issue, so this never double-reports the same field.
   if (rateLimitEnabled && !redisEnabled) {
     issues.push({ field: "REDIS_URL", reason: "is required when RATE_LIMIT_ENABLED is true" });
+  }
+
+  let threadReuseEnabled: boolean = ENV_DEFAULTS.OPENCODE_THREAD_REUSE_ENABLED;
+  if (present(raw.OPENCODE_THREAD_REUSE_ENABLED)) {
+    const parsed = coerceBoolean(raw.OPENCODE_THREAD_REUSE_ENABLED);
+    if (parsed === undefined) {
+      issues.push({
+        field: "OPENCODE_THREAD_REUSE_ENABLED",
+        reason: 'must be "true" or "false"',
+      });
+    } else {
+      threadReuseEnabled = parsed;
+    }
+  }
+
+  // Thread reuse is Redis-backed by definition: a session-to-thread mapping must
+  // be visible to every replica and must be leased atomically, which cannot be
+  // done from process-local state. Enabling it without an endpoint is a
+  // configuration error, never a silent downgrade to stateless behaviour.
+  if (threadReuseEnabled && !redisEnabled) {
+    issues.push({
+      field: "REDIS_URL",
+      reason: "is required when OPENCODE_THREAD_REUSE_ENABLED is true",
+    });
   }
 
   let logContent: boolean = ENV_DEFAULTS.LOG_CONTENT;
@@ -492,6 +525,8 @@ function loadEnvConfig(source: NodeJS.ProcessEnv): EnvConfig {
     RATE_LIMIT_REQUESTS: rateLimitRequests,
     RATE_LIMIT_WINDOW_MS: rateLimitWindowMs,
     RATE_LIMIT_BURST: rateLimitBurst,
+    OPENCODE_THREAD_REUSE_ENABLED: threadReuseEnabled,
+    OPENCODE_THREAD_REUSE_TTL_MS: threadReuseTtlMs,
   };
 
   // Structural/enum/bounds validation. Reasons are generic; env keys are static.
