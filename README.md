@@ -186,14 +186,24 @@ keep-alive` comments every 15 s while polling waits, deterministic
   `"ask"` permission behavior — new usage should select
   `collectiviq-tools-beta`, and removing the alias will require a separately
   announced breaking configuration change.
+- **Optional bounded metrics and opt-in tracing, both off by default.** With
+  `METRICS_ENABLED=true` the gateway serves the fifteen Prometheus metrics of
+  specification section 23.2 at `GET /metrics` (outside `/v1`, **unauthenticated
+  — isolate it at the network layer**); with `TRACING_ENABLED=true` it emits the
+  nine manual OpenTelemetry spans of section 23.3 over OTLP/HTTP. Labels and span
+  attributes are closed vocabularies, so no prompt, answer, path, tool argument,
+  credential, or identifier can reach either signal. Off by default means
+  genuinely inert: no registry, no route (a `404`), no exporter, no per-request
+  telemetry allocation, and no call into either port — one fixed boolean check
+  per call site is all that remains. See "Metrics and tracing" below.
 
 ## What is not implemented yet
 
-`GET /metrics`, native CollectivIQ tool calling, and shared cross-replica
-capacity accounting.
-(Optional Redis-backed idempotency and optional Redis-backed cross-replica rate
-limiting ARE implemented — see "Idempotent requests" and "Rate limiting" below —
-but both are **off by default**, and capacity/queueing stay process-local.)
+Native CollectivIQ tool calling and shared cross-replica capacity accounting.
+(Optional Redis-backed idempotency, optional Redis-backed cross-replica rate
+limiting, and optional metrics/tracing ARE implemented — see "Idempotent
+requests", "Rate limiting", and "Metrics and tracing" below — but all are **off
+by default**, and capacity/queueing stay process-local.)
 (Supported opt-in beta emulated tool calling is implemented but **not enabled by
 default**. Its numerical section-30 release gates are met — the state-aware
 report-v5 evaluator completed a full live campaign on 2026-09-01 in which all
@@ -853,9 +863,9 @@ nothing about repeatability or long sessions.
 **Behaviour worth knowing before you turn it on.**
 
 - **Not production ready.** It was pulled forward ahead of the remaining
-  production-hardening work (metrics, tracing, shared capacity accounting, load
-  and security review, dependency scanning, runbooks), and upstream message
-  ordering, pagination, thread cleanup, and retention are still unverified.
+  production-hardening work (shared capacity accounting, load and security
+  review, dependency scanning, runbooks), and upstream message ordering,
+  pagination, thread cleanup, and retention are still unverified.
 - **Answers are matched by run id, not by thread history.** Every completion
   records the `combined_run_id` its submission returned and accepts only messages
   carrying that same id. A reused thread therefore cannot yield an earlier turn's
@@ -892,6 +902,102 @@ acknowledgement-safe `committed` step, the state-specific lease and TTL policy,
 and run correlation) is in
 [`.agent/docs/tech-software-spec.md`](.agent/docs/tech-software-spec.md)
 section 5.1.1.
+
+### Metrics and tracing (optional; both off by default)
+
+Bounded Prometheus metrics and opt-in OpenTelemetry tracing are implemented and
+**disabled by default**. With both switches off there is no metrics registry, no
+`/metrics` route (the endpoint returns `404`), no tracer, no exporter, no timer,
+no socket, no telemetry object, sample, or closure, and no call into either
+port. What remains is one fixed boolean check per call site, decided at
+construction — the gateway behaves exactly as it did before.
+
+```bash
+# Metrics only, scraped over loopback.
+export METRICS_ENABLED=true
+
+# Tracing to a local OTLP/HTTP collector, sampling every root span.
+export TRACING_ENABLED=true
+export TRACING_OTLP_ENDPOINT=http://127.0.0.1:4318/v1/traces
+export TRACING_SAMPLE_RATIO=1
+```
+
+```bash
+curl http://127.0.0.1:8787/metrics     # Prometheus exposition, no credential needed
+```
+
+**`GET /metrics` is deliberately unauthenticated, and isolating it is your job.**
+It sits outside `/v1` and performs no gateway-key check. A scrape credential
+would be a second secret to distribute and rotate, and the process cannot verify
+whether the interface it is bound to is private — so the gateway does not pretend
+to. Bind to loopback and scrape locally, expose the endpoint only on a private
+network, or firewall it to the scraper. **Never publish it on a public
+listener.** The exposition contains no prompt, answer, path, tool argument,
+credential, or identifier, but it does reveal traffic volumes, latencies, error
+categories, and your configured virtual-model ids.
+
+What you get:
+
+- The fifteen metrics of specification section 23.2 — request counts and
+  durations, active/queued capacity, upstream calls and durations, poll counts
+  and durations, timeouts, errors, tool outcomes, open SSE streams, and client
+  cancellations — with fixed histogram buckets that cover the ~90 s upstream
+  deadline.
+- Closed, bounded labels only: an endpoint TEMPLATE (never the request URL), an
+  HTTP status family, a configured virtual-model id (anything else becomes
+  `none`), the transport, and the public error `code`. Capacity, rate-limit,
+  idempotency, and thread-reuse failures stay individually distinguishable.
+- The nine manual spans of section 23.3, with explicit parentage under
+  `gateway.request`. There is **no automatic instrumentation** — it would capture
+  URLs, headers, and query strings — and no trace header is ever sent to
+  CollectivIQ.
+
+Things worth knowing before you enable tracing:
+
+- The gateway becomes an OTLP/HTTP client and POSTs spans continuously to
+  `TRACING_OTLP_ENDPOINT`. It sends **no exporter authentication header** (none is
+  configurable yet), so the collector must be reachable only from the gateway's
+  network. Prefer `https://` wherever the link is not private.
+- **`OTEL_*` environment variables are inert at construction.** The SDK would
+  normally treat them as a fallback — enough for `OTEL_EXPORTER_OTLP_HEADERS` to
+  attach a credential to every export or for a client-certificate variable to
+  read a file at startup — so the gateway builds every SDK object with them
+  removed from the environment. Configure tracing through the four settings
+  above. This covers everything the installed SDK reads while constructing those
+  objects; it is not a promise about a future SDK that reads the environment
+  lazily at export time, so prefer simply not setting `OTEL_*` at all.
+- `TRACING_OTLP_ENDPOINT` must be the full canonical traces URL, at most 2048
+  UTF-8 bytes. A bare origin such as `http://127.0.0.1:4318` or a root-only
+  `https://collector/` is rejected, as are query strings and fragments — down to a
+  bare trailing `?` or `#` — so every replica sends exactly where you wrote. **An endpoint embedding credentials
+  (`https://user:pass@collector/v1/traces`) is also rejected** — the gateway
+  sends no exporter authentication, so such a value could never authenticate
+  anything and would only park a secret in a non-secret setting. Configuration
+  errors never echo the submitted endpoint, and it is redacted from logs.
+- Spans carry closed metadata only and never an exception message: a failed span
+  gets an error status plus a closed error category.
+- Shutdown flushes and closes the exporter under a fixed 2-second budget, after
+  Redis, and can neither hang nor fail the shutdown sequence.
+
+Telemetry is best-effort: it never changes admission order, status codes, or
+response bodies, and a misconfigured or unreachable collector costs you traces,
+not requests. Specification sections 23.2 and 23.3 own the full contract.
+
+**Known limitations before you turn either feature on.** Every test is hermetic,
+so some things are simply unmeasured:
+
+- **No live collector has ever been exercised.** Wire-level OTLP encoding and
+  collector interoperability are unverified — the tracing tests use an in-memory
+  exporter. Validate against your own collector in a non-production environment
+  first.
+- **Sustained scraping is unmeasured.** Registry behaviour under a frequent
+  Prometheus scrape, and the memory profile of the batch span processor under
+  sustained traffic, belong to the outstanding Phase 4 load gate. Start with a
+  conservative scrape interval and a `TRACING_SAMPLE_RATIO` below `1` on a busy
+  deployment.
+- **This layer has not been through the Phase 4 security review**, which is still
+  outstanding along with shared capacity accounting, load testing, dependency
+  scanning, and the release/backup runbooks. Phase 4 is not complete.
 
 ## Validation
 
@@ -1404,36 +1510,40 @@ gateway validates the mode-appropriate credential at startup. Only
 
 ## Configuration reference
 
-| Variable                          | Required   | Default                           | Notes                                                                                                                   |
-| --------------------------------- | ---------- | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `ENVIRONMENT`                     | no         | `production`                      | `development` \| `staging` \| `production`                                                                              |
-| `HOST`                            | no         | `127.0.0.1`                       | Loopback by default                                                                                                     |
-| `PORT`                            | no         | `8787`                            | 1–65535                                                                                                                 |
-| `COLLECTIVIQ_BASE_URL`            | no         | `https://api.prod.collectiviq.ai` | Must be an absolute http(s) URL                                                                                         |
-| `COLLECTIVIQ_AUTH_MODE`           | no         | `bearer`                          | `bearer` \| `password`; selects the upstream credential                                                                 |
-| `COLLECTIVIQ_API_KEY`             | bearer     | —                                 | Bearer-mode upstream token (≤16 KiB, preserved exactly); required when `COLLECTIVIQ_AUTH_MODE=bearer`                   |
-| `COLLECTIVIQ_USERNAME`            | password   | —                                 | Password-mode username (trimmed, ≤320 bytes); required when `COLLECTIVIQ_AUTH_MODE=password`                            |
-| `COLLECTIVIQ_PASSWORD`            | password   | —                                 | Password-mode password (preserved exactly, ≤4096 bytes); required when `COLLECTIVIQ_AUTH_MODE=password`                 |
-| `COLLECTIVIQ_GATEWAY_KEYS`        | **yes**    | —                                 | Comma-separated client keys; trimmed, de-duplicated, ≤64 keys, ≤8192 UTF-8 bytes/key; enforced on `/v1/*`               |
-| `MODEL_CONFIG_PATH`               | no         | `./config/models.yaml`            | Path to the YAML model file                                                                                             |
-| `LOG_LEVEL`                       | no         | `info`                            | Pino level                                                                                                              |
-| `LOG_CONTENT`                     | no         | `false`                           | May be `true` only when `ENVIRONMENT=development`                                                                       |
-| `MAX_REQUEST_BODY_BYTES`          | no         | `8388608`                         | 1024 – 67108864                                                                                                         |
-| `MAX_CONCURRENT_REQUESTS`         | no         | `4`                               | Global active completions (process-local); 1–1024                                                                       |
-| `MAX_CONCURRENT_REQUESTS_PER_KEY` | no         | `2`                               | Per-gateway-key active completions; 1–1024 and ≤ `MAX_CONCURRENT_REQUESTS`                                              |
-| `MAX_QUEUED_REQUESTS`             | no         | `20`                              | Bounded admission queue length; 0–100000 (0 disables queueing)                                                          |
-| `MAX_QUEUE_WAIT_MS`               | no         | `5000`                            | Max time in the admission queue before a `429`; 1–600000                                                                |
-| `SHUTDOWN_DRAIN_MS`               | no         | `30000`                           | Graceful-shutdown drain before in-flight polling is cancelled; 0–600000                                                 |
-| `REDIS_URL`                       | no         | _(empty — Redis disabled)_        | Canonical `redis://` / `rediss://` only (no query/fragment). **Secret-bearing** (may embed credentials); redacted       |
-| `IDEMPOTENCY_ENCRYPTION_KEY`      | with Redis | —                                 | **Required when `REDIS_URL` is set.** Exactly 32 bytes as canonical unpadded base64url (43 chars). **Secret**; redacted |
-| `IDEMPOTENCY_TTL_MS`              | no         | `600000`                          | Lifetime of a cached final response; 60000–3600000                                                                      |
-| `REDIS_KEY_PREFIX`                | no         | `collectiviq-gateway`             | Redis key namespace shared by both optional features; 1–64 chars matching `[A-Za-z0-9_-]+`                              |
-| `RATE_LIMIT_ENABLED`              | no         | `false`                           | Cross-replica per-key rate limiting; exactly `"true"`/`"false"`. `true` **requires** `REDIS_URL`. Adds no new secret    |
-| `RATE_LIMIT_REQUESTS`             | no         | `60`                              | Sustained requests per window, per gateway key; 1–100000. Validated even while disabled                                 |
-| `RATE_LIMIT_WINDOW_MS`            | no         | `60000`                           | Window the sustained rate is expressed over, in ms; 1000–3600000. Validated even while disabled                         |
-| `RATE_LIMIT_BURST`                | no         | `8`                               | Requests admitted immediately from an idle key; 1–10000 and ≤ `RATE_LIMIT_REQUESTS`                                     |
-| `OPENCODE_THREAD_REUSE_ENABLED`   | no         | `false`                           | OpenCode thread reuse; exactly `"true"`/`"false"`. `true` **requires** `REDIS_URL`. Adds no new secret                  |
-| `OPENCODE_THREAD_REUSE_TTL_MS`    | no         | `604800000`                       | Sliding idle lifetime of a session-to-thread mapping; 300000–2592000000. Validated even while disabled                  |
+| Variable                          | Required     | Default                           | Notes                                                                                                                                                                                                                   |
+| --------------------------------- | ------------ | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ENVIRONMENT`                     | no           | `production`                      | `development` \| `staging` \| `production`                                                                                                                                                                              |
+| `HOST`                            | no           | `127.0.0.1`                       | Loopback by default                                                                                                                                                                                                     |
+| `PORT`                            | no           | `8787`                            | 1–65535                                                                                                                                                                                                                 |
+| `COLLECTIVIQ_BASE_URL`            | no           | `https://api.prod.collectiviq.ai` | Must be an absolute http(s) URL                                                                                                                                                                                         |
+| `COLLECTIVIQ_AUTH_MODE`           | no           | `bearer`                          | `bearer` \| `password`; selects the upstream credential                                                                                                                                                                 |
+| `COLLECTIVIQ_API_KEY`             | bearer       | —                                 | Bearer-mode upstream token (≤16 KiB, preserved exactly); required when `COLLECTIVIQ_AUTH_MODE=bearer`                                                                                                                   |
+| `COLLECTIVIQ_USERNAME`            | password     | —                                 | Password-mode username (trimmed, ≤320 bytes); required when `COLLECTIVIQ_AUTH_MODE=password`                                                                                                                            |
+| `COLLECTIVIQ_PASSWORD`            | password     | —                                 | Password-mode password (preserved exactly, ≤4096 bytes); required when `COLLECTIVIQ_AUTH_MODE=password`                                                                                                                 |
+| `COLLECTIVIQ_GATEWAY_KEYS`        | **yes**      | —                                 | Comma-separated client keys; trimmed, de-duplicated, ≤64 keys, ≤8192 UTF-8 bytes/key; enforced on `/v1/*`                                                                                                               |
+| `MODEL_CONFIG_PATH`               | no           | `./config/models.yaml`            | Path to the YAML model file                                                                                                                                                                                             |
+| `LOG_LEVEL`                       | no           | `info`                            | Pino level                                                                                                                                                                                                              |
+| `LOG_CONTENT`                     | no           | `false`                           | May be `true` only when `ENVIRONMENT=development`                                                                                                                                                                       |
+| `MAX_REQUEST_BODY_BYTES`          | no           | `8388608`                         | 1024 – 67108864                                                                                                                                                                                                         |
+| `MAX_CONCURRENT_REQUESTS`         | no           | `4`                               | Global active completions (process-local); 1–1024                                                                                                                                                                       |
+| `MAX_CONCURRENT_REQUESTS_PER_KEY` | no           | `2`                               | Per-gateway-key active completions; 1–1024 and ≤ `MAX_CONCURRENT_REQUESTS`                                                                                                                                              |
+| `MAX_QUEUED_REQUESTS`             | no           | `20`                              | Bounded admission queue length; 0–100000 (0 disables queueing)                                                                                                                                                          |
+| `MAX_QUEUE_WAIT_MS`               | no           | `5000`                            | Max time in the admission queue before a `429`; 1–600000                                                                                                                                                                |
+| `SHUTDOWN_DRAIN_MS`               | no           | `30000`                           | Graceful-shutdown drain before in-flight polling is cancelled; 0–600000                                                                                                                                                 |
+| `REDIS_URL`                       | no           | _(empty — Redis disabled)_        | Canonical `redis://` / `rediss://` only (no query/fragment). **Secret-bearing** (may embed credentials); redacted                                                                                                       |
+| `IDEMPOTENCY_ENCRYPTION_KEY`      | with Redis   | —                                 | **Required when `REDIS_URL` is set.** Exactly 32 bytes as canonical unpadded base64url (43 chars). **Secret**; redacted                                                                                                 |
+| `IDEMPOTENCY_TTL_MS`              | no           | `600000`                          | Lifetime of a cached final response; 60000–3600000                                                                                                                                                                      |
+| `REDIS_KEY_PREFIX`                | no           | `collectiviq-gateway`             | Redis key namespace shared by both optional features; 1–64 chars matching `[A-Za-z0-9_-]+`                                                                                                                              |
+| `RATE_LIMIT_ENABLED`              | no           | `false`                           | Cross-replica per-key rate limiting; exactly `"true"`/`"false"`. `true` **requires** `REDIS_URL`. Adds no new secret                                                                                                    |
+| `RATE_LIMIT_REQUESTS`             | no           | `60`                              | Sustained requests per window, per gateway key; 1–100000. Validated even while disabled                                                                                                                                 |
+| `RATE_LIMIT_WINDOW_MS`            | no           | `60000`                           | Window the sustained rate is expressed over, in ms; 1000–3600000. Validated even while disabled                                                                                                                         |
+| `RATE_LIMIT_BURST`                | no           | `8`                               | Requests admitted immediately from an idle key; 1–10000 and ≤ `RATE_LIMIT_REQUESTS`                                                                                                                                     |
+| `OPENCODE_THREAD_REUSE_ENABLED`   | no           | `false`                           | OpenCode thread reuse; exactly `"true"`/`"false"`. `true` **requires** `REDIS_URL`. Adds no new secret                                                                                                                  |
+| `OPENCODE_THREAD_REUSE_TTL_MS`    | no           | `604800000`                       | Sliding idle lifetime of a session-to-thread mapping; 300000–2592000000. Validated even while disabled                                                                                                                  |
+| `METRICS_ENABLED`                 | no           | `false`                           | Exposes `GET /metrics`; exactly `"true"`/`"false"`. **Unauthenticated when enabled — isolate it at the network layer**                                                                                                  |
+| `TRACING_ENABLED`                 | no           | `false`                           | Opt-in OpenTelemetry tracing over OTLP/HTTP; exactly `"true"`/`"false"`. `true` **requires** `TRACING_OTLP_ENDPOINT`                                                                                                    |
+| `TRACING_OTLP_ENDPOINT`           | with tracing | _(empty — no exporter)_           | Canonical absolute http(s) traces URL ≤2048 UTF-8 bytes, e.g. `http://127.0.0.1:4318/v1/traces`. No query/fragment, **no embedded `user:pass@` credentials**, and a **non-root path** (any path, not just `/v1/traces`) |
+| `TRACING_SAMPLE_RATIO`            | no           | `1`                               | Root-span sampling probability; a plain decimal in `[0, 1]`. Validated even while disabled                                                                                                                              |
 
 The upstream credential authenticates the gateway to CollectivIQ: in `bearer`
 mode `COLLECTIVIQ_API_KEY` is sent as a static bearer token; in `password` mode

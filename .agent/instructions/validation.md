@@ -419,6 +419,90 @@ guard on an invalid current-format checkpoint, and no-live-content scans of the
 serialized report and checkpoint). The v5/v4 additions are listed in the
 state-aware block above.
 
+**Observability evidence (Phase 4C, implemented — optional, both off by
+default).** Specification section 29.9 owns the layered test inventory and
+sections 23.2/23.3 the normative contract; do not restate them here.
+Operationally:
+
+- Every observability suite is HERMETIC and runs inside `npm run validate`. No
+  OTLP collector, Redis, OpenCode, credential, or live CollectivIQ call is
+  needed, and none may be introduced: an enabled tracer is exercised only through
+  an injected in-memory exporter.
+- Hermetic coverage that must accompany any change in this area:
+  `test/unit/metrics.test.ts`, `test/unit/tracing.test.ts`,
+  `test/unit/telemetry-runtime.test.ts`,
+  `test/unit/generation-telemetry.test.ts`,
+  `test/integration/observability.test.ts`, the observability block in
+  `test/unit/config.test.ts`, and the dependency-close cases in
+  `test/unit/shutdown.test.ts` — then `npm run validate`.
+- Four properties are easy to regress and are asserted deliberately: the
+  `@prometheus-io/client`
+  GLOBAL default registry must stay free of every `collectiviq_gateway_` series
+  (two server instances in one process must not share state); a JSON reply and a
+  HIJACKED SSE reply must each settle request metrics EXACTLY once, including on
+  a real-socket disconnect; constructing or closing an ENABLED telemetry
+  runtime must make zero outbound requests (the suites spy on `fetch`,
+  `http.request`, and `https.request`); and ambient `OTEL_*` variables must stay
+  inert. The last one is proven behaviourally rather than by inspection: with
+  `OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY` set to a sentinel path, an
+  `fs.readFileSync` spy must never see it while the real exporter is built, and
+  the same spy is then shown to catch a deliberate read so the assertion cannot
+  pass vacuously. It was confirmed red-before-green: constructing the SDK
+  exporter WITHOUT the isolation does attempt that read.
+- Disabled inertness is proven by EXECUTION, not inspection: the integration
+  suite wires ports that RECORD every call and then throw, and asserts the
+  recorded list is empty. Recording matters as much as throwing — `streamClosed`
+  runs in a `finally` after the response has already ended, so a throw there
+  changes neither status nor body and a response-only assertion would miss it.
+  The net now drives JSON success, SSE success, a `401`, a model `404`, a
+  tool-schema `400`, an upstream failure on both transports, a completion
+  timeout, a required-choice parse failure, a REAL-SOCKET client cancellation, an
+  idempotent replay, and `/metrics`.
+- SHUTDOWN is held to the same standard, in `test/unit/telemetry-runtime.test.ts`:
+  closing a disabled runtime — and a metrics-only one — must record no
+  `shutdown` call on a recording tracing port, while an enabled port records
+  exactly one per close and the close still resolves when that shutdown rejects.
+  Those cases drive `composeTelemetryRuntime`, the exported seam
+  `createTelemetryRuntime` itself routes through, so no production-only test hook
+  is involved. Use that seam rather than mocking module globals if you extend
+  lifecycle coverage.
+- Know the LIMIT that remains: while BOTH ports are off the root hook is not
+  installed, so those cases prove the end-to-end invariant but cannot isolate an
+  individual call-site guard. The MIXED case (metrics disabled, tracing live)
+  exists for that and does catch a missing `metricsOn` guard on the cancellation
+  path — extend it rather than assuming the fully-disabled cases cover a new
+  guard. Shutdown cancellation is still not driven while disabled.
+- The failed-span contract (`ERROR` status, ABSENT status message, the expected
+  closed category) is asserted on SIX exits: `collectiviq.process_message`,
+  `collectiviq.poll`, `gateway.serialize`, `gateway.parse`, `gateway.stream`
+  (post-header failure), and `gateway.request` (client cancellation on both
+  transports). EXPORTED-EXACTLY-ONCE is additionally asserted on four of those —
+  `gateway.serialize`, `gateway.parse`, `gateway.stream`, and `gateway.request` —
+  by filtering the exporter and asserting a length of one; the two upstream spans
+  read the first match only, so a duplicate there would not be caught. Add the
+  count assertion whenever a failure path can reach a span's `end()` twice.
+  `gateway.validate`, `gateway.encode`, and `collectiviq.create_thread` failure
+  exits are implemented but not individually asserted. Spec §29.9 enumerates the
+  same ASSERTED set; it does not name these three, so this bullet is where the
+  negative lives. Prefer extending the set over trusting it to be exhaustive.
+- Privacy is asserted by sentinel scan, not by inspection: synthetic secret,
+  prompt, answer, path, thread-id, session-id, idempotency-key, gateway-key, and
+  tool-argument sentinels are pushed through the ports and must be absent from
+  both the Prometheus exposition and every serialized span.
+- `test/unit/polling.test.ts` now asserts the exact `pollCount` on each
+  `PollOutcome`. Those are strengthened assertions, not new tolerance — keep the
+  exact counts if you change poll timing.
+- Not covered: no live OTLP collector is contacted, so wire-level OTLP encoding
+  and collector interoperability are unverified; registry behaviour under
+  sustained scraping AND the memory profile of an enabled `BatchSpanProcessor`
+  under sustained traffic both belong to the outstanding Phase 4 load gate; and
+  shutdown cancellation is not driven while telemetry is disabled. Spec §29.9
+  lists the same set — keep the two in step. Only the first two are
+  operator-facing and are repeated in `README.md` and
+  `.agent/instructions/operations.md`; the shutdown-cancellation gap is evidence
+  detail owned here and in §29.9, with no operator action attached, so do not
+  add it to the operator documents.
+
 ## Validation Order
 
 Run the narrowest meaningful check first, then broaden based on risk:

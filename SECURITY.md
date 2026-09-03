@@ -41,8 +41,9 @@ production readiness. Specification
 section 30 owns the graduation decision and the campaign and gate details). Two
 OPTIONAL Redis-backed features exist and are **off by default** — cross-replica
 idempotency (Phase 4A) and cross-replica per-gateway-key rate limiting
-(Phase 4B), both described below. Metrics/tracing, true upstream streaming, and
-native tool mode are not implemented. The completion path calls CollectivIQ only
+(Phase 4B), both described below, plus optional bounded metrics and opt-in
+OpenTelemetry tracing (Phase 4C), also off by default and described below. True
+upstream streaming and native tool mode are not implemented. The completion path calls CollectivIQ only
 when a real request is served (never during import/construction/build smoke). A
 user-observed, sanitized live OpenCode/CollectivIQ foreground **transport** smoke
 was reported on **2026-08-15** (protocol-mode `collectiviq-claude` response
@@ -638,7 +639,10 @@ errorCode, resolved, resolution, persisted }] }` (no longer `succeeded`/
   enforcement is bounded to the configured window, it fails closed on a Redis
   outage (trading availability for correctness on the completion path), and an
   evicted quota key silently resets that key's allowance.
-- No metrics endpoint is exposed.
+- The metrics endpoint is **off by default** and, when enabled, is
+  **unauthenticated** — isolating it is the operator's responsibility (see
+  "Optional metrics and tracing" below). Tracing is likewise off by default and,
+  when enabled, sends spans to a collector with no exporter authentication.
 - Readiness probes only the optional Redis dependency; CollectivIQ is
   deliberately not probed, and the response body remains a simple
   ready/not-ready state.
@@ -827,8 +831,8 @@ disclosure, and keep the same isolation and secret-handling controls the Phase 4
 section already requires.
 
 **Known residual risks.** It is **not production ready**: the remaining Phase 4
-controls (metrics, tracing, shared capacity accounting, load and security review,
-dependency scanning, runbooks) are outstanding, and upstream message ordering,
+controls (shared capacity accounting, load and security review, dependency
+scanning, runbooks) are outstanding, and upstream message ordering,
 pagination, thread cleanup, and retention remain unverified. A Redis failure
 immediately after `create_thread` can leave one blank orphan thread, which is
 deliberately never guess-deleted. A hard replica kill mid-submit blocks that
@@ -846,6 +850,92 @@ provider thread deleted afterwards by the user. Neither result changes any risk
 above: the smoke is a single observation, not repeatability, cross-account or
 cross-version behaviour, or a retention or deletion guarantee, and further live
 runs need fresh approval.
+
+## Optional metrics and tracing (Phase 4C)
+
+Both are **implemented and disabled by default**. With `METRICS_ENABLED=false`
+and `TRACING_ENABLED=false` there is no Prometheus registry, no `/metrics` route
+(the endpoint returns `404`), no tracer, no exporter, no timer, no socket, no
+per-request telemetry allocation, and no call into either port. What remains is
+one fixed boolean check per call site — the claim is "no telemetry objects,
+samples, or closures", not "zero instructions". Neither feature introduces a new
+secret, requires Redis,
+or depends on any other feature.
+
+**Cardinality is the privacy boundary.** Every metric label and span attribute is
+a member of a frozen vocabulary or a CONFIGURED virtual-model id, re-checked at
+write time; an unrecognized value collapses to a fixed fallback rather than
+becoming a new series. Prompts, answers, source code, file and repository paths,
+URLs, tool names/arguments/results, credentials, gateway keys and scopes,
+idempotency keys, session ids, thread ids, request ids, tool-call ids, and
+exception text have no representation in the API at all. The endpoint label is
+always a route TEMPLATE, never the request URL. A failed span carries an error
+status with **no message** plus a closed error category taken from the envelope
+the gateway itself returned; `recordException` is never called, and span limits
+forbid events and links outright.
+
+**No automatic instrumentation is installed**, and none may be added: it would
+capture full URLs, headers, and query strings — gateway keys, idempotency keys,
+session ids — into span attributes. No trace header is ever propagated to
+CollectivIQ.
+
+**`GET /metrics` is unauthenticated when enabled, by design.** A scrape
+credential would be a second secret to distribute and rotate, and the process
+cannot verify whether the interface it is bound to is private. **Isolating the
+endpoint is the operator's responsibility**: bind to loopback and scrape locally,
+expose it only on a private network, or firewall it to the scraper. Never publish
+it on a public listener. The exposition carries no content or identifiers, but it
+does disclose traffic volumes, latencies, error categories, and the configured
+virtual-model ids.
+
+**Tracing is outbound egress to a trust boundary.** An enabled gateway POSTs
+spans continuously to `TRACING_OTLP_ENDPOINT` and sends **no exporter
+authentication header** (none is configurable in this slice), so the collector
+must be reachable only from the gateway's own network; prefer `https://` wherever
+the link is not private.
+
+**The endpoint is validated as a credential-free, bounded, canonical URL.** It
+must be an absolute lowercase `http(s)` URL of at most 2048 UTF-8 bytes, with a
+non-empty host, no query, no fragment, an exact canonical round-trip, a
+**non-root path**, and **no embedded userinfo**. Rejecting `user:pass@` is what
+makes the no-exporter-authentication statement above complete: the gateway would
+never send such a credential, so accepting one would only park a secret in a
+setting that is not handled as a secret. The byte bound is measured on the **raw**
+environment value, before trimming and before any parse, so whitespace padding
+cannot carry an oversized value past the limit. The value is validated whenever
+present, even while tracing is disabled, and configuration errors are a closed
+set of reasons that never echo the submitted host, path, or credential.
+
+**Redaction covers the endpoint at any depth**, through two mechanisms that are
+both required: `TRACING_OTLP_ENDPOINT` is in `REDACT_PATHS` (which reaches the
+root and one nesting level), and the recursive sanitizer additionally matches the
+exact normalized key names `otlpendpoint` and `tracingotlpendpoint`, so a deeply
+nested occurrence is redacted too. The match is deliberately exact rather than an
+`endpoint` substring, which would also hide innocuous operational fields such as
+`endpointCount`.
+
+**Ambient `OTEL_*` variables are inert at construction.** The OpenTelemetry SDK
+normally treats them as a fallback for anything the caller did not set, which
+would let `OTEL_EXPORTER_OTLP_HEADERS` attach a secret-bearing header to every
+export, let `OTEL_EXPORTER_OTLP_[TRACES_]CLIENT_KEY`/`_CERTIFICATE` read files
+from disk during construction, and let `OTEL_BSP_*` retune the batch processor.
+The gateway builds every SDK object with those variables temporarily removed from
+the environment and exactly restored afterwards, so telemetry configuration comes
+from validated application configuration only, and neither arbitrary resource
+attributes nor exporter headers are accepted. **Scope this claim honestly:** it
+covers every environment read the installed SDK performs while constructing those
+objects, and it cannot bind a future SDK version that reads the environment
+lazily at export time. The durable control is the deployment rule that the
+gateway's environment carries no `OTEL_*` variables at all.
+
+**Known residual risks.** Enabling either feature widens a deployment's
+observable surface: a compromised collector reveals request timing, volumes,
+error categories, and model usage per environment. No wire-level OTLP
+interoperability has been verified against a live collector, and this
+observability layer has not yet been through the outstanding Phase 4 security
+review or load gate. Telemetry is best-effort by design — it never changes
+admission order, status codes, or response bodies — so it must not be relied on
+as a control.
 
 ## Remote deployment
 

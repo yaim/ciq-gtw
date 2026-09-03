@@ -264,9 +264,11 @@ earlier one; the plugin supplied session identity on BOTH turns (section 25); an
 hidden title generation stayed absent while native-title propagation still worked.
 
 **It is still not production ready, and one passing smoke does not change that.**
-The outstanding Phase 4 controls (metrics, tracing, shared cross-replica capacity
+The outstanding Phase 4 controls (shared cross-replica capacity
 accounting, load testing, a security review, dependency scanning, backup/release
-procedures, and runbooks) remain outstanding, and the upstream questions this
+procedures, and runbooks) remain outstanding — optional metrics and tracing are
+now implemented (Phase 4C, sections 23.2 and 23.3) but off by default and change
+nothing here — and the upstream questions this
 feature is most sensitive to — message ordering and pagination (section 35, items
 7 and 8), thread cleanup (item 9), and retention (items 22–25) — remain
 unanswered. The approval-gated real-Redis suite also passes (section 29.8), so the
@@ -833,6 +835,13 @@ GET  /metrics
 ```
 
 `/metrics` should not be publicly exposed without network controls or separate authentication.
+
+**Implementation status (Phase 4C, implemented).** `GET /metrics` exists only
+when `METRICS_ENABLED=true`; otherwise the route is not registered and the
+endpoint returns the framework `404`. It is registered on the ROOT instance,
+outside the authenticated `/v1` group, and carries no application
+authentication — operators must isolate it at the network layer (sections 23.2,
+31.2). It never calls CollectivIQ or Redis.
 
 `GET /v1/opencode/session-title` is an **authenticated gateway extension**, not
 part of the bounded OpenAI compatibility profile; it supports the OpenCode
@@ -3513,6 +3522,153 @@ Do not use:
 * tool-call ID;
 * arbitrary tool arguments.
 
+**Implementation status (Phase 4C, implemented — OPTIONAL, off by default).**
+The complete metric set above is implemented in `src/observability/metrics.ts`
+over a PRIVATE `@prometheus-io/client` registry (the maintained successor to the
+deprecated `prom-client`). `METRICS_ENABLED=false` (the default) means the port
+is the no-op: no registry, no series, no route, no per-request telemetry
+allocation, and `GET /metrics` returns the framework `404`.
+
+**Disabled means structurally inert, not cheaply no-op.** Both ports expose an
+`enabled` flag fixed at construction, and EVERY call site branches on it. A
+disabled gateway therefore builds no span options or attribute objects,
+constructs no observation samples or per-request closures, reads no telemetry
+clock, does not bind the capacity source, does not decorate the upstream adapter,
+does not install the root request hook, and never passes a request span into the
+completion pipeline — it calls into neither port at all.
+
+That holds at SHUTDOWN as well: the telemetry runtime's `close()` skips
+`tracing.shutdown()` outright when the port is disabled, rather than delegating
+to a no-op. A disabled port owns no provider, exporter, processor, or timer, so
+there is nothing to flush; calling it anyway would be the one place the
+"disabled means uncalled" invariant quietly stopped holding.
+
+State the residual cost honestly: what remains is one FIXED BOOLEAN CHECK at each
+call site (and one nullish check on the per-request handle). The claim is "no
+telemetry objects, samples, closures, clock reads, or port calls", NOT "zero
+instructions".
+
+Three mechanisms make that structural rather than conventional, and none may be
+replaced by a no-op object:
+
+* the root request hook is not installed at all when both ports are off, so
+  `request.telemetry` stays `null` and there is no per-request handle to call;
+* `RequestTelemetry` is nullable everywhere — there is deliberately no shared
+  no-op handle, because one would let authentication, model-miss, and
+  error-envelope paths keep invoking methods on a path that must be inert;
+* span helpers and the stream failure helper are `null` rather than no-op
+  functions, and every call site uses optional invocation, which short-circuits
+  WITHOUT evaluating its arguments — so the attribute objects are never built.
+
+`test/integration/observability.test.ts` proves this by wiring ports that RECORD
+every call and then throw, asserting the recorded list is empty. Recording is
+essential: `streamClosed` runs in a `finally` after the response has already
+ended, where a throw would change neither status nor body.
+
+**The closed label vocabulary** lives in `src/observability/labels.ts` and is the
+single mechanism bounding cardinality. Every emitted value is either a member of
+a frozen list or a CONFIGURED virtual-model id, and both are re-checked at write
+time; an unrecognized value collapses to a fixed fallback rather than creating a
+series.
+
+| Dimension | Closed values |
+| --- | --- |
+| `endpoint` | `/healthz`, `/readyz`, `/metrics`, `/v1/models`, `/v1/models/:model`, `/v1/chat/completions`, `/v1/opencode/session-title`, `other` — always the route TEMPLATE, never `request.url` |
+| `status_family` | `2xx`, `4xx`, `5xx`, `other` |
+| `model` | a configured virtual-model id, or `none` when no configured model applies |
+| `transport` | `json`, `sse` |
+| `error_category` | the public OpenAI error `code` of the envelope the gateway itself returned (24 values), or `other` |
+| `operation` | `create_thread`, `process_message`, `get_messages`, `get_threads` |
+| `outcome` (upstream) | `success`, `error`, `cancelled` |
+| `outcome` (poll phase) | `answer`, `timeout`, `error`, `cancelled` |
+| `tool_mode` | `disabled`, `emulated`, `native` |
+| `parser_source` | `desired-source`, `individual-consensus`, `individual-single` |
+
+Using the public error CODE as the error category is deliberate: it keeps
+capacity, cross-replica rate-limit, idempotency, and thread-reuse failures
+individually distinguishable without a second taxonomy that could drift from the
+public contract. The category always comes from an envelope the gateway
+constructed — never from inspecting a thrown value.
+
+| Metric | Type | Labels |
+| --- | --- | --- |
+| `..._requests_total` | counter | `endpoint`, `status_family`, `model`, `transport` |
+| `..._request_duration_seconds` | histogram | `endpoint`, `status_family`, `model`, `transport` |
+| `..._active_requests` | gauge | — |
+| `..._queued_requests` | gauge | — |
+| `..._upstream_requests_total` | counter | `operation`, `outcome` |
+| `..._upstream_request_duration_seconds` | histogram | `operation`, `outcome` |
+| `..._poll_count` | counter | `model` |
+| `..._poll_duration_seconds` | histogram | `model`, `outcome` |
+| `..._timeouts_total` | counter | `model` |
+| `..._errors_total` | counter | `endpoint`, `error_category` |
+| `..._tool_responses_total` | counter | `model`, `tool_mode`, `parser_source` |
+| `..._tool_parse_failures_total` | counter | `model` |
+| `..._tool_schema_failures_total` | counter | `model` |
+| `..._stream_connections` | gauge | — |
+| `..._client_cancellations_total` | counter | `endpoint`, `transport` |
+
+**Fixed buckets**, chosen so a completion at or beyond the ~90 s upstream
+deadline lands in a real bucket rather than only in `+Inf`:
+
+```text
+request_duration_seconds   0.05 0.1 0.25 0.5 1 2.5 5 10 20 30 45 60 90 120 180
+upstream_request_duration_seconds  0.01 0.05 0.1 0.25 0.5 1 2.5 5 10 20 30 60 90
+poll_duration_seconds      0.5 1 2.5 5 10 20 30 45 60 90 120 180
+```
+
+**Exactly-one ownership.** Every metric has a single writer, which is what makes
+"exactly once per request" structural rather than conventional:
+
+| Signal | Owner |
+| --- | --- |
+| `requests_total`, `request_duration_seconds`, `errors_total`, `client_cancellations_total` | `src/api/request-telemetry.ts` (a root `onRequest` hook) |
+| `active_requests`, `queued_requests` | pulled from the existing `CapacityController` snapshot at scrape time |
+| `upstream_requests_total`, `upstream_request_duration_seconds` | the adapter decorator `src/generation/adapter-telemetry.ts` |
+| `poll_count`, `poll_duration_seconds`, `timeouts_total` | `src/generation/chat-completion.ts` |
+| `tool_responses_total`, `tool_parse_failures_total` | `src/generation/chat-completion.ts` |
+| `tool_schema_failures_total` | `src/api/chat-completions-route.ts` (a submitted toolset rejected at the request boundary) |
+| `stream_connections` | `src/api/chat-stream-response.ts` |
+
+Request settlement is driven from the raw Node response's `finish`/`close`
+events behind a one-shot guard, NOT from Fastify's `onResponse`, because the
+streamed path hijacks the reply and may be force-destroyed without ever being
+"sent". A JSON reply, a fully delivered stream, a stream cut short by a
+disconnect, and a force-closed socket therefore each settle exactly once. A
+`close` with nothing ended is the client-cancellation condition, so a cancelled
+request is counted at most once on either transport.
+
+Consequences worth stating plainly:
+
+* An idempotent REPLAY settles as a gateway request but increments no upstream
+  counter, because it performs no upstream work.
+* A post-header SSE failure keeps the committed `200` status line, so it counts
+  as `status_family="2xx"` while still contributing its closed `error_category`.
+* A client disconnect on the non-streamed path also keeps the default `200`
+  status; `client_cancellations_total` is what makes it visible.
+* `poll_count` counts the attempts of COMPLETED polling phases (a phase that
+  threw carries no attempt count); `upstream_requests_total{operation="get_messages"}`
+  counts every individual attempt, including those of a failed phase.
+* A stream FORCE-CLOSED during shutdown because the client was backpressured and
+  not draining is counted as a client cancellation. The transport cannot
+  distinguish an undrainable client from a departed one, and the rest of the
+  gateway already classifies that destroy as a disconnect (it aborts the same
+  client-abort controller), so the metric deliberately agrees with the behaviour
+  rather than inventing a separate judgement.
+* `tool_schema_failures_total` currently always reports `model="none"`. The
+  rejection happens at the request boundary and the resolved model is not carried
+  on the error envelope. The label is retained for shape consistency with the
+  other two tool metrics and so a later change can populate it without breaking
+  existing dashboards.
+
+**Privacy.** No prompt, answer, source code, file or repository path, URL, tool
+name/argument/result, credential, gateway key or scope, idempotency key, session
+id, thread id, request id, or exception text has any representation in this API,
+and a value smuggled into a label field is discarded by the closed-set re-check.
+The exposition does disclose traffic volumes, latencies, error categories, and
+the configured virtual-model ids — which is precisely why `/metrics` needs the
+network isolation required by sections 21.2 and 31.2.
+
 ## 23.3 Distributed tracing
 
 Recommended spans:
@@ -3530,6 +3686,82 @@ gateway.stream
 ```
 
 Trace propagation to CollectivIQ should occur only if custom correlation headers are officially supported.
+
+**Implementation status (Phase 4C, implemented — OPTIONAL, off by default).**
+All nine spans are implemented in `src/observability/tracing.ts` over the
+OpenTelemetry Node trace SDK with an OTLP/HTTP exporter. `TRACING_ENABLED=false`
+(the default) means the port is the no-op: no provider, no exporter, no
+processor, no timer, no socket, and a shared frozen no-op span.
+
+Normative properties:
+
+* **Manual spans only.** No automatic instrumentation package is installed. Auto
+  instrumentation would capture full URLs, headers, and query strings — gateway
+  keys, idempotency keys, session ids — into attributes. The nine names above are
+  the entire vocabulary; a name outside it produces no span.
+* **No global registration.** `provider.register()` is never called, so no global
+  context manager or propagator is installed. Parentage is EXPLICIT: a caller
+  passes the parent span and everything else starts at `ROOT_CONTEXT`.
+  `context.active()` is never consulted, so a span tree never depends on
+  scheduling. `gateway.request` is the root; `gateway.validate`,
+  `gateway.serialize`, `collectiviq.create_thread`,
+  `collectiviq.process_message`, `collectiviq.poll`, `gateway.parse`,
+  `gateway.encode`, and `gateway.stream` are its children, and the SSE
+  `gateway.encode` is a child of `gateway.stream`.
+* **Fixed service metadata.** Exactly `service.name = "collectiviq-gateway"` and
+  `deployment.environment.name = ENVIRONMENT`. No resource detectors, no
+  host/process/OS/container metadata, and no caller-supplied resource attributes.
+* **No environment self-configuration at construction.** The SDK treats `OTEL_*`
+  variables as a FALLBACK for anything the caller did not set, which would
+  otherwise let an ambient `OTEL_EXPORTER_OTLP_HEADERS` attach a secret-bearing
+  header to every export, let `OTEL_EXPORTER_OTLP_[TRACES_]CLIENT_KEY`/
+  `_CERTIFICATE` read files from disk during construction, and let `OTEL_BSP_*`
+  retune the batch processor. The gateway therefore builds the exporter, the span
+  processor, and the provider with every `OTEL_*` variable temporarily removed
+  from the environment and exactly restored afterwards. Construction is
+  synchronous, so no other task observes the reduced environment, and this covers
+  every environment read the installed SDK performs while building those objects
+  rather than an enumeration of override options.
+
+  The guarantee is scoped to CONSTRUCTION and must not be described more broadly.
+  It cannot bind a future SDK version that reads the environment lazily at export
+  time; the durable control against that is the deployment rule that the
+  gateway's environment should not carry `OTEL_*` variables at all.
+* **Closed attributes.** Only `collectiviq.endpoint`, `.status_family`,
+  `.transport`, `.model`, `.prompt_mode`, `.tool_mode`, `.error_category`,
+  `.upstream_operation`, `.upstream_outcome`, `.poll_outcome`, `.parser_source`,
+  `.poll_count`, `.tool_call_count`, and `.thread_reused`. Each is re-validated
+  against the same closed vocabularies as the metrics and DROPPED when
+  unrecognized; counts are clamped to a bounded non-negative integer. Span limits
+  additionally forbid events and links outright (`0`), so exception text and
+  remote link context cannot be attached even by a later mistake.
+* **No exception recording.** A failed span carries `SpanStatusCode.ERROR` with
+  NO status message plus the closed `collectiviq.error_category`.
+  `recordException` is never called.
+* **Every failure exit marks its span failed.** This applies to every manual
+  span, not only the root: an unexpected validation failure, a serializer failure
+  or prompt-byte rejection, a failed `create_thread` or `process_message`, a poll
+  that timed out / errored / was cancelled, a required-choice parse failure, a
+  JSON or SSE encoding failure, and every SSE transport exit that did not deliver
+  the terminal frame and `[DONE]`. The category always comes from trusted gateway
+  state — the envelope the gateway itself will return, or its own `timedOut`
+  flag — and never from inspecting a thrown value. Where the exact envelope is
+  not yet decided at the point the span closes (an upstream call whose
+  normalization happens later in the orchestrator's catch), the closed fallback
+  `other` is recorded rather than a guess, and the root `gateway.request` span
+  still carries the precise category.
+* **Bounded sampling.** `ParentBasedSampler` over a `TraceIdRatioBasedSampler`
+  with `TRACING_SAMPLE_RATIO`, clamped into `[0, 1]`.
+* **Bounded shutdown.** `shutdown()` races the provider's own flush-and-shutdown
+  against a fixed 2 s budget, is idempotent, resolves `void` either way, never
+  rejects, and `unref`s its timer, so an unreachable collector can neither delay
+  process exit nor surface dynamic exception text.
+* **No upstream propagation.** No trace header is added to any CollectivIQ
+  request; upstream correlation support remains unverified.
+* **Telemetry never changes behaviour.** Every span method is total and swallows
+  failures, admission order is untouched, and a disabled or unwired tracer
+  degrades to no traces rather than failing a request — the deliberate difference
+  from the rate limiter and thread-reuse coordinator, whose absence fails closed.
 
 ---
 
@@ -3565,6 +3797,12 @@ METRICS_ENABLED=true
 REDIS_URL=
 MODEL_CONFIG_PATH=./config/models.yaml
 ```
+
+`METRICS_ENABLED=true` above is a RECOMMENDATION for a hosted deployment that
+has somewhere to scrape from and has isolated the endpoint, not the implemented
+DEFAULT. The implemented default is `false` (section 23.2 and the Phase 4C table
+below), and the same applies to `TRACING_ENABLED`. Where this section and the
+implementation-status tables differ, the tables describe what the code does.
 
 Configuration validation must occur before the HTTP server starts.
 
@@ -3641,6 +3879,44 @@ reason as the rate-limit settings. The bounds live in `THREAD_REUSE_LIMITS` in
 Both produce value-free `ConfigError` issues. Every replica must additionally
 share the same upstream credentials, origin, and model configuration, or one
 OpenCode session will not resolve to the same mapping everywhere.
+
+**Implementation status (Phase 4C, implemented).** Optional observability
+(sections 23.2 and 23.3) adds four validated environment variables. BOTH
+features are OFF by default and are validated independently of each other:
+metrics add a route, tracing adds an exporter, and neither implies the other or
+requires Redis, a credential, or any other feature. The bounds live in
+`TRACING_LIMITS` in `src/config/schema.ts`.
+
+| Variable | Default | Rule |
+| --- | --- | :--- |
+| `METRICS_ENABLED` | `false` | Strictly `"true"` or `"false"`. When true, `GET /metrics` is registered outside `/v1` with NO application authentication; when false the route does not exist and returns `404`. |
+| `TRACING_ENABLED` | `false` | Strictly `"true"` or `"false"`. Enabling it **requires** `TRACING_OTLP_ENDPOINT`. |
+| `TRACING_OTLP_ENDPOINT` | *(empty — no exporter)* | Only a canonical absolute `http://`/`https://` URL, bounded to `TRACING_LIMITS.endpointBytes` (2048 UTF-8 bytes, measured on the RAW value BEFORE trimming and before any parse, so padding cannot smuggle an oversized value past the limit): supported lowercase scheme, non-empty host, no query or fragment, and an exact round-trip through URL serialization. "No query or fragment" is judged on the SUBMITTED string, so a bare trailing `?` or `#` is rejected even though the parser reports both as empty while preserving the character in `href` — otherwise `…/v1/traces?` would round-trip byte-for-byte and be accepted. Percent-encoded path bytes (`%3F`, `%23`) are ordinary path data and stay accepted. It must additionally **embed no userinfo** (`user:pass@`, literal or percent-encoded) and carry a **non-root path** — WHICH path is unconstrained, since an operator may front a collector on any route. Supply the full traces path, e.g. `http://127.0.0.1:4318/v1/traces`. A PRESENT value is validated even while tracing is disabled. |
+| `TRACING_SAMPLE_RATIO` | `1` | A plain decimal in `[0, 1]`. An exponent, hexadecimal, `NaN`, `Infinity`, or a thousands separator is REJECTED rather than reinterpreted, so a mistyped probability fails at startup instead of silently disabling or saturating tracing. |
+
+All four produce value-free `ConfigError` issues drawn from a closed set
+(`length is outside allowed bounds`, `must not embed credentials`, `must be a
+canonical absolute http(s) URL`, `must include a non-root path`); the submitted
+endpoint — which may carry a host, path, or credential an operator considers
+sensitive — is never echoed. Redaction is defence in depth and needs BOTH
+mechanisms: `TRACING_OTLP_ENDPOINT` is in `REDACT_PATHS`, which reaches only the
+root and one nesting level, and the recursive sanitizer additionally matches the
+exact normalized key names `otlpendpoint` and `tracingotlpendpoint`, covering an
+occurrence at any depth. The match is exact rather than an `endpoint` substring,
+which would also hide operational fields such as `endpointCount`.
+
+Rejecting userinfo is what makes the "no exporter authentication" guarantee of
+section 23.3 complete: without it an operator could smuggle a credential into a
+setting that is not handled as a secret, and the gateway would send it on every
+export.
+
+Telemetry packages do not read their own `OTEL_*` environment variables **during
+construction**: every SDK object is built with those variables temporarily
+removed from the environment (section 23.3), so the validated endpoint, the
+fixed resource, the bounded sampler, and the span limits are the only inputs an
+`OTEL_*` variable could otherwise have displaced. This is a construction-time
+guarantee only — it does not, and cannot, promise anything about a future SDK
+version that reads the environment lazily at export time.
 
 Gateway client keys (`COLLECTIVIQ_GATEWAY_KEYS`) are bounded by conservative,
 non-overridable initial limits: at most **64** configured keys, and at most
@@ -4026,6 +4302,8 @@ collectiviq-gateway/
 │   │   ├── errors.ts
 │   │   ├── models-route.ts
 │   │   ├── chat-route.ts
+│   │   ├── metrics-route.ts
+│   │   ├── request-telemetry.ts
 │   │   └── health-route.ts
 │   ├── openai/
 │   │   ├── request-schema.ts
@@ -4041,6 +4319,7 @@ collectiviq-gateway/
 │   │   ├── service.ts
 │   │   ├── state-machine.ts
 │   │   ├── polling.ts
+│   │   ├── adapter-telemetry.ts
 │   │   └── model-resolver.ts
 │   ├── prompts/
 │   │   ├── serializer.ts
@@ -4081,8 +4360,10 @@ collectiviq-gateway/
 │   │   └── runtime.ts
 │   ├── observability/
 │   │   ├── logger.ts
+│   │   ├── labels.ts
 │   │   ├── metrics.ts
-│   │   └── tracing.ts
+│   │   ├── tracing.ts
+│   │   └── telemetry.ts
 │   └── shared/
 │       ├── ids.ts
 │       ├── timeout.ts
@@ -4575,6 +4856,165 @@ unanswered upstream ordering, pagination, cleanup, and retention questions of
 section 5.1.1 are unaffected. The separate sanitized two-turn live smoke of
 2026-09-02 (section 5.1.1) covers the end-to-end path for one local/account
 configuration; every further live run requires fresh approval.
+
+### 29.9 Observability tests (Phase 4C, implemented)
+
+Coverage for optional metrics and tracing (sections 23.2 and 23.3). Every suite
+is hermetic and runs inside `npm run validate`; none needs a collector, Redis,
+OpenCode, a credential, or a live CollectivIQ call.
+
+**Configuration** (the observability block in `test/unit/config.test.ts`): both
+switches default to false with a stable configuration shape; strict
+`"true"`/`"false"` parsing for each; `TRACING_OTLP_ENDPOINT` required when
+tracing is enabled; canonical absolute http(s) acceptance with a non-canonical
+scheme, a bare origin, a query, a fragment, a missing host, and a non-http scheme
+all rejected; a bare TRAILING `?` or `#` rejected too, guarded by an assertion
+that the value really does survive both the emptiness and the round-trip checks
+so the case cannot quietly stop testing anything, while percent-encoded `%3F` and
+`%23` path bytes stay accepted; userinfo reported ahead of a trailing delimiter
+when a value carries both; a PRESENT endpoint validated while tracing is disabled; the sample
+ratio bounded to a plain decimal in `[0, 1]` with an exponent, hexadecimal,
+`NaN`, `Infinity`, a leading dot, and a comma separator rejected rather than
+clamped; neither switch requiring Redis or a credential; and every failure
+value-free, including the submitted endpoint, path, and query token.
+
+**Metrics registry** (`test/unit/metrics.test.ts`): the exact name and Prometheus
+TYPE of all fifteen metrics; the exact declared buckets, including the 90-second
+boundary; exact label names and values; `errors_total` incremented only when an
+error category is present; an unconfigured, `null`, or empty model collapsing to
+`none`; two independently created instances not sharing state; the client library's
+GLOBAL default registry left free of every `collectiviq_gateway_` series; the
+capacity gauges re-read from the bound source on each scrape and reporting `0`
+while unbound; `stream_connections` never going negative; `NaN`/negative/infinite
+durations recorded as `0` with no `NaN` in the exposition; a zero, negative,
+fractional, or non-finite poll count incrementing nothing; hostile secret,
+path, id, prompt, and tool-argument sentinels passed through the model field and
+absent from the exposition; and the no-op implementation accepting every call.
+
+**Tracing** (`test/unit/tracing.test.ts`, over an `InMemorySpanExporter` and a
+synchronous processor): all nine span names; explicit parentage and shared trace
+ids, with a parentless span a root; every closed attribute emitted under its
+exact `collectiviq.*` key while unrecognized enum values are DROPPED and counts
+are clamped or dropped; `setError` setting the ERROR status with an empty message
+plus the closed category; an idempotent `end()`; `sampleRatio: 0` exporting no
+root spans while `1` does; a bounded, idempotent, non-rejecting shutdown even
+when the injected exporter rejects; ZERO outbound requests for the no-op port and
+for enabled-port CONSTRUCTION; and sentinel values forced through every field by
+cast, absent from every serialized span name, attribute set, and status.
+
+**Composition and lifecycle** (`test/unit/telemetry-runtime.test.ts`): a fully
+inert default; each port built from its own switch with neither implying the
+other; a no-op fallback if an enabled tracer somehow had no endpoint; tracing
+staying a no-op on `buildServer`'s default path even when enabled, because only
+the process root can discharge an exporter's shutdown obligation; a frozen shared
+disabled instance; zero outbound requests while constructing, exercising, and
+closing both an enabled and a disabled runtime; and an idempotent,
+non-rejecting close. Close-time inertness is proven the same way the request
+path's is — through a tracing port that RECORDS every call rather than a no-op
+that cannot tell: closing a disabled runtime, and closing a metrics-only one,
+must leave that record empty, while an enabled port records exactly one
+`shutdown` per close and still resolves when that shutdown rejects. Those cases
+drive the exported composition seam `composeTelemetryRuntime`, which
+`createTelemetryRuntime` itself routes through, so the lifecycle is exercised
+over supplied ports without a production-only test hook. It additionally proves the `OTEL_*` isolation
+BEHAVIOURALLY: with `OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY` pointing at a sentinel
+path, an `fs.readFileSync` spy never sees it while the real exporter is
+constructed (and the same spy is shown to catch a deliberate read, so the
+assertion cannot pass vacuously); the environment is exactly restored
+afterwards; `OTEL_SERVICE_NAME` cannot displace the fixed service identity; and
+constructing the real exporter under hostile `OTEL_*` values still opens no
+connection. `test/unit/shutdown.test.ts` additionally asserts that
+shared dependencies close LAST — after `close()` and the forced cancel — and that
+a rejecting dependency close is routed to the content-free sink without
+rejecting or skipping the sequence.
+
+**Generation instrumentation** (`test/unit/generation-telemetry.test.ts`, driving
+the REAL completion runtime, the real poller, and the real capacity controller
+over a fake adapter): upstream counters per operation, including one increment
+per individual `get_messages` poll; the polling phase recorded exactly once with
+the true attempt count; the specification §23.3 spans emitted as children of a
+supplied `gateway.request` span with closed attributes only; the pull-based
+capacity gauges reflecting held permits and returning to zero; a completion
+timeout counted exactly once with a `timeout` phase outcome; a failed submit
+labelled `error` with its span still ended and no poll phase recorded; the
+FAILED-SPAN contract on four representative exits — a failed `process_message`,
+a poll timeout, an oversized prompt, and a required-choice parse failure — each
+asserting `SpanStatusCode.ERROR`, an ABSENT status message, the expected closed
+category, and — for the serializer and the parser, whose failure paths leave the
+span through a `catch` that must not also re-end it — that exactly one such span
+was exported despite the throw; an emulated tool-call success incrementing `tool_responses_total` through
+the real generation wiring with a non-error parse span; prompt,
+answer, thread-id, run-id, key-id, and path sentinels absent from both the
+exposition and the spans; and a DISABLED port leaving the adapter literally
+undecorated.
+
+**Wiring over the real runtime and disabled inertness**
+(`test/integration/observability.test.ts`): an idempotent REPLAY over a real
+coordinator and the shared in-memory store returns the identical completion,
+increments `requests_total` a second time, and leaves every upstream and poll
+metric untouched; a successful SSE completion returns `stream_connections` to
+zero and nests `gateway.encode` under `gateway.stream` under `gateway.request`; a
+request-boundary tool-schema rejection increments
+`tool_schema_failures_total{model="none"}` and performs no upstream work; and
+DISABLED telemetry wired with ports that RECORD every call and then throw serves,
+without a single recorded call: JSON success, SSE success, `401`/`404`/`400`
+request-boundary errors, an upstream failure on both transports, a completion
+timeout, a required-choice tool parse failure, a REAL-SOCKET client cancellation,
+and an idempotent replay — with `GET /metrics` absent. A further MIXED
+configuration (metrics disabled, tracing genuinely live) drives a real-socket
+cancellation and asserts both that the metrics port is untouched and that the
+root span is still marked failed; the fully-disabled cases cannot isolate a
+per-call-site guard on their own, because the root hook is not installed at all.
+
+Root-span CANCELLATION semantics are asserted on both transports over a real
+socket: `SpanStatusCode.ERROR`, an ABSENT status message, the closed `other`
+category, exactly one exported `gateway.request` span, one cancellation counter
+increment, `requests_total` VALUE `1`, a stream gauge back to zero, and — because
+a disconnect is not a gateway failure — no `errors_total` series at all. A
+normally completed request is asserted NOT to carry an error status.
+
+**API lifecycle** (`test/integration/observability.test.ts`): `/metrics` absent
+(`404`) when disabled; present when enabled, with the registry content type,
+`cache-control: no-store`, and identical behaviour with a valid key, an invalid
+key, and no key at all — it is unauthenticated by design; nothing registered on
+the client library's global registry; a JSON completion and a hijacked SSE completion
+each settling EXACTLY once on their own transport; health and unauthenticated
+requests settling under their own closed endpoints; capacity, idempotency, thread-reuse,
+cross-replica rate-limit, shutdown-cancellation, and model-not-found failures
+each landing in their own closed `error_category`; a completion with no upstream
+work (the shape of an idempotent replay) settling as a request while incrementing
+no upstream counter; `gateway.validate`/`gateway.encode` parented under
+`gateway.request`; a REAL-socket client disconnect on both transports
+recording exactly one cancellation, exactly one request settlement, and a stream
+gauge back to zero; and prompt, answer, thread, session, idempotency-key, gateway-key,
+and path sentinels absent from both the exposition and the spans.
+
+A post-header SSE failure is asserted as ONE contract in a single case, because
+its parts are only meaningful together: the status line reads `200` and stays
+`2xx` forever once the header is committed, so the same case pins
+`requests_total{transport="sse",status_family="2xx"}` at `1`, exactly one
+`errors_total` series carrying the envelope's own closed category (not the
+`other` fallback), `stream_connections` back to zero, and exactly one exported
+`gateway.stream` span with `SpanStatusCode.ERROR`, an ABSENT status message, and
+that same category — plus the root span's matching category, transport, and `2xx`
+family. Split across cases, the pair could drift into "`2xx` and no error
+recorded" with every individual assertion still green.
+
+**Not covered.** No live OTLP collector is contacted by any suite, so wire-level
+OTLP encoding and collector interoperability are unverified — an enabled tracer
+has never been observed against a real collector. Load behaviour of the registry
+under sustained scraping is likewise unmeasured and belongs to the outstanding
+Phase 4 load gate (section 29.5), as is the memory profile of an enabled
+`BatchSpanProcessor` under sustained traffic. Shutdown cancellation is not driven
+while telemetry is disabled.
+
+The two OPERATOR-facing limitations — no live collector, and unmeasured load
+behaviour — are repeated in `README.md` and `.agent/instructions/operations.md`,
+so someone enabling either feature meets them without reading this
+specification. The shutdown-cancellation gap is test-coverage detail with no
+operator action attached; this section and `.agent/instructions/validation.md`
+own it, and it is deliberately NOT restated in the operator documents. Keep that
+split: one detailed evidence owner, concise operator-facing limitations.
 
 ---
 
@@ -5803,6 +6243,27 @@ Redis now gives cross-replica **idempotency** (Phase 4A) and cross-replica
 **rate limiting** (Phase 4B). Concurrency accounting remains process-local, so
 shared capacity is still outstanding Phase 4 work.
 
+**Metrics exposure when `METRICS_ENABLED=true` (Phase 4C).** `GET /metrics` is
+registered outside `/v1` and carries NO application authentication. That is a
+deliberate decision (section 23.2): a scrape credential would be a second secret
+to distribute and rotate, and the process cannot verify whether the interface it
+is bound to is private. Operators MUST therefore isolate the endpoint
+themselves — bind to loopback and scrape locally, expose it only on a private
+network or subnet, or firewall it to the scraper — and MUST NOT publish it on a
+public listener. The exposition carries no prompt, answer, path, tool,
+credential, or identifier, but it does disclose traffic volumes, latencies,
+error categories, and the configured virtual-model ids. With
+`METRICS_ENABLED=false` (the default) the route does not exist at all.
+
+**Tracing egress when `TRACING_ENABLED=true` (Phase 4C).** The gateway becomes an
+OTLP/HTTP client of `TRACING_OTLP_ENDPOINT` and will send spans to it
+continuously. Treat that endpoint as a trust boundary: prefer a collector on a
+private network, use `https://` wherever the link is not private, and remember
+that the gateway sends no exporter authentication header (none is configurable
+in this slice), so the collector must be reachable only from the gateway's own
+network. With `TRACING_ENABLED=false` (the default) no exporter exists and no
+connection is ever attempted.
+
 ### 31.3 Graceful shutdown
 
 On `SIGTERM`:
@@ -5835,6 +6296,20 @@ Because the Redis composition root owns exactly one client, the shutdown closes
 ONE connection, last and exactly once, whichever Redis-backed features are
 enabled. `buildServer` still builds only the pure, socket-free scope derivers and
 never creates a client.
+
+**Implementation status (Phase 4C, implemented).** Telemetry joins Redis in the
+SAME final bounded dependency-close step, after the application has drained, so
+an in-flight completion can still export its final spans while requests wind
+down. Redis closes first, then — only when tracing is actually ENABLED — the
+tracing provider flushes and shuts down under its own fixed 2 s budget. A
+disabled port is skipped outright rather than delegated to a no-op `shutdown()`,
+so "disabled means uncalled" holds at shutdown exactly as it does on the request
+path. That close is non-rejecting by contract and its timer
+is `unref`'d, so an unreachable collector can neither hang shutdown nor surface
+dynamic exception text; a failure is routed to the same content-free error sink
+as a `close()` failure. `buildServer` may build the (pure, socket-free)
+Prometheus registry, but only the process composition root constructs and closes
+the OTLP exporter.
 
 ---
 
@@ -6082,7 +6557,9 @@ guarantee, combined-answer support, long-duration streaming, or general non-Clau
 routing. Any further live run still requires separate explicit approval before live
 CollectivIQ traffic. `stream:true` synthetic SSE is
 implemented (Phase 2, below); tools stay in Phase 3; optional Redis-backed
-idempotency is Phase 4A (section 18.1); metrics/tracing remain unimplemented;
+idempotency is Phase 4A (section 18.1); optional metrics/tracing are Phase 4C
+(sections 23.2 and 23.3) and are off by default, so they change nothing here
+unless explicitly enabled;
 upstream deletion is not performed, and Phase 1 itself performs no thread reuse
 (the optional, off-by-default Phase 5A reuse in section 5.1.1 came later and
 changes nothing here unless it is explicitly enabled).
@@ -6327,14 +6804,37 @@ left empty, and the container was stopped afterwards. No live CollectivIQ call
 was made or required, and no dependency or lockfile entry changed. Capacity
 remains PROCESS-LOCAL.
 
+**Phase 4C — metrics and tracing: implemented (optional, off by default).** The
+third Phase 4 deliverable is complete and documented in sections 8.1, 23.2, 23.3,
+24, 26, 29.9, 31.2, and 31.3. BOTH switches default to false, and "off" means
+genuinely inert: no Prometheus registry, no `/metrics` route (the endpoint
+returns `404`), no tracer provider, no exporter, no timer, no socket, no
+per-request telemetry allocation, and no call into either port — leaving one
+fixed boolean check per call site (section 23.2). Five exactly-pinned
+dependencies were added —
+`@prometheus-io/client`, `@opentelemetry/api`, `@opentelemetry/sdk-trace-node`,
+`@opentelemetry/exporter-trace-otlp-http`, and `@opentelemetry/resources` — and
+no automatic-instrumentation package, because auto instrumentation would capture
+URLs, headers, and uncontrolled attributes. Evidence is hermetic
+(`test/unit/metrics.test.ts`, `test/unit/tracing.test.ts`,
+`test/unit/telemetry-runtime.test.ts`, `test/unit/generation-telemetry.test.ts`,
+`test/integration/observability.test.ts`, plus the observability block in
+`test/unit/config.test.ts` and the dependency-close cases in
+`test/unit/shutdown.test.ts`); no collector, Redis, OpenCode, or live CollectivIQ
+call was made or required. Admission order, SSE framing, cancellation,
+idempotency, thread reuse, and shutdown semantics are unchanged, and capacity
+remains PROCESS-LOCAL.
+
 **Explicitly still outstanding in Phase 4:**
 
 * shared cross-replica capacity accounting — capacity stays PROCESS-LOCAL;
-* metrics and tracing;
-* load testing and a security review of the idempotency, rate-limiting, and
-  thread-reuse layers;
+* load testing and a security review of the idempotency, rate-limiting,
+  thread-reuse, metrics, and tracing layers;
 * dependency scanning;
 * backup and release procedures, and runbooks.
+
+Metrics and tracing being implemented does NOT close Phase 4 and does not make
+any feature production ready.
 
 Native tool mode (section 13) and true upstream streaming (section 14.5) remain
 Phase 5 work and are unaffected. Phase 5A (thread reuse) has been pulled forward

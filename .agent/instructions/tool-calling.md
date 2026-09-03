@@ -9,9 +9,10 @@ release gate in `.agent/docs/tech-software-spec.md` section 30 is **met**, and o
 that evidence the feature graduated from experimental to supported opt-in beta.
 It is still **not** enabled as a default production OpenCode model: default
 enablement is a separate decision taken only after the Phase 4 controls (Redis/
-idempotency, per-key rate limiting, metrics, tracing, the §29.5 load tests,
+idempotency, per-key rate limiting, metrics and tracing, the §29.5 load tests,
 security review, dependency scanning, runbooks, backup configuration, release
-process). **Section 30 owns the graduation decision; summarize it here, never
+process — the first three are implemented and off by default; the rest are
+outstanding). **Section 30 owns the graduation decision; summarize it here, never
 restate its evidence.**
 
 Beta is not production readiness. Never rewrite "supported beta" as

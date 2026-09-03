@@ -27,7 +27,7 @@ When changing any of the above, update spec section 24.1, the [upstream contract
 - Load secrets from environment or an approved secret manager and redact them from startup output, logs, traces, metrics, errors, tests, snapshots, commands, and fixtures.
 - Production requires gateway authentication. Authentication may be disabled only for an explicitly local single-user service bound exclusively to loopback.
 - Compare keys using a timing-safe strategy where practical, hash only the correlation identity needed for bounded operational metadata, and never log the presented key.
-- Metrics need network isolation or independent authentication; health output must not disclose configuration values.
+- Metrics need network isolation or independent authentication; health output must not disclose configuration values. `GET /metrics` is IMPLEMENTED, off by default, and deliberately unauthenticated when enabled (see the Phase 4C entry below) — the isolation obligation is the operator's.
 
 ## Content Confidentiality
 
@@ -219,6 +219,78 @@ security-relevant guarantees are:
   deletes a provider thread; an evicted mapping (a `noeviction` violation)
   silently starts a new one; and all replicas must share the endpoint, key,
   prefix, gateway-key set, upstream credentials, origin, and model configuration.
+
+**Implementation status (Phase 4C, implemented — OPTIONAL, both OFF by
+default).** `src/observability/metrics.ts`, `tracing.ts`, and the shared closed
+vocabulary in `labels.ts` are the only modules that emit telemetry.
+Specification sections 23.2 and 23.3 own the normative contract; the
+security-relevant guarantees are:
+
+- **Off unless explicitly enabled.** `METRICS_ENABLED=false` and
+  `TRACING_ENABLED=false` (both defaults) mean no registry, no `/metrics` route
+  (the endpoint returns `404`), no tracer, no exporter, no timer, no socket, and
+  no per-request telemetry allocation and no call into either port (one fixed
+  boolean check per call site remains). No new secret is introduced by either
+  feature.
+- **Cardinality IS the privacy boundary.** Every emitted label and span attribute
+  is a member of a frozen vocabulary or a CONFIGURED virtual-model id, re-checked
+  at write time; an unrecognized value collapses to a fixed fallback (metrics) or
+  is dropped (spans). Prompts, answers, source code, file/repository paths, URLs,
+  tool names/arguments/results, credentials, gateway keys and scopes, idempotency
+  keys, session ids, thread ids, request ids, tool-call ids, and exception text
+  have no representation in the API at all, and a value smuggled into a label
+  field cannot escape the re-check. The endpoint label is always a route
+  TEMPLATE, never `request.url`.
+- **No exception text, ever.** A failed span carries `SpanStatusCode.ERROR` with
+  NO status message plus a closed error category taken from the envelope the
+  gateway itself built; `recordException` is never called and span limits forbid
+  events and links outright. Error categories likewise never come from inspecting
+  a thrown value.
+- **No automatic instrumentation.** No auto-instrumentation package is installed,
+  because it would capture full URLs, headers, and query strings — gateway keys,
+  idempotency keys, session ids — into span attributes. Do not add one.
+- **`/metrics` is unauthenticated when enabled.** That is a documented decision:
+  a scrape credential would be a second secret to distribute and rotate, and the
+  process cannot verify that its bound interface is private. Operators MUST
+  isolate it (loopback, private network, or firewall). The exposition still
+  discloses traffic volumes, latencies, error categories, and the configured
+  virtual-model ids.
+- **Tracing is outbound egress to a trust boundary.** An enabled gateway POSTs
+  spans continuously to `TRACING_OTLP_ENDPOINT` and sends no exporter
+  authentication header (none is configurable in this slice). Treat the collector
+  as reachable only from the gateway's own network, and prefer `https://` off a
+  private link. No trace header is ever propagated to CollectivIQ.
+- **Credential-free, bounded OTLP endpoint.** `TRACING_OTLP_ENDPOINT` must be a
+  canonical absolute lowercase http(s) URL of at most 2048 UTF-8 bytes, with a
+  non-empty host, no query/fragment, an exact round-trip, a NON-ROOT path, and NO
+  userinfo. The userinfo rule is what makes the no-exporter-authentication
+  guarantee complete — do not relax it. Errors are a closed reason set that never
+  echoes the value.
+  - The bound is measured on the RAW environment value, BEFORE trimming and
+    before any parse. Trimming first was a real defect: whitespace padding plus a
+    short URL slipped past the limit entirely. `validateOtlpEndpoint` owns the
+    whole contract and returns the canonical value, so a caller cannot
+    reintroduce it by pre-trimming.
+  - Redaction needs BOTH mechanisms. `REDACT_PATHS` covers only the root and one
+    nesting level; arbitrary depth is covered because `isSecretKey` matches the
+    exact normalized names `otlpendpoint` and `tracingotlpendpoint`. Keep that
+    match EXACT — an `endpoint` substring marker would also hide operational
+    fields such as `endpointCount`, `endpointLabel`, and `endpoints`.
+- **No environment self-configuration AT CONSTRUCTION.** The SDK treats `OTEL_*`
+  variables as a fallback for anything the caller did not set — enough to attach
+  a secret-bearing exporter header, read a client-certificate file from disk at
+  construction, or retune the batch processor. Every SDK object is therefore
+  built with those variables temporarily removed from the environment and
+  exactly restored afterwards, so an ambient `OTEL_*` value is inert. Do not
+  replace that with an enumeration of override options. Equally, do NOT widen the
+  claim: it covers construction-time reads by the installed SDK only, and says
+  nothing about a future SDK that reads the environment lazily at export time.
+- **Residual risks to state honestly.** Enabling metrics or tracing widens the
+  observable surface of a deployment; a collector compromise reveals request
+  timing, volumes, error categories, and model usage per environment; no
+  wire-level OTLP interoperability has been verified against a live collector;
+  and the observability layer has not yet been through the outstanding Phase 4
+  security review or load gate.
 
 ## Network and Deployment
 

@@ -168,7 +168,7 @@ contract and the state machine — do not restate them here. Operationally:
   `503 thread_reuse_unavailable` + `Retry-After: 2`. Never downgrade a failure to
   a silently created replacement thread.
 - **Not production ready.** It was pulled forward ahead of the remaining Phase 4
-  controls (metrics, tracing, shared capacity accounting, load and security
+  controls (shared capacity accounting, load and security
   review, dependency scanning, backup/release procedures, runbooks), and upstream
   ordering, pagination, cleanup, and retention remain unverified. Do not describe
   it as production ready or make it a default.
@@ -212,6 +212,89 @@ contract and the state machine — do not restate them here. Operationally:
 
 ## Observability
 
+**Implementation status (Phase 4C, implemented — OPTIONAL, both OFF by
+default).** Bounded Prometheus metrics live in `src/observability/metrics.ts`,
+manual OpenTelemetry tracing in `src/observability/tracing.ts`, the shared closed
+label vocabulary in `src/observability/labels.ts`, and composition in
+`src/observability/telemetry.ts`. Specification sections 23.2 and 23.3 own the
+normative contract — the metric list, label vocabulary, buckets, ownership table,
+and span rules — do not restate them here. Operationally:
+
+- **Off means STRUCTURALLY inert.** With `METRICS_ENABLED=false` and
+  `TRACING_ENABLED=false` there is no registry, no `/metrics` route (the endpoint
+  returns `404`), no tracer provider, no exporter, no timer, and no socket. Both
+  ports expose an `enabled` flag fixed at construction and every call site
+  branches on it, so a disabled gateway also builds no span options, no
+  observation samples, and no per-request closures, reads no telemetry clock,
+  binds no capacity source, does not decorate the adapter, does not install the
+  root request hook, and calls neither port. The honest residual cost is one
+  fixed boolean check per call site — the claim is "no telemetry objects,
+  samples, closures, clock reads, or port calls", not "zero instructions".
+  That extends to SHUTDOWN: the telemetry close step skips `tracing.shutdown()`
+  when the port is disabled rather than delegating to a no-op, because a disabled
+  port owns nothing to flush.
+- **Nullability is the mechanism; do not reintroduce a no-op handle.**
+  `request.telemetry` is `null` when disabled, span helpers are `null` rather
+  than no-op functions, and call sites use optional access/invocation (which
+  short-circuits without evaluating arguments). A shared no-op object would make
+  every authentication failure, model miss, and error envelope call a method on a
+  path that must be inert. The no-op port implementations stay total as defence
+  in depth only — never rely on them instead of the branch.
+- **Four validated variables** (spec §24): `METRICS_ENABLED` and
+  `TRACING_ENABLED` (strict `"true"`/`"false"`, default `false`),
+  `TRACING_OTLP_ENDPOINT` (canonical absolute http(s) URL, ≤2048 UTF-8 bytes,
+  with NO embedded `user:pass@` credentials, no query or fragment delimiter —
+  a bare trailing `?` or `#` counts — and a NON-ROOT path; supply the full
+  traces path, e.g. `http://127.0.0.1:4318/v1/traces`; REQUIRED when tracing is
+  enabled and validated whenever present), and `TRACING_SAMPLE_RATIO` (a plain
+  decimal in `[0, 1]`, default `1`). Errors stay value-free and never echo the
+  endpoint, which is also redacted from logs. Neither feature requires Redis, a
+  credential, or any other feature.
+- **`GET /metrics` is unauthenticated by design and must be isolated by the
+  operator.** It sits outside `/v1`, has no gateway-key check, and the process
+  cannot verify whether the interface it is bound to is private. Bind to loopback
+  and scrape locally, or expose it only on a private network or behind a
+  firewall. Never publish it on a public listener. The exposition contains no
+  prompt, answer, path, tool, credential, or identifier, but it does disclose
+  traffic volumes, latencies, error categories, and the configured
+  virtual-model ids.
+- **Tracing is outbound egress.** An enabled gateway continuously POSTs spans to
+  `TRACING_OTLP_ENDPOINT` with no exporter authentication header (none is
+  configurable in this slice), so the collector must be reachable only from the
+  gateway's network. Prefer `https://` off a private link. Setting an `OTEL_*`
+  variable will NOT change this: they are removed from the environment while the
+  SDK objects are constructed, so an ambient endpoint, header, client
+  certificate, or batch-processor setting is inert. That isolation is
+  construction-time only — the deployment rule is still to set no `OTEL_*`
+  variable at all.
+- **Telemetry is best-effort, never a correctness control.** Every observation is
+  total and non-throwing, admission order is untouched, and an enabled-but-unwired
+  tracer degrades to no traces rather than failing requests. That is the
+  deliberate opposite of the rate limiter and thread-reuse coordinator, whose
+  absence must fail closed — do not "fix" telemetry to match them.
+- **Ownership is one writer per signal** (spec §23.2 owns the table). Request
+  count/duration/errors/cancellations belong to the root hook in
+  `src/api/request-telemetry.ts`, upstream counters to the decorator in
+  `src/generation/adapter-telemetry.ts`, poll/timeout/tool signals to
+  `src/generation/chat-completion.ts`, and the stream gauge to
+  `src/api/chat-stream-response.ts`. Adding a second writer for an existing
+  metric is a duplicate-counting bug, not extra coverage.
+- **Request settlement reads the raw response, not `onResponse`.** A hijacked SSE
+  reply may be force-destroyed without Fastify ever "sending" it, so settlement
+  listens for `finish`/`close` behind a one-shot guard. Preserve that if you
+  touch the SSE transport. A client disconnect additionally marks the root
+  `gateway.request` span failed with the closed `other` category — the status
+  line may still read `200` — while deliberately NOT adding an `errors_total`
+  sample, because the disconnect is already counted as a cancellation.
+- **Unmeasured before enabling either feature.** No live OTLP collector has been
+  exercised, so wire-level encoding and collector interoperability are
+  unverified; registry behaviour under sustained scraping and the batch
+  processor's memory profile under sustained traffic belong to the outstanding
+  Phase 4 load gate; and this layer has not been through the Phase 4 security
+  review. Advise a conservative scrape interval and a `TRACING_SAMPLE_RATIO`
+  below `1` on a busy deployment, and validate a collector outside production
+  first.
+
 - Emit structured metadata for request state, latency, poll counts, sizes, bounded model/source/tool-mode categories, parser path, and errors.
 - Keep prompt/response/tool content and identifying IDs out of default signals.
 - Metrics and labels must match specification section 23 and remain bounded in cardinality.
@@ -251,7 +334,7 @@ remains authoritative; `/user/events` is not used.
 - Connect client disconnects to a shared abort signal.
 - Abort pending upstream HTTP calls when possible, stop polling/keep-alives, close SSE, and release capacity.
 - Do not retry cancelled work.
-- On `SIGTERM`, stop admission, mark readiness false, drain active requests for the configured period, cancel the remainder, close Redis/metrics resources, and exit.
+- On `SIGTERM`, stop admission, mark readiness false, drain active requests for the configured period, cancel the remainder, close Redis and telemetry resources in the one bounded dependency-close step (Redis first, then — only when tracing is actually enabled — the tracing provider under its fixed 2 s budget), and exit. That close is non-rejecting and its timer is `unref`'d, so an unreachable collector can neither hang shutdown nor surface dynamic exception text.
 - Test shutdown with active polling and streaming requests; avoid hanging timers or sockets.
 
 ## Deployment
