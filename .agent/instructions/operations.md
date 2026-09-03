@@ -2,7 +2,7 @@
 
 ## Scope
 
-Read `.agent/docs/tech-software-spec.md` sections 15–19, 23–25, 28, and 31 before changing runtime configuration, capacity, health, observability, Docker, or shutdown behavior.
+Read `.agent/docs/tech-software-spec.md` sections 15–19, 19.2, 23–25, 28, and 31 before changing runtime configuration, capacity, health, observability, Docker, or shutdown behavior.
 
 ## Configuration
 
@@ -27,8 +27,8 @@ disconnected/reconnecting client keeps `/readyz` at `503`, and readiness recover
 automatically when the client connects. CollectivIQ is deliberately not a probe.
 The response bodies are unchanged (`{"status":"ready"}` / `{"status":"not_ready"}`).
 Since Phase 4B that stays ONE probe over the ONE shared Redis connection,
-covering idempotency, rate limiting, or both — enabling a second Redis-backed
-feature adds no second probe.
+covering idempotency, rate limiting, shared capacity, thread reuse, or any
+combination — enabling a further Redis-backed feature adds no second probe.
 
 - `/healthz` proves the process/router event loop is alive and never calls CollectivIQ.
 - `/readyz` checks loaded config/models/secrets, optional Redis, and initialized capacity state.
@@ -48,7 +48,14 @@ acquired **before** `createThread` and released on every exit path; overflow/
 closed-admission returns `429` + `Retry-After: 5`. Graceful shutdown
 (`src/index.ts`) marks readiness false, calls `closeAdmission()`, allows
 `SHUTDOWN_DRAIN_MS`, then aborts the shared shutdown signal to cancel in-flight
-polling and release permits. Capacity is process-local (not cross-replica).
+polling and release permits. This controller is process-local and is the whole
+of admission control while `SHARED_CAPACITY_ENABLED=false` (the default) — the
+only configuration in which the production composition selects it. When shared
+capacity is
+enabled the two ACTIVE limits become cluster-wide through the coordinator in
+`src/shared-capacity/` (Phase 4D, below) and only the queue length and queue wait
+stay per replica; the step's position in the admission order is identical in both
+modes.
 
 **Implementation status (Phase 4A, implemented — OPTIONAL, off by default).**
 Cross-replica idempotency for `POST /v1/chat/completions` lives in
@@ -99,10 +106,13 @@ section 18.1 owns the normative contract — do not restate it here. Operational
   command queue disabled, bounded connect/command deadlines, capped automatic
   reconnect, explicit `isReady`-based availability, and no dynamic error text in
   logs.
-- **Still process-local:** capacity and queueing. Rate limiting is process-local
-  only while Phase 4B is disabled; when `RATE_LIMIT_ENABLED=true` the per-key
-  quota spans replicas (below). Shared cross-replica capacity accounting remains
-  outstanding Phase 4 work.
+- **Queueing is always process-local.** Capacity is too while
+  `SHARED_CAPACITY_ENABLED=false` (the default); when Phase 4D is enabled the two
+  ACTIVE limits span replicas while `MAX_QUEUED_REQUESTS` and `MAX_QUEUE_WAIT_MS`
+  stay per replica (below). Rate limiting is likewise process-local only while
+  Phase 4B is disabled; when `RATE_LIMIT_ENABLED=true` the per-key quota spans
+  replicas (below). Idempotency neither depends on the capacity mode nor changes
+  with it: the claim still precedes capacity in both.
 
 **Implementation status (Phase 4B, implemented — OPTIONAL, off by default).**
 Cross-replica per-gateway-key rate limiting for `POST /v1/chat/completions` lives
@@ -149,9 +159,121 @@ contract — do not restate it here. Operationally:
   remaining-quota headers exist.
 - **One connection.** `src/redis/client.ts` is the ONLY module importing
   node-redis, and `src/redis/runtime.ts` creates exactly one client per process
-  shared by idempotency, rate limiting, and thread reuse. Readiness is one probe
-  over that one connection, and shutdown closes it last, exactly once. Do not add
-  a second client.
+  shared by idempotency, rate limiting, shared capacity, and thread reuse.
+  Readiness is one probe over that one connection, and shutdown closes it last,
+  exactly once. Do not add a second client.
+
+**Implementation status (Phase 4D, implemented — OPTIONAL, off by default).**
+Cross-replica ACTIVE-capacity accounting for `POST /v1/chat/completions` lives in
+`src/shared-capacity/` over the shared substrate in `src/redis/`, and is enabled
+only by `SHARED_CAPACITY_ENABLED=true`. Specification section 19.2 owns the
+normative contract — do not restate it here. Operationally:
+
+- **Optional and fail-closed.** With the feature disabled no capacity scope is
+  derived, no coordinator is built, and no Redis capacity operation runs;
+  admission is byte-for-byte the pre-Phase-4D process-local controller. When
+  enabled, a disconnected Redis, a command timeout, corrupt or ambiguous state,
+  or an enabled-but-unwired instance returns `503 capacity_unavailable` +
+  `Retry-After: 2` rather than admitting a request whose cluster occupancy is
+  unknown. Enabling it therefore trades availability for correctness on the
+  completion path, exactly like Phase 4B.
+- **One validated variable, no new tuning knob** (spec §24):
+  `SHARED_CAPACITY_ENABLED` (strict `"true"`/`"false"`, default `false`; a
+  present-but-invalid value is a value-free `ConfigError` even while the feature
+  is disabled). Enabling it REQUIRES `REDIS_URL`, which already requires
+  `IDEMPOTENCY_ENCRYPTION_KEY` — no new secret, no new dependency, no lockfile
+  change. Enabling it without a Redis endpoint is a value-free startup error,
+  never a silent downgrade to per-replica limits.
+- **The existing limits are REINTERPRETED, not replaced.**
+  `MAX_CONCURRENT_REQUESTS` and `MAX_CONCURRENT_REQUESTS_PER_KEY` become
+  CLUSTER-WIDE active limits; `MAX_QUEUED_REQUESTS` and `MAX_QUEUE_WAIT_MS` stay
+  PER REPLICA. Size them accordingly: with the defaults and four replicas,
+  enabling the feature takes the cluster's global active ceiling from an
+  effective 16 down to 4, so raise the two active limits deliberately rather than
+  discovering the change as a throughput regression.
+- **Only the ACTIVE permits are shared.** Queues stay process-local, local FIFO
+  order and per-key bypass are preserved, and **no cross-replica queue fairness
+  is promised** — replicas compete for the shared budget and a busy replica's
+  queue does not yield to an idle one. A load balancer that concentrates arrivals
+  on one replica will see that replica's queue absorb the difference.
+- **`MAX_QUEUED_REQUESTS` stops being the exact per-replica waiting bound.**
+  Cluster occupancy is only knowable after a Redis round trip, so a request that
+  can start a claim immediately is admitted as a PENDING CANDIDATE rather than a
+  queued waiter. That carve-out is what keeps `MAX_QUEUED_REQUESTS=0` usable at
+  all: with the queue disabled, one request is still admitted long enough to ask
+  Redis whether a permit is free, and if the claim grants nothing it receives the
+  ordinary `429` rather than being left queued. The in-system bound per replica
+  is therefore `local active + one pending batch + local queue`, not
+  `local active + local queue`. The extra term is bounded by the batch size,
+  lasts one Redis command deadline, holds no permit, and makes no upstream call —
+  but state the three-term bound when sizing a deployment, and do not describe
+  `MAX_QUEUED_REQUESTS` as an exact cap on in-flight-plus-waiting work.
+- **Being at the cluster limit is backpressure, not a rejection.** A waiter stays
+  QUEUED until it is granted, times out, is cancelled, or admission closes. The
+  `429 gateway_capacity_exceeded` + `Retry-After: 5` still comes only from a full
+  local queue, a queue-wait timeout, or closed admission — in BOTH capacity modes,
+  with an identical body.
+- **Admission order is unchanged.** The capacity step keeps its existing position:
+  authentication → validation/model/tools → `Idempotency-Key` validation and body
+  fingerprinting → reuse eligibility → prompt preparation → rate limit → reuse
+  lease → idempotency claim/wait/replay → process-local FIFO queue + shared active
+  permit → reuse/idempotency `processing` transition → create or continue the
+  thread → submit once → poll → release the permit → encode. Consequences worth
+  knowing: rate-limit quota is spent before capacity and is never refunded, so a
+  capacity failure still costs a unit; idempotency waiters and cached replays take
+  no capacity at all; a capacity failure before `processing` releases or restores
+  the idempotency claim and the reuse lease; and on the SSE transport capacity is
+  reached AFTER the headers and the assistant-role opener, so a capacity failure
+  there is a content-free SSE error record rather than an HTTP status. No
+  `create_thread`/`process_message` retry was added.
+- **Redis's own clock decides the lease, and there is no heartbeat.** The lease is
+  a CRASH REAPER derived from the holder's own request deadline plus a fixed
+  margin and stamped from Redis `TIME`, so a live request's permit cannot expire
+  mid-completion (its own deadline fires first) while a hard-killed replica's
+  permits are reclaimed within a bounded window. There are exactly two atomic Lua
+  scripts and deliberately no renewal script — do not add one, and do not
+  introduce a Node clock, a local occupancy counter, or a read-then-write.
+- **`noeviction` applies here too, and it is mandatory.** An evicted or otherwise
+  lost registry key forgets live permits and can briefly OVER-admit up to the full
+  configured limit again. The gateway cannot detect this, so it is a deployment
+  requirement, not a runtime check. A Redis restart has the same effect.
+  Persistence and backups remain intentionally unnecessary: the registry is
+  transient occupancy state whose worst-case loss is that one bounded over-admission.
+- **Enablement requires a coordinated drain/restart.** Mixed local/shared rolling
+  operation is **unsupported**: while some replicas count locally and others count
+  cluster-wide, neither limit means what it says. Changing the capacity limits
+  needs the same coordinated restart, because a divergent limit makes the shared
+  budget ambiguous. Drain, restart every replica with identical settings, then
+  resume traffic.
+- **Every replica must share** an IDENTICAL Redis endpoint,
+  `IDEMPOTENCY_ENCRYPTION_KEY`, `REDIS_KEY_PREFIX`, `COLLECTIVIQ_GATEWAY_KEYS`
+  set, `SHARED_CAPACITY_ENABLED` value, and capacity limits. Divergent settings
+  mean the budget is not the single shared budget it appears to be.
+- **The capacity gauges stay PER INSTANCE.** `collectiviq_gateway_active_requests`
+  and `collectiviq_gateway_queued_requests` (spec §23.2) report this replica's
+  own occupancy and queue in both modes; no replica can observe cluster occupancy
+  directly. Aggregating the active gauge across replicas in Prometheus
+  approximates live cluster occupancy, but it cannot see an orphan lease left by
+  an ambiguous claim, so treat the aggregate as an estimate rather than the
+  registry's contents. The only observability change in this phase is the added
+  closed error category `capacity_unavailable`; there is **no new metric and no
+  new span name**.
+- **Residual risks to state honestly.** A failed or unacknowledged release
+  conservatively UNDER-admits this replica until the lease expires, and never
+  changes an already successful response. An unavailable, corrupt, or ambiguous
+  claim is never retried and never compensated, so a member that was added
+  becomes an orphan lease bounded by its own deadline and invisible to the local
+  gauges. Corrupt or oversized registry state fails closed and is deliberately
+  left byte-for-byte untouched rather than pruned; it self-heals within one lease
+  window because the key always expires at its latest member deadline.
+- **What the real-Redis gate does and does not cover.** The suite
+  `test/redis/shared-capacity-store.test.ts` **has now been run and passes** as
+  part of the 86/86 four-suite gate (approved local runs, 2026-09-03,
+  specification section 29.10), so the Lua and the store contract are verified
+  against Redis 8.8.2 in that configuration. That is not a cross-version
+  guarantee and not production readiness: the Phase 4 load gate is still
+  outstanding, so behaviour under sustained contention remains unmeasured.
+  Exercise the feature against a disposable Redis outside production first.
 
 **Implementation status (Phase 5A, implemented — OPTIONAL, off by default).**
 Cross-replica OpenCode thread reuse for `POST /v1/chat/completions` lives in
@@ -168,10 +290,10 @@ contract and the state machine — do not restate them here. Operationally:
   `503 thread_reuse_unavailable` + `Retry-After: 2`. Never downgrade a failure to
   a silently created replacement thread.
 - **Not production ready.** It was pulled forward ahead of the remaining Phase 4
-  controls (shared capacity accounting, load and security
-  review, dependency scanning, backup/release procedures, runbooks), and upstream
-  ordering, pagination, cleanup, and retention remain unverified. Do not describe
-  it as production ready or make it a default.
+  controls (load testing, the broader security review, dependency scanning,
+  backup/release procedures, runbooks), and upstream ordering, pagination,
+  cleanup, and retention remain unverified. Do not describe it as production
+  ready or make it a default.
 - **Mapping lifetime and leases.** `OPENCODE_THREAD_REUSE_TTL_MS` (7 days by
   default) is a SLIDING idle TTL reset by every turn; there is deliberately no
   turn cap. Expiry forgets the mapping only — it never deletes the provider
@@ -185,6 +307,9 @@ contract and the state machine — do not restate them here. Operationally:
   while it waits, so another turn of the same session gets `409` meanwhile, and a
   `MAX_QUEUE_WAIT_MS` well above the reserved lease can lose the lease and fail
   that turn with `503`. Both are fail-closed; size the two settings together.
+  Enabling shared capacity does not change this — the queue and its wait stay per
+  replica — but a smaller cluster-wide active budget makes queue waits longer, so
+  re-check the pairing whenever the two active limits change.
 - **Pre-enablement check.** Every completion matches answers by the
   `combined_run_id` its submission returned. Verify the account's
   `process_message` returns one and that `get_messages` entries carry it, or
@@ -207,7 +332,8 @@ contract and the state machine — do not restate them here. Operationally:
 - Always release permits during success, error, timeout, client abort, and shutdown.
 - Redis-backed idempotency uses the client key, request-body hash, processing/final state, and short expiration.
 - Same key/body may await or replay the existing result; same key/different body returns `409`.
-- Cross-replica capacity/idempotency requires shared state; do not imply process-local coordination is global.
+- Cross-replica capacity and idempotency both require shared state. Do not imply process-local coordination is global: state which capacity mode a claim applies to, and never describe the default (`SHARED_CAPACITY_ENABLED=false`) process-local limits as cluster-wide, or the enabled ACTIVE limits as per replica.
+- Optional shared capacity spans only the two ACTIVE limits and keeps the capacity step exactly where it is in the admission order; the queue length and queue wait stay per replica, and a full cluster leaves waiters queued rather than rejecting them.
 - Optional thread reuse takes its session lease after the rate-limit decision and before capacity; renew the lease while waiting for capacity, and release it on every exit path.
 
 ## Observability
@@ -341,16 +467,18 @@ remains authoritative; `/user/events` is not used.
 
 Local native execution binds to loopback. Local Docker may bind the process to all container interfaces only when compose publishes `127.0.0.1:8787:8787` on the host.
 
-Hosted deployments require the controls in specification section 31.2. Sticky sessions are unnecessary: requests are stateless by default, and the one exception — optional OpenCode thread reuse — keeps its mapping in the shared Redis rather than in a replica, so any replica can serve any turn. Redis is required when idempotency, rate-limit, or thread-reuse semantics must span replicas.
+Hosted deployments require the controls in specification section 31.2. Sticky sessions are unnecessary: requests are stateless by default, and the one exception — optional OpenCode thread reuse — keeps its mapping in the shared Redis rather than in a replica, so any replica can serve any turn. Redis is required when idempotency, rate-limit, capacity, or thread-reuse semantics must span replicas.
 
-**Redis in Compose (Phase 4A/4B, implemented).** `compose.yaml` carries an OPT-IN
-`redis` profile using the pinned
+**Redis in Compose (Phase 4A/4B/4D/5A, implemented).** `compose.yaml` carries an
+OPT-IN `redis` profile using the pinned
 `redis:8.8.2-alpine`, published only on `127.0.0.1:6379`, with persistence
-disabled and no embedded password. The gateway deliberately has no `depends_on`
-on it, so it starts and serves `/healthz` whether or not Redis is running. That
-ONE Redis backs BOTH optional features — idempotency (`:idem:` keys) and rate
-limiting (`:rate:` keys) — and the gateway opens exactly ONE connection for them,
-so the same profile serves either feature or both.
+disabled, `maxmemory-policy noeviction` set explicitly, and no embedded password.
+The gateway deliberately has no `depends_on` on it, so it starts and serves
+`/healthz` whether or not Redis is running. That ONE Redis backs ALL FOUR optional
+features — idempotency (`:idem:` keys), rate limiting (`:rate:` keys), shared
+capacity (the single `:capacity:` registry key), and thread reuse (`:reuse:` keys)
+— and the gateway opens exactly ONE connection for them, so the same profile
+serves any combination.
 
 `REDIS_URL` must resolve from wherever the GATEWAY PROCESS runs, so the two local
 setups differ and must not be mixed:
@@ -365,10 +493,12 @@ setups differ and must not be mixed:
 
 This local profile does NOT meet production requirements: a hosted Redis additionally
 needs network isolation, ACL/authentication from a managed secret, TLS where the
-link is not private, the application-layer encryption key, and identical
-Redis/key/prefix/gateway-key **and `RATE_LIMIT_*`** configuration on every
-replica. Redis persistence and backups are not required for this ephemeral
-encrypted cache state, nor for the self-expiring rate-limit timestamps.
+link is not private, the application-layer encryption key, `maxmemory-policy
+noeviction`, and identical Redis/key/prefix/gateway-key **plus `RATE_LIMIT_*`,
+`SHARED_CAPACITY_ENABLED`, and the two `MAX_CONCURRENT_REQUESTS*` capacity
+limits** on every replica. Redis persistence and backups are not required for
+this ephemeral encrypted cache state, the self-expiring rate-limit timestamps, or
+the transient capacity lease registry.
 
 ## Operational Validation
 
@@ -377,6 +507,11 @@ Cover as relevant:
 - invalid startup config and secret-redacted failure output;
 - liveness/readiness success and dependency-degraded states;
 - capacity acquisition, queue timeout, overload response, and permit cleanup;
+- shared-capacity admission (a batched claim honouring the cluster-wide global and
+  per-key limits with per-key bypass), a full cluster leaving waiters QUEUED
+  rather than rejected, fail-closed `503 capacity_unavailable` on an unavailable,
+  corrupt, or ambiguous claim, idempotent release, and zero capacity Redis
+  activity while disabled;
 - rate-limit admission, exhaustion (`429` + computed `Retry-After`), fail-closed
   `503` on an unavailable Redis, and zero limiter activity while disabled;
 - client disconnect during create/submit/poll and during SSE;

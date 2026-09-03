@@ -349,15 +349,20 @@ reasonCode]` ledger with fixed integer reason codes AND a compact per-committed-
   `isUpstreamError` identity guard, and untrusted values are never inspected or
   re-thrown to the framework). The matched gateway key is exposed internally only
   as **opaque** identities, never the raw key or its digest: the index-based
-  `k<index>` used solely for per-key capacity accounting, plus — when the
-  corresponding optional feature is configured — the cross-replica idempotency
-  scope and the cross-replica rate-limit scope, which are derived under separate
-  cryptographic domains and are therefore different values for the same key. All
-  are precomputed at startup, and none is logged, reflected, or returned. **Process-local** capacity (global + per-key
+  `k<index>` used solely for the process-local per-key capacity accounting, plus —
+  when the corresponding optional feature is configured — the cross-replica
+  idempotency scope, the cross-replica rate-limit scope, the cross-replica
+  thread-reuse scope, and the cross-replica capacity scope, each derived under its
+  own cryptographic domain and therefore four unrelated values for the same key.
+  All are precomputed at startup, and none is logged, reflected, or returned.
+  Capacity (global + per-key
   active limits, a bounded FIFO queue, and a bounded queue wait) is acquired
   **before** the upstream thread is created and released on every exit path
   (success, upstream failure, timeout, client disconnect, shutdown); overflow
-  returns `429` + `Retry-After: 5`. Capacity does **not** span replicas. The total
+  returns `429` + `Retry-After: 5`. It is **process-local by default** and does
+  **not** span replicas unless the optional, off-by-default shared-capacity
+  feature is enabled, which makes only the two ACTIVE limits cluster-wide and
+  leaves the queue bounds per replica (see the Phase 4D section below). The total
   request deadline **and cancellation** are **authoritative** in the poller (both
   checked before every poll and **rechecked the instant the poll settles**, so
   cancellation seen in-flight always wins — no late poll, no late answer, and no
@@ -466,7 +471,8 @@ reasonCode]` ledger with fixed integer reason codes AND a compact per-committed-
   backpressure; a write failure or socket close is treated as client cancellation,
   which aborts polling, releases the capacity permit, clears every keep-alive
   timer, and writes no body to a gone client. As with the non-streamed path,
-  capacity is process-local, and a submitted CollectivIQ generation may continue
+  capacity is process-local unless shared capacity is explicitly enabled, and a
+  submitted CollectivIQ generation may continue
   upstream after a disconnect because no verified upstream cancellation endpoint
   exists.
 - **Bounded OpenAPI retrieval.** `scripts/openapi/fetch-openapi.ts` contacts only
@@ -627,10 +633,13 @@ errorCode, resolved, resolution, persisted }] }` (no longer `succeeded`/
   (`stream: true`/SSE) is implemented as text-only buffered synthetic SSE, not
   true upstream streaming; a basic live stream completed on 2026-08-15, but the
   long-running / keep-alive streaming smoke test is not run.
-- Capacity/backpressure is **process-local** — it does not coordinate across
-  replicas, and shared capacity accounting requires state that does not yet
-  exist. Cross-replica **rate limiting** is now available as an optional,
-  off-by-default Redis feature (see below); it does not make capacity shared.
+- Capacity/backpressure is **process-local by default** — it does not coordinate
+  across replicas unless the optional, off-by-default cross-replica
+  active-capacity feature is enabled (see below), and even then only the two
+  ACTIVE limits are shared while the admission queue stays per replica.
+  Cross-replica **rate limiting**
+  is separately available as an optional, off-by-default Redis feature (see
+  below); enabling it does not make capacity shared.
 - Optional Redis-backed idempotency is implemented but **off by default**. Its
   protection is bounded to `IDEMPOTENCY_TTL_MS`, CollectivIQ's own
   POST-idempotency semantics are unknown, and a hard replica kill mid-completion
@@ -639,6 +648,13 @@ errorCode, resolved, resolution, persisted }] }` (no longer `succeeded`/
   enforcement is bounded to the configured window, it fails closed on a Redis
   outage (trading availability for correctness on the completion path), and an
   evicted quota key silently resets that key's allowance.
+- Optional Redis-backed cross-replica active-capacity accounting is implemented
+  but **off by default**. It fails closed on a Redis outage or corrupt state, an
+  evicted or lost registry key can briefly over-admit undetectably, a failed
+  release conservatively under-admits until the lease expires, and enablement
+  requires a coordinated drain/restart. Its real-Redis contract suite **has now
+  been run and passes** against Redis 8.8.2, which is neither a cross-version
+  guarantee nor production readiness.
 - The metrics endpoint is **off by default** and, when enabled, is
   **unauthenticated** — isolating it is the operator's responsibility (see
   "Optional metrics and tracing" below). Tracing is likewise off by default and,
@@ -665,7 +681,8 @@ fingerprint HMAC, AES-256-GCM). The Redis key is an HMAC of the namespace, a
 stable per-gateway-key scope, and the client's idempotency key — so the client's
 raw key never reaches Redis. The scope is an HMAC of the raw gateway key computed
 once at startup: identical on every replica, independent of key ordering, never
-logged or returned, and separate from the process-local capacity identity. A
+logged or returned, and separate from the process-local per-key capacity
+identity. A
 cached answer is reachable only through the exact namespace + scope + client-key
 triple, and the ciphertext's associated data binds the record version, the storage
 key, and the body fingerprint, so a relocated, rebound, or tampered record fails
@@ -738,8 +755,9 @@ never re-read per request. It is never logged, reflected, or returned.
 
 **Nothing sensitive reaches Redis.** The stored value is one bounded decimal
 integer of microseconds — a theoretical arrival time — under
-`<REDIS_KEY_PREFIX>:rate:<HMAC digest>`, domain-separated from the idempotency
-keyspace. Never a raw gateway key, the process-local capacity identity, an
+`<REDIS_KEY_PREFIX>:rate:<HMAC digest>`, domain-separated from the idempotency,
+capacity, and thread-reuse keyspaces. Never a raw gateway key, the process-local
+per-key capacity identity, an
 authorization value, a prompt, a request body, a model id, a thread id, or
 completion content. The key is an HMAC, not any client-supplied value, and each
 entry expires on its own replenishment deadline.
@@ -769,9 +787,111 @@ noeviction` applies here too: an evicted quota key resets that key's allowance t
 a full burst and the gateway cannot detect it. Every replica must share the same
 Redis endpoint, encryption key, `REDIS_KEY_PREFIX`, gateway-key set, and
 `RATE_LIMIT_*` settings, or the quota is not the single shared quota it appears
-to be. Capacity accounting is still process-local. The real-Redis contract suite
+to be. Capacity accounting is process-local unless the separate, off-by-default
+Phase 4D feature below is enabled; this feature neither depends on it nor changes
+with it. The real-Redis contract suite
 for this feature has been run once under explicit approval, alongside the
 Phase 4A suite, against a disposable pinned Redis.
+
+## Optional Redis-backed shared capacity (Phase 4D)
+
+Cross-replica ACTIVE-capacity accounting for `POST /v1/chat/completions` is
+**optional and disabled by default**. With `SHARED_CAPACITY_ENABLED=false` no
+capacity scope is derived, no coordinator is built, and no Redis capacity
+operation ever runs; admission is byte-for-byte the process-local controller.
+Specification section 19.2 owns the normative contract; the security-relevant
+posture is:
+
+**No new secret.** Enabling it requires `REDIS_URL` (already secret-bearing and
+redacted) and reuses the existing `IDEMPOTENCY_ENCRYPTION_KEY`. The one added
+setting, `SHARED_CAPACITY_ENABLED`, is a non-secret strict boolean whose
+present-but-invalid value is rejected at startup even while the feature is
+disabled, with a value-free error. No new dependency and no lockfile change.
+
+**Separate key domain, and a fifth opaque key identity.** The capacity HMAC
+subkey is expanded from that same master key under a **distinct** HKDF salt and
+`info` label with its own domain tags, so it is cryptographically independent of
+every idempotency, rate-limit, and thread-reuse subkey — a gateway key's four
+cross-replica scopes are four unrelated values. No code is shared with the other
+three keyrings (the length-framing helper is deliberately duplicated), so a change
+here can never re-key another feature's stored state. Derivation is deterministic
+across replicas and independent of gateway-key ORDER, which is what lets one
+budget span replicas; `capacityScopeId` is computed once at startup so the raw key
+is never re-read per request. Neither the scope, the random owner token, nor the
+derived registry key is ever logged, reflected, returned in a response, or placed
+in an error. The positional process-local `k<index>` is deliberately never written
+to Redis: it would leak the configured key order and could not be shared anyway.
+
+**Nothing sensitive reaches Redis, and nothing needs encrypting.** State is ONE
+namespace-level sorted set at `<REDIS_KEY_PREFIX>:capacity:<HMAC digest>` — a
+separate `:capacity:` category that cannot collide with the idempotency,
+rate-limit, or thread-reuse keyspaces. Each member is exactly
+`<version>|<owner token>|<capacity scope>`: a format version, 128 bits of CSPRNG
+owner token, and the opaque per-key scope, both unpadded base64url with an
+out-of-alphabet delimiter so no component value can forge an extra field. The
+score is an integer lease deadline stamped from Redis's own clock. It holds **no**
+request, thread, session, model, tool, prompt, answer, credential, authorization
+value, raw gateway key, or process-local capacity identity. There is deliberately
+no per-scope key — the global limit must be counted across all gateway keys — and
+the key expires at the latest active lease and is deleted when empty.
+
+**Fail-closed, never fail-open, and never compensated.** Both operations are
+single atomic Lua scripts against Redis's own clock, never a Node clock.
+Cardinality is checked before any member is materialized, so an over-cardinality
+registry is classified corrupt without its bytes being read; member size,
+encoding, score, and owner-token uniqueness are validated server-side before any
+mutation. A wrong type, an oversized or malformed member, a bad score, a
+duplicated token, a disconnected Redis, a command timeout, an unusable reply, or a
+coordinator without a derived scope all return `503 capacity_unavailable` +
+`Retry-After: 2`. Corrupt state is never pruned or repaired, because a "repair"
+would hand out permits another replica may still hold; it self-heals within one
+lease window because the key always expires at its latest member deadline. An
+unavailable, corrupt, or ambiguous claim is never retried and never compensated:
+the gateway cannot know whether the mutation applied, so a retry could
+double-count a permit it already holds and a speculative release could remove one
+another replica now holds. The gateway never admits a request whose cluster
+occupancy is unknown, because doing so would silently multiply the configured
+cluster-wide limit by the replica count.
+
+**Content-free responses.** The `503 capacity_unavailable` body and the existing
+`429 gateway_capacity_exceeded` body are fixed and reveal no limit, occupancy,
+scope, owner token, or registry key. Being at the cluster limit leaves a waiter
+queued rather than rejecting it, so the `429` still comes only from a full local
+queue, a queue-wait timeout, or closed admission — in both capacity modes. A
+request rejected here creates no thread, submits nothing, registers no title
+correlation, and makes no upstream call; on the streamed transport it arrives as a
+content-free SSE error record, because capacity is reached after the SSE headers
+by design. The only observability change is the added closed error category
+`capacity_unavailable`; no new metric and no new span were introduced.
+
+**Known residual risks.** `maxmemory-policy noeviction` is **mandatory** here, as
+the Phase 4A section already requires: an evicted or otherwise lost registry key
+forgets live permits and can briefly **over-admit** up to the full configured
+limit again, and the gateway cannot detect it. A Redis restart has the same
+effect. Redis persistence and backups remain unnecessary — this is transient
+occupancy state whose worst-case loss is that one bounded over-admission. In the
+other direction, a failed or unacknowledged release conservatively
+**under-admits** that replica until the lease expires; it never changes an
+already successful response. An ambiguous claim can leave an orphan lease that the
+per-instance capacity gauges cannot see, so aggregating them across replicas is an
+estimate of cluster occupancy rather than the registry's contents. The lease is a
+crash reaper with no heartbeat and no renewal, so a hard-killed replica's permits
+are reclaimed only when their deadlines pass. Enabling the feature deliberately
+trades availability for correctness on the completion path. Mixed local/shared
+rolling operation is **unsupported**: enablement or a capacity-limit change
+requires a coordinated drain/restart, and every replica must share the same Redis
+endpoint, encryption key, `REDIS_KEY_PREFIX`, gateway-key set,
+`SHARED_CAPACITY_ENABLED` value, and both `MAX_CONCURRENT_REQUESTS*` limits. The
+real-Redis contract suite for this feature (`test/redis/shared-capacity-store.test.ts`)
+**has now been run and passes** as part of the complete four-suite gate — 86 of 86
+tests in the second of two approved local runs against a disposable pinned
+`redis:8.8.2-alpine` with `maxmemory-policy noeviction`, the database empty
+afterwards and every disposable resource removed (the first run scored 80/86 on a
+defect in that suite's own inspection helper, not in the gateway). Its Lua scripts are therefore
+verified against a real server rather than only an in-memory fake, for Redis
+8.8.2 in that configuration — not a cross-version guarantee and not production
+readiness. Those runs were local, not CI; each execution needs fresh approval; and
+the Phase 4 load and security gates remain outstanding.
 
 ## Optional Redis-backed OpenCode thread reuse (Phase 5A)
 
@@ -779,10 +899,11 @@ Phase 4A suite, against a disposable pinned Redis.
 derived, no coordinator is built, and no reuse Redis operation ever runs. Turning
 it on requires `REDIS_URL` (and therefore `IDEMPOTENCY_ENCRYPTION_KEY`) and
 introduces **no new secret**: the four thread-reuse subkeys are HKDF-expanded from
-that same master key under a salt and labels distinct from every idempotency and
-rate-limit domain, sharing no code with either, so a change here cannot re-key
-existing records. A gateway key therefore carries three unrelated opaque scopes,
-none of which is ever logged, reflected, or returned.
+that same master key under a salt and labels distinct from every idempotency,
+rate-limit, and shared-capacity domain, sharing no code with any of them, so a
+change here cannot re-key existing records. A gateway key therefore carries four
+unrelated cross-replica opaque scopes, none of which is ever logged, reflected, or
+returned.
 
 **This is the first upstream identifier the gateway persists — and it is
 encrypted.** A mapping record holds only a version, a state, a random owner token,
@@ -831,7 +952,7 @@ disclosure, and keep the same isolation and secret-handling controls the Phase 4
 section already requires.
 
 **Known residual risks.** It is **not production ready**: the remaining Phase 4
-controls (shared capacity accounting, load and security review, dependency
+controls (load testing, the broader security review, dependency
 scanning, runbooks) are outstanding, and upstream message ordering,
 pagination, thread cleanup, and retention remain unverified. A Redis failure
 immediately after `create_thread` can leave one blank orphan thread, which is
@@ -841,9 +962,11 @@ deletes a provider thread. An evicted mapping (a `maxmemory-policy noeviction`
 violation) silently starts a new thread. All replicas must share the same Redis
 endpoint, encryption key, `REDIS_KEY_PREFIX`, gateway-key set, upstream
 credentials, origin, and model configuration. The real-Redis contract suite for
-this feature **has now been run and passes** (2026-09-02, 59 tests across all
-three Redis suites, on a disposable instance left with zero keys and then
-removed), so the Lua scripts are proven against a real Redis 8.8.2. A sanitized
+this feature **has now been run and passes** (2026-09-02, 59 tests across the
+three Redis suites that existed then, on a disposable instance left with zero keys
+and then removed), so its Lua scripts are proven against a real Redis 8.8.2. That
+run predates the Phase 4D shared-capacity suite, which passed later in its own
+approved 2026-09-03 runs; the 59-test result is not an all-four result. A sanitized
 two-turn live smoke on 2026-09-02 also observed the end-to-end path work for one
 local/account configuration, with one upstream thread serving both turns and its
 provider thread deleted afterwards by the user. Neither result changes any risk

@@ -99,9 +99,11 @@ direct` (latest-user-only prompt, no protocol wrapper) — is the committed Open
   automatically for text-only models (a bounded `tools` array plus an
   `auto`/`none` `tool_choice`) by discarding it while rejecting any tool use that
   requires or names a tool (Phase 2.1; see below),
-  serializes a deterministic versioned prompt, enforces process-local global +
-  per-key capacity with a bounded queue (`429` + `Retry-After: 5` when at
-  capacity), creates one new CollectivIQ thread (or continues the session's
+  serializes a deterministic versioned prompt, enforces global +
+  per-key active capacity with a bounded queue (`429` + `Retry-After: 5` when at
+  capacity) — per replica by default, or cluster-wide for the two active limits
+  when the optional shared-capacity feature is enabled (see below) —
+  creates one new CollectivIQ thread (or continues the session's
   leased one when thread reuse is enabled and the request is eligible), submits
   once (no `create_thread`/
   `process_message` retries), and polls `get_messages` under a total deadline with
@@ -186,6 +188,14 @@ keep-alive` comments every 15 s while polling waits, deterministic
   `"ask"` permission behavior — new usage should select
   `collectiviq-tools-beta`, and removing the alias will require a separately
   announced breaking configuration change.
+- **Optional cross-replica active-capacity accounting, off by default.** With
+  `SHARED_CAPACITY_ENABLED=true` the two active limits
+  (`MAX_CONCURRENT_REQUESTS` and `MAX_CONCURRENT_REQUESTS_PER_KEY`) become
+  **cluster-wide** instead of per replica, enforced through one atomic Redis lease
+  registry; the admission queue (`MAX_QUEUED_REQUESTS`, `MAX_QUEUE_WAIT_MS`) stays
+  per replica. Off by default means no capacity scope is derived, no coordinator
+  is built, and no Redis capacity operation runs — admission is exactly the
+  process-local controller it has always been. See "Shared capacity" below.
 - **Optional bounded metrics and opt-in tracing, both off by default.** With
   `METRICS_ENABLED=true` the gateway serves the fifteen Prometheus metrics of
   specification section 23.2 at `GET /metrics` (outside `/v1`, **unauthenticated
@@ -199,11 +209,14 @@ keep-alive` comments every 15 s while polling waits, deterministic
 
 ## What is not implemented yet
 
-Native CollectivIQ tool calling and shared cross-replica capacity accounting.
+Native CollectivIQ tool calling.
 (Optional Redis-backed idempotency, optional Redis-backed cross-replica rate
-limiting, and optional metrics/tracing ARE implemented — see "Idempotent
-requests", "Rate limiting", and "Metrics and tracing" below — but all are **off
-by default**, and capacity/queueing stay process-local.)
+limiting, optional Redis-backed cross-replica active-capacity accounting, and
+optional metrics/tracing ARE implemented — see "Idempotent requests", "Rate
+limiting", "Shared capacity", and "Metrics and tracing" below — but all are **off
+by default**. With shared capacity off, which is the default, capacity and
+queueing are process-local; enabling it makes only the two active limits
+cluster-wide and leaves queueing per replica.)
 (Supported opt-in beta emulated tool calling is implemented but **not enabled by
 default**. Its numerical section-30 release gates are met — the state-aware
 report-v5 evaluator completed a full live campaign on 2026-09-01 in which all
@@ -716,8 +729,11 @@ id — and the Redis key itself is an HMAC, not your key.
 - Redis persistence and backups are **not required**: this is short-lived,
   encrypted cache state, and the supplied Compose profile disables RDB and AOF.
 - Redis buys cross-replica **idempotency** and, separately, cross-replica **rate
-  limiting** (below). Concurrency limits (`MAX_CONCURRENT_REQUESTS*`, the queue)
-  remain **process-local**; shared capacity accounting is not implemented.
+  limiting** and cross-replica **active-capacity accounting** (both below). Each
+  is enabled independently. With shared capacity off (the default), the
+  concurrency limits (`MAX_CONCURRENT_REQUESTS*`, the queue) remain
+  **process-local**; with it on, only the two active limits become cluster-wide
+  and the queue stays per replica.
 - A hosted Redis additionally needs network isolation, ACL/authentication from a
   managed secret, and TLS (`rediss://`) where the link is not private.
 
@@ -795,13 +811,150 @@ here gets an ordinary JSON error, never an SSE error record. Other `429`s
   feature deliberately trades availability for correctness; unmetered traffic
   during an outage would defeat the control.
 - Enforcement is bounded to the configured window — it smooths a rate rather than
-  capping total spend over a longer horizon — and capacity/queueing stay
-  process-local.
+  capping total spend over a longer horizon. It does not change how capacity is
+  counted: queueing always stays per replica, and the active limits are per
+  replica unless you separately enable shared capacity (next section).
 
 The full contract (the GCRA algorithm, key derivation, stored-state validation,
 and the exact admission order) is in
 [`.agent/docs/tech-software-spec.md`](.agent/docs/tech-software-spec.md)
 section 19.1.
+
+### Shared capacity (optional Redis; off by default)
+
+By default `MAX_CONCURRENT_REQUESTS` and `MAX_CONCURRENT_REQUESTS_PER_KEY` bound
+in-flight completions **per replica**, so four replicas of a gateway configured
+for four active requests will run up to sixteen. With
+`SHARED_CAPACITY_ENABLED=true` those two limits become **cluster-wide** instead:
+every replica competes for one shared budget held in Redis.
+
+**It is off unless you turn it on.** With `SHARED_CAPACITY_ENABLED=false` (the
+default) no capacity scope is derived, no coordinator is built, and no Redis
+capacity operation ever runs — admission is byte-for-byte the process-local
+controller it has always been.
+
+```bash
+export SHARED_CAPACITY_ENABLED=true
+```
+
+| Variable                  | Default | Rule                                                               |
+| ------------------------- | ------- | ------------------------------------------------------------------ |
+| `SHARED_CAPACITY_ENABLED` | `false` | Exactly `"true"` or `"false"`. `true` requires a valid `REDIS_URL` |
+
+That is the only variable this feature adds. It introduces **no new secret, no
+new dependency, and no new tuning knob** — it reinterprets settings you already
+have. Enabling it **requires Redis**: doing so without a valid `REDIS_URL` is a
+startup configuration error, not a silent downgrade to per-replica limits.
+Because `REDIS_URL` already requires `IDEMPOTENCY_ENCRYPTION_KEY`, no new secret
+is needed — the capacity scope is derived from that master key under a separate
+cryptographic domain. A present-but-invalid value is rejected at startup even
+while the feature is disabled.
+
+**What changes, and what does not.**
+
+| Setting                           | Off (default) | On           |
+| --------------------------------- | ------------- | ------------ |
+| `MAX_CONCURRENT_REQUESTS`         | Per replica   | Cluster-wide |
+| `MAX_CONCURRENT_REQUESTS_PER_KEY` | Per replica   | Cluster-wide |
+| `MAX_QUEUED_REQUESTS`             | Per replica   | Per replica  |
+| `MAX_QUEUE_WAIT_MS`               | Per replica   | Per replica  |
+
+**Re-size the two active limits before you switch it on.** With the defaults and
+four replicas, enabling this takes the cluster's global active ceiling from an
+effective 16 down to 4. That is the point of the feature, but discovering it as a
+throughput regression is avoidable: raise the two active limits deliberately.
+
+Only the active permits are shared. **No cross-replica queue fairness is
+promised** — replicas compete for the shared budget, and a busy replica's queue
+does not yield to an idle one, so a load balancer that concentrates arrivals on
+one replica will see that replica's queue absorb the difference.
+
+**`MAX_QUEUED_REQUESTS` is no longer the exact bound on requests waiting inside
+one replica.** Cluster occupancy is only knowable after a Redis round trip, so a
+request that can start a claim immediately is admitted as a _pending candidate_
+rather than a queued waiter — which is what keeps `MAX_QUEUED_REQUESTS=0`
+working: with the queue disabled, one request may still be admitted long enough
+to ask Redis whether a permit is free. If that claim grants nothing, it gets the
+ordinary `429` and is not left queued. The practical consequence is that a
+replica's in-system total is `local active + one pending batch + local queue`
+rather than `local active + local queue`. The extra term is bounded by the batch
+size, lasts one Redis command deadline, and holds no permit and makes no upstream
+call — but size a deployment against the three-term bound.
+
+| Situation                                               | Result                                                                    |
+| ------------------------------------------------------- | ------------------------------------------------------------------------- |
+| Feature disabled (default)                              | Unchanged; per-replica limits, no Redis capacity interaction              |
+| Within the cluster-wide limits                          | Runs normally; no new response header is added                            |
+| Cluster at its limit right now                          | The request stays **queued** — ordinary backpressure, not a rejection     |
+| Local queue full, queue wait exceeded, or shutting down | `429` `gateway_capacity_exceeded` + `Retry-After: 5` (same in both modes) |
+| Redis unavailable, or the registry is corrupt/ambiguous | Fails closed: `503` `capacity_unavailable` + `Retry-After: 2`             |
+
+Those two responses say different things. The `429` means the cluster is busy and
+a retry may succeed shortly; the `503` means the gateway cannot tell how busy the
+cluster is, and admitting the request anyway would silently multiply your
+configured limit by the replica count. A request rejected at either point creates
+no thread and makes no CollectivIQ call. On a `"stream": true` request the SSE
+headers are already sent by the time capacity is reached, so a capacity failure
+arrives as a content-free SSE error record rather than an HTTP status — that is
+existing behaviour and is unchanged.
+
+**Operational requirements and limits.**
+
+- **Enabling it — or changing the capacity limits — requires a coordinated
+  drain/restart.** Mixed operation is **unsupported**: while some replicas count
+  locally and others count cluster-wide, neither limit means what it says. Drain,
+  restart every replica with identical settings, then resume traffic.
+- **All replicas must share** the same `REDIS_URL`,
+  `IDEMPOTENCY_ENCRYPTION_KEY`, `REDIS_KEY_PREFIX`, `COLLECTIVIQ_GATEWAY_KEYS`,
+  `SHARED_CAPACITY_ENABLED` value, **and both `MAX_CONCURRENT_REQUESTS*`
+  limits**. Otherwise the budget is not the single shared budget it appears to be.
+- One Redis backs every enabled feature and the gateway opens **one** connection.
+  Capacity state is a single lease registry under a separate `:capacity:` key
+  category and cannot collide with idempotency, rate-limit, or thread-reuse keys.
+- **What Redis stores:** one sorted set whose members are a format version, a
+  random owner token, and the opaque per-gateway-key capacity scope, scored by a
+  lease deadline stamped from Redis's own clock. No request, thread, session,
+  model, tool, prompt, answer, credential, or raw gateway key — the registry key
+  itself is an HMAC. The key expires at the latest active lease and is deleted
+  when empty.
+- `maxmemory-policy noeviction` is **required** here, as it already is for
+  idempotency. An evicted or otherwise lost registry key forgets live permits and
+  can briefly **over-admit** up to your full configured limit again, and the
+  gateway cannot detect it. A Redis restart has the same effect. Redis
+  persistence and backups remain unnecessary: this is transient occupancy state
+  whose worst-case loss is that one bounded over-admission.
+- **A Redis outage fails the completion path closed** (`503`). Enabling this
+  feature deliberately trades availability for correctness, exactly like rate
+  limiting.
+- In the other direction, a failed or unacknowledged release conservatively
+  **under-admits** that replica until the lease expires. It never changes an
+  already successful response.
+- **The capacity gauges stay per instance.** `collectiviq_gateway_active_requests`
+  and `collectiviq_gateway_queued_requests` report this replica's own occupancy
+  and queue in both modes. Summing the active gauge across replicas in Prometheus
+  approximates live cluster occupancy, but it cannot see an orphan lease left
+  behind by an ambiguous claim, so treat the aggregate as an estimate rather than
+  the registry's contents. This feature adds no new metric and no new span — the
+  only observability change is the new `capacity_unavailable` error category.
+- **The lease is a crash reaper, not a heartbeat.** It is derived from the
+  request's own deadline plus a fixed margin, so a live request's permit cannot
+  expire mid-completion, and a hard-killed replica's permits are reclaimed once
+  their deadlines pass.
+- **Exercised against a real Redis 8.8.2, but only that.** `npm run test:redis`
+  gains a fourth suite for this feature,
+  `test/redis/shared-capacity-store.test.ts`, and the complete four-suite gate
+  **has now been run and passes — 86 of 86 tests** — under two approved local
+  runs against a disposable pinned `redis:8.8.2-alpine`. So the server-side Lua
+  really does execute correctly there, rather than being modelled only by an
+  in-memory fake. That is not a cross-version guarantee, and it is not production
+  readiness: the Phase 4 load gate is still outstanding, so behaviour under
+  sustained cross-replica contention remains unverified. Try this feature against
+  a disposable Redis outside production first.
+
+The full contract (the lease registry format, key derivation, the batched atomic
+claim, and the exact admission order) is in
+[`.agent/docs/tech-software-spec.md`](.agent/docs/tech-software-spec.md)
+section 19.2.
 
 ### OpenCode thread reuse (optional Redis; off by default)
 
@@ -863,8 +1016,8 @@ nothing about repeatability or long sessions.
 **Behaviour worth knowing before you turn it on.**
 
 - **Not production ready.** It was pulled forward ahead of the remaining
-  production-hardening work (shared capacity accounting, load and security
-  review, dependency scanning, runbooks), and upstream message ordering,
+  production-hardening work (load testing, the broader security review,
+  dependency scanning, runbooks), and upstream message ordering,
   pagination, thread cleanup, and retention are still unverified.
 - **Answers are matched by run id, not by thread history.** Every completion
   records the `combined_run_id` its submission returned and accepts only messages
@@ -996,8 +1149,8 @@ so some things are simply unmeasured:
   conservative scrape interval and a `TRACING_SAMPLE_RATIO` below `1` on a busy
   deployment.
 - **This layer has not been through the Phase 4 security review**, which is still
-  outstanding along with shared capacity accounting, load testing, dependency
-  scanning, and the release/backup runbooks. Phase 4 is not complete.
+  outstanding along with load testing, dependency scanning, and the
+  release/backup runbooks. Phase 4 is not complete.
 
 ## Validation
 
@@ -1007,19 +1160,19 @@ npm run validate        # format check, lint, typecheck, tests, build, build smo
 
 Individual checks:
 
-| Command                    | Purpose                                                                                                                      |
-| -------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `npm run format:check`     | Prettier formatting check                                                                                                    |
-| `npm run lint`             | ESLint (typed rules)                                                                                                         |
-| `npm run typecheck`        | Strict `tsc --noEmit` over sources and tests                                                                                 |
-| `npm test`                 | Vitest unit + integration + contract suites                                                                                  |
-| `npm run test:unit`        | Unit tests only                                                                                                              |
-| `npm run test:integration` | Server integration tests only                                                                                                |
-| `npm run test:contract`    | Hermetic upstream contract tests (mock HTTP)                                                                                 |
-| `npm run test:coverage`    | Tests with V8 coverage                                                                                                       |
-| `npm run build`            | Compile to `dist/`                                                                                                           |
-| `npm run test:build`       | Import compiled output; assert no open socket                                                                                |
-| `npm run test:redis`       | Real-Redis contract suites — idempotency, rate limiting, and thread reuse (needs `REDIS_TEST_URL`; excluded from `validate`) |
+| Command                    | Purpose                                                                                                                                       |
+| -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `npm run format:check`     | Prettier formatting check                                                                                                                     |
+| `npm run lint`             | ESLint (typed rules)                                                                                                                          |
+| `npm run typecheck`        | Strict `tsc --noEmit` over sources and tests                                                                                                  |
+| `npm test`                 | Vitest unit + integration + contract suites                                                                                                   |
+| `npm run test:unit`        | Unit tests only                                                                                                                               |
+| `npm run test:integration` | Server integration tests only                                                                                                                 |
+| `npm run test:contract`    | Hermetic upstream contract tests (mock HTTP)                                                                                                  |
+| `npm run test:coverage`    | Tests with V8 coverage                                                                                                                        |
+| `npm run build`            | Compile to `dist/`                                                                                                                            |
+| `npm run test:build`       | Import compiled output; assert no open socket                                                                                                 |
+| `npm run test:redis`       | Real-Redis contract suites — idempotency, rate limiting, shared capacity, and thread reuse (needs `REDIS_TEST_URL`; excluded from `validate`) |
 
 `validate` is hermetic: it makes no network, live-upstream, Docker, Redis, or
 load checks. The contract suite runs against a local mock HTTP server.
@@ -1037,18 +1190,31 @@ quota, and every corrupt-state class failing closed. The thread-reuse suite prov
 two independent coordinators serializing on one session, a concurrent same-session
 acquire admitting exactly one winner, reserved-versus-processing lease expiry,
 renewal from authoritative state, the sliding TTL reset, ambiguous expiry, script
-recovery, and corrupt or oversized state failing closed. All three use only
-synthetic values, randomize their key namespace per run, and delete every key they
-create.
+recovery, and corrupt or oversized state failing closed. The shared-capacity suite
+covers the batched atomic claim under concurrency against Redis's own clock, the
+cluster-wide global and per-key limits with per-key bypass, lease expiry and
+pruning, idempotent release, registry-key expiry and deletion, script recovery,
+and every corrupt-state class failing closed. All four use only synthetic values,
+randomize their key namespace per run, and delete every key they create.
 
 The command is excluded from `validate` and runs as its own required CI gate
 against the pinned `redis:8.8.2-alpine`; it **fails loudly** rather than skipping
 when `REDIS_TEST_URL` is unset. Never point it at a production Redis — every suite
 issues a server-wide `SCRIPT FLUSH`, so this must always be a disposable instance.
-All three suites were last run together under explicit approval on **2026-09-02**
-and passed (**59 tests**) against a disposable `redis:8.8.2-alpine`, with `DBSIZE`
-verified at zero and only that service removed afterwards. That is a standing
-result, not a rerun: starting Redis or Docker requires fresh approval every time.
+**All four suites have now been run together and pass — 4 files, 86 tests** —
+under two approved local runs on **2026-09-03** against a disposable pinned
+`redis:8.8.2-alpine` with `maxmemory-policy noeviction`, `DBSIZE` verified at zero
+both before and after with no suite key left behind, and the container and its
+Compose network removed. (The first of those two runs was 80/86 because of a
+defect in the shared-capacity suite's own inspection helper, which read the
+registry as though the client spoke RESP2; correcting that test changed no
+production code, Lua, or dependency. Earlier, on **2026-09-02**, the
+idempotency, rate-limit, and thread-reuse suites passed **59 tests** together
+before the shared-capacity suite existed — that result is not an all-four
+result.) That recorded 86/86 evidence comes from approved LOCAL runs; CI is
+separately configured to execute the same four-suite gate. All of it is a
+standing record, not a rerun — starting Redis or Docker requires fresh approval
+every time.
 
 The suite runs natively, so start ONLY the `redis` service — naming it keeps the
 gateway container out of it (the gateway would also demand
@@ -1478,9 +1644,9 @@ export COLLECTIVIQ_GATEWAY_KEYS=gw-fake-key-change-me
 docker compose up --build
 ```
 
-An **opt-in** Redis profile is available for idempotency, rate-limit, and
-thread-reuse development. One Redis backs every enabled Redis-backed feature and
-the gateway opens one connection.
+An **opt-in** Redis profile is available for idempotency, rate-limit,
+shared-capacity, and thread-reuse development. One Redis backs every enabled
+Redis-backed feature and the gateway opens one connection.
 It is not started by default and the gateway has no `depends_on` on it, so the
 gateway starts and serves `/healthz` whether or not Redis is running:
 
@@ -1495,10 +1661,12 @@ REDIS_URL=redis://redis:6379 docker compose --profile redis up --build
 
 That service uses the pinned `redis:8.8.2-alpine`, publishes only on
 `127.0.0.1:6379`, disables persistence (the records are short-lived encrypted
-cache state and self-expiring rate-limit timestamps), and configures **no
+cache state, self-expiring rate-limit timestamps, and a transient capacity lease
+registry), sets `maxmemory-policy noeviction` explicitly because every one of
+those features requires it, and configures **no
 password** — it is reachable only from the Compose network and host loopback. It
-does **not** meet production requirements: see "Idempotent requests" and "Rate
-limiting" above and `SECURITY.md`.
+does **not** meet production requirements: see "Idempotent requests", "Rate
+limiting", and "Shared capacity" above and `SECURITY.md`.
 
 The container binds `HOST=0.0.0.0` internally, but Compose publishes the port
 only on `127.0.0.1:8787`. Credentials are supplied via environment
@@ -1525,15 +1693,16 @@ gateway validates the mode-appropriate credential at startup. Only
 | `LOG_LEVEL`                       | no           | `info`                            | Pino level                                                                                                                                                                                                              |
 | `LOG_CONTENT`                     | no           | `false`                           | May be `true` only when `ENVIRONMENT=development`                                                                                                                                                                       |
 | `MAX_REQUEST_BODY_BYTES`          | no           | `8388608`                         | 1024 – 67108864                                                                                                                                                                                                         |
-| `MAX_CONCURRENT_REQUESTS`         | no           | `4`                               | Global active completions (process-local); 1–1024                                                                                                                                                                       |
-| `MAX_CONCURRENT_REQUESTS_PER_KEY` | no           | `2`                               | Per-gateway-key active completions; 1–1024 and ≤ `MAX_CONCURRENT_REQUESTS`                                                                                                                                              |
-| `MAX_QUEUED_REQUESTS`             | no           | `20`                              | Bounded admission queue length; 0–100000 (0 disables queueing)                                                                                                                                                          |
-| `MAX_QUEUE_WAIT_MS`               | no           | `5000`                            | Max time in the admission queue before a `429`; 1–600000                                                                                                                                                                |
+| `MAX_CONCURRENT_REQUESTS`         | no           | `4`                               | Global active completions; 1–1024. Per replica by default, **cluster-wide** when `SHARED_CAPACITY_ENABLED=true`                                                                                                         |
+| `MAX_CONCURRENT_REQUESTS_PER_KEY` | no           | `2`                               | Per-gateway-key active completions; 1–1024 and ≤ `MAX_CONCURRENT_REQUESTS`. Per replica by default, **cluster-wide** when `SHARED_CAPACITY_ENABLED=true`                                                                |
+| `MAX_QUEUED_REQUESTS`             | no           | `20`                              | Bounded admission queue length; 0–100000 (0 disables queueing). Always **per replica**                                                                                                                                  |
+| `MAX_QUEUE_WAIT_MS`               | no           | `5000`                            | Max time in the admission queue before a `429`; 1–600000. Always **per replica**                                                                                                                                        |
 | `SHUTDOWN_DRAIN_MS`               | no           | `30000`                           | Graceful-shutdown drain before in-flight polling is cancelled; 0–600000                                                                                                                                                 |
 | `REDIS_URL`                       | no           | _(empty — Redis disabled)_        | Canonical `redis://` / `rediss://` only (no query/fragment). **Secret-bearing** (may embed credentials); redacted                                                                                                       |
 | `IDEMPOTENCY_ENCRYPTION_KEY`      | with Redis   | —                                 | **Required when `REDIS_URL` is set.** Exactly 32 bytes as canonical unpadded base64url (43 chars). **Secret**; redacted                                                                                                 |
 | `IDEMPOTENCY_TTL_MS`              | no           | `600000`                          | Lifetime of a cached final response; 60000–3600000                                                                                                                                                                      |
-| `REDIS_KEY_PREFIX`                | no           | `collectiviq-gateway`             | Redis key namespace shared by both optional features; 1–64 chars matching `[A-Za-z0-9_-]+`                                                                                                                              |
+| `REDIS_KEY_PREFIX`                | no           | `collectiviq-gateway`             | Redis key namespace shared by every Redis-backed feature (`:idem:`, `:rate:`, `:capacity:`, `:reuse:` categories); 1–64 chars matching `[A-Za-z0-9_-]+`                                                                 |
+| `SHARED_CAPACITY_ENABLED`         | no           | `false`                           | Cross-replica active-capacity accounting; exactly `"true"`/`"false"`. `true` **requires** `REDIS_URL` and makes the two `MAX_CONCURRENT_REQUESTS*` limits cluster-wide. Adds no new secret and no new tuning setting    |
 | `RATE_LIMIT_ENABLED`              | no           | `false`                           | Cross-replica per-key rate limiting; exactly `"true"`/`"false"`. `true` **requires** `REDIS_URL`. Adds no new secret                                                                                                    |
 | `RATE_LIMIT_REQUESTS`             | no           | `60`                              | Sustained requests per window, per gateway key; 1–100000. Validated even while disabled                                                                                                                                 |
 | `RATE_LIMIT_WINDOW_MS`            | no           | `60000`                           | Window the sustained rate is expressed over, in ms; 1000–3600000. Validated even while disabled                                                                                                                         |

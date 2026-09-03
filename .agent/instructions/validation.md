@@ -16,7 +16,7 @@
 | `npm run test:contract` | Upstream contract | Vitest `test/contract` only (hermetic mock HTTP server, no network) |
 | `npm run test:compatibility` | SDK compatibility | Standalone hermetic suite (`test/compatibility`, own `vitest.compatibility.config.ts`); pinned `ai`/`@ai-sdk/openai-compatible` SDK vs an ephemeral loopback gateway with a **fake** completion — no network/credentials/CollectivIQ. **Excluded from `validate`/CI** |
 | `npm run test:adversarial` | Tool release gate | Standalone hermetic suite (`test/adversarial`, own `vitest.adversarial.config.ts`); ≥200 deterministic tool-protocol cases against the pure engine — no network/credentials/CollectivIQ. **Excluded from `validate`/CI** |
-| `npm run test:redis` | Redis gate (idempotency + rate limiting + thread reuse) | Standalone suite directory (`test/redis`, own `vitest.redis.config.ts`) requiring a REAL Redis at `REDIS_TEST_URL`. Now covers THREE suites: `idempotency-store.test.ts` (Phase 4A), `rate-limit-store.test.ts` (Phase 4B), and `thread-reuse-store.test.ts` (Phase 5A). Synthetic credentials/content only, randomized key prefix per run, every key deleted. **Excluded from `validate`** (which stays hermetic and Redis-free) but run in CI as an **additional required gate** with the pinned `redis:8.8.2-alpine` service. Never point it at a production Redis. **All three suites have now been run and pass (59 tests, 2026-09-02).** Every execution is separately approval-gated: a past run authorizes no future Docker or Redis command. |
+| `npm run test:redis` | Redis gate (idempotency + rate limiting + shared capacity + thread reuse) | Standalone suite directory (`test/redis`, own `vitest.redis.config.ts`) requiring a REAL Redis at `REDIS_TEST_URL`. Now covers FOUR suites: `idempotency-store.test.ts` (Phase 4A), `rate-limit-store.test.ts` (Phase 4B), `shared-capacity-store.test.ts` (Phase 4D), and `thread-reuse-store.test.ts` (Phase 5A). Synthetic credentials/content only, randomized key prefix per run, every key deleted. **Excluded from `validate`** (which stays hermetic and Redis-free) but run in CI as an **additional required gate** with the pinned `redis:8.8.2-alpine` service. Never point it at a production Redis. **All four suites have been run together and pass: 4 files / 86 tests, two approved LOCAL runs on 2026-09-03 (see specification section 29.10).** The earlier 59-test 2026-09-02 result covered only the Phase 4A/4B/5A suites and must not be cited as an all-four result. That recorded 86/86 evidence comes from approved LOCAL runs; CI is separately configured to execute the same four-suite gate. Every execution is separately approval-gated: a past run authorizes no future Docker or Redis command. |
 | `npm run eval:tools` | Live tool gate | Approval-gated LIVE evaluator (`src/eval/`). Default is a credential-free/network-free preflight; the fully-approved path probes the fixed CollectivIQ origin. Network-only; **must NEVER be added to `validate`/CI**. Five authorized campaigns have run. The operative evidence is the **completed 2026-09-01 report-v5 campaign** (the first completed campaign on the state-aware report-v5 / checkpoint-v4 evaluator): it finished the full corpus across two resumable execution segments with cleanup and checkpoint finalization succeeding, **all eight gates passed**, and overall **`passed: true`**, so the numerical section-30 criteria are **met** and Phase 3 graduated to supported opt-in beta while staying non-default and permission-gated. Any future live run is separately approval-gated. The 2026-08-31 report-v4 campaign is historical evidence. See specification section 30 for the complete record and all gate values. |
 | `npm run eval:tools:diagnose` | Live tool diagnostic | Approval-gated LIVE **multi-step transition diagnostic** (`src/eval/tools-diagnostic-cli.ts`). Default is a credential-free/network-free preflight; the fully-approved path runs ONLY the 20 multi-step scenarios (global corpus ordinals 201–220, max 80 upstream rounds) against the fixed CollectivIQ origin in password mode. It **establishes no release gate** — its output has no gates and no `passed` field, only `completed` — and it uses a SEPARATE diagnostic checkpoint so it can never touch the release evaluator's. Network-only; **must NEVER be added to `validate`/CI**. **ONE live run has completed**, under the historical v2 classifier (20/20 scenarios, 54/54 threads deleted, zero cleanup/journal failures, finalized checkpoint, no abort; 7 scenarios followed the old static schedule and 13 failed at round 2 with `expected-already-invoked`). It showed the static round-2 expectation was stale but did NOT prove those edits succeeded. The current **v3** diagnostic has NOT been run live; every live invocation is separately approval-gated. See specification section 30.1. |
 | `npm run test:coverage` | Coverage | Vitest with V8 coverage |
@@ -79,7 +79,7 @@ section 19.1 the normative contract; do not restate them here. Operationally:
   records which scopes were charged, in order, relative to the rest of the route.
   Real atomicity, the Lua script, and Redis's own clock are proven only by
   `test/redis/rate-limit-store.test.ts`.
-- `npm run test:redis` now runs all THREE `test/redis/` suites and keeps its existing
+- `npm run test:redis` now runs all FOUR `test/redis/` suites and keeps its existing
   contract: excluded from `vitest.config.ts` and from `validate` (which stays
   hermetic and Redis-free), a required CI gate in its own job with the pinned
   `redis:8.8.2-alpine`, failing loudly rather than skipping when `REDIS_TEST_URL`
@@ -97,6 +97,108 @@ section 19.1 the normative contract; do not restate them here. Operationally:
   rejection stays a JSON error; and a disabled limiter performs zero operations.
   Do not weaken those into limiter-level assertions.
 
+**Shared-capacity evidence (Phase 4D, implemented — optional, off by default).**
+Specification section 29.10 owns the layered test inventory and section 19.2 the
+normative contract; do not restate them here. Operationally:
+
+- Hermetic coverage that must accompany any change in this area:
+  `test/unit/shared-capacity-{keyring,redis-store,coordinator,runtime}.test.ts`,
+  the shared-capacity blocks in `test/unit/config.test.ts`,
+  `test/unit/gateway-auth.test.ts`, and `test/unit/redis-runtime.test.ts`, the
+  `CapacityRequest` port-signature adaptation in `test/unit/capacity.test.ts`
+  (which exercises the UNCHANGED process-local controller through the expanded
+  port and asserts no shared-capacity behaviour — keep the Phase 4D behaviour
+  inventory in the dedicated shared-capacity suites), and
+  `test/integration/chat-completions-shared-capacity.test.ts` over the injected
+  fake in `test/support/fake-shared-capacity-store.ts` — then
+  `npm run validate`, and `npm run test:redis` against a real Redis.
+- `test/support/fake-shared-capacity-store.ts` stands in for the REDIS SERVER,
+  never for the coordinator logic under test: it mirrors the Lua prune/count/grant
+  and owner-token guards and forces each closed claim and release outcome
+  (`claimed` with a chosen granted subset, `corrupt`, `unavailable`). Real
+  atomicity, the two Lua scripts, and Redis's own clock are proven only by
+  `test/redis/shared-capacity-store.test.ts`.
+- The integration suite is where the ROUTE properties belong, because they are not
+  coordinator properties: the capacity step stays in its existing admission
+  position (after the rate-limit decision, the reuse lease, and the idempotency
+  claim; before the `processing` transition and any upstream call); a full cluster
+  leaves the waiter QUEUED and only the local queue bounds or closed admission
+  produce `429 gateway_capacity_exceeded` + `Retry-After: 5`; an unavailable,
+  corrupt, or ambiguous claim produces `503 capacity_unavailable` +
+  `Retry-After: 2` with no thread created and no upstream call; the same failure
+  on the streamed transport arrives as a content-free SSE error record rather than
+  an HTTP status, because capacity is reached after the SSE headers by design;
+  rate-limit quota already spent is not refunded; idempotency waiters and cached
+  replays take no permit; a capacity failure before `processing` releases or
+  restores the idempotency claim and the reuse lease; and with
+  `SHARED_CAPACITY_ENABLED=false` the coordinator is never built and ZERO capacity
+  Redis operations occur. Two route properties are there for reasons the unit
+  layer structurally cannot cover: a `release()` that throws SYNCHRONOUSLY must
+  still leave a `200`, because the failure it guards against is the route's own
+  `finally` turning a completed response into the fixed `500`; and a zero-length
+  queue whose own immediate claim grants nothing must produce the `429`, because
+  the regression was a request that never resolved at all rather than a
+  coordinator outcome. Keep both at the route.
+- Assert the fail-closed rules as ABSENCES, not just statuses: a `corrupt` or
+  `unavailable` claim must produce no retry and no compensating release, and
+  corrupt registry state must be left untouched. A test that only checks the
+  `503` would pass while the coordinator silently retried an ambiguous mutation.
+- **Red-before-green evidence for the six hardening remediations.** An
+  independent review of the initial Phase 4D implementation produced six fixes —
+  strict claim/release reply validation, the future-score ceiling, exact
+  canonical member components plus the strict numeric guards, arrival backoff
+  integrity, queue-bound reapplication after every settlement, and the
+  synchronous release-failure guard. Each was implemented against focused cases
+  that were MANUALLY OBSERVED FAILING first, which is why those cases are worth
+  preserving rather than folding into broader ones. What was observed red:
+  - in `test/unit/shared-capacity-redis-store.test.ts`, nine of thirty — the
+    corrected two-owners-for-one-candidate defect, the whole
+    "reply the SUBMITTED batch cannot justify" table, the non-canonical and
+    wrong-length owner cases, `corrupt` at exact arity one, the release
+    extra-field cases, the duplicate-candidate batch guard, and three static Lua
+    assertions (the deadline bound, the exact canonical patterns, the numeric
+    guards);
+  - in `test/unit/shared-capacity-coordinator.test.ts`, nine — two backoff-
+    integrity cases and the locally-held-permit release pre-emption case (each
+    producing more claims
+    than the cadence allows), three queue-bound cases (a zero-length queue never
+    resolving at all, overflow waiters never settled, and a steady-state queue
+    reaching twice its bound), both synchronous release-throw cases, and the
+    per-key bypass case adapted to fire the retry;
+  - the drained-queue timer-hygiene case, which was added AFTER that round and so
+    was verified by REVERTING its single line rather than observed red
+    beforehand, with its mutation guard confirmed still green;
+  - the two later route-level regressions (a zero-length queue whose immediate
+    claim grants nothing, and a synchronous `release()` throw), each likewise
+    verified by reverting its fix — the first then times out instead of
+    answering `429`, the second returns the fixed `500`.
+
+  Two caveats. This evidence is HISTORICAL — it records how the fixes were
+  demonstrated, not a command anyone can re-run to reproduce the red state, and
+  the distinction between "observed red first" and "verified by reverting" is
+  kept deliberately because they are different strengths of evidence. And none of
+  it executes Lua: the unit layer asserts the script SOURCE and the arguments the
+  store ships, so it cannot replace the real-Redis gate below.
+- **The real-Redis suite `test/redis/shared-capacity-store.test.ts` HAS now been
+  run and passes** — two approved LOCAL runs on 2026-09-03 ended in a complete
+  four-suite gate of **86/86** on a disposable pinned `redis:8.8.2-alpine` with
+  `maxmemory-policy noeviction`, `DBSIZE` 0 afterwards, and the container and
+  Compose network removed. So the Lua scripts, the batched grant under genuine
+  concurrency, lease expiry against Redis's own clock, `EVALSHA`→`EVAL` recovery,
+  and the corrupt-state classes are proven against a real server rather than only
+  the in-memory fake — for Redis 8.8.2 in that configuration, which is neither a
+  cross-version guarantee nor production readiness. That recorded evidence comes
+  from approved local runs and CI is separately configured to execute the same
+  four-suite gate;
+  running it requires fresh approval every time, and all four `test/redis/` suites
+  issue a server-wide `SCRIPT FLUSH`, so it must only ever target a disposable
+  instance. Specification section 29.10 owns the two-run evidence, including the
+  first run's 80/86 test-only RESP3 decoding defect; do not restate it here.
+- Behaviour under sustained cross-replica contention (throughput, queue-wait
+  distribution, orphan-lease accumulation) belongs to the outstanding Phase 4
+  **load gate**, which is still **not implemented**. Load suites must not be added
+  to `validate`.
+
 `validate` is hermetic. The upstream contract suite (`test/contract`) is now
 implemented and hermetic (a local mock HTTP server; no network, credentials, or
 CollectivIQ calls); it runs as part of `npm run test` and therefore inside
@@ -109,9 +211,10 @@ is likewise kept **out** of `validate`/CI and run only on its own. The
 (`vitest.adversarial.config.ts`) is now implemented and is likewise hermetic but
 kept **out** of `validate`/CI. The **Redis contract suites**
 `test:redis` (`vitest.redis.config.ts`; idempotency, rate limiting since Phase
-4B, and OpenCode thread reuse since Phase 5A) are the only suites that require an
-external service; they must **never** be added to `validate`, but they ARE a
-required CI gate in their own job with a pinned `redis:8.8.2-alpine` service. The
+4B, shared capacity since Phase 4D, and OpenCode thread reuse since Phase 5A) are
+the only suites that require an external service; they must **never** be added to
+`validate`, but they ARE a required CI gate in their own job with a pinned
+`redis:8.8.2-alpine` service. The
 network-only `eval:tools` live evaluator, the
 network-only `eval:tools:diagnose` live diagnostic, and the `contract:*`
 commands must **never** be added to `validate` or CI. Load,
@@ -637,9 +740,14 @@ the gateway's 60 s correlation registry (its own `test/unit/title-bridge.test.ts
 the plugin's `sessions` map, and the plugin's separate `metaCache`.
 
 **Phase 5A real-Redis gate evidence (2026-09-02, two approved runs).** The
-`npm run test:redis` gate now passes in full — 3 files, 59 tests — and the route
-there is worth remembering, because the first run's failures were TEST defects and
-were correctly NOT treated as production defects.
+`npm run test:redis` gate passed in full over the THREE suites that existed then —
+3 files, 59 tests — and the route there is worth remembering, because the first
+run's failures were TEST defects and were correctly NOT treated as production
+defects. (This evidence covers the Phase 4A/4B/5A suites only. Phase 4D later
+added a fourth suite, `test/redis/shared-capacity-store.test.ts`, and the
+all-four gate has since passed 86/86 in its own approved 2026-09-03 runs —
+specification section 29.10 owns that record. Never merge the two: the 59/59
+result did not include Phase 4D.)
 
 The first approved run on a disposable pinned `redis:8.8.2-alpine` (host loopback
 only) produced **57 passed / 2 failed**, both failures in
@@ -664,7 +772,7 @@ throughout; upstream and gateway credential variables unset; **no live Collectiv
 request and no real credential**.
 
 Two operational notes for anyone rerunning it. Every execution needs FRESH
-approval — the 2026-09-02 runs authorize nothing later. And all three suites call
+approval — the 2026-09-02 runs authorize nothing later. And all four suites call
 `SCRIPT FLUSH`, which clears the whole server's Lua script cache, so this gate must
 only ever target a disposable instance, never a shared or production Redis.
 
@@ -777,7 +885,7 @@ Include boundary escape, protocol redefinition, invented tools, invalid/oversize
 
 ### Load and lifecycle
 
-Model the configured four active/twenty queued baseline and long upstream latency. Check queue behavior, memory steady state, cancellations, timer/socket cleanup, graceful shutdown, and recovery after upstream outage.
+Model the configured four active/twenty queued baseline and long upstream latency. Check queue behavior, memory steady state, cancellations, timer/socket cleanup, graceful shutdown, and recovery after upstream outage. When the optional Phase 4D layer is in scope, also model several replicas competing for one cluster-wide active budget and check throughput, queue-wait distribution, and orphan-lease accumulation. None of this is implemented; these suites must not be added to `validate`.
 
 ## Change-to-Test Map
 
@@ -792,6 +900,7 @@ Model the configured four active/twenty queued baseline and long upstream latenc
 | Auth, secrets, or logging | Positive/negative auth tests and assertions that secrets/content never appear |
 | Limits, capacity, or Redis | Boundary, queue/permit cleanup, conflict/TTL, and cross-request isolation tests |
 | Rate limiting | GCRA arithmetic, key-derivation separation, fail-closed corrupt/unavailable state, route ordering and quota accounting, plus the real-Redis suite |
+| Shared cross-replica capacity | HKDF/HMAC domain separation from Phase 4A/4B/5A, collision-free member framing, batched grant honouring the cluster-wide global and per-key limits with per-key bypass, full-cluster-leaves-queued (never a `429`), idempotent release, no retry or compensation on a corrupt/unavailable/ambiguous claim, corrupt state left untouched, lease derived from the request deadline with no renewal, unchanged route admission ordering with its `503`/SSE-record behaviour, zero Redis activity while disabled, plus the real-Redis suite |
 | OpenCode thread reuse | HKDF domain separation from Phase 4A/4B, collision-free identity framing, AEAD binding/tampering, strict state-specific record parsing, every state transition including lease expiry and ambiguity, the acknowledgement-safe `commit`/`activate` pair under a LOST REPLY (not merely a pre-mutation failure), an activation that finds the record GENUINELY REMOVED leaving a bounded tombstone rather than a clean slate, state-derived Redis lifetimes at the minimum mapping TTL, route eligibility and ordering, and the real-Redis suite |
 | Upstream run correlation | Required `combined_run_id` on a successful submission, `string \| null` normalization on message entries, candidate-level filtering that survives an outranking stale message, and a timeout rather than an uncorrelated answer |
 | Health, shutdown, or Docker | Lifecycle/integration test and safe-binding inspection |
