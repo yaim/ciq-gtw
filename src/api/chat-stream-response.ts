@@ -59,6 +59,9 @@ import {
   type StreamableResult,
   type StreamMeta,
 } from "../openai/chat-stream.js";
+import { toErrorCategory, type ErrorCategory } from "../observability/labels.js";
+import { DISABLED_TELEMETRY, type Telemetry } from "../observability/telemetry.js";
+import type { GatewaySpan } from "../observability/tracing.js";
 
 /** Default keep-alive cadence, in ms (specification section 14). */
 export const KEEP_ALIVE_INTERVAL_MS = 15_000;
@@ -104,6 +107,23 @@ export interface StreamChatCompletionOptions<R extends StreamableResult = Stream
   readonly onCompleted?: (result: R) => void;
   /** Keep-alive cadence override (tests only). */
   readonly keepAliveMs?: number;
+  /**
+   * Observability ports (specification section 23). The transport owns the
+   * `stream_connections` gauge and the `gateway.stream` span; it owns no
+   * request-level counter, so a streamed request still settles exactly once at
+   * the API lifecycle.
+   */
+  readonly telemetry?: Telemetry;
+  /** Explicit parent for the `gateway.stream` span. */
+  readonly parentSpan?: GatewaySpan;
+  /** The resolved virtual-model id, used only as a closed span attribute. */
+  readonly model?: string;
+  /**
+   * Report the CLOSED envelope chosen for a post-header failure. A stream that
+   * has already committed its status line cannot change it, so this is the only
+   * way the request-level error category learns what went wrong.
+   */
+  readonly onErrorEnvelope?: (apiError: OpenAIApiError) => void;
 }
 
 /**
@@ -343,6 +363,11 @@ export async function streamChatCompletion<R extends StreamableResult = Streamab
   const { reply, meta, run, runSignal, clientAbort } = opts;
   const keepAliveMs = opts.keepAliveMs ?? KEEP_ALIVE_INTERVAL_MS;
   const res = reply.raw;
+  const { metrics, tracing } = opts.telemetry ?? DISABLED_TELEMETRY;
+  // Fixed for the lifetime of the ports, so a disabled transport builds no span
+  // options and calls neither port.
+  const metricsOn = metrics.enabled;
+  const tracingOn = tracing.enabled;
 
   /** Fire the success hook once, swallowing any throw (it must never affect the stream). */
   const notifyCompleted = (result: R): void => {
@@ -372,16 +397,55 @@ export async function streamChatCompletion<R extends StreamableResult = Streamab
     return;
   }
 
+  // Opened only once the headers are committed, and closed on EVERY exit path
+  // by the `finally` below. The gauge is incremented as the LAST statement
+  // before the guarded region, so nothing can run between an increment and its
+  // guaranteed decrement. Both are skipped outright when their port is
+  // disabled: no span options are built and neither port is called.
+  const streamSpan = tracingOn
+    ? tracing.startSpan("gateway.stream", {
+        ...(opts.parentSpan !== undefined ? { parent: opts.parentSpan } : {}),
+        attributes: {
+          transport: "sse",
+          ...(opts.model !== undefined ? { model: opts.model } : {}),
+        },
+      })
+    : null;
+
+  /**
+   * Mark the stream span FAILED exactly once (specification §23.3). A stream
+   * that ends without delivering its terminal frame and `[DONE]` did not
+   * complete, so every such exit is an error span; `other` is the closed
+   * fallback for the exits with no gateway envelope to read a category from.
+   *
+   * `null` — not a no-op function — when there is no span, so a disabled stream
+   * allocates no closure. Every call site uses optional invocation, which
+   * short-circuits without evaluating its argument.
+   */
+  const failStream =
+    streamSpan === null
+      ? null
+      : ((): ((category: ErrorCategory) => void) => {
+          let failed = false;
+          return (category: ErrorCategory): void => {
+            if (failed) return;
+            failed = true;
+            streamSpan.setError(category);
+          };
+        })();
+
   const writer = new FrameWriter(res, clientAbort, runSignal);
   // Force-close the socket on any terminal path reached because of shutdown, a
   // client disconnect, or a transport failure — so a hijacked SSE keep-alive
   // socket cannot outlive the request and stall shutdown. A clean success (no
   // abort, transport still open) ends gracefully instead.
   const finish = (): void => finishResponse(res, runSignal.aborted || writer.isClosed);
+  if (metricsOn) metrics.streamOpened();
   try {
     // 1. Assistant-role opener BEFORE capacity acquisition or any upstream
     //    request. If it cannot be delivered, run()/keep-alive never start.
     if ((await writer.write(sseData(roleChunk(meta)))) === "closed") {
+      failStream?.("other");
       finish();
       return;
     }
@@ -410,6 +474,7 @@ export async function streamChatCompletion<R extends StreamableResult = Streamab
     // If the transport is already gone (client disconnect or a force-closed,
     // stuck response), write no body — just make sure the socket is ended.
     if (writer.isClosed || clientAbort.signal.aborted) {
+      failStream?.("other");
       finish();
       return;
     }
@@ -417,26 +482,72 @@ export async function streamChatCompletion<R extends StreamableResult = Streamab
     if (!failed && result !== undefined) {
       // 4. Emit the body then the terminal chunk then [DONE]. Every write is
       //    checked so we stop the instant the transport closes.
+      // The `gateway.encode` span covers the deterministic ENCODING work only —
+      // the tool-call frames or the code-point-safe answer split — and never the
+      // subsequent writes, which belong to `gateway.stream`.
+      //
+      // The two shapes differ in what the span encloses. The tool branch builds
+      // both of its (small, fixed) frames up front. The text branch encloses
+      // only the split — which already returned an eager array before this
+      // change — and still encodes each content frame lazily at its write site,
+      // so an answer of any size keeps its original memory profile.
+      const encodeSpan = tracingOn
+        ? tracing.startSpan("gateway.encode", {
+            ...(streamSpan !== null ? { parent: streamSpan } : {}),
+            attributes: {
+              transport: "sse",
+              ...(opts.model !== undefined ? { model: opts.model } : {}),
+              ...(result.kind === "tool_calls" ? { toolCallCount: result.toolCalls.length } : {}),
+            },
+          })
+        : null;
       if (result.kind === "tool_calls") {
         // One complete, indexed tool-call delta, then the tool-calls terminal.
-        if ((await writer.write(sseData(toolCallsChunk(meta, result.toolCalls)))) === "closed") {
+        let toolFrame: string;
+        let toolTerminalFrame: string;
+        try {
+          toolFrame = sseData(toolCallsChunk(meta, result.toolCalls));
+          toolTerminalFrame = sseData(terminalToolChunk(meta));
+        } catch (error) {
+          // An encoder failure this late cannot change the committed status.
+          encodeSpan?.setError("internal_error");
+          encodeSpan?.end();
+          failStream?.("internal_error");
+          throw error;
+        }
+        encodeSpan?.end();
+        if ((await writer.write(toolFrame)) === "closed") {
+          failStream?.("other");
           finish();
           return;
         }
-        if ((await writer.write(sseData(terminalToolChunk(meta)))) === "closed") {
+        if ((await writer.write(toolTerminalFrame)) === "closed") {
+          failStream?.("other");
           finish();
           return;
         }
       } else {
         // Text content deltas then the `stop` terminal. An empty answer emits no
         // content frames but still emits the terminal chunk and [DONE].
-        for (const piece of splitAnswerIntoChunks(result.content)) {
+        let pieces: readonly string[];
+        try {
+          pieces = splitAnswerIntoChunks(result.content);
+        } catch (error) {
+          encodeSpan?.setError("internal_error");
+          encodeSpan?.end();
+          failStream?.("internal_error");
+          throw error;
+        }
+        encodeSpan?.end();
+        for (const piece of pieces) {
           if ((await writer.write(sseData(contentChunk(meta, piece)))) === "closed") {
+            failStream?.("other");
             finish();
             return;
           }
         }
         if ((await writer.write(sseData(terminalChunk(meta)))) === "closed") {
+          failStream?.("other");
           finish();
           return;
         }
@@ -444,6 +555,7 @@ export async function streamChatCompletion<R extends StreamableResult = Streamab
       const doneOutcome = await writer.write(DONE_FRAME);
       // Only a fully delivered terminal + [DONE] counts as a streamed success.
       if (doneOutcome === "written") notifyCompleted(result);
+      else failStream?.("other");
       finish();
       return;
     }
@@ -452,9 +564,21 @@ export async function streamChatCompletion<R extends StreamableResult = Streamab
     //    chunk), while the transport is writable.
     const apiError = mapStreamFailure(failure, clientAbort);
     if (apiError === null) {
+      // The client is already gone, so there is no envelope to read a category
+      // from; the stream still did not complete.
+      failStream?.("other");
       finish();
       return;
     }
+    // Report the CHOSEN envelope's closed category so a post-header failure is
+    // still distinguishable in `errors_total`, even though the `200` status line
+    // was committed long before it happened.
+    try {
+      opts.onErrorEnvelope?.(apiError);
+    } catch {
+      // Reporting must never affect the delivered stream.
+    }
+    failStream?.(toErrorCategory(apiError.body.error.code));
     if ((await writer.write(sseError(apiError.body))) === "closed") {
       finish();
       return;
@@ -463,5 +587,7 @@ export async function streamChatCompletion<R extends StreamableResult = Streamab
     finish();
   } finally {
     writer.dispose();
+    streamSpan?.end();
+    if (metricsOn) metrics.streamClosed();
   }
 }

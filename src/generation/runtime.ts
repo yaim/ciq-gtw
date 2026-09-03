@@ -19,6 +19,8 @@ import { createChatCompletionService, type ChatCompletionService } from "./chat-
 import { createIdGenerator, systemClock } from "./seams.js";
 import { createTitleBridge, type TitleBridge } from "../opencode/title-bridge.js";
 import { createToolCallIdGenerator, type ToolCallIdGenerator } from "../tools/index.js";
+import { DISABLED_TELEMETRY, type Telemetry } from "../observability/telemetry.js";
+import { instrumentAdapter } from "./adapter-telemetry.js";
 import type { CapacityController, Clock, IdGenerator, Poller, PromptSerializer } from "./types.js";
 
 /** The completion pipeline plus the capacity controller the root drains. */
@@ -39,6 +41,13 @@ export interface CompletionRuntimeSeams {
   readonly clock?: Clock;
   readonly titleBridge?: TitleBridge;
   readonly toolCallIds?: ToolCallIdGenerator;
+  /**
+   * Observability ports. Unlike the fields above this is COMPOSITION wiring, not
+   * a test fake: the process root passes the telemetry it also closes on
+   * shutdown. Omitted means fully disabled, so no gauge is bound, no adapter is
+   * wrapped, and no span is created.
+   */
+  readonly telemetry?: Telemetry;
 }
 
 /** Build the upstream adapter from validated config (no I/O; login is lazy). */
@@ -71,7 +80,16 @@ export function createCompletionRuntime(
       maxQueued: config.MAX_QUEUED_REQUESTS,
       maxQueueWaitMs: config.MAX_QUEUE_WAIT_MS,
     });
-  const adapter = seams.adapter ?? buildAdapter(config);
+  const telemetry = seams.telemetry ?? DISABLED_TELEMETRY;
+  // The two capacity gauges are pull based: binding a snapshot source keeps the
+  // controller free of any metrics dependency and cannot perturb admission.
+  // Skipped outright when metrics are disabled, so a disabled gateway never
+  // hands the controller to a port at all.
+  if (telemetry.metrics.enabled) telemetry.metrics.bindCapacitySource(capacity);
+  // Wrap the adapter BEFORE the poller is built so each individual
+  // `get_messages` poll is measured too. The wrapper is transparent and is
+  // skipped entirely when metrics are disabled.
+  const adapter = instrumentAdapter(seams.adapter ?? buildAdapter(config), telemetry.metrics);
   const poller = seams.poller ?? createPoller(adapter);
   const serializer = seams.serializer ?? createPromptSerializer();
   const ids = seams.ids ?? createIdGenerator();
@@ -86,6 +104,7 @@ export function createCompletionRuntime(
     ids,
     clock,
     toolCallIds,
+    telemetry,
   });
   // The title bridge shares the same adapter (its OBSERVED-ONLY `getThreadTitle`)
   // and clock. Construction opens no socket and makes no CollectivIQ call.

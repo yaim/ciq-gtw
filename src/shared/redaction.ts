@@ -80,6 +80,17 @@ export const REDACT_PATHS: readonly string[] = [
   "*.IDEMPOTENCY_ENCRYPTION_KEY",
   "encryptionKey",
   "*.encryptionKey",
+  // Optional OpenTelemetry tracing (specification section 23.3). The exporter
+  // is sent no authentication and the loader rejects a credential-bearing
+  // endpoint outright, so no accepted value carries a secret. These paths cover
+  // the value BEFORE it is validated, and the collector address is operational
+  // topology that need not reach a log either way.
+  "TRACING_OTLP_ENDPOINT",
+  "*.TRACING_OTLP_ENDPOINT",
+  "tracingOtlpEndpoint",
+  "*.tracingOtlpEndpoint",
+  "otlpEndpoint",
+  "*.otlpEndpoint",
 ];
 
 /** Substrings that unambiguously mark a credential-bearing or identity key. */
@@ -100,14 +111,36 @@ const SECRET_KEY_MARKERS = [
   "encryptionkey",
 ];
 
-/** Exact normalized key names that are always credentials. */
-const SECRET_KEY_EXACT = new Set(["key", "token", "bearer"]);
+/**
+ * Exact normalized key names whose value is always replaced.
+ *
+ * `key`/`token`/`bearer` are credentials outright. The OTLP endpoint is not —
+ * the loader rejects a credential-bearing endpoint — but it is matched here for
+ * the same reasons `REDACT_PATHS` covers it: a value logged before validation
+ * has not been rejected yet, and the collector address is operational topology
+ * that need not reach a log. `REDACT_PATHS` only reaches the root and one
+ * nesting level, so without these entries a deeply nested endpoint is logged in
+ * full.
+ *
+ * Matching is EXACT rather than through an `endpoint` marker, which would also
+ * hide operational fields such as `endpointCount`, `endpointLabel`, and
+ * `endpoints`.
+ */
+const SECRET_KEY_EXACT = new Set([
+  "key",
+  "token",
+  "bearer",
+  // `otlpEndpoint` (the tracing options field); `TRACING_OTLP_ENDPOINT` and
+  // `tracingOtlpEndpoint` both normalize to the second entry.
+  "otlpendpoint",
+  "tracingotlpendpoint",
+]);
 
 function normalizeKey(key: string): string {
   return key.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-/** Whether a property name denotes a credential whose value must be redacted. */
+/** Whether a property name denotes a value that must be redacted. */
 export function isSecretKey(key: string): boolean {
   const normalized = normalizeKey(key);
   if (SECRET_KEY_EXACT.has(normalized)) return true;

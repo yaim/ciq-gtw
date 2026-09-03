@@ -63,6 +63,9 @@ function configFor(baseUrl: string, model = modelWith()): AppConfig {
     RATE_LIMIT_BURST: 8,
     OPENCODE_THREAD_REUSE_ENABLED: false,
     OPENCODE_THREAD_REUSE_TTL_MS: 604_800_000,
+    METRICS_ENABLED: false,
+    TRACING_ENABLED: false,
+    TRACING_SAMPLE_RATIO: 1,
     models: [model],
   };
 }

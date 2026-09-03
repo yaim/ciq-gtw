@@ -193,7 +193,7 @@ describe("createPoller", () => {
     const { clock, sleep } = timeSeam(1_000);
     const poller = createPoller(adapter, { clock, sleep, random: () => 0.5 });
     const outcome = await poller.poll(params({ deadlineMs: 500 }));
-    expect(outcome).toEqual({ kind: "timeout" });
+    expect(outcome).toEqual({ kind: "timeout", pollCount: 0 });
     expect(getMessages).not.toHaveBeenCalled();
   });
 
@@ -216,7 +216,7 @@ describe("createPoller", () => {
     };
     const poller = createPoller(adapter, { clock, sleep, random: () => 0.5 });
     const outcome = await poller.poll(params({ deadlineMs: 100 }));
-    expect(outcome).toEqual({ kind: "timeout" });
+    expect(outcome).toEqual({ kind: "timeout", pollCount: 1 });
     expect(getMessages).toHaveBeenCalledTimes(1);
   });
 
@@ -238,7 +238,7 @@ describe("createPoller", () => {
     };
     const poller = createPoller(adapter, { clock, sleep, random: () => 0.5 });
     const outcome = await poller.poll(params({ deadlineMs: 100 }));
-    expect(outcome).toEqual({ kind: "timeout" });
+    expect(outcome).toEqual({ kind: "timeout", pollCount: 1 });
   });
 
   it("throws cancellation (distinct from timeout) when the signal is already aborted", async () => {
@@ -337,7 +337,7 @@ describe("createPoller", () => {
     const outcome = await poller.poll(
       params({ pollIntervalMs: 500, maxPollIntervalMs: 500, deadlineMs: 1_000 }),
     );
-    expect(outcome).toEqual({ kind: "timeout" });
+    expect(outcome).toEqual({ kind: "timeout", pollCount: 2 });
     // Two 500ms sleeps land exactly on the deadline; the third read sees now >= deadline.
     expect(sleeps).toEqual([500, 500]);
   });
@@ -379,7 +379,7 @@ describe("createPoller", () => {
     const outcome = await poller.poll(
       params({ pollIntervalMs: 100, maxPollIntervalMs: 1_000, deadlineMs: 150 }),
     );
-    expect(outcome).toEqual({ kind: "timeout" });
+    expect(outcome).toEqual({ kind: "timeout", pollCount: 2 });
     // First sleep 100 (now=100), second clamped to remaining 50 (now=150), then timeout.
     expect(sleeps).toEqual([100, 50]);
   });
@@ -454,7 +454,7 @@ describe("run correlation (specification §8.6)", () => {
     const { clock, sleep } = timeSeam();
     const poller = createPoller(adapter, { clock, sleep, random: () => 0.5 });
     const outcome = await poller.poll(params({ deadlineMs: 1_200 }));
-    expect(outcome).toEqual({ kind: "timeout" });
+    expect(outcome).toEqual({ kind: "timeout", pollCount: 3 });
   });
 
   it("returns this run's answer as soon as it appears", async () => {

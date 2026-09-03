@@ -8,6 +8,8 @@ import Fastify, {
 } from "fastify";
 import type { TypeBoxTypeProvider } from "@fastify/type-provider-typebox";
 import { registerHealthRoutes, type ReadinessState } from "./api/health-route.js";
+import { registerMetricsRoute } from "./api/metrics-route.js";
+import { registerRequestTelemetry } from "./api/request-telemetry.js";
 import { registerV1Routes } from "./api/v1-routes.js";
 import { createGatewayAuthenticator, type GatewayAuthenticator } from "./api/gateway-auth.js";
 import { createModelCatalog, type ModelCatalog } from "./generation/model-catalog.js";
@@ -17,6 +19,7 @@ import type { TitleBridge } from "./opencode/title-bridge.js";
 import { buildGatewayScopeDeriver, type IdempotencyCoordinator } from "./idempotency/index.js";
 import { buildRateLimitScopeDeriver, type RateLimiter } from "./rate-limit/index.js";
 import { buildThreadReuseScopeDeriver, type ThreadReuseCoordinator } from "./thread-reuse/index.js";
+import { createServerDefaultTelemetry, type Telemetry } from "./observability/telemetry.js";
 import type { AppConfig } from "./config/schema.js";
 
 /** The chat-completions wiring the `/v1` scope needs. */
@@ -104,6 +107,16 @@ export interface BuildServerOptions {
    * unaffected.
    */
   readonly threadReuse?: ThreadReuseCoordinator;
+  /**
+   * Observability ports (specification section 23).
+   *
+   * The process composition root injects the telemetry it also CLOSES on
+   * shutdown. When omitted, metrics are still built from `config` (a private
+   * Prometheus registry is pure and socket-free) while tracing stays a no-op,
+   * because an OTLP exporter is a live resource nobody would flush on this
+   * path. Either way construction opens no socket and contacts no collector.
+   */
+  readonly telemetry?: Telemetry;
 }
 
 /**
@@ -124,8 +137,21 @@ export function buildServer(options: BuildServerOptions): GatewayServer {
     ...(logger ? { loggerInstance: logger } : {}),
   }).withTypeProvider<TypeBoxTypeProvider>();
 
+  const telemetry = options.telemetry ?? createServerDefaultTelemetry(config);
+
+  // Request-lifecycle telemetry is registered FIRST so its root `onRequest` hook
+  // runs before authentication and covers every route, including health checks
+  // and unmatched paths. It installs nothing when telemetry is disabled.
+  registerRequestTelemetry(app, telemetry);
+
   // Liveness/readiness stay unauthenticated on the root instance.
   registerHealthRoutes(app, readiness);
+
+  // `GET /metrics` lives OUTSIDE `/v1`, carries no application authentication,
+  // and exists only when configuration enables it — a disabled gateway returns
+  // the framework `404`. Operators must isolate it at the network layer; the
+  // process cannot verify that the interface it is bound to is private.
+  if (config.METRICS_ENABLED) registerMetricsRoute(app, telemetry.metrics);
 
   // Authenticated public API. The catalog captures a single Unix-seconds
   // timestamp at construction and reuses it for every model object it serves.
@@ -151,7 +177,7 @@ export function buildServer(options: BuildServerOptions): GatewayServer {
   const completion: CompletionWiring =
     options.completion ??
     (() => {
-      const runtime = createCompletionRuntime(config);
+      const runtime = createCompletionRuntime(config, { telemetry });
       return {
         chatService: runtime.chatService,
         titleBridge: runtime.titleBridge,
@@ -174,6 +200,7 @@ export function buildServer(options: BuildServerOptions): GatewayServer {
     // Same rule for thread reuse: configuration decides whether the gate runs.
     threadReuseEnabled: config.OPENCODE_THREAD_REUSE_ENABLED,
     ...(options.threadReuse !== undefined ? { threadReuse: options.threadReuse } : {}),
+    telemetry,
   });
 
   return app;

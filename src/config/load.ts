@@ -21,6 +21,7 @@ import {
   ModelsFileShapeSchema,
   RATE_LIMIT_LIMITS,
   REDIS_KEY_PREFIX_PATTERN,
+  TRACING_LIMITS,
   VirtualModelSchema,
   type AppConfig,
   type EnvConfig,
@@ -85,6 +86,10 @@ const KNOWN_ENV_KEYS = [
   "RATE_LIMIT_BURST",
   "OPENCODE_THREAD_REUSE_ENABLED",
   "OPENCODE_THREAD_REUSE_TTL_MS",
+  "METRICS_ENABLED",
+  "TRACING_ENABLED",
+  "TRACING_OTLP_ENDPOINT",
+  "TRACING_SAMPLE_RATIO",
 ] as const;
 
 export interface LoadConfigOptions {
@@ -121,6 +126,20 @@ function coerceBoolean(raw: string): boolean | undefined {
   if (value === "true") return true;
   if (value === "false") return false;
   return undefined;
+}
+
+/**
+ * Coerce a plain decimal ratio. Deliberately stricter than `Number()`: an
+ * exponent, hexadecimal, `Infinity`, `NaN`, or a thousands separator is a
+ * rejection rather than a surprising numeric interpretation, so a mistyped
+ * sampling probability fails at startup instead of silently disabling or
+ * saturating tracing. Range enforcement stays with the schema.
+ */
+function coerceRatio(raw: string): number | undefined {
+  const trimmed = raw.trim();
+  if (!/^\d+(\.\d+)?$/.test(trimmed)) return undefined;
+  const value = Number(trimmed);
+  return Number.isFinite(value) ? value : undefined;
 }
 
 /** Split, trim, drop empties, and de-duplicate a comma-separated key list. */
@@ -166,6 +185,96 @@ function isCanonicalRedisUrl(raw: string): boolean {
   if (url.hostname === "") return false;
   if (url.search !== "" || url.hash !== "") return false;
   return url.href === raw;
+}
+
+/**
+ * Stable, value-free rejection reasons for an OTLP/HTTP traces endpoint. Each is
+ * a fixed sentence; none reproduces the submitted URL, its host, its path, or an
+ * embedded credential.
+ */
+const OTLP_ENDPOINT_REASONS = {
+  length: "length is outside allowed bounds",
+  credentials: "must not embed credentials",
+  canonical: "must be a canonical absolute http(s) URL",
+  path: "must include a non-root path",
+} as const;
+
+type OtlpEndpointReason = (typeof OTLP_ENDPOINT_REASONS)[keyof typeof OTLP_ENDPOINT_REASONS];
+
+/** A value-free endpoint result; the canonical value is returned on acceptance. */
+type OtlpEndpointCheck =
+  | { readonly ok: true; readonly value: string }
+  | { readonly ok: false; readonly reason: OtlpEndpointReason };
+
+/**
+ * Validate an OTLP/HTTP traces endpoint, returning either a stable reason or
+ * the canonical value to store.
+ *
+ * Canonical form: the value must parse, use exactly one of the two supported
+ * lowercase schemes, carry a hostname, omit any query/fragment, and serialize
+ * back to the submitted string byte-for-byte. The round-trip rejects an
+ * uppercase scheme, a non-normalized escape, and a bare origin without its
+ * trailing slash, so every replica sends telemetry to exactly the endpoint the
+ * operator wrote.
+ *
+ * Two further rules narrow the value to what the exporter can actually use:
+ *
+ *  - Userinfo is rejected. The gateway attaches NO exporter authentication, so
+ *    a `user:pass@` endpoint could never authenticate anything; accepting one
+ *    would only park a credential in a setting that is not handled as a secret.
+ *    The WHATWG parser surfaces userinfo through `username`/`password` whether
+ *    it was written literally or percent-encoded, so both spellings are caught.
+ *  - A root-only path is rejected. OTLP/HTTP posts spans to a traces path, so a
+ *    bare origin would send them to the collector root. Which path is NOT
+ *    constrained — an operator may front a collector on any route — only that
+ *    one is present.
+ *  - A query or fragment DELIMITER is rejected, empty value or not. Emptiness is
+ *    checked on the submitted string rather than on `search`/`hash`, because the
+ *    parser reports both as `""` for a bare trailing `?` or `#` while `href`
+ *    keeps the character — so `…/v1/traces?` would otherwise round-trip
+ *    byte-for-byte and be accepted as canonical.
+ *
+ * This function takes the RAW environment value and owns the whole contract:
+ * the byte bound is measured before trimming and before parsing, so neither an
+ * oversized URL nor an oversized whitespace pad can reach the URL parser, and a
+ * caller cannot bound a value it has already shortened. Everything after the
+ * bound runs on the trimmed value, which is what an accepted result returns.
+ */
+function validateOtlpEndpoint(raw: string): OtlpEndpointCheck {
+  if (Buffer.byteLength(raw, "utf8") > TRACING_LIMITS.endpointBytes) {
+    return { ok: false, reason: OTLP_ENDPOINT_REASONS.length };
+  }
+
+  const candidate = raw.trim();
+
+  let url: URL;
+  try {
+    url = new URL(candidate);
+  } catch {
+    return { ok: false, reason: OTLP_ENDPOINT_REASONS.canonical };
+  }
+
+  // Checked first, and for any scheme: an operator who submitted a credential
+  // needs to be told that it was a credential, not that it was badly spelled.
+  if (url.username !== "" || url.password !== "") {
+    return { ok: false, reason: OTLP_ENDPOINT_REASONS.credentials };
+  }
+
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    return { ok: false, reason: OTLP_ENDPOINT_REASONS.canonical };
+  }
+  if (url.hostname === "") return { ok: false, reason: OTLP_ENDPOINT_REASONS.canonical };
+  // Read off the submitted string, not off `search`/`hash`: a bare trailing `?`
+  // or `#` leaves both empty yet survives in `href`. Percent-encoded path data
+  // (`%3F`, `%23`) is untouched, because the parser never leaves a bare
+  // delimiter inside a path — a literal one always opens a query or fragment.
+  if (candidate.includes("?") || candidate.includes("#")) {
+    return { ok: false, reason: OTLP_ENDPOINT_REASONS.canonical };
+  }
+  if (url.href !== candidate) return { ok: false, reason: OTLP_ENDPOINT_REASONS.canonical };
+
+  if (url.pathname === "/") return { ok: false, reason: OTLP_ENDPOINT_REASONS.path };
+  return { ok: true, value: candidate };
 }
 
 /**
@@ -409,6 +518,62 @@ function loadEnvConfig(source: NodeJS.ProcessEnv): EnvConfig {
     });
   }
 
+  // Optional observability (specification sections 23.2, 23.3). Both features
+  // are OFF by default and are validated independently of each other: metrics
+  // add a route, tracing adds an exporter, and neither implies the other.
+  let metricsEnabled: boolean = ENV_DEFAULTS.METRICS_ENABLED;
+  if (present(raw.METRICS_ENABLED)) {
+    const parsed = coerceBoolean(raw.METRICS_ENABLED);
+    if (parsed === undefined) {
+      issues.push({ field: "METRICS_ENABLED", reason: 'must be "true" or "false"' });
+    } else {
+      metricsEnabled = parsed;
+    }
+  }
+
+  let tracingEnabled: boolean = ENV_DEFAULTS.TRACING_ENABLED;
+  if (present(raw.TRACING_ENABLED)) {
+    const parsed = coerceBoolean(raw.TRACING_ENABLED);
+    if (parsed === undefined) {
+      issues.push({ field: "TRACING_ENABLED", reason: 'must be "true" or "false"' });
+    } else {
+      tracingEnabled = parsed;
+    }
+  }
+
+  // A PRESENT endpoint is validated even while tracing is disabled, so a broken
+  // value fails at deploy time rather than on the day the feature is switched
+  // on — the same rule the rate-limit and thread-reuse settings follow.
+  let tracingEndpoint: string | undefined;
+  const rawTracingEndpoint = raw.TRACING_OTLP_ENDPOINT;
+  if (present(rawTracingEndpoint)) {
+    // Handed over untouched: the bound must see what the operator actually set.
+    const endpoint = validateOtlpEndpoint(rawTracingEndpoint);
+    if (!endpoint.ok) {
+      issues.push({ field: "TRACING_OTLP_ENDPOINT", reason: endpoint.reason });
+    } else {
+      tracingEndpoint = endpoint.value;
+    }
+  } else if (tracingEnabled) {
+    // Tracing exports over OTLP/HTTP by definition; there is no local sink to
+    // fall back to, so enabling it without a destination is a configuration
+    // error rather than a silent downgrade to no tracing at all.
+    issues.push({
+      field: "TRACING_OTLP_ENDPOINT",
+      reason: "is required when TRACING_ENABLED is true",
+    });
+  }
+
+  let tracingSampleRatio: number = ENV_DEFAULTS.TRACING_SAMPLE_RATIO;
+  if (present(raw.TRACING_SAMPLE_RATIO)) {
+    const parsed = coerceRatio(raw.TRACING_SAMPLE_RATIO);
+    if (parsed === undefined) {
+      issues.push({ field: "TRACING_SAMPLE_RATIO", reason: "must be a decimal ratio" });
+    } else {
+      tracingSampleRatio = parsed;
+    }
+  }
+
   let logContent: boolean = ENV_DEFAULTS.LOG_CONTENT;
   if (present(raw.LOG_CONTENT)) {
     const parsed = coerceBoolean(raw.LOG_CONTENT);
@@ -527,6 +692,12 @@ function loadEnvConfig(source: NodeJS.ProcessEnv): EnvConfig {
     RATE_LIMIT_BURST: rateLimitBurst,
     OPENCODE_THREAD_REUSE_ENABLED: threadReuseEnabled,
     OPENCODE_THREAD_REUSE_TTL_MS: threadReuseTtlMs,
+    METRICS_ENABLED: metricsEnabled,
+    TRACING_ENABLED: tracingEnabled,
+    // Omitted unless it validated, so structural validation never
+    // double-reports an already-recorded issue.
+    ...(tracingEndpoint !== undefined ? { TRACING_OTLP_ENDPOINT: tracingEndpoint } : {}),
+    TRACING_SAMPLE_RATIO: tracingSampleRatio,
   };
 
   // Structural/enum/bounds validation. Reasons are generic; env keys are static.

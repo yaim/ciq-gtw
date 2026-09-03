@@ -45,6 +45,9 @@ import { Type } from "@fastify/type-provider-typebox";
 import type { FastifyError } from "fastify";
 import type { GatewayServer } from "../server.js";
 import { isAuthenticated, isHandlerStarted, markHandlerStarted } from "./request-phase.js";
+import { requestTelemetry } from "./request-telemetry.js";
+import { toErrorCategory } from "../observability/labels.js";
+import { DISABLED_TELEMETRY, type Telemetry } from "../observability/telemetry.js";
 import type { ModelCatalog } from "../generation/model-catalog.js";
 import {
   ChatCompletionError,
@@ -150,6 +153,12 @@ export interface ChatCompletionsRouteDeps {
    * reuse eligible are entirely unaffected.
    */
   readonly threadReuse?: ThreadReuseCoordinator;
+  /**
+   * Observability ports (specification section 23). Telemetry is recorded
+   * around the EXISTING admission order and never changes it: no gate moves, no
+   * status changes, and a disabled telemetry port allocates nothing.
+   */
+  readonly telemetry?: Telemetry;
 }
 
 /**
@@ -223,6 +232,9 @@ export function registerChatCompletionsRoute(
       const chosen = fromParserPhase
         ? (classifyFrameworkError(error) ?? INTERNAL_ERROR)
         : INTERNAL_ERROR;
+      // The category comes from the envelope the gateway just chose, never from
+      // the thrown value, which is still never inspected here.
+      requestTelemetry(request)?.recordError(toErrorCategory(chosen.body.error.code));
       reply.code(chosen.status);
       return chosen.body;
     });
@@ -254,7 +266,20 @@ export function registerChatCompletionsRoute(
         // reaching the error handler is an application error and fails closed.
         markHandlerStarted(request);
 
+        const telemetry = deps.telemetry ?? DISABLED_TELEMETRY;
+        const rt = requestTelemetry(request);
+        // Resolved per request from ports whose `enabled` is fixed at
+        // construction. Every telemetry statement below is guarded by one of
+        // these, so a disabled gateway builds no span options and calls neither
+        // port; `rt.span` is `null` for the same reason.
+        const metricsOn = telemetry.metrics.enabled;
+        const tracingOn = telemetry.tracing.enabled;
+
         const sendError = (apiError: OpenAIApiError): OpenAIApiError["body"] => {
+          // Closed category read from the gateway's OWN envelope. This is what
+          // keeps capacity, rate-limit, idempotency, and thread-reuse failures
+          // individually distinguishable in `errors_total`.
+          rt?.recordError(toErrorCategory(apiError.body.error.code));
           // Every envelope status is a declared response code; the cast satisfies
           // the typed reply without widening the public contract.
           reply.code(apiError.status as 400 | 401 | 404 | 409 | 413 | 429 | 502 | 503 | 504 | 500);
@@ -272,10 +297,50 @@ export function registerChatCompletionsRoute(
         // never flows past this point. The validator resolves the INTERNAL model
         // policy (never exposed to the client) so the model-aware tool-metadata
         // bridge runs inside the boundary that already owns raw-body access.
-        const validated = validateChatRequest(request.body, (id) => deps.catalog.resolveModel(id));
-        if (!validated.ok) return sendError(validated.error);
+        // `rt` is non-null whenever either port is enabled, so the handle reads
+        // inside this branch are safe; the fallbacks keep the compiler honest.
+        const validateSpan = tracingOn
+          ? telemetry.tracing.startSpan("gateway.validate", {
+              ...(rt?.span != null ? { parent: rt.span } : {}),
+              attributes: { endpoint: rt?.endpoint ?? "other" },
+            })
+          : null;
+        let validated: ReturnType<typeof validateChatRequest>;
+        try {
+          validated = validateChatRequest(request.body, (id) => deps.catalog.resolveModel(id));
+        } catch (error) {
+          // The validator is designed never to throw on a hostile body, but a
+          // span must not be left open if it ever did. The request still fails
+          // closed through the scope's error handler, whose envelope is the
+          // fixed internal error — the trusted category recorded here.
+          validateSpan?.setError("internal_error");
+          validateSpan?.end();
+          throw error;
+        }
+        if (!validated.ok) {
+          // A rejection whose `param` is `tools` means the SUBMITTED tool
+          // definitions could not be compiled or bounded — the single owner of
+          // `tool_schema_failures_total`. The model is unknown at this point on
+          // some paths, so it is reported as `null` rather than guessed.
+          if (metricsOn && validated.error.body.error.param === "tools") {
+            telemetry.metrics.observeToolSchemaFailure(null);
+          }
+          // Read inside the optional call, so a disabled tracer performs no
+          // property loads for a value only the span would use.
+          validateSpan?.setError(toErrorCategory(validated.error.body.error.code));
+          validateSpan?.end();
+          return sendError(validated.error);
+        }
         const normalized = validated.request;
         const model = validated.model;
+        // Model and tool metadata are recorded only AFTER successful validation,
+        // so a rejected request can never introduce an unresolved label value.
+        rt?.setModel(model.id);
+        if (validateSpan !== null) {
+          rt?.span?.setAttributes({ model: model.id, toolMode: model.toolMode });
+          validateSpan.setAttributes({ model: model.id, toolMode: model.toolMode });
+          validateSpan.end();
+        }
 
         // The auth hook guarantees an identity before the handler runs.
         const keyId = request.gatewayKeyId;
@@ -393,6 +458,10 @@ export function registerChatCompletionsRoute(
             // The compiled toolset (emulated mode only) lets `run` parse/vote over
             // upstream tool-call candidates; it is not part of the frozen request.
             ...(validated.toolset !== undefined ? { toolset: validated.toolset } : {}),
+            // Explicit span parent: every generation span becomes a child of
+            // this request rather than an orphaned root. Omitted entirely when
+            // tracing is disabled, so generation starts no span at all.
+            ...(rt?.span != null ? { requestSpan: rt.span } : {}),
           });
         } catch (error) {
           reply.raw.removeListener("close", onClose);
@@ -460,11 +529,31 @@ export function registerChatCompletionsRoute(
           result: CachedResult,
         ): ReturnType<typeof encodeChatCompletion> => {
           setIgnoredHeader(false);
-          return encodeChatCompletion(
-            result.kind === "tool_calls"
-              ? { ...identity, kind: "tool_calls", toolCalls: result.toolCalls }
-              : { ...identity, content: result.content },
-          );
+          const encodeSpan = tracingOn
+            ? telemetry.tracing.startSpan("gateway.encode", {
+                ...(rt?.span != null ? { parent: rt.span } : {}),
+                attributes: {
+                  model: model.id,
+                  transport: "json",
+                  ...(result.kind === "tool_calls"
+                    ? { toolCallCount: result.toolCalls.length }
+                    : {}),
+                },
+              })
+            : null;
+          try {
+            return encodeChatCompletion(
+              result.kind === "tool_calls"
+                ? { ...identity, kind: "tool_calls", toolCalls: result.toolCalls }
+                : { ...identity, content: result.content },
+            );
+          } catch (error) {
+            // An encoder failure becomes the route's fixed internal error.
+            encodeSpan?.setError("internal_error");
+            throw error;
+          } finally {
+            encodeSpan?.end();
+          }
         };
 
         // --- Idempotent replay / wait ---------------------------------------
@@ -533,6 +622,7 @@ export function registerChatCompletionsRoute(
               return encodeJson(replayed, replayed.result);
             }
             setIgnoredHeader(true);
+            rt?.setTransport("sse");
             try {
               await streamChatCompletion({
                 reply,
@@ -547,6 +637,21 @@ export function registerChatCompletionsRoute(
                 run: () => Promise.resolve(replayed.result),
                 runSignal: signal,
                 clientAbort,
+                telemetry,
+                ...(rt?.span != null ? { parentSpan: rt.span } : {}),
+                model: model.id,
+                // A replay cannot fail in `run`, but a transport failure after
+                // the header still needs the same closed category as a live
+                // stream rather than the generic `other` fallback. Built only
+                // when a handle exists, so a disabled request allocates no
+                // callback at all.
+                ...(rt !== null
+                  ? {
+                      onErrorEnvelope: (apiError: OpenAIApiError): void => {
+                        rt.recordError(toErrorCategory(apiError.body.error.code));
+                      },
+                    }
+                  : {}),
               });
             } finally {
               reply.raw.removeListener("close", onClose);
@@ -715,6 +820,7 @@ export function registerChatCompletionsRoute(
           // record. The writer hijacks the reply and owns all response output.
           if (normalized.stream) {
             setIgnoredHeader(true);
+            rt?.setTransport("sse");
             await streamChatCompletion({
               reply,
               meta: { id: prepared.id, created: prepared.created, model: prepared.model, index: 0 },
@@ -724,6 +830,20 @@ export function registerChatCompletionsRoute(
               // Register the correlation ONLY after the terminal chunk + [DONE]
               // were delivered — never on a failed/cancelled/disconnected stream.
               onCompleted: registerTitleCorrelation,
+              telemetry,
+              ...(rt?.span != null ? { parentSpan: rt.span } : {}),
+              model: model.id,
+              // A post-header failure never reaches `sendError`, so the SSE
+              // transport reports its own closed error category. The closure is
+              // built only when a handle exists, so a disabled gateway allocates
+              // nothing here either.
+              ...(rt !== null
+                ? {
+                    onErrorEnvelope: (apiError: OpenAIApiError): void => {
+                      rt.recordError(toErrorCategory(apiError.body.error.code));
+                    },
+                  }
+                : {}),
             });
             return reply;
           }

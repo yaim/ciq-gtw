@@ -1,11 +1,15 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { stringify } from "yaml";
 import { ConfigError, loadConfig } from "../../src/config/load.js";
-import { MODEL_CONFIG_LIMITS, type VirtualModelDefinition } from "../../src/config/schema.js";
+import {
+  MODEL_CONFIG_LIMITS,
+  TRACING_LIMITS,
+  type VirtualModelDefinition,
+} from "../../src/config/schema.js";
 
 const EXAMPLE_MODELS = resolve(process.cwd(), "config/models.example.yaml");
 
@@ -568,6 +572,466 @@ describe("loadConfig — optional cross-replica rate limiting", () => {
     const formatted = new ConfigError(issues).format();
     expect(formatted).not.toContain("SENSITIVE-VALUE");
     expect(formatted).not.toContain("SENSITIVE-REQUESTS");
+  });
+});
+
+describe("loadConfig — optional observability", () => {
+  function issuesFor(overrides: Record<string, string | undefined>): ConfigError["issues"] {
+    try {
+      loadConfig({ env: baseEnv(overrides) });
+      throw new Error("expected ConfigError");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfigError);
+      return (error as ConfigError).issues;
+    }
+  }
+
+  it("leaves BOTH features disabled by default with a stable configuration shape", () => {
+    const config = loadConfig({ env: baseEnv() });
+    expect(config.METRICS_ENABLED).toBe(false);
+    expect(config.TRACING_ENABLED).toBe(false);
+    expect(config.TRACING_OTLP_ENDPOINT).toBeUndefined();
+    expect(config.TRACING_SAMPLE_RATIO).toBe(1);
+  });
+
+  it("accepts only the strict boolean syntax for both switches", () => {
+    expect(loadConfig({ env: baseEnv({ METRICS_ENABLED: "true" }) }).METRICS_ENABLED).toBe(true);
+    expect(loadConfig({ env: baseEnv({ METRICS_ENABLED: " TRUE " }) }).METRICS_ENABLED).toBe(true);
+    for (const value of ["1", "0", "yes", "on", "enabled"]) {
+      expect(issuesFor({ METRICS_ENABLED: value })).toContainEqual({
+        field: "METRICS_ENABLED",
+        reason: 'must be "true" or "false"',
+      });
+      expect(issuesFor({ TRACING_ENABLED: value })).toContainEqual({
+        field: "TRACING_ENABLED",
+        reason: 'must be "true" or "false"',
+      });
+    }
+  });
+
+  it("REQUIRES an OTLP endpoint when tracing is explicitly enabled", () => {
+    // Tracing exports over OTLP/HTTP by definition; there is no local sink to
+    // silently fall back to.
+    expect(issuesFor({ TRACING_ENABLED: "true" })).toContainEqual({
+      field: "TRACING_OTLP_ENDPOINT",
+      reason: "is required when TRACING_ENABLED is true",
+    });
+    for (const TRACING_OTLP_ENDPOINT of ["", "   "]) {
+      expect(issuesFor({ TRACING_ENABLED: "true", TRACING_OTLP_ENDPOINT })).toContainEqual({
+        field: "TRACING_OTLP_ENDPOINT",
+        reason: "is required when TRACING_ENABLED is true",
+      });
+    }
+  });
+
+  it("accepts only a canonical absolute http(s) endpoint", () => {
+    const ok = loadConfig({
+      env: baseEnv({
+        TRACING_ENABLED: "true",
+        TRACING_OTLP_ENDPOINT: "http://127.0.0.1:4318/v1/traces",
+      }),
+    });
+    expect(ok.TRACING_OTLP_ENDPOINT).toBe("http://127.0.0.1:4318/v1/traces");
+    expect(
+      loadConfig({
+        env: baseEnv({
+          TRACING_ENABLED: "true",
+          TRACING_OTLP_ENDPOINT: "https://collector.internal:4318/v1/traces",
+        }),
+      }).TRACING_OTLP_ENDPOINT,
+    ).toBe("https://collector.internal:4318/v1/traces");
+
+    for (const endpoint of [
+      "redis://127.0.0.1:6379",
+      "ftp://collector/v1/traces",
+      "HTTP://127.0.0.1:4318/v1/traces", // non-canonical scheme casing
+      "http://127.0.0.1:4318", // a bare origin does not round-trip
+      "http://127.0.0.1:4318/v1/traces?tenant=a", // query rejected
+      "http://127.0.0.1:4318/v1/traces#frag", // fragment rejected
+      "http:///v1/traces", // no host
+      "not-a-url",
+    ]) {
+      expect(issuesFor({ TRACING_OTLP_ENDPOINT: endpoint })).toContainEqual({
+        field: "TRACING_OTLP_ENDPOINT",
+        reason: "must be a canonical absolute http(s) URL",
+      });
+    }
+  });
+
+  it("validates a PRESENT endpoint even while tracing is disabled", () => {
+    // The same rule the rate-limit and thread-reuse settings follow: a broken
+    // value must fail at deploy time, not on the day the feature is enabled.
+    expect(issuesFor({ TRACING_ENABLED: "false", TRACING_OTLP_ENDPOINT: "nope" })).toContainEqual({
+      field: "TRACING_OTLP_ENDPOINT",
+      reason: "must be a canonical absolute http(s) URL",
+    });
+  });
+
+  it("rejects an endpoint embedding credentials, including percent-encoded userinfo", () => {
+    // The gateway attaches no exporter authentication, so userinfo could never
+    // authenticate anything — it would only park a secret in a setting that is
+    // neither documented nor handled as one. Each of these parses, round-trips
+    // byte-for-byte, and carries a real path, so the userinfo rule is the only
+    // thing standing between them and acceptance.
+    for (const endpoint of [
+      "https://user@collector.internal/v1/traces",
+      "https://user:pass@collector.internal/v1/traces",
+      "https://us%65r:p%61ss@collector.internal/v1/traces",
+      "http://user:pass@127.0.0.1:4318/v1/traces",
+    ]) {
+      for (const TRACING_ENABLED of ["true", "false"]) {
+        expect(issuesFor({ TRACING_ENABLED, TRACING_OTLP_ENDPOINT: endpoint })).toContainEqual({
+          field: "TRACING_OTLP_ENDPOINT",
+          reason: "must not embed credentials",
+        });
+      }
+    }
+  });
+
+  it("rejects a root-only endpoint", () => {
+    // OTLP/HTTP posts spans to a traces path; a bare origin would send them to
+    // the collector root.
+    for (const endpoint of [
+      "http://collector.internal/",
+      "https://collector.internal/",
+      "http://127.0.0.1:4318/",
+    ]) {
+      for (const TRACING_ENABLED of ["true", "false"]) {
+        expect(issuesFor({ TRACING_ENABLED, TRACING_OTLP_ENDPOINT: endpoint })).toContainEqual({
+          field: "TRACING_OTLP_ENDPOINT",
+          reason: "must include a non-root path",
+        });
+      }
+    }
+  });
+
+  it("rejects a trailing query or fragment delimiter even when its value is EMPTY", () => {
+    // The WHATWG parser keeps a bare trailing `?`/`#` in `href` while reporting
+    // an empty `search`/`hash`, so these round-trip byte-for-byte and neither the
+    // emptiness check nor the canonical comparison sees anything wrong. The
+    // delimiter itself has to be rejected, or an operator's endpoint would not
+    // be the string the exporter is told to POST to.
+    for (const endpoint of [
+      "http://127.0.0.1:4318/v1/traces?",
+      "http://127.0.0.1:4318/v1/traces#",
+      "https://collector.internal/v1/traces?",
+      "https://collector.internal/v1/traces#",
+    ]) {
+      // Guard against the day the parser changes: this case only means
+      // something while the value really does survive both existing checks.
+      const parsed = new URL(endpoint);
+      expect(parsed.href).toBe(endpoint);
+      expect(parsed.search).toBe("");
+      expect(parsed.hash).toBe("");
+
+      for (const TRACING_ENABLED of ["true", "false"]) {
+        expect(issuesFor({ TRACING_ENABLED, TRACING_OTLP_ENDPOINT: endpoint })).toContainEqual({
+          field: "TRACING_OTLP_ENDPOINT",
+          reason: "must be a canonical absolute http(s) URL",
+        });
+      }
+    }
+  });
+
+  it("reports embedded credentials ahead of a trailing delimiter", () => {
+    // Precedence matters for the operator's sake: a value carrying BOTH faults
+    // must still be reported as a credential, which is the actionable one.
+    expect(
+      issuesFor({ TRACING_OTLP_ENDPOINT: "https://user:pass@collector.internal/v1/traces?" }),
+    ).toContainEqual({
+      field: "TRACING_OTLP_ENDPOINT",
+      reason: "must not embed credentials",
+    });
+  });
+
+  it("accepts percent-encoded delimiter characters inside the path", () => {
+    // `%3F` and `%23` are ordinary path data, not a query or fragment. Rejecting
+    // the DELIMITER must not turn into rejecting encoded bytes that merely
+    // decode to one.
+    for (const endpoint of [
+      "http://127.0.0.1:4318/v1/tr%3Faces",
+      "http://127.0.0.1:4318/v1/tr%23aces",
+      "https://collector.internal/otel/ingest%3Fv1",
+    ]) {
+      expect(
+        loadConfig({ env: baseEnv({ TRACING_OTLP_ENDPOINT: endpoint }) }).TRACING_OTLP_ENDPOINT,
+      ).toBe(endpoint);
+    }
+  });
+
+  it("accepts any non-root path, including a custom collector route", () => {
+    // Which path is deliberately NOT constrained: an operator may front a
+    // collector on a route that is not `/v1/traces`.
+    for (const endpoint of [
+      "http://127.0.0.1:4318/v1/traces",
+      "https://collector.internal:4318/v1/traces",
+      "https://collector.internal/otel/ingest",
+    ]) {
+      for (const TRACING_ENABLED of ["true", "false"]) {
+        expect(
+          loadConfig({ env: baseEnv({ TRACING_ENABLED, TRACING_OTLP_ENDPOINT: endpoint }) })
+            .TRACING_OTLP_ENDPOINT,
+        ).toBe(endpoint);
+      }
+    }
+  });
+
+  it("rejects an over-bound endpoint on the BOUND, not on a parse failure", () => {
+    // The oversized value below is a well-formed, canonical, non-root https URL:
+    // size is its ONLY defect, so a length rejection proves the bound ran before
+    // the parser rather than a parse failure standing in for it.
+    const base = "https://collector.internal/";
+    const oversized = base + "a".repeat(TRACING_LIMITS.endpointBytes);
+    expect(Buffer.byteLength(oversized, "utf8")).toBeGreaterThan(TRACING_LIMITS.endpointBytes);
+
+    const issues = issuesFor({ TRACING_OTLP_ENDPOINT: oversized });
+    expect(issues).toContainEqual({
+      field: "TRACING_OTLP_ENDPOINT",
+      reason: "length is outside allowed bounds",
+    });
+    expect(issues).not.toContainEqual({
+      field: "TRACING_OTLP_ENDPOINT",
+      reason: "must be a canonical absolute http(s) URL",
+    });
+
+    // The same URL cut to exactly the bound is accepted.
+    const atBound = base + "a".repeat(TRACING_LIMITS.endpointBytes - base.length);
+    expect(Buffer.byteLength(atBound, "utf8")).toBe(TRACING_LIMITS.endpointBytes);
+    expect(
+      loadConfig({ env: baseEnv({ TRACING_OTLP_ENDPOINT: atBound }) }).TRACING_OTLP_ENDPOINT,
+    ).toBe(atBound);
+  });
+
+  it("measures the endpoint bound in UTF-8 bytes, not string length", () => {
+    const base = "https://collector.internal/v1/traces/";
+    // "é" costs two UTF-8 bytes, so byte count and string length diverge.
+    const padChars = Math.floor((TRACING_LIMITS.endpointBytes - base.length) / 2);
+    const underBound = base + "é".repeat(padChars);
+    const overBound = base + "é".repeat(padChars + 1);
+
+    expect(Buffer.byteLength(underBound, "utf8")).toBeLessThanOrEqual(TRACING_LIMITS.endpointBytes);
+    expect(Buffer.byteLength(overBound, "utf8")).toBeGreaterThan(TRACING_LIMITS.endpointBytes);
+    // Both string lengths stay well under the bound; only the byte count crosses
+    // it, so a string-length check would let the oversized value through.
+    expect(overBound.length).toBeLessThan(TRACING_LIMITS.endpointBytes);
+
+    // Under the bound the value reaches the parser, which rejects it because a
+    // non-ASCII path is percent-encoded and no longer round-trips.
+    expect(issuesFor({ TRACING_OTLP_ENDPOINT: underBound })).toContainEqual({
+      field: "TRACING_OTLP_ENDPOINT",
+      reason: "must be a canonical absolute http(s) URL",
+    });
+
+    const overIssues = issuesFor({ TRACING_OTLP_ENDPOINT: overBound });
+    expect(overIssues).toContainEqual({
+      field: "TRACING_OTLP_ENDPOINT",
+      reason: "length is outside allowed bounds",
+    });
+    expect(overIssues).not.toContainEqual({
+      field: "TRACING_OTLP_ENDPOINT",
+      reason: "must be a canonical absolute http(s) URL",
+    });
+  });
+
+  it("bounds the RAW endpoint value, not the trimmed one", () => {
+    // The bound exists to keep an oversized environment value away from the URL
+    // parser, so it must measure what the operator actually set. Trimming first
+    // would shrink each of these back under the cap and accept it.
+    const endpoint = "http://127.0.0.1:4318/v1/traces";
+    const pad = " ".repeat(TRACING_LIMITS.endpointBytes);
+
+    for (const padded of [pad + endpoint, endpoint + pad, pad + endpoint + pad]) {
+      expect(Buffer.byteLength(padded, "utf8")).toBeGreaterThan(TRACING_LIMITS.endpointBytes);
+      expect(padded.trim()).toBe(endpoint);
+
+      const issues = issuesFor({ TRACING_OTLP_ENDPOINT: padded });
+      expect(issues).toContainEqual({
+        field: "TRACING_OTLP_ENDPOINT",
+        reason: "length is outside allowed bounds",
+      });
+      expect(issues).not.toContainEqual({
+        field: "TRACING_OTLP_ENDPOINT",
+        reason: "must be a canonical absolute http(s) URL",
+      });
+    }
+  });
+
+  it("measures the RAW bound in UTF-8 bytes even when the padding is multibyte", () => {
+    const endpoint = "http://127.0.0.1:4318/v1/traces";
+    // U+3000 IDEOGRAPHIC SPACE costs three UTF-8 bytes and IS stripped by
+    // `trim()`, so the raw value crosses the byte bound while its string length
+    // stays far below it: a character count would let it through twice over.
+    const padded = "\u3000".repeat(800) + endpoint;
+    expect(padded.length).toBeLessThan(TRACING_LIMITS.endpointBytes);
+    expect(Buffer.byteLength(padded, "utf8")).toBeGreaterThan(TRACING_LIMITS.endpointBytes);
+    expect(padded.trim()).toBe(endpoint);
+
+    const issues = issuesFor({ TRACING_OTLP_ENDPOINT: padded });
+    expect(issues).toContainEqual({
+      field: "TRACING_OTLP_ENDPOINT",
+      reason: "length is outside allowed bounds",
+    });
+    expect(issues).not.toContainEqual({
+      field: "TRACING_OTLP_ENDPOINT",
+      reason: "must be a canonical absolute http(s) URL",
+    });
+  });
+
+  it("accepts a raw value at exactly the byte bound and rejects one byte more", () => {
+    const endpoint = "http://127.0.0.1:4318/v1/traces";
+    const atBound = " ".repeat(TRACING_LIMITS.endpointBytes - endpoint.length) + endpoint;
+    expect(Buffer.byteLength(atBound, "utf8")).toBe(TRACING_LIMITS.endpointBytes);
+    // Exactly at the bound the value is still trimmed and stored canonically.
+    expect(
+      loadConfig({ env: baseEnv({ TRACING_OTLP_ENDPOINT: atBound }) }).TRACING_OTLP_ENDPOINT,
+    ).toBe(endpoint);
+
+    const oneOver = ` ${atBound}`;
+    expect(Buffer.byteLength(oneOver, "utf8")).toBe(TRACING_LIMITS.endpointBytes + 1);
+    expect(issuesFor({ TRACING_OTLP_ENDPOINT: oneOver })).toContainEqual({
+      field: "TRACING_OTLP_ENDPOINT",
+      reason: "length is outside allowed bounds",
+    });
+
+    // The same boundary with no padding at all, so the +/-1 behaviour is not an
+    // artefact of trimming.
+    const base = "https://collector.internal/";
+    const pathAtBound = base + "a".repeat(TRACING_LIMITS.endpointBytes - base.length);
+    expect(Buffer.byteLength(pathAtBound, "utf8")).toBe(TRACING_LIMITS.endpointBytes);
+    expect(
+      loadConfig({ env: baseEnv({ TRACING_OTLP_ENDPOINT: pathAtBound }) }).TRACING_OTLP_ENDPOINT,
+    ).toBe(pathAtBound);
+    expect(issuesFor({ TRACING_OTLP_ENDPOINT: `${pathAtBound}a` })).toContainEqual({
+      field: "TRACING_OTLP_ENDPOINT",
+      reason: "length is outside allowed bounds",
+    });
+  });
+
+  it("still trims a within-bound endpoint before storing it", () => {
+    // Bounding the raw value must not change what an ordinary padded setting
+    // resolves to.
+    for (const TRACING_ENABLED of ["true", "false"]) {
+      expect(
+        loadConfig({
+          env: baseEnv({
+            TRACING_ENABLED,
+            TRACING_OTLP_ENDPOINT: "  http://127.0.0.1:4318/v1/traces  ",
+          }),
+        }).TRACING_OTLP_ENDPOINT,
+      ).toBe("http://127.0.0.1:4318/v1/traces");
+    }
+  });
+
+  it("never hands an over-bound endpoint to the URL parser", () => {
+    // Keeping an oversized value out of the parser is the reason the bound
+    // exists, so assert it directly rather than inferring it from the reason.
+    // Other settings (the upstream base URL) legitimately parse during the same
+    // load, so the assertion is that neither spelling of THIS value appears.
+    const overBound = " ".repeat(TRACING_LIMITS.endpointBytes) + "http://127.0.0.1:4318/v1/traces";
+    const parsed: string[] = [];
+    vi.stubGlobal(
+      "URL",
+      new Proxy(URL, {
+        construct(target, args: unknown[], newTarget): object {
+          const input = args[0];
+          if (typeof input === "string") parsed.push(input);
+          return Reflect.construct(target, args, newTarget) as object;
+        },
+      }),
+    );
+
+    try {
+      expect(issuesFor({ TRACING_OTLP_ENDPOINT: overBound })).toContainEqual({
+        field: "TRACING_OTLP_ENDPOINT",
+        reason: "length is outside allowed bounds",
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    // The upstream base URL is parsed during the same load, so a non-empty
+    // record proves the stub was actually in effect and the assertion below is
+    // not vacuously true.
+    expect(parsed.length).toBeGreaterThan(0);
+    expect(parsed).not.toContain(overBound);
+    expect(parsed).not.toContain(overBound.trim());
+  });
+
+  it("never echoes an endpoint's host, path, or embedded credentials", () => {
+    const issues = issuesFor({
+      TRACING_OTLP_ENDPOINT:
+        "https://SENSITIVE-USER:SENSITIVE-PASS@sensitive.host.internal/SENSITIVE-PATH",
+    });
+    const formatted = new ConfigError(issues).format();
+    for (const sentinel of [
+      "SENSITIVE-USER",
+      "SENSITIVE-PASS",
+      "SENSITIVE-PATH",
+      "sensitive.host.internal",
+    ]) {
+      expect(formatted).not.toContain(sentinel);
+    }
+    expect(formatted).toContain("TRACING_OTLP_ENDPOINT: must not embed credentials");
+  });
+
+  it("bounds the sample ratio to a plain decimal in [0, 1]", () => {
+    for (const [raw, expected] of [
+      ["0", 0],
+      ["1", 1],
+      ["0.05", 0.05],
+      [" 0.5 ", 0.5],
+    ] as const) {
+      expect(loadConfig({ env: baseEnv({ TRACING_SAMPLE_RATIO: raw }) }).TRACING_SAMPLE_RATIO).toBe(
+        expected,
+      );
+    }
+    // Out of range is a bounds failure; unparseable is a syntax failure. Both
+    // are rejected rather than clamped, so a mistyped probability is visible.
+    expect(issuesFor({ TRACING_SAMPLE_RATIO: "1.5" })).toContainEqual({
+      field: "TRACING_SAMPLE_RATIO",
+      reason: "is outside allowed range",
+    });
+    for (const value of ["-0.1", "1e-2", "0x1", "abc", "NaN", "Infinity", ".5", "1,0"]) {
+      expect(issuesFor({ TRACING_SAMPLE_RATIO: value })).toContainEqual({
+        field: "TRACING_SAMPLE_RATIO",
+        reason: "must be a decimal ratio",
+      });
+    }
+  });
+
+  it("needs no Redis, credential, or other feature to enable either switch", () => {
+    const config = loadConfig({
+      env: baseEnv({
+        METRICS_ENABLED: "true",
+        TRACING_ENABLED: "true",
+        TRACING_OTLP_ENDPOINT: "http://127.0.0.1:4318/v1/traces",
+        TRACING_SAMPLE_RATIO: "0.25",
+      }),
+    });
+    expect(config.METRICS_ENABLED).toBe(true);
+    expect(config.TRACING_ENABLED).toBe(true);
+    expect(config.TRACING_SAMPLE_RATIO).toBe(0.25);
+    expect(config.REDIS_URL).toBeUndefined();
+  });
+
+  it("keeps every observability failure value-free", () => {
+    const issues = issuesFor({
+      METRICS_ENABLED: "SENSITIVE-METRICS",
+      TRACING_ENABLED: "SENSITIVE-TRACING",
+      TRACING_OTLP_ENDPOINT: "http://collector.internal/SENSITIVE-PATH?token=SENSITIVE-TOKEN",
+      TRACING_SAMPLE_RATIO: "SENSITIVE-RATIO",
+    });
+    const formatted = new ConfigError(issues).format();
+    for (const sentinel of [
+      "SENSITIVE-METRICS",
+      "SENSITIVE-TRACING",
+      "SENSITIVE-PATH",
+      "SENSITIVE-TOKEN",
+      "SENSITIVE-RATIO",
+      "collector.internal",
+    ]) {
+      expect(formatted).not.toContain(sentinel);
+    }
   });
 });
 

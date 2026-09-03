@@ -120,8 +120,14 @@ export type PollOutcome =
       readonly kind: "answer";
       readonly content: string;
       readonly messages: readonly UpstreamMessage[];
+      /** How many `get_messages` attempts this polling run issued. */
+      readonly pollCount: number;
     }
-  | { readonly kind: "timeout" };
+  | {
+      readonly kind: "timeout";
+      /** How many `get_messages` attempts this polling run issued. */
+      readonly pollCount: number;
+    };
 
 /** Waits for a usable CollectivIQ message via the adapter's `getMessages`. */
 export interface Poller {

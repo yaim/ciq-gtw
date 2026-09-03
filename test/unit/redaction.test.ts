@@ -1,11 +1,21 @@
 import { describe, expect, it } from "vitest";
+import { pino } from "pino";
 import {
   isSecretKey,
+  REDACT_PATHS,
   REDACTION_PLACEHOLDER,
   SANITIZE_LIMITS,
   SANITIZE_MARKERS,
+  sanitizeLogRecord,
   sanitizeLogValue,
 } from "../../src/shared/redaction.js";
+
+/** Walk a sanitized structure down to a nested object, keeping the tests readable. */
+function at(root: unknown, ...path: readonly string[]): Record<string, unknown> {
+  let node = root as Record<string, unknown>;
+  for (const key of path) node = node[key] as Record<string, unknown>;
+  return node;
+}
 
 describe("sanitizeLogValue", () => {
   it("redacts credential-named fields at arbitrary nesting", () => {
@@ -244,6 +254,67 @@ describe("sanitizeLogValue", () => {
     }
   });
 
+  it("redacts the OTLP tracing endpoint far deeper than any Pino path can reach", () => {
+    // `REDACT_PATHS` covers the root and one nesting level; below that the
+    // recursive sanitizer is the only thing standing between an endpoint and
+    // the log line, and it decides purely from the key name.
+    const result = sanitizeLogValue({
+      a: {
+        b: {
+          c: {
+            TRACING_OTLP_ENDPOINT: "https://SENTINEL-DEEP-ENV/v1/traces",
+            tracingOtlpEndpoint: "https://SENTINEL-DEEP-CAMEL/v1/traces",
+            otlpEndpoint: "https://SENTINEL-DEEP-OPTION/v1/traces",
+          },
+        },
+      },
+      options: [{ tracing: { otlpEndpoint: "https://SENTINEL-DEEP-ARRAY/v1/traces" } }],
+    });
+
+    const leaf = at(result, "a", "b", "c");
+    for (const key of ["TRACING_OTLP_ENDPOINT", "tracingOtlpEndpoint", "otlpEndpoint"]) {
+      expect(leaf[key]).toBe(REDACTION_PLACEHOLDER);
+    }
+
+    const serialized = JSON.stringify(result);
+    for (const sentinel of [
+      "SENTINEL-DEEP-ENV",
+      "SENTINEL-DEEP-CAMEL",
+      "SENTINEL-DEEP-OPTION",
+      "SENTINEL-DEEP-ARRAY",
+    ]) {
+      expect(serialized).not.toContain(sentinel);
+    }
+  });
+
+  it("keeps innocuous endpoint-named operational fields visible at the same depth", () => {
+    // The endpoint is matched by EXACT normalized name, never by an `endpoint`
+    // substring: a substring marker would also swallow these, and telemetry
+    // labels and counters must stay readable in a log.
+    const neighbours = {
+      endpointCount: 3,
+      endpointLabel: "chat_completions",
+      endpoints: ["chat_completions", "models"],
+    };
+    const result = sanitizeLogValue({
+      a: { b: { c: { ...neighbours, otlpEndpoint: "https://SENTINEL-NEIGHBOUR/v1/traces" } } },
+    });
+
+    const leaf = at(result, "a", "b", "c");
+    expect(leaf["endpointCount"]).toBe(3);
+    expect(leaf["endpointLabel"]).toBe("chat_completions");
+    expect(leaf["endpoints"]).toEqual(["chat_completions", "models"]);
+    expect(leaf["otlpEndpoint"]).toBe(REDACTION_PLACEHOLDER);
+
+    expect(isSecretKey("endpointCount")).toBe(false);
+    expect(isSecretKey("endpointLabel")).toBe(false);
+    expect(isSecretKey("endpoints")).toBe(false);
+    expect(isSecretKey("endpoint")).toBe(false);
+    for (const key of ["TRACING_OTLP_ENDPOINT", "tracingOtlpEndpoint", "otlpEndpoint"]) {
+      expect(isSecretKey(key)).toBe(true);
+    }
+  });
+
   it("redacts login credentials nested inside hostile arrays and error values", () => {
     const result = sanitizeLogValue({
       attempts: [
@@ -261,5 +332,131 @@ describe("sanitizeLogValue", () => {
     }
     // The error still reduces to its fixed, allowlisted shape.
     expect(serialized).toContain("E_AUTH");
+  });
+});
+
+describe("REDACT_PATHS", () => {
+  /** Emit one record through the exact Pino redaction `createLogger` installs. */
+  function logThrough(record: Record<string, unknown>): Record<string, unknown> {
+    let line = "";
+    const logger = pino(
+      { redact: { paths: [...REDACT_PATHS], censor: REDACTION_PLACEHOLDER } },
+      {
+        write(chunk: string): void {
+          line += chunk;
+        },
+      },
+    );
+    logger.info(record, "test");
+    return JSON.parse(line) as Record<string, unknown>;
+  }
+
+  it("redacts the OTLP tracing endpoint the same way it redacts the Redis URL", () => {
+    // The endpoint is not a secret once validated — the loader rejects
+    // credential-bearing values outright — but it is redacted as defense in
+    // depth against a value logged before validation, and because the collector
+    // address is operational topology.
+    const record = logThrough({
+      TRACING_OTLP_ENDPOINT: "https://SENTINEL-ENDPOINT-ENV/v1/traces",
+      tracingOtlpEndpoint: "https://SENTINEL-ENDPOINT-CAMEL/v1/traces",
+      otlpEndpoint: "https://SENTINEL-ENDPOINT-OPTION/v1/traces",
+      REDIS_URL: "redis://SENTINEL-REDIS-ENV:6379",
+      config: {
+        TRACING_OTLP_ENDPOINT: "https://SENTINEL-ENDPOINT-NESTED-ENV/v1/traces",
+        tracingOtlpEndpoint: "https://SENTINEL-ENDPOINT-NESTED-CAMEL/v1/traces",
+        REDIS_URL: "redis://SENTINEL-REDIS-NESTED:6379",
+      },
+      tracing: { otlpEndpoint: "https://SENTINEL-ENDPOINT-NESTED-OPTION/v1/traces" },
+      endpointCount: 1,
+    });
+
+    for (const key of ["TRACING_OTLP_ENDPOINT", "tracingOtlpEndpoint", "otlpEndpoint", "REDIS_URL"])
+      expect(record[key]).toBe(REDACTION_PLACEHOLDER);
+
+    const config = record["config"] as Record<string, unknown>;
+    expect(config["TRACING_OTLP_ENDPOINT"]).toBe(REDACTION_PLACEHOLDER);
+    expect(config["tracingOtlpEndpoint"]).toBe(REDACTION_PLACEHOLDER);
+    expect(config["REDIS_URL"]).toBe(REDACTION_PLACEHOLDER);
+    expect((record["tracing"] as Record<string, unknown>)["otlpEndpoint"]).toBe(
+      REDACTION_PLACEHOLDER,
+    );
+
+    // Non-secret neighbours stay usable.
+    expect(record["endpointCount"]).toBe(1);
+
+    const serialized = JSON.stringify(record);
+    for (const sentinel of [
+      "SENTINEL-ENDPOINT-ENV",
+      "SENTINEL-ENDPOINT-CAMEL",
+      "SENTINEL-ENDPOINT-OPTION",
+      "SENTINEL-ENDPOINT-NESTED-ENV",
+      "SENTINEL-ENDPOINT-NESTED-CAMEL",
+      "SENTINEL-ENDPOINT-NESTED-OPTION",
+      "SENTINEL-REDIS-ENV",
+      "SENTINEL-REDIS-NESTED",
+    ]) {
+      expect(serialized).not.toContain(sentinel);
+    }
+  });
+});
+
+describe("logger pipeline", () => {
+  /**
+   * Emit one record through both layers `createLogger` installs: Pino's redact
+   * paths and the sanitizing `formatters.log` hook.
+   */
+  function logThrough(record: Record<string, unknown>): string {
+    let line = "";
+    const logger = pino(
+      {
+        redact: { paths: [...REDACT_PATHS], censor: REDACTION_PLACEHOLDER },
+        formatters: { log: (value) => sanitizeLogRecord(value) },
+      },
+      {
+        write(chunk: string): void {
+          line += chunk;
+        },
+      },
+    );
+    logger.info(record, "test");
+    return line;
+  }
+
+  it("redacts a deeply nested OTLP endpoint that no redact path reaches", () => {
+    // Four levels down, well past the single level `*.` covers, so the
+    // recursive sanitizer is the layer that has to catch this.
+    const line = logThrough({
+      telemetry: {
+        tracing: {
+          resolved: {
+            options: {
+              TRACING_OTLP_ENDPOINT: "https://SENTINEL-PIPELINE-ENV/v1/traces",
+              tracingOtlpEndpoint: "https://SENTINEL-PIPELINE-CAMEL/v1/traces",
+              otlpEndpoint: "https://SENTINEL-PIPELINE-OPTION/v1/traces",
+              endpointCount: 2,
+              endpointLabel: "chat_completions",
+              endpoints: ["chat_completions", "models"],
+            },
+          },
+        },
+      },
+    });
+
+    for (const sentinel of [
+      "SENTINEL-PIPELINE-ENV",
+      "SENTINEL-PIPELINE-CAMEL",
+      "SENTINEL-PIPELINE-OPTION",
+    ]) {
+      expect(line).not.toContain(sentinel);
+    }
+
+    const options = at(JSON.parse(line), "telemetry", "tracing", "resolved", "options");
+    for (const key of ["TRACING_OTLP_ENDPOINT", "tracingOtlpEndpoint", "otlpEndpoint"]) {
+      expect(options[key]).toBe(REDACTION_PLACEHOLDER);
+    }
+    // Operational neighbours survive at the same depth.
+    expect(options["endpointCount"]).toBe(2);
+    expect(options["endpointLabel"]).toBe("chat_completions");
+    expect(options["endpoints"]).toEqual(["chat_completions", "models"]);
   });
 });

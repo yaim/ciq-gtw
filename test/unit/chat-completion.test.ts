@@ -125,7 +125,9 @@ function makeService(deps: Partial<ChatCompletionDeps> & { trace: Trace }) {
     adapter: rest.adapter ?? fakeAdapter(trace),
     poller:
       rest.poller ??
-      fakePoller(() => Promise.resolve({ kind: "answer", content: "answer text", messages: [] })),
+      fakePoller(() =>
+        Promise.resolve({ kind: "answer", content: "answer text", messages: [], pollCount: 1 }),
+      ),
     ids: rest.ids ?? { completionId: () => "chatcmpl_ciq_test" },
     clock: rest.clock ?? { nowMs: () => 1_000_000 },
     toolCallIds: rest.toolCallIds ?? { toolCallId: () => "call_ciq_test" },
@@ -316,7 +318,7 @@ describe("chat-completion orchestration", () => {
     const trace: Trace = { events: [], processInputs: [], released: 0 };
     const service = makeService({
       trace,
-      poller: fakePoller(() => Promise.resolve({ kind: "timeout" })),
+      poller: fakePoller(() => Promise.resolve({ kind: "timeout", pollCount: 3 })),
     });
     await expect(run(service)).rejects.toMatchObject({
       apiError: { status: 504, body: { error: { code: "completion_timeout" } } },
@@ -567,7 +569,7 @@ describe("chat-completion with a leased OpenCode thread (specification §5.1.1)"
       trace,
       adapter: reuseAdapter(trace, [[message(1, "previous turn", PRIOR_RUN_ID)]]),
       poller: {
-        poll: () => Promise.resolve({ kind: "answer", content: "new", messages: [] }),
+        poll: () => Promise.resolve({ kind: "answer", content: "new", messages: [], pollCount: 1 }),
       },
     });
     const signal = new AbortController().signal;
@@ -603,7 +605,7 @@ describe("chat-completion with a leased OpenCode thread (specification §5.1.1)"
       poller: {
         poll: (p) => {
           seen = p;
-          return Promise.resolve({ kind: "answer", content: "new", messages: [] });
+          return Promise.resolve({ kind: "answer", content: "new", messages: [], pollCount: 1 });
         },
       },
     });
@@ -686,7 +688,7 @@ describe("chat-completion with a leased OpenCode thread (specification §5.1.1)"
       poller: {
         poll: (p) => {
           seen = p;
-          return Promise.resolve({ kind: "answer", content: "x", messages: [] });
+          return Promise.resolve({ kind: "answer", content: "x", messages: [], pollCount: 1 });
         },
       },
     });

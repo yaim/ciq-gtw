@@ -55,6 +55,13 @@ const config = {
   RATE_LIMIT_BURST: 8,
   OPENCODE_THREAD_REUSE_ENABLED: false,
   OPENCODE_THREAD_REUSE_TTL_MS: 604_800_000,
+  // Observability CONFIGURED but owned by the process root: `buildServer` may
+  // build the (pure, socket-free) Prometheus registry and register `/metrics`,
+  // but it must never construct an OTLP exporter or contact a collector.
+  METRICS_ENABLED: true,
+  TRACING_ENABLED: true,
+  TRACING_OTLP_ENDPOINT: "http://127.0.0.1:4318/v1/traces",
+  TRACING_SAMPLE_RATIO: 1,
   models: [],
 };
 

@@ -78,6 +78,24 @@ services:
       # and is NOT production ready (see .env.example).
       OPENCODE_THREAD_REUSE_ENABLED: "${OPENCODE_THREAD_REUSE_ENABLED:-false}"
       OPENCODE_THREAD_REUSE_TTL_MS: "${OPENCODE_THREAD_REUSE_TTL_MS:-604800000}"
+      # OPTIONAL observability (Phase 4C). Both disabled by default, in which
+      # case there is no Prometheus registry, no /metrics route (the endpoint
+      # returns 404), no tracer, and no exporter. Neither needs Redis or a
+      # credential.
+      #
+      # `GET /metrics` is UNAUTHENTICATED when enabled. It is reachable here only
+      # through the loopback publication above (127.0.0.1:8787), which is what
+      # keeps this local setup safe; a hosted deployment must isolate it with a
+      # private network or firewall instead.
+      #
+      # TRACING_OTLP_ENDPOINT is resolved by the GATEWAY PROCESS, so a collector
+      # running on the host is NOT `127.0.0.1` from inside this container — use
+      # the collector's Compose service name, or `host.docker.internal` where
+      # your Docker runtime supports it.
+      METRICS_ENABLED: "${METRICS_ENABLED:-false}"
+      TRACING_ENABLED: "${TRACING_ENABLED:-false}"
+      TRACING_OTLP_ENDPOINT: "${TRACING_OTLP_ENDPOINT:-}"
+      TRACING_SAMPLE_RATIO: "${TRACING_SAMPLE_RATIO:-1}"
     volumes:
       # Provide your own model file (copied from config/models.example.yaml).
       - "./config/models.yaml:/app/config/models.yaml:ro"

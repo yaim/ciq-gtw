@@ -91,4 +91,48 @@ describe("runGracefulShutdown", () => {
     expect(errors).toHaveLength(1);
     expect(trace.aborted).toBe(1);
   });
+
+  it("closes shared dependencies LAST, after the application has drained", async () => {
+    // Redis and telemetry must stay usable throughout the drain so an in-flight
+    // completion can settle its idempotency record and export its final spans.
+    const trace: Trace = { order: [], aborted: 0 };
+    await runGracefulShutdown(
+      makeDeps(
+        {
+          close: () => {
+            trace.order.push("close");
+            return Promise.resolve();
+          },
+          closeDependencies: () => {
+            trace.order.push("closeDependencies");
+            return Promise.resolve();
+          },
+        },
+        trace,
+      ),
+    );
+    expect(trace.order).toEqual([
+      "setNotReady",
+      "closeAdmission",
+      "close",
+      "abortInFlight",
+      "closeDependencies",
+    ]);
+  });
+
+  it("does not let a failing dependency close reject or skip the sequence", async () => {
+    const trace: Trace = { order: [], aborted: 0 };
+    const errors: unknown[] = [];
+    await runGracefulShutdown(
+      makeDeps(
+        {
+          closeDependencies: () => Promise.reject(new Error("telemetry flush failed")),
+          onError: (e) => errors.push(e),
+        },
+        trace,
+      ),
+    );
+    expect(errors).toHaveLength(1);
+    expect(trace.aborted).toBe(1);
+  });
 });

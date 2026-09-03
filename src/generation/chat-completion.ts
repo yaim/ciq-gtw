@@ -57,6 +57,10 @@ import {
   type ToolCallIdGenerator,
 } from "../tools/index.js";
 import { selectWinningMessage } from "./polling.js";
+import { toParserSource, type PollOutcomeLabel } from "../observability/labels.js";
+import { DISABLED_TELEMETRY, type Telemetry } from "../observability/telemetry.js";
+import type { GatewaySpan, SpanAttributes, SpanName } from "../observability/tracing.js";
+import { elapsedSeconds } from "../shared/elapsed.js";
 import type { CapacityController, Clock, IdGenerator, Poller, PromptSerializer } from "./types.js";
 
 /**
@@ -69,6 +73,23 @@ import type { CapacityController, Clock, IdGenerator, Poller, PromptSerializer }
  * users, answers, OpenCode session titles, or credentials.
  */
 export const THREAD_TITLE = "New Thread";
+
+/**
+ * Close one upstream span as FAILED (specification §23.3: `ERROR` status, no
+ * status message, a closed category).
+ *
+ * The exact public envelope for an upstream failure is decided later, by the
+ * orchestrator's outer catch, from the normalized `UpstreamError` category — so
+ * no more precise category is trusted at this point and the closed fallback is
+ * used rather than a guess. The root `gateway.request` span still records the
+ * exact category, taken from the envelope the gateway actually returns.
+ */
+function failUpstreamSpan(span: GatewaySpan | null, cancelled: boolean): void {
+  if (span === null) return;
+  span.setAttributes({ upstreamOutcome: cancelled ? "cancelled" : "error" });
+  span.setError("other");
+  span.end();
+}
 
 // Branded registries of the gateway's own completion error instances. Membership
 // is tested by object IDENTITY (WeakSet.has triggers no getter and no Proxy trap),
@@ -126,6 +147,13 @@ export interface ChatCompletionDeps {
   readonly clock: Clock;
   /** Gateway-owned tool-call id generator (emulated mode only). */
   readonly toolCallIds: ToolCallIdGenerator;
+  /**
+   * Observability ports (specification section 23). Omitted means fully
+   * disabled, which is the default for tests and for any caller that has not
+   * opted in. Telemetry is best-effort and never changes control flow, admission
+   * order, or the response.
+   */
+  readonly telemetry?: Telemetry;
 }
 
 /** Per-request context (already authenticated, validated, and model-resolved). */
@@ -142,6 +170,12 @@ export interface ChatCompletionRequestContext {
    * upstream tool-call candidates using the same compiled validators.
    */
   readonly toolset?: CompiledToolset;
+  /**
+   * The caller's `gateway.request` span, used as the explicit parent for every
+   * span this service creates. Absent means the spans are roots (or no-ops when
+   * tracing is disabled); it never affects the completion itself.
+   */
+  readonly requestSpan?: GatewaySpan;
 }
 
 /** The active tool policy threaded into `run` for emulated-mode selection. */
@@ -180,6 +214,8 @@ export interface PreparedCompletion {
   readonly toolContext?: PreparedToolContext;
   /** Configured source order, used for deterministic tool-consensus tie-breaks. */
   readonly selectedLlms: readonly string[];
+  /** The caller's `gateway.request` span, carried through as the span parent. */
+  readonly requestSpan?: GatewaySpan;
 }
 
 /**
@@ -284,6 +320,48 @@ export interface ChatCompletionService {
 
 /** Build the completion service from its ports. */
 export function createChatCompletionService(deps: ChatCompletionDeps): ChatCompletionService {
+  const telemetry = deps.telemetry ?? DISABLED_TELEMETRY;
+  const { metrics, tracing } = telemetry;
+  // Resolved ONCE, at construction. Every telemetry statement below is guarded
+  // by one of these booleans, so a disabled gateway builds no span options, no
+  // observation samples, and no closures, reads no telemetry clock, and calls
+  // into neither port. A boolean test is the whole cost.
+  const metricsOn = metrics.enabled;
+  const tracingOn = tracing.enabled;
+
+  /**
+   * Start a child span, or `null` when tracing is disabled.
+   *
+   * Built ONCE here rather than per `run()`, and `null` (not a no-op function)
+   * when tracing is off — so a disabled completion allocates no closure. Call it
+   * with optional invocation (`startChild?.(…)`), which short-circuits WITHOUT
+   * evaluating its arguments, so the attribute objects below are never
+   * constructed either.
+   */
+  const startChild = tracingOn
+    ? (parent: GatewaySpan | undefined, name: SpanName, attributes?: SpanAttributes): GatewaySpan =>
+        tracing.startSpan(name, {
+          ...(parent !== undefined ? { parent } : {}),
+          ...(attributes !== undefined ? { attributes } : {}),
+        })
+    : null;
+
+  /**
+   * Single owner of `timeouts_total`: exactly one increment per completion that
+   * terminates as the public completion timeout, whichever path produced it (the
+   * poll deadline, an abort attributed to the deadline, or an upstream timeout
+   * mapped to the same envelope). Identity comparison against the frozen
+   * envelope is what makes "exactly once" checkable.
+   *
+   * Built ONCE here and `null` when metrics are disabled, so a disabled
+   * completion allocates no closure — the same rule `startChild` follows.
+   */
+  const noteTerminalError = metricsOn
+    ? (apiError: OpenAIApiError, modelId: string): void => {
+        if (apiError === COMPLETION_TIMEOUT_ERROR) metrics.observeTimeout(modelId);
+      }
+    : null;
+
   return {
     prepare(ctx: ChatCompletionRequestContext): PreparedCompletion {
       const { request, model } = ctx;
@@ -293,10 +371,28 @@ export function createChatCompletionService(deps: ChatCompletionDeps): ChatCompl
       // capacity is taken, any upstream call is made, or any SSE header is
       // committed. Mint the stream-stable identity here so both the JSON and SSE
       // encoders reuse one id/timestamp across the whole response.
-      const prompt = deps.serializer.serialize(request, model.promptMode);
+      const serializeSpan =
+        startChild?.(ctx.requestSpan, "gateway.serialize", {
+          model: model.id,
+          promptMode: model.promptMode,
+          toolMode: model.toolMode,
+        }) ?? null;
+      let prompt: string;
+      try {
+        prompt = deps.serializer.serialize(request, model.promptMode);
+      } catch (error) {
+        // No trusted category exists for an unexpected serializer failure, but
+        // the gateway's own response for it is the fixed internal error.
+        serializeSpan?.setError("internal_error");
+        serializeSpan?.end();
+        throw error;
+      }
       if (Buffer.byteLength(prompt, "utf8") > model.maximumPromptBytes) {
+        serializeSpan?.setError("context_length_exceeded");
+        serializeSpan?.end();
         throw new ChatCompletionError(CONTEXT_LENGTH_EXCEEDED_ERROR);
       }
+      serializeSpan?.end();
       // Tools are active only for an emulated model with a compiled toolset, a
       // non-empty tool set, and a `tool_choice` other than `none`. Otherwise the
       // completion produces ordinary text and no tool selection runs.
@@ -322,6 +418,7 @@ export function createChatCompletionService(deps: ChatCompletionDeps): ChatCompl
         keyId: ctx.keyId,
         selectedLlms: model.selectedLlms,
         ...(toolContext !== undefined ? { toolContext } : {}),
+        ...(ctx.requestSpan !== undefined ? { requestSpan: ctx.requestSpan } : {}),
       };
     },
 
@@ -347,6 +444,10 @@ export function createChatCompletionService(deps: ChatCompletionDeps): ChatCompl
       /** Map an abort to the right terminal error (deadline vs client/shutdown). */
       const cancellationError = (): Error =>
         timedOut ? new ChatCompletionError(COMPLETION_TIMEOUT_ERROR) : new RequestCancelledError();
+
+      // Every span this run creates hangs off the caller's `gateway.request`
+      // span, so a completion is one trace rather than a scatter of roots.
+      const parentSpan = prepared.requestSpan;
 
       try {
         // Acquire capacity before creating an upstream thread.
@@ -385,10 +486,27 @@ export function createChatCompletionService(deps: ChatCompletionDeps): ChatCompl
           if (leasedThreadId !== undefined) {
             threadId = leasedThreadId;
           } else {
-            const thread = await deps.adapter.createThread({
-              title: THREAD_TITLE,
-              signal: combined,
-            });
+            const createSpan =
+              startChild?.(parentSpan, "collectiviq.create_thread", {
+                model: model.id,
+                upstreamOperation: "create_thread",
+              }) ?? null;
+            let thread: Awaited<ReturnType<typeof deps.adapter.createThread>>;
+            try {
+              thread = await deps.adapter.createThread({
+                title: THREAD_TITLE,
+                signal: combined,
+              });
+            } catch (error) {
+              // The public envelope is decided later, by the outer catch, from
+              // the normalized upstream category — so the precise category is
+              // not yet trusted here and the closed fallback is used. The root
+              // `gateway.request` span still carries the exact one.
+              failUpstreamSpan(createSpan, combined.aborted);
+              throw error;
+            }
+            createSpan?.setAttributes({ upstreamOutcome: "success" });
+            createSpan?.end();
             threadId = thread.threadId;
             // The caller binds the new thread to its mapping BEFORE any submit,
             // so a failure here leaves a blank thread rather than an untracked
@@ -410,22 +528,77 @@ export function createChatCompletionService(deps: ChatCompletionDeps): ChatCompl
           // thing that later proves a polled message belongs to this completion,
           // so it is carried straight into the poll and into tool-consensus
           // selection; it is never logged, retained, or exposed.
-          const submitted = await deps.adapter.processMessage({
-            threadId,
-            prompt: prepared.prompt,
-            selectedLlms: model.selectedLlms,
-            generateCombined: model.generateCombined,
-            signal: combined,
-          });
-          const outcome = await deps.poller.poll({
-            threadId,
-            answerSource: model.answerSource,
-            pollIntervalMs: model.pollIntervalMs,
-            maxPollIntervalMs: model.maxPollIntervalMs,
-            deadlineMs,
-            signal: combined,
-            combinedRunId: submitted.combinedRunId,
-          });
+          const submitSpan =
+            startChild?.(parentSpan, "collectiviq.process_message", {
+              model: model.id,
+              upstreamOperation: "process_message",
+            }) ?? null;
+          let submitted: Awaited<ReturnType<typeof deps.adapter.processMessage>>;
+          try {
+            submitted = await deps.adapter.processMessage({
+              threadId,
+              prompt: prepared.prompt,
+              selectedLlms: model.selectedLlms,
+              generateCombined: model.generateCombined,
+              signal: combined,
+            });
+          } catch (error) {
+            failUpstreamSpan(submitSpan, combined.aborted);
+            throw error;
+          }
+          submitSpan?.setAttributes({ upstreamOutcome: "success" });
+          submitSpan?.end();
+
+          // The whole polling PHASE is one span and one duration sample; the
+          // individual `get_messages` attempts are counted by the adapter
+          // decorator, which is the only layer that sees each one.
+          const pollSpan =
+            startChild?.(parentSpan, "collectiviq.poll", {
+              model: model.id,
+              upstreamOperation: "get_messages",
+            }) ?? null;
+          const pollStartNs = metricsOn ? process.hrtime.bigint() : 0n;
+          let pollOutcome: PollOutcomeLabel = "error";
+          let pollAttempts = 0;
+          let outcome: Awaited<ReturnType<typeof deps.poller.poll>>;
+          try {
+            outcome = await deps.poller.poll({
+              threadId,
+              answerSource: model.answerSource,
+              pollIntervalMs: model.pollIntervalMs,
+              maxPollIntervalMs: model.maxPollIntervalMs,
+              deadlineMs,
+              signal: combined,
+              combinedRunId: submitted.combinedRunId,
+            });
+            pollAttempts = outcome.pollCount;
+            pollOutcome = outcome.kind === "timeout" ? "timeout" : "answer";
+          } catch (error) {
+            // A throw carries no attempt count, so the phase reports zero polls
+            // while the decorator's per-attempt counter stays complete. The
+            // deadline is distinguished from a client/shutdown abort here for
+            // the same reason the public status is: they are different failures.
+            pollOutcome = timedOut ? "timeout" : combined.aborted ? "cancelled" : "error";
+            throw error;
+          } finally {
+            if (metricsOn) {
+              metrics.observePollPhase({
+                model: model.id,
+                outcome: pollOutcome,
+                durationSeconds: elapsedSeconds(pollStartNs),
+                pollCount: pollAttempts,
+              });
+            }
+            if (pollSpan !== null) {
+              pollSpan.setAttributes({ pollOutcome, pollCount: pollAttempts });
+              // Anything but a delivered answer is a failed phase. A deadline is
+              // the one outcome whose public envelope is already known here.
+              if (pollOutcome !== "answer") {
+                pollSpan.setError(pollOutcome === "timeout" ? "completion_timeout" : "other");
+              }
+              pollSpan.end();
+            }
+          }
           if (outcome.kind === "timeout") {
             throw new ChatCompletionError(COMPLETION_TIMEOUT_ERROR);
           }
@@ -435,72 +608,129 @@ export function createChatCompletionService(deps: ChatCompletionDeps): ChatCompl
             upstreamThreadId: threadId,
             upstreamThreadCreated: !reused,
           } as const;
+          // Whether this completion CONTINUED an OpenCode session's thread
+          // (specification §5.1.1) is recorded on the request span, which is
+          // where a reader looks for a completion's shape. It is a boolean about
+          // the gateway's own decision — never the thread or session identity.
+          if (tracingOn) parentSpan?.setAttributes({ threadReused: reused });
 
-          // Text mode (no active tools): return the desired-source answer.
-          const toolContext = prepared.toolContext;
-          if (toolContext === undefined) {
-            return { kind: "text", content: outcome.content, ...threadInfo };
-          }
-
-          // Emulated tool mode: parse/vote over the validated message snapshot.
-          const individuals: SourceCandidate[] = [];
-          for (const source of prepared.selectedLlms) {
-            // Consensus reads the same snapshot the poller ranked, so it applies
-            // the same run correlation: a stale individual from an earlier turn
-            // must never get a vote.
-            const message = selectWinningMessage(outcome.messages, source, submitted.combinedRunId);
-            if (message !== null && typeof message.content === "string") {
-              individuals.push({
-                source,
-                content: message.content,
-                percentUsage: message.percentUsage ?? null,
-              });
+          // Response parsing (specification section 8.7). The span covers both
+          // transports and both modes; only emulated mode reports a parser
+          // source, because text mode does no parsing.
+          const parseSpan =
+            startChild?.(parentSpan, "gateway.parse", {
+              model: model.id,
+              toolMode: model.toolMode,
+            }) ?? null;
+          try {
+            // Text mode (no active tools): return the desired-source answer.
+            const toolContext = prepared.toolContext;
+            if (toolContext === undefined) {
+              return { kind: "text", content: outcome.content, ...threadInfo };
             }
-          }
-          const selection = selectGeneration({
-            desired: { content: outcome.content },
-            individuals,
-            toolset: toolContext.toolset,
-            choice: toolContext.choice,
-            parallelToolCalls: toolContext.parallelToolCalls,
-            selectedLlms: prepared.selectedLlms,
-            idGen: deps.toolCallIds,
-          });
-          if (!selection.ok) {
-            // `required`/named choice with no valid tool call → 502 (never a
-            // silent text fallback).
-            throw new ChatCompletionError(INVALID_TOOL_RESPONSE_ERROR);
-          }
-          if (selection.generation.kind === "tool_calls") {
+
+            // Emulated tool mode: parse/vote over the validated message snapshot.
+            const individuals: SourceCandidate[] = [];
+            for (const source of prepared.selectedLlms) {
+              // Consensus reads the same snapshot the poller ranked, so it applies
+              // the same run correlation: a stale individual from an earlier turn
+              // must never get a vote.
+              const message = selectWinningMessage(
+                outcome.messages,
+                source,
+                submitted.combinedRunId,
+              );
+              if (message !== null && typeof message.content === "string") {
+                individuals.push({
+                  source,
+                  content: message.content,
+                  percentUsage: message.percentUsage ?? null,
+                });
+              }
+            }
+            const selection = selectGeneration({
+              desired: { content: outcome.content },
+              individuals,
+              toolset: toolContext.toolset,
+              choice: toolContext.choice,
+              parallelToolCalls: toolContext.parallelToolCalls,
+              selectedLlms: prepared.selectedLlms,
+              idGen: deps.toolCallIds,
+            });
+            if (!selection.ok) {
+              // `required`/named choice with no valid tool call → 502 (never a
+              // silent text fallback). This is the single owner of
+              // `tool_parse_failures_total`.
+              if (metricsOn) metrics.observeToolParseFailure(model.id);
+              parseSpan?.setError("invalid_tool_response");
+              throw new ChatCompletionError(INVALID_TOOL_RESPONSE_ERROR);
+            }
+            if (selection.generation.kind === "tool_calls") {
+              const parserSource = toParserSource(selection.generation.source);
+              if (parserSource !== null) {
+                if (metricsOn) {
+                  metrics.observeToolResponse({
+                    model: model.id,
+                    toolMode: model.toolMode,
+                    parserSource,
+                  });
+                }
+                parseSpan?.setAttributes({
+                  parserSource,
+                  toolCallCount: selection.generation.calls.length,
+                });
+              }
+              return {
+                kind: "tool_calls",
+                toolCalls: selection.generation.calls,
+                ...threadInfo,
+              };
+            }
             return {
-              kind: "tool_calls",
-              toolCalls: selection.generation.calls,
+              kind: "text",
+              content: selection.generation.content,
               ...threadInfo,
             };
+          } catch (error) {
+            // Selection is total in practice, so this is defence in depth — but
+            // §23.3 requires EVERY failure exit to mark its span failed, and a
+            // `finally` alone would end it with an UNSET status. A
+            // `ChatCompletionError` already recorded its own precise category.
+            if (!isChatCompletionError(error)) parseSpan?.setError("internal_error");
+            throw error;
+          } finally {
+            parseSpan?.end();
           }
-          return {
-            kind: "text",
-            content: selection.generation.content,
-            ...threadInfo,
-          };
         } finally {
           acquisition.permit.release();
         }
       } catch (error) {
-        if (isChatCompletionError(error) || isRequestCancelledError(error)) {
+        if (isChatCompletionError(error)) {
+          noteTerminalError?.(error.apiError, model.id);
           throw error;
         }
+        if (isRequestCancelledError(error)) throw error;
         // Any failure once the combined signal has aborted is a cancellation:
         // either the total deadline (→ 504) or a client/shutdown abort. This
         // also covers an abort surfaced as a rejected sleep (a DOM abort
         // reason rather than an UpstreamError).
-        if (combined.aborted) throw cancellationError();
+        if (combined.aborted) {
+          const cancelled = cancellationError();
+          if (isChatCompletionError(cancelled)) noteTerminalError?.(cancelled.apiError, model.id);
+          throw cancelled;
+        }
         // Trap-safe identity check: an arbitrary thrown value (e.g. a hostile
         // Proxy) is never touched by `instanceof`/prototype lookup. Fields are
         // read only AFTER identity is established.
         if (isUpstreamError(error)) {
-          if (error.category === "cancellation") throw cancellationError();
-          throw new ChatCompletionError(openAIErrorForUpstream(error));
+          if (error.category === "cancellation") {
+            const cancelled = cancellationError();
+            if (isChatCompletionError(cancelled)) noteTerminalError?.(cancelled.apiError, model.id);
+            throw cancelled;
+          }
+          const mapped = openAIErrorForUpstream(error);
+          noteTerminalError?.(mapped, model.id);
+          throw new ChatCompletionError(mapped);
         }
         // An unexpected error propagates unmapped; the route returns the fixed 500.
         throw error;

@@ -4,6 +4,7 @@ import { createLogger, emitContentLoggingWarning } from "./observability/logger.
 import { createReadinessState } from "./api/health-route.js";
 import { createCompletionRuntime } from "./generation/runtime.js";
 import { createRedisRuntime } from "./redis/runtime.js";
+import { createTelemetryRuntime } from "./observability/telemetry.js";
 import { buildServer } from "./server.js";
 
 /** Fixed message returned for any non-{@link ConfigError} startup failure. */
@@ -49,10 +50,11 @@ export interface GracefulShutdownDeps {
   /** Bounded drain window (ms) before remaining work is force-cancelled. */
   readonly drainMs: number;
   /**
-   * Close shared external resources (the one Redis connection) AFTER the
-   * application has drained, so an in-flight completion can still persist or
-   * settle its idempotency record while requests are winding down. Bounded and
-   * non-rejecting by contract.
+   * Close shared external resources (the one Redis connection and the telemetry
+   * exporter) AFTER the application has drained, so an in-flight completion can
+   * still persist or settle its idempotency record — and still emit its final
+   * spans — while requests are winding down. Bounded and non-rejecting by
+   * contract.
    */
   readonly closeDependencies?: () => Promise<void>;
   /** Optional content-free error sink for a close() failure. */
@@ -84,8 +86,9 @@ export async function runGracefulShutdown(deps: GracefulShutdownDeps): Promise<v
     clearTimeout(drainTimer);
     deps.abortInFlight();
   }
-  // 6. Application draining is complete: close Redis and any other shared
-  //    resource last, so idempotency finalization stayed possible throughout.
+  // 6. Application draining is complete: close Redis and telemetry (and any
+  //    other shared resource) last, so idempotency finalization and final span
+  //    export stayed possible throughout.
   if (deps.closeDependencies !== undefined) {
     try {
       await deps.closeDependencies();
@@ -111,6 +114,11 @@ export async function main(): Promise<void> {
   // every service shares the ONE client this runtime owns.
   const redis = createRedisRuntime(config);
 
+  // Optional observability (specification section 23), OFF by default. The
+  // process root owns it because the OTLP exporter must be flushed and shut
+  // down; construction opens no socket and contacts no collector.
+  const telemetry = createTelemetryRuntime(config);
+
   // Readiness is dependency aware: when Redis is CONFIGURED the instance is
   // ready only while the client is actually connected, so a disconnected or
   // reconnecting Redis keeps `/readyz` at 503 while `/healthz` stays 200. One
@@ -123,12 +131,13 @@ export async function main(): Promise<void> {
   // Build the completion runtime once so the process root can share the same
   // capacity controller for shutdown draining. Construction opens no socket and
   // performs no CollectivIQ/login I/O (a password login stays lazy).
-  const runtime = createCompletionRuntime(config);
+  const runtime = createCompletionRuntime(config, { telemetry });
   const shutdownController = new AbortController();
   const app = buildServer({
     config,
     readiness,
     logger,
+    telemetry,
     completion: {
       chatService: runtime.chatService,
       titleBridge: runtime.titleBridge,
@@ -152,10 +161,15 @@ export async function main(): Promise<void> {
       abortInFlight: () => shutdownController.abort(),
       close: () => app.close(),
       drainMs: config.SHUTDOWN_DRAIN_MS,
-      // Redis stays available throughout draining so an in-flight completion can
-      // still commit or settle its idempotency record; the one shared connection
-      // is closed last, exactly once.
-      ...(redis !== null ? { closeDependencies: () => redis.close() } : {}),
+      // Redis and telemetry stay available throughout draining so an in-flight
+      // completion can still commit or settle its idempotency record and export
+      // its final spans; both are closed last, exactly once. Telemetry closes
+      // after Redis and can neither delay nor fail the sequence — its shutdown
+      // is bounded and non-rejecting.
+      closeDependencies: async (): Promise<void> => {
+        if (redis !== null) await redis.close();
+        await telemetry.close();
+      },
       onError: (error) =>
         logger.error(
           { err: { name: error instanceof Error ? error.name : "unknown" } },

@@ -7,10 +7,13 @@ import type { TitleBridge } from "../opencode/title-bridge.js";
 import type { IdempotencyCoordinator } from "../idempotency/index.js";
 import type { RateLimiter } from "../rate-limit/index.js";
 import type { ThreadReuseCoordinator } from "../thread-reuse/index.js";
+import { DISABLED_TELEMETRY, type Telemetry } from "../observability/telemetry.js";
 import { registerModelRoutes } from "./models-route.js";
 import { registerChatCompletionsRoute } from "./chat-completions-route.js";
 import { registerOpenCodeTitleRoute } from "./opencode-title-route.js";
 import { markAuthenticated } from "./request-phase.js";
+import { requestTelemetry } from "./request-telemetry.js";
+import { toErrorCategory } from "../observability/labels.js";
 import { INTERNAL_ERROR, INVALID_API_KEY_ERROR } from "../openai/errors.js";
 
 declare module "fastify" {
@@ -88,6 +91,11 @@ export interface V1RouteDeps {
    * with `503` (ineligible completions are unaffected).
    */
   readonly threadReuse?: ThreadReuseCoordinator;
+  /**
+   * Observability ports (specification section 23). Omitted means disabled;
+   * telemetry never affects admission order, status codes, or response bodies.
+   */
+  readonly telemetry?: Telemetry;
 }
 
 /**
@@ -119,7 +127,10 @@ export function registerV1Routes(app: GatewayServer, deps: V1RouteDeps): void {
 
       // Any unexpected failure inside the group becomes the fixed internal
       // envelope. The thrown value's message/stack/cause/body is never read.
-      scope.setErrorHandler((_error, _request, reply) => {
+      scope.setErrorHandler((_error, request, reply) => {
+        // The category comes from the fixed envelope, never from the thrown
+        // value, which is still never inspected.
+        requestTelemetry(request)?.recordError(toErrorCategory(INTERNAL_ERROR.body.error.code));
         reply.code(INTERNAL_ERROR.status);
         return INTERNAL_ERROR.body;
       });
@@ -127,6 +138,9 @@ export function registerV1Routes(app: GatewayServer, deps: V1RouteDeps): void {
       scope.addHook("onRequest", async (request, reply) => {
         const result = deps.authenticator.authenticate(request.headers.authorization);
         if (!result.ok) {
+          requestTelemetry(request)?.recordError(
+            toErrorCategory(INVALID_API_KEY_ERROR.body.error.code),
+          );
           // Awaiting the sent reply completes the lifecycle, so no handler runs.
           // The body is the fixed authentication envelope.
           await reply.code(INVALID_API_KEY_ERROR.status).send(INVALID_API_KEY_ERROR.body);
@@ -155,6 +169,7 @@ export function registerV1Routes(app: GatewayServer, deps: V1RouteDeps): void {
         ...(deps.rateLimiter !== undefined ? { rateLimiter: deps.rateLimiter } : {}),
         threadReuseEnabled: deps.threadReuseEnabled,
         ...(deps.threadReuse !== undefined ? { threadReuse: deps.threadReuse } : {}),
+        telemetry: deps.telemetry ?? DISABLED_TELEMETRY,
       });
       // Rate limiting is scoped to the completion route ONLY: model metadata and
       // the session-title extension are cheap, non-generative reads that must

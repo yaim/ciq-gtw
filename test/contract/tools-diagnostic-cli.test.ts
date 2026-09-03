@@ -1922,7 +1922,13 @@ describe("live-round — the shared lifecycle extracted from the release evaluat
     { role: "user", content: "synthetic round request" },
   ]);
   const okPoller: Poller = {
-    poll: () => Promise.resolve({ kind: "answer", content: finalEnvelope("x"), messages: [] }),
+    poll: () =>
+      Promise.resolve({
+        kind: "answer",
+        content: finalEnvelope("x"),
+        messages: [],
+        pollCount: 1,
+      }),
   };
 
   function journalSpy(): RecoveryJournalSink & { events: string[] } {
@@ -1970,7 +1976,12 @@ describe("live-round — the shared lifecycle extracted from the release evaluat
           deadlineMs: params.deadlineMs,
           answerSource: params.answerSource,
         });
-        return Promise.resolve({ kind: "answer", content: finalEnvelope("x"), messages: [] });
+        return Promise.resolve({
+          kind: "answer",
+          content: finalEnvelope("x"),
+          messages: [],
+          pollCount: 1,
+        });
       },
     };
     const before = Date.now();
@@ -2001,7 +2012,12 @@ describe("live-round — the shared lifecycle extracted from the release evaluat
     const capturingPoller: Poller = {
       poll: (params) => {
         seen.push(params.answerSource);
-        return Promise.resolve({ kind: "answer", content: finalEnvelope("x"), messages: [] });
+        return Promise.resolve({
+          kind: "answer",
+          content: finalEnvelope("x"),
+          messages: [],
+          pollCount: 1,
+        });
       },
     };
     await runLiveRound(

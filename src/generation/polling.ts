@@ -186,6 +186,10 @@ export function createPoller(adapter: CollectivIQAdapter, seams: PollerSeams = {
   async function poll(params: PollParams): Promise<PollOutcome> {
     const fixed = params.pollIntervalMs === params.maxPollIntervalMs;
     let interval = params.pollIntervalMs;
+    // Observational only: how many `get_messages` attempts this run issued. It
+    // never influences the loop, and it is reported on the returned outcome so
+    // the orchestrator can record it without the poller knowing about metrics.
+    let pollCount = 0;
 
     for (;;) {
       // The total request deadline and client/shutdown cancellation are
@@ -193,11 +197,12 @@ export function createPoller(adapter: CollectivIQAdapter, seams: PollerSeams = {
       // is never issued once the deadline has expired or the request was
       // cancelled. Cancellation is kept distinct from a timeout.
       if (params.signal.aborted) throw new UpstreamError("cancellation");
-      if (clock.nowMs() >= params.deadlineMs) return { kind: "timeout" };
+      if (clock.nowMs() >= params.deadlineMs) return { kind: "timeout", pollCount };
 
       let messages: readonly UpstreamMessage[] | null = null;
       let pollError: unknown;
       let failed = false;
+      pollCount += 1;
       try {
         const res = await adapter.getMessages(params.threadId, params.signal);
         messages = res.messages;
@@ -220,7 +225,7 @@ export function createPoller(adapter: CollectivIQAdapter, seams: PollerSeams = {
         // A failure observed AT OR AFTER the deadline (but with no cancellation)
         // is the gateway timeout — regardless of whether it was retryable — and
         // must not leak out as an upstream transport error.
-        if (clock.nowMs() >= params.deadlineMs) return { kind: "timeout" };
+        if (clock.nowMs() >= params.deadlineMs) return { kind: "timeout", pollCount };
         // Otherwise only an idempotent-GET retryable error may be retried (with
         // time still remaining); every other failure is terminal. A transient
         // miss falls through to the backoff sleep. The retryable field is read
@@ -230,13 +235,13 @@ export function createPoller(adapter: CollectivIQAdapter, seams: PollerSeams = {
         // Recheck the deadline AFTER the poll resolves and BEFORE accepting its
         // result: a response that arrived at or after the deadline is a timeout,
         // never a successful completion.
-        if (clock.nowMs() >= params.deadlineMs) return { kind: "timeout" };
+        if (clock.nowMs() >= params.deadlineMs) return { kind: "timeout", pollCount };
         // Only a message this run produced may be selected, so an earlier turn's
         // answer in a reused thread — or any unrelated entry — can never win.
         const answer = selectAnswer(messages, params.answerSource, params.combinedRunId);
         // Return the full validated snapshot alongside the selected desired-source
         // answer so the tool engine can parse/vote over per-source candidates.
-        if (answer !== null) return { kind: "answer", content: answer, messages };
+        if (answer !== null) return { kind: "answer", content: answer, messages, pollCount };
       }
 
       // Next sleep: the base/jittered interval never exceeds the configured
@@ -245,7 +250,7 @@ export function createPoller(adapter: CollectivIQAdapter, seams: PollerSeams = {
       const capped = Math.min(jittered, params.maxPollIntervalMs);
       const remaining = params.deadlineMs - clock.nowMs();
       const sleepMs = Math.max(0, Math.min(capped, remaining));
-      if (sleepMs <= 0) return { kind: "timeout" };
+      if (sleepMs <= 0) return { kind: "timeout", pollCount };
 
       await sleeper.sleep(sleepMs, params.signal);
 

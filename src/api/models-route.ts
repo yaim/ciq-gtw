@@ -3,6 +3,8 @@ import type { GatewayServer } from "../server.js";
 import type { ModelCatalog } from "../generation/model-catalog.js";
 import { ModelListSchema, ModelObjectSchema, encodeModelList } from "../openai/models.js";
 import { MODEL_NOT_FOUND_ERROR, OpenAIErrorSchema } from "../openai/errors.js";
+import { requestTelemetry } from "./request-telemetry.js";
+import { toErrorCategory } from "../observability/labels.js";
 
 /** Path parameters for `GET /v1/models/:model`. */
 const ModelParams = Type.Object({ model: Type.String() });
@@ -47,6 +49,9 @@ export function registerModelRoutes(app: GatewayServer, catalog: ModelCatalog): 
     (request, reply) => {
       const resolved = catalog.resolve(request.params.model);
       if (resolved === undefined) {
+        requestTelemetry(request)?.recordError(
+          toErrorCategory(MODEL_NOT_FOUND_ERROR.body.error.code),
+        );
         // Literal status keeps the typed response-schema union satisfied; the
         // value equals MODEL_NOT_FOUND_ERROR.status (404).
         reply.code(404);

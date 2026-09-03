@@ -125,6 +125,30 @@ export const THREAD_REUSE_LIMITS = {
   ttlMs: { min: 300_000, max: 2_592_000_000 },
 } as const;
 
+/**
+ * Conservative, non-overridable bounds for the OPTIONAL observability layer
+ * (specification sections 23.2, 23.3, 24). Both metrics and tracing are
+ * disabled by default; enabling tracing additionally requires a canonical OTLP
+ * traces endpoint. Relaxing any bound is a configuration-contract/security
+ * change, not a runtime override.
+ */
+export const TRACING_LIMITS = {
+  /**
+   * Root-span sampling probability. `0` records nothing, `1` records every
+   * root span. Bounded so a mistyped value can never be interpreted as a
+   * percentage or a multiplier.
+   */
+  sampleRatio: { min: 0, max: 1 },
+  /**
+   * Maximum size of `TRACING_OTLP_ENDPOINT`, in UTF-8 bytes (not string
+   * length). An operator-authored collector endpoint is an origin plus a short
+   * traces path, so this is generous by orders of magnitude; it exists so an
+   * oversized environment value is rejected outright instead of being handed to
+   * the URL parser.
+   */
+  endpointBytes: 2048,
+} as const;
+
 /** Allowed characters for `REDIS_KEY_PREFIX` (a value-free operational namespace). */
 export const REDIS_KEY_PREFIX_PATTERN = /^[A-Za-z0-9_-]+$/;
 
@@ -194,6 +218,13 @@ export const ENV_DEFAULTS = {
   // configuration shape is stable whether or not the feature is enabled.
   OPENCODE_THREAD_REUSE_ENABLED: false,
   OPENCODE_THREAD_REUSE_TTL_MS: 604_800_000, // 7 days
+  // Optional observability (specification sections 23.2, 23.3). BOTH are OFF by
+  // default: no `/metrics` route is registered and no tracer, exporter, or
+  // sampler is constructed. The sample ratio is validated regardless so the
+  // configuration shape is stable whether or not tracing is enabled.
+  METRICS_ENABLED: false,
+  TRACING_ENABLED: false,
+  TRACING_SAMPLE_RATIO: 1,
 } as const;
 
 /**
@@ -297,6 +328,17 @@ export const EnvConfigSchema = Type.Object(
     OPENCODE_THREAD_REUSE_TTL_MS: Type.Integer({
       minimum: THREAD_REUSE_LIMITS.ttlMs.min,
       maximum: THREAD_REUSE_LIMITS.ttlMs.max,
+    }),
+    // Optional observability (specification sections 23.2, 23.3). Both flags
+    // default to false. The OTLP endpoint stays absent unless it validated, and
+    // the loader requires it whenever tracing is enabled; the sample ratio
+    // always carries a validated value so the shape is stable either way.
+    METRICS_ENABLED: Type.Boolean(),
+    TRACING_ENABLED: Type.Boolean(),
+    TRACING_OTLP_ENDPOINT: Type.Optional(Type.String({ minLength: 1 })),
+    TRACING_SAMPLE_RATIO: Type.Number({
+      minimum: TRACING_LIMITS.sampleRatio.min,
+      maximum: TRACING_LIMITS.sampleRatio.max,
     }),
   },
   { additionalProperties: false },
