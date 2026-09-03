@@ -13,7 +13,7 @@ import { CollectivIQHttpAdapter } from "../collectiviq/adapter.js";
 import { buildCredentialProviderFromConfig, RUNTIME_MAX_LOGINS } from "../collectiviq/auth.js";
 import type { CollectivIQAdapter, TransportBase } from "../collectiviq/types.js";
 import { createPromptSerializer } from "../prompts/serializer.js";
-import { createCapacityController } from "./capacity.js";
+import { createCapacityController, createUnavailableCapacityController } from "./capacity.js";
 import { createPoller } from "./polling.js";
 import { createChatCompletionService, type ChatCompletionService } from "./chat-completion.js";
 import { createIdGenerator, systemClock } from "./seams.js";
@@ -34,7 +34,24 @@ export interface CompletionRuntime {
 /** Optional injected collaborators (tests provide fakes; production omits them). */
 export interface CompletionRuntimeSeams {
   readonly adapter?: CollectivIQAdapter;
+  /**
+   * Explicit controller override, highest precedence. A TEST seam: it replaces
+   * whichever controller configuration would otherwise select.
+   */
   readonly capacity?: CapacityController;
+  /**
+   * The optional CROSS-REPLICA capacity controller (Phase 4D). Unlike the field
+   * above this is COMPOSITION wiring: it rides the process-owned Redis
+   * connection, so the Redis composition root builds it and passes it here.
+   *
+   * Whether shared capacity is ON comes from `config.SHARED_CAPACITY_ENABLED`,
+   * never from this field. Omitting it while the feature is enabled is an
+   * unavailable dependency, not a disabled feature, and every completion then
+   * fails closed with `503 capacity_unavailable` — never a silent downgrade to
+   * per-replica limits, which would multiply the configured cluster-wide limit
+   * by the replica count.
+   */
+  readonly sharedCapacity?: CapacityController;
   readonly poller?: Poller;
   readonly serializer?: PromptSerializer;
   readonly ids?: IdGenerator;
@@ -67,22 +84,45 @@ function buildAdapter(config: AppConfig): CollectivIQAdapter {
   });
 }
 
-/** Compose the completion runtime from validated configuration. */
-export function createCompletionRuntime(
-  config: AppConfig,
-  seams: CompletionRuntimeSeams = {},
-): CompletionRuntime {
-  const capacity =
-    seams.capacity ??
-    createCapacityController({
+/**
+ * Select the admission controller from validated configuration.
+ *
+ * Exactly three outcomes, and the third is the reason configuration — not the
+ * presence of an injected object — is authoritative:
+ *
+ *  - shared capacity DISABLED (the default): the process-local controller of
+ *    specification §19, byte-for-byte the pre-Phase-4D behaviour, with no scope
+ *    derived and no Redis capacity operation ever issued;
+ *  - shared capacity ENABLED and wired: the injected cross-replica controller;
+ *  - shared capacity ENABLED but UNWIRED: a fail-closed controller that admits
+ *    nothing. Falling back to the local controller here would silently multiply
+ *    the configured cluster-wide limit by the replica count.
+ */
+function selectCapacity(config: AppConfig, seams: CompletionRuntimeSeams): CapacityController {
+  if (seams.capacity !== undefined) return seams.capacity;
+  if (!config.SHARED_CAPACITY_ENABLED) {
+    return createCapacityController({
       maxConcurrent: config.MAX_CONCURRENT_REQUESTS,
       maxConcurrentPerKey: config.MAX_CONCURRENT_REQUESTS_PER_KEY,
       maxQueued: config.MAX_QUEUED_REQUESTS,
       maxQueueWaitMs: config.MAX_QUEUE_WAIT_MS,
     });
+  }
+  return seams.sharedCapacity ?? createUnavailableCapacityController();
+}
+
+/** Compose the completion runtime from validated configuration. */
+export function createCompletionRuntime(
+  config: AppConfig,
+  seams: CompletionRuntimeSeams = {},
+): CompletionRuntime {
+  const capacity = selectCapacity(config, seams);
   const telemetry = seams.telemetry ?? DISABLED_TELEMETRY;
   // The two capacity gauges are pull based: binding a snapshot source keeps the
-  // controller free of any metrics dependency and cannot perturb admission.
+  // controller free of any metrics dependency and cannot perturb admission. The
+  // source is whichever controller is ACTIVE, so the gauges follow the local or
+  // the shared controller without either knowing about metrics. Both stay
+  // PER-INSTANCE views either way — no replica can observe cluster occupancy.
   // Skipped outright when metrics are disabled, so a disabled gateway never
   // hands the controller to a port at all.
   if (telemetry.metrics.enabled) telemetry.metrics.bindCapacitySource(capacity);

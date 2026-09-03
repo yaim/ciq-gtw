@@ -2,12 +2,21 @@
  * Process-local admission control (specification section 19).
  *
  * Enforces a global active-permit limit, a per-key active-permit limit, and a
- * bounded FIFO wait queue with a bounded per-waiter wait. Capacity is NOT shared
- * across replicas. The controller never throws from `acquire`; every outcome is
- * a discriminated {@link CapacityAcquisition}. No timer or abort listener is ever
- * left dangling on any exit path.
+ * bounded FIFO wait queue with a bounded per-waiter wait. This controller's
+ * limits are PER REPLICA, and they are the whole of admission control while
+ * `SHARED_CAPACITY_ENABLED=false` (the default) — the only configuration in
+ * which the production composition selects it (`selectCapacity` in
+ * `runtime.ts`; tests may of course construct it directly). When shared capacity
+ * is enabled the two ACTIVE limits move to the cross-replica coordinator in
+ * `src/shared-capacity/` (specification section 19.2) and only the queue length
+ * and queue wait stay per replica.
+ *
+ * The controller never throws from `acquire`; every outcome is a discriminated
+ * {@link CapacityAcquisition}, and it never answers `unavailable` — it has no
+ * dependency that could be unavailable. No timer or abort listener is ever left
+ * dangling on any exit path.
  */
-import type { CapacityAcquisition, CapacityController, Permit } from "./types.js";
+import type { CapacityAcquisition, CapacityController, CapacityRequest, Permit } from "./types.js";
 
 export interface CapacityLimits {
   /** Maximum number of concurrently held permits across all keys. */
@@ -101,7 +110,13 @@ export function createCapacityController(limits: CapacityLimits): CapacityContro
     }
   }
 
-  function acquire(keyId: string, signal: AbortSignal): Promise<CapacityAcquisition> {
+  /**
+   * Admit one request. Only `keyId` and `signal` are read: the shared scope and
+   * the request deadline on {@link CapacityRequest} exist for the cross-replica
+   * controller, which derives its permit lease from the latter.
+   */
+  function acquire(request: CapacityRequest): Promise<CapacityAcquisition> {
+    const { keyId, signal } = request;
     if (closed) return Promise.resolve({ ok: false, reason: "capacity" });
     if (signal.aborted) return Promise.resolve({ ok: false, reason: "cancelled" });
 
@@ -167,5 +182,32 @@ export function createCapacityController(limits: CapacityLimits): CapacityContro
     get queuedCount(): number {
       return queue.length;
     },
+  };
+}
+
+/**
+ * A controller that admits nothing, for the one inconsistent wiring that must
+ * not silently downgrade: `SHARED_CAPACITY_ENABLED=true` with no cross-replica
+ * coordinator composed (specification section 19.2).
+ *
+ * Falling back to the process-local controller there would silently multiply the
+ * configured cluster-wide limit by the replica count — exactly the failure this
+ * control exists to prevent — so every acquisition reports `unavailable`, which
+ * the route maps to `503 capacity_unavailable`. Validated configuration makes
+ * the state unreachable in production; this is the fail-closed backstop.
+ *
+ * It holds nothing and queues nothing, so both gauges are always zero and
+ * `closeAdmission` has nothing to reject.
+ */
+export function createUnavailableCapacityController(): CapacityController {
+  return {
+    acquire(): Promise<CapacityAcquisition> {
+      return Promise.resolve({ ok: false, reason: "unavailable" });
+    },
+    closeAdmission(): void {
+      /* nothing was ever admitted */
+    },
+    activeCount: 0,
+    queuedCount: 0,
   };
 }

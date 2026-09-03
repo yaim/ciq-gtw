@@ -1172,6 +1172,87 @@ describe("loadConfig — optional OpenCode thread reuse", () => {
   });
 });
 
+describe("loadConfig — optional cross-replica shared capacity", () => {
+  const VALID_KEY = randomBytes(32).toString("base64url");
+  /** The Redis settings that make enabling shared capacity valid. */
+  const REDIS = {
+    REDIS_URL: "redis://127.0.0.1:6379",
+    IDEMPOTENCY_ENCRYPTION_KEY: VALID_KEY,
+  } as const;
+
+  function issuesFor(overrides: Record<string, string | undefined>): ConfigError["issues"] {
+    try {
+      loadConfig({ env: baseEnv(overrides) });
+      throw new Error("expected ConfigError");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfigError);
+      return (error as ConfigError).issues;
+    }
+  }
+
+  it("is DISABLED by default, leaving the two active limits per replica", () => {
+    const config = loadConfig({ env: baseEnv() });
+    expect(config.SHARED_CAPACITY_ENABLED).toBe(false);
+    expect(config.MAX_CONCURRENT_REQUESTS).toBe(4);
+    expect(config.MAX_CONCURRENT_REQUESTS_PER_KEY).toBe(2);
+  });
+
+  it("accepts only the strict boolean syntax", () => {
+    expect(
+      loadConfig({ env: baseEnv({ SHARED_CAPACITY_ENABLED: "false" }) }).SHARED_CAPACITY_ENABLED,
+    ).toBe(false);
+    expect(
+      loadConfig({ env: baseEnv({ ...REDIS, SHARED_CAPACITY_ENABLED: "true" }) })
+        .SHARED_CAPACITY_ENABLED,
+    ).toBe(true);
+    for (const value of ["1", "0", "yes", "no", "on", "enabled"]) {
+      expect(issuesFor({ ...REDIS, SHARED_CAPACITY_ENABLED: value })).toContainEqual({
+        field: "SHARED_CAPACITY_ENABLED",
+        reason: 'must be "true" or "false"',
+      });
+    }
+  });
+
+  it("REQUIRES a Redis endpoint when explicitly enabled", () => {
+    // A cluster-wide active budget cannot be enforced from process-local state,
+    // so enabling it without Redis is an error rather than a silent downgrade
+    // that would multiply the configured limit by the replica count.
+    expect(issuesFor({ SHARED_CAPACITY_ENABLED: "true" })).toContainEqual({
+      field: "REDIS_URL",
+      reason: "is required when SHARED_CAPACITY_ENABLED is true",
+    });
+    for (const REDIS_URL of ["", "   "]) {
+      expect(issuesFor({ SHARED_CAPACITY_ENABLED: "true", REDIS_URL })).toContainEqual({
+        field: "REDIS_URL",
+        reason: "is required when SHARED_CAPACITY_ENABLED is true",
+      });
+    }
+  });
+
+  it("rejects a PRESENT invalid value rather than resolving it to disabled", () => {
+    // Silently falling back to the default would leave a deployment believing
+    // shared capacity is on while every replica counts its own permits.
+    const issues = issuesFor({ SHARED_CAPACITY_ENABLED: "yes" });
+    expect(issues).toContainEqual({
+      field: "SHARED_CAPACITY_ENABLED",
+      reason: 'must be "true" or "false"',
+    });
+    // An unparsed switch is never read as `true`, so it raises no Redis
+    // requirement of its own.
+    expect(issues).not.toContainEqual({
+      field: "REDIS_URL",
+      reason: "is required when SHARED_CAPACITY_ENABLED is true",
+    });
+  });
+
+  it("keeps every shared-capacity failure value-free", () => {
+    const issues = issuesFor({ SHARED_CAPACITY_ENABLED: "SENSITIVE-VALUE" });
+    const formatted = new ConfigError(issues).format();
+    expect(formatted).not.toContain("SENSITIVE-VALUE");
+    expect(formatted).toContain("SHARED_CAPACITY_ENABLED");
+  });
+});
+
 describe("loadConfig — gateway keys", () => {
   /** Load with a raw gateway-key string, returning either config or issues. */
   function loadWithKeys(rawKeys: string): ReturnType<typeof loadConfig> {

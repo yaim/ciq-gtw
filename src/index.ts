@@ -109,9 +109,10 @@ export async function main(): Promise<void> {
   const logger = createLogger(config);
 
   // Optional Redis-backed services: idempotency (Phase 4A), cross-replica rate
-  // limiting (Phase 4B), and OpenCode thread reuse (Phase 5A). `null` when
-  // REDIS_URL is blank/absent; either way construction creates no socket, and
-  // every service shares the ONE client this runtime owns.
+  // limiting (Phase 4B), cross-replica capacity (Phase 4D), and OpenCode thread
+  // reuse (Phase 5A). `null` when REDIS_URL is blank/absent; either way
+  // construction creates no socket, and every service shares the ONE client this
+  // runtime owns.
   const redis = createRedisRuntime(config);
 
   // Optional observability (specification section 23), OFF by default. The
@@ -131,7 +132,17 @@ export async function main(): Promise<void> {
   // Build the completion runtime once so the process root can share the same
   // capacity controller for shutdown draining. Construction opens no socket and
   // performs no CollectivIQ/login I/O (a password login stays lazy).
-  const runtime = createCompletionRuntime(config, { telemetry });
+  //
+  // The cross-replica capacity controller (Phase 4D) is handed over here because
+  // it rides the one Redis connection above. `SHARED_CAPACITY_ENABLED` — not the
+  // presence of this object — decides whether it is used, so an enabled instance
+  // that somehow has no controller fails closed instead of reverting to
+  // per-replica limits. `closeAdmission()` during shutdown then applies to
+  // whichever controller is active.
+  const runtime = createCompletionRuntime(config, {
+    telemetry,
+    ...(redis?.sharedCapacity != null ? { sharedCapacity: redis.sharedCapacity } : {}),
+  });
   const shutdownController = new AbortController();
   const app = buildServer({
     config,

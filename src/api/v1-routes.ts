@@ -20,7 +20,8 @@ declare module "fastify" {
   interface FastifyRequest {
     /**
      * Opaque, stable per-configured-key identity set by the `/v1` auth hook on
-     * success (never the raw key). Used only for process-local per-key capacity.
+     * success (never the raw key). Used only for PROCESS-LOCAL per-key capacity;
+     * it is ordering dependent and must never be written to shared state.
      * `null` until authenticated.
      */
     gatewayKeyId: string | null;
@@ -47,6 +48,16 @@ declare module "fastify" {
      * `null` until authenticated, and also `null` when thread reuse is disabled.
      */
     gatewayReuseScopeId: string | null;
+    /**
+     * Opaque, stable CROSS-REPLICA capacity scope for the matched key (never the
+     * raw key), derived under a FOURTH independent HKDF domain so it shares no
+     * value with any other scope on this request. It is the identity the shared
+     * lease registry stores, so the cluster-wide per-key active limit is stable
+     * across replicas and independent of gateway-key ORDER. Never logged or
+     * reflected. `null` until authenticated, and also `null` when shared
+     * capacity is disabled.
+     */
+    gatewayCapacityScopeId: string | null;
   }
 }
 
@@ -124,6 +135,7 @@ export function registerV1Routes(app: GatewayServer, deps: V1RouteDeps): void {
       scope.decorateRequest("gatewayScopeId", null);
       scope.decorateRequest("gatewayRateLimitScopeId", null);
       scope.decorateRequest("gatewayReuseScopeId", null);
+      scope.decorateRequest("gatewayCapacityScopeId", null);
 
       // Any unexpected failure inside the group becomes the fixed internal
       // envelope. The thrown value's message/stack/cause/body is never read.
@@ -150,6 +162,7 @@ export function registerV1Routes(app: GatewayServer, deps: V1RouteDeps): void {
         request.gatewayScopeId = result.scopeId;
         request.gatewayRateLimitScopeId = result.rateLimitScopeId;
         request.gatewayReuseScopeId = result.reuseScopeId;
+        request.gatewayCapacityScopeId = result.capacityScopeId;
         // Trusted provenance marker: authentication completed normally. The chat
         // route's error boundary uses this (plus the not-yet-in-handler marker)
         // to prove a subsequent throw came from Fastify's parser phase — the only

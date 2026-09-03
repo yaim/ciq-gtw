@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createCapacityController, type CapacityLimits } from "../../src/generation/capacity.js";
-import type { CapacityAcquisition } from "../../src/generation/types.js";
+import type { CapacityAcquisition, CapacityController } from "../../src/generation/types.js";
 
 function limits(overrides: Partial<CapacityLimits> = {}): CapacityLimits {
   return {
@@ -17,6 +17,19 @@ function openSignal(): AbortSignal {
   return new AbortController().signal;
 }
 
+/**
+ * Acquire from the process-local controller, which admits on `keyId` and
+ * `signal` alone. The cross-replica scope and the request deadline are supplied
+ * because the port requires them, and are inert here by design.
+ */
+function acquire(
+  controller: CapacityController,
+  keyId: string,
+  signal: AbortSignal,
+): Promise<CapacityAcquisition> {
+  return controller.acquire({ keyId, capacityScopeId: null, requestTimeoutMs: 30_000, signal });
+}
+
 function grantOf(outcome: CapacityAcquisition): { release(): void } {
   if (!outcome.ok) throw new Error(`expected grant, got ${outcome.reason}`);
   return outcome.permit;
@@ -29,7 +42,7 @@ afterEach(() => {
 describe("createCapacityController", () => {
   it("grants immediately when under both limits", async () => {
     const controller = createCapacityController(limits());
-    const outcome = await controller.acquire("k1", openSignal());
+    const outcome = await acquire(controller, "k1", openSignal());
     expect(outcome.ok).toBe(true);
     expect(controller.activeCount).toBe(1);
     expect(controller.queuedCount).toBe(0);
@@ -37,16 +50,16 @@ describe("createCapacityController", () => {
 
   it("returns cancelled for an already-aborted signal", async () => {
     const controller = createCapacityController(limits());
-    const outcome = await controller.acquire("k1", AbortSignal.abort());
+    const outcome = await acquire(controller, "k1", AbortSignal.abort());
     expect(outcome).toEqual({ ok: false, reason: "cancelled" });
     expect(controller.activeCount).toBe(0);
   });
 
   it("queues when the global limit is reached", async () => {
     const controller = createCapacityController(limits({ maxConcurrent: 1 }));
-    await controller.acquire("k1", openSignal());
+    await acquire(controller, "k1", openSignal());
     let settled = false;
-    const pending = controller.acquire("k2", openSignal()).then((o) => {
+    const pending = acquire(controller, "k2", openSignal()).then((o) => {
       settled = true;
       return o;
     });
@@ -60,12 +73,12 @@ describe("createCapacityController", () => {
     const controller = createCapacityController(
       limits({ maxConcurrent: 3, maxConcurrentPerKey: 1 }),
     );
-    await controller.acquire("A", openSignal());
+    await acquire(controller, "A", openSignal());
     let aSecondSettled = false;
-    void controller.acquire("A", openSignal()).then(() => {
+    void acquire(controller, "A", openSignal()).then(() => {
       aSecondSettled = true;
     });
-    const b = await controller.acquire("B", openSignal());
+    const b = await acquire(controller, "B", openSignal());
     await Promise.resolve();
     expect(b.ok).toBe(true);
     expect(aSecondSettled).toBe(false);
@@ -77,13 +90,13 @@ describe("createCapacityController", () => {
     const controller = createCapacityController(
       limits({ maxConcurrent: 1, maxConcurrentPerKey: 5 }),
     );
-    const first = grantOf(await controller.acquire("A", openSignal()));
+    const first = grantOf(await acquire(controller, "A", openSignal()));
     const order: string[] = [];
-    const second = controller.acquire("B", openSignal()).then((o) => {
+    const second = acquire(controller, "B", openSignal()).then((o) => {
       order.push("B");
       return grantOf(o);
     });
-    const third = controller.acquire("C", openSignal()).then((o) => {
+    const third = acquire(controller, "C", openSignal()).then((o) => {
       order.push("C");
       return grantOf(o);
     });
@@ -105,14 +118,14 @@ describe("createCapacityController", () => {
     const controller = createCapacityController(
       limits({ maxConcurrent: 3, maxConcurrentPerKey: 1 }),
     );
-    const a1 = grantOf(await controller.acquire("A", openSignal()));
+    const a1 = grantOf(await acquire(controller, "A", openSignal()));
     let a2Granted = false;
-    void controller.acquire("A", openSignal()).then((o) => {
+    void acquire(controller, "A", openSignal()).then((o) => {
       a2Granted = o.ok;
     });
-    const b1 = grantOf(await controller.acquire("B", openSignal()));
+    const b1 = grantOf(await acquire(controller, "B", openSignal()));
     let b2Granted = false;
-    void controller.acquire("B", openSignal()).then((o) => {
+    void acquire(controller, "B", openSignal()).then((o) => {
       b2Granted = o.ok;
     });
     await Promise.resolve();
@@ -133,11 +146,11 @@ describe("createCapacityController", () => {
     const controller = createCapacityController(
       limits({ maxConcurrent: 1, maxConcurrentPerKey: 5, maxQueued: 1 }),
     );
-    await controller.acquire("A", openSignal());
-    void controller.acquire("B", openSignal());
+    await acquire(controller, "A", openSignal());
+    void acquire(controller, "B", openSignal());
     await Promise.resolve();
     expect(controller.queuedCount).toBe(1);
-    const overflow = await controller.acquire("C", openSignal());
+    const overflow = await acquire(controller, "C", openSignal());
     expect(overflow).toEqual({ ok: false, reason: "capacity" });
   });
 
@@ -146,8 +159,8 @@ describe("createCapacityController", () => {
     const controller = createCapacityController(
       limits({ maxConcurrent: 1, maxConcurrentPerKey: 5, maxQueueWaitMs: 500 }),
     );
-    await controller.acquire("A", openSignal());
-    const waiter = controller.acquire("B", openSignal());
+    await acquire(controller, "A", openSignal());
+    const waiter = acquire(controller, "B", openSignal());
     await Promise.resolve();
     expect(controller.queuedCount).toBe(1);
     await vi.advanceTimersByTimeAsync(500);
@@ -159,9 +172,9 @@ describe("createCapacityController", () => {
     const controller = createCapacityController(
       limits({ maxConcurrent: 1, maxConcurrentPerKey: 5 }),
     );
-    await controller.acquire("A", openSignal());
+    await acquire(controller, "A", openSignal());
     const aborter = new AbortController();
-    const waiter = controller.acquire("B", aborter.signal);
+    const waiter = acquire(controller, "B", aborter.signal);
     await Promise.resolve();
     expect(controller.queuedCount).toBe(1);
     aborter.abort();
@@ -173,8 +186,8 @@ describe("createCapacityController", () => {
     const controller = createCapacityController(
       limits({ maxConcurrent: 1, maxConcurrentPerKey: 5 }),
     );
-    const first = grantOf(await controller.acquire("A", openSignal()));
-    const second = controller.acquire("B", openSignal()).then(grantOf);
+    const first = grantOf(await acquire(controller, "A", openSignal()));
+    const second = acquire(controller, "B", openSignal()).then(grantOf);
     await Promise.resolve();
 
     first.release();
@@ -188,8 +201,8 @@ describe("createCapacityController", () => {
     const controller = createCapacityController(
       limits({ maxConcurrent: 1, maxConcurrentPerKey: 5 }),
     );
-    const held = grantOf(await controller.acquire("A", openSignal()));
-    const queued = controller.acquire("B", openSignal());
+    const held = grantOf(await acquire(controller, "A", openSignal()));
+    const queued = acquire(controller, "B", openSignal());
     await Promise.resolve();
     expect(controller.queuedCount).toBe(1);
 
@@ -197,7 +210,7 @@ describe("createCapacityController", () => {
     expect(await queued).toEqual({ ok: false, reason: "capacity" });
     expect(controller.queuedCount).toBe(0);
 
-    const afterClose = await controller.acquire("C", openSignal());
+    const afterClose = await acquire(controller, "C", openSignal());
     expect(afterClose).toEqual({ ok: false, reason: "capacity" });
 
     // Held permits remain releasable.

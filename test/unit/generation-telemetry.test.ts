@@ -26,6 +26,7 @@ import {
 } from "../../src/observability/tracing.js";
 import type { Telemetry } from "../../src/observability/telemetry.js";
 import type { AppConfig, VirtualModel } from "../../src/config/schema.js";
+import type { CapacityAcquisition } from "../../src/generation/types.js";
 import type { NormalizedChatRequest } from "../../src/openai/chat-types.js";
 import type {
   CollectivIQAdapter,
@@ -114,6 +115,7 @@ function makeConfig(models: readonly VirtualModel[]): AppConfig {
     MAX_CONCURRENT_REQUESTS_PER_KEY: 2,
     MAX_QUEUED_REQUESTS: 20,
     MAX_QUEUE_WAIT_MS: 5_000,
+    SHARED_CAPACITY_ENABLED: false,
     SHUTDOWN_DRAIN_MS: 30_000,
     IDEMPOTENCY_TTL_MS: 600_000,
     REDIS_KEY_PREFIX: "collectiviq-gateway",
@@ -398,8 +400,15 @@ describe("generation telemetry — a successful completion", () => {
     expect(sample(idle, "collectiviq_gateway_queued_requests")).toBe(0);
 
     // Hold two permits, then read the gauges while they are held.
-    const first = await runtime.capacity.acquire("k0", new AbortController().signal);
-    const second = await runtime.capacity.acquire("k1", new AbortController().signal);
+    const permit = (keyId: string): Promise<CapacityAcquisition> =>
+      runtime.capacity.acquire({
+        keyId,
+        capacityScopeId: null,
+        requestTimeoutMs: 30_000,
+        signal: new AbortController().signal,
+      });
+    const first = await permit("k0");
+    const second = await permit("k1");
     expect(first.ok && second.ok).toBe(true);
     const busy = await t.metrics.collect();
     expect(sample(busy, "collectiviq_gateway_active_requests")).toBe(2);

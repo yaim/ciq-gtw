@@ -153,9 +153,15 @@ export const REQUEST_BODY_TOO_LARGE_ERROR: OpenAIApiError = apiError(
 );
 
 /**
- * `429` — the gateway's process-local capacity (active/queue) is exhausted, or
- * admission is closed during shutdown. Paired with a `Retry-After: 5` header by
- * the route (specification section 19).
+ * `429` — the gateway's admission capacity is exhausted, or admission is closed
+ * during shutdown. Paired with a `Retry-After: 5` header by the route
+ * (specification sections 19, 19.2).
+ *
+ * It covers a full local queue, a queue-wait timeout, and closed admission in
+ * BOTH capacity modes: with `SHARED_CAPACITY_ENABLED=false` the exhausted limits
+ * are this replica's, and with it enabled they are the cluster's active limits
+ * reached through this replica's still-local queue. The body is identical either
+ * way and reveals no limit, occupancy, or scope.
  */
 export const GATEWAY_CAPACITY_EXCEEDED_ERROR: OpenAIApiError = apiError(
   429,
@@ -396,6 +402,29 @@ export const THREAD_REUSE_UNAVAILABLE_ERROR: OpenAIApiError = apiError(
   "OpenCode thread reuse is currently unavailable.",
   "server_error",
   "thread_reuse_unavailable",
+  null,
+  2,
+);
+
+// --- Phase 4D: optional cross-replica capacity (specification §19.2) ---------
+
+/**
+ * `503` — cross-replica capacity accounting is enabled but its decision could
+ * not be made: Redis is disabled for this instance, disconnected, timed out,
+ * holding corrupt state, or answered ambiguously, or the feature is enabled
+ * without a coordinator or a derived scope.
+ *
+ * Deliberately DISTINCT from `gateway_capacity_exceeded`. That `429` means the
+ * cluster is busy and a retry may succeed shortly; this `503` means the gateway
+ * cannot tell how busy the cluster is, and admitting the request anyway would
+ * silently multiply the configured cluster-wide limit by the replica count. The
+ * gateway fails CLOSED instead. Always paired with `Retry-After: 2`.
+ */
+export const CAPACITY_UNAVAILABLE_ERROR: OpenAIApiError = apiError(
+  503,
+  "Shared gateway capacity accounting is currently unavailable.",
+  "server_error",
+  "capacity_unavailable",
   null,
   2,
 );

@@ -15,6 +15,12 @@
  *    BEFORE thread creation and released on every exit path.
  *    `create_thread`/`process_message` are never retried.
  *
+ * Capacity is taken through the {@link CapacityController} port, so this module
+ * is identical whether admission is process-local (specification §19) or backed
+ * by the optional cross-replica lease registry (§19.2). The one visible
+ * difference is that the shared controller can report `unavailable`, which maps
+ * to `503 capacity_unavailable` rather than the busy-cluster `429`.
+ *
  * The default is STATELESS: every completion creates its own thread. A caller
  * that has already leased an OpenCode session's thread (Phase 5A, specification
  * section 5.1.1) may instead supply it through
@@ -40,6 +46,7 @@ import type { NormalizedChatRequest } from "../openai/chat-types.js";
 import { isUpstreamError } from "../collectiviq/errors.js";
 import type { CollectivIQAdapter } from "../collectiviq/types.js";
 import {
+  CAPACITY_UNAVAILABLE_ERROR,
   CONTEXT_LENGTH_EXCEEDED_ERROR,
   COMPLETION_TIMEOUT_ERROR,
   GATEWAY_CAPACITY_EXCEEDED_ERROR,
@@ -160,8 +167,15 @@ export interface ChatCompletionDeps {
 export interface ChatCompletionRequestContext {
   readonly request: NormalizedChatRequest;
   readonly model: VirtualModel;
-  /** Opaque gateway-key identity for per-key capacity accounting. */
+  /** Opaque PROCESS-LOCAL gateway-key identity for per-key capacity accounting. */
   readonly keyId: string;
+  /**
+   * Opaque CROSS-REPLICA capacity scope for the matched gateway key (Phase 4D),
+   * or `null` when shared capacity is disabled. Passed straight through to the
+   * capacity port, which is the only collaborator that interprets it; this
+   * service never learns whether capacity is local or shared.
+   */
+  readonly capacityScopeId?: string | null;
   /** Combined client-disconnect + shutdown abort signal (the deadline is added here). */
   readonly signal: AbortSignal;
   /**
@@ -203,8 +217,10 @@ export interface PreparedCompletion {
   readonly prompt: string;
   /** The resolved internal model policy driving capacity/upstream/poll bounds. */
   readonly policy: VirtualModel;
-  /** Opaque gateway-key identity for per-key capacity accounting. */
+  /** Opaque PROCESS-LOCAL gateway-key identity for per-key capacity accounting. */
   readonly keyId: string;
+  /** Opaque CROSS-REPLICA capacity scope, or `null` when shared capacity is off. */
+  readonly capacityScopeId: string | null;
   /**
    * The active emulated-tool policy, present only when tools are active (emulated
    * model, non-empty tools, `tool_choice` ≠ `none`). Absent means the completion
@@ -416,6 +432,7 @@ export function createChatCompletionService(deps: ChatCompletionDeps): ChatCompl
         prompt,
         policy: model,
         keyId: ctx.keyId,
+        capacityScopeId: ctx.capacityScopeId ?? null,
         selectedLlms: model.selectedLlms,
         ...(toolContext !== undefined ? { toolContext } : {}),
         ...(ctx.requestSpan !== undefined ? { requestSpan: ctx.requestSpan } : {}),
@@ -450,11 +467,27 @@ export function createChatCompletionService(deps: ChatCompletionDeps): ChatCompl
       const parentSpan = prepared.requestSpan;
 
       try {
-        // Acquire capacity before creating an upstream thread.
-        const acquisition = await deps.capacity.acquire(prepared.keyId, combined);
+        // Acquire capacity before creating an upstream thread. The controller may
+        // be the process-local one (specification §19) or the optional
+        // cross-replica one (§19.2); this service cannot tell, and deliberately
+        // passes both identities plus the request's own deadline so whichever is
+        // wired has what it needs.
+        const acquisition = await deps.capacity.acquire({
+          keyId: prepared.keyId,
+          capacityScopeId: prepared.capacityScopeId,
+          requestTimeoutMs: model.requestTimeoutMs,
+          signal: combined,
+        });
         if (!acquisition.ok) {
           if (acquisition.reason === "capacity") {
             throw new ChatCompletionError(GATEWAY_CAPACITY_EXCEEDED_ERROR);
+          }
+          // Only the shared controller can answer this: the decision could not be
+          // made, so admitting the request would silently exceed the configured
+          // cluster-wide limit. Distinct from the `429` above, which means the
+          // cluster is genuinely busy.
+          if (acquisition.reason === "unavailable") {
+            throw new ChatCompletionError(CAPACITY_UNAVAILABLE_ERROR);
           }
           throw cancellationError();
         }

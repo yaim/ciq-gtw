@@ -64,6 +64,7 @@ function config(): AppConfig {
     MAX_CONCURRENT_REQUESTS_PER_KEY: 2,
     MAX_QUEUED_REQUESTS: 20,
     MAX_QUEUE_WAIT_MS: 5_000,
+    SHARED_CAPACITY_ENABLED: false,
     SHUTDOWN_DRAIN_MS: 30_000,
     IDEMPOTENCY_TTL_MS: 600_000,
     REDIS_KEY_PREFIX: "collectiviq-gateway",
@@ -90,6 +91,7 @@ const fakeService: ChatCompletionService = {
     policy: ctx.model,
     selectedLlms: ctx.model.selectedLlms,
     keyId: ctx.keyId,
+    capacityScopeId: null,
   }),
   run: (): Promise<CompletionResult> =>
     Promise.resolve({

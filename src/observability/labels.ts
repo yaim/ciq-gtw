@@ -60,9 +60,9 @@ export function toStatusFamily(status: number): StatusFamily {
 /**
  * The closed set of public OpenAI error `code` values the gateway can emit
  * (`src/openai/errors.ts`), used directly as the error category. Using the code
- * keeps capacity, rate-limit, idempotency, and thread-reuse failures
- * individually distinguishable without inventing a second taxonomy that could
- * drift from the public contract.
+ * keeps capacity, shared-capacity, rate-limit, idempotency, and thread-reuse
+ * failures individually distinguishable without inventing a second taxonomy that
+ * could drift from the public contract.
  *
  * The category is always read from an envelope the gateway itself constructed —
  * never from an inspected thrown value — and any value outside this list
@@ -77,6 +77,7 @@ export const ERROR_CATEGORIES = [
   "context_length_exceeded",
   "request_too_large",
   "gateway_capacity_exceeded",
+  "capacity_unavailable",
   "upstream_quota_exceeded",
   "upstream_authentication_failed",
   "invalid_upstream_response",

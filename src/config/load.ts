@@ -75,6 +75,7 @@ const KNOWN_ENV_KEYS = [
   "MAX_CONCURRENT_REQUESTS_PER_KEY",
   "MAX_QUEUED_REQUESTS",
   "MAX_QUEUE_WAIT_MS",
+  "SHARED_CAPACITY_ENABLED",
   "SHUTDOWN_DRAIN_MS",
   "REDIS_URL",
   "IDEMPOTENCY_ENCRYPTION_KEY",
@@ -518,6 +519,27 @@ function loadEnvConfig(source: NodeJS.ProcessEnv): EnvConfig {
     });
   }
 
+  let sharedCapacityEnabled: boolean = ENV_DEFAULTS.SHARED_CAPACITY_ENABLED;
+  if (present(raw.SHARED_CAPACITY_ENABLED)) {
+    const parsed = coerceBoolean(raw.SHARED_CAPACITY_ENABLED);
+    if (parsed === undefined) {
+      issues.push({ field: "SHARED_CAPACITY_ENABLED", reason: 'must be "true" or "false"' });
+    } else {
+      sharedCapacityEnabled = parsed;
+    }
+  }
+
+  // Cross-replica capacity is Redis-backed by definition: a shared active-permit
+  // budget cannot be enforced from process-local state. Enabling it without an
+  // endpoint is a configuration error, never a silent downgrade to per-replica
+  // limits — which would multiply the configured limit by the replica count.
+  if (sharedCapacityEnabled && !redisEnabled) {
+    issues.push({
+      field: "REDIS_URL",
+      reason: "is required when SHARED_CAPACITY_ENABLED is true",
+    });
+  }
+
   // Optional observability (specification sections 23.2, 23.3). Both features
   // are OFF by default and are validated independently of each other: metrics
   // add a route, tracing adds an exporter, and neither implies the other.
@@ -675,6 +697,7 @@ function loadEnvConfig(source: NodeJS.ProcessEnv): EnvConfig {
     MAX_CONCURRENT_REQUESTS_PER_KEY: maxConcurrentPerKey,
     MAX_QUEUED_REQUESTS: maxQueued,
     MAX_QUEUE_WAIT_MS: maxQueueWaitMs,
+    SHARED_CAPACITY_ENABLED: sharedCapacityEnabled,
     SHUTDOWN_DRAIN_MS: shutdownDrainMs,
     // Both optional fields are omitted unless they validated, so structural
     // validation never double-reports an already-recorded issue.

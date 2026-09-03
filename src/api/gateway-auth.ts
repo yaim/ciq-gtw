@@ -37,12 +37,13 @@ function sha256(value: string): Buffer {
 /**
  * The result of authenticating a presented credential.
  *
- * Success carries FOUR separate opaque identities for the matched key, and none
+ * Success carries FIVE separate opaque identities for the matched key, and none
  * of them is the raw key or its digest:
  *
  *  - `keyId` — the PROCESS-LOCAL identity (`k<index>`), derived from the key's
- *    configuration index and used only for per-key capacity accounting. It is
- *    ordering dependent and meaningless outside this process.
+ *    configuration index and used only for per-key capacity accounting when
+ *    capacity is process-local. It is ordering dependent and meaningless outside
+ *    this process, so it must never be written to shared state.
  *  - `scopeId` — the CROSS-REPLICA idempotency scope, an HMAC of the raw key
  *    under an HKDF-derived subkey. It is identical on every replica configured
  *    with the same encryption key and is independent of gateway-key ordering, so
@@ -55,6 +56,11 @@ function sha256(value: string): Buffer {
  *  - `reuseScopeId` — the CROSS-REPLICA OpenCode thread-reuse scope, derived the
  *    same way under a THIRD independent HKDF salt/label. It is `null` when
  *    thread reuse is disabled.
+ *  - `capacityScopeId` — the CROSS-REPLICA capacity scope, derived the same way
+ *    under a FOURTH independent HKDF salt/label. It is what makes the per-key
+ *    ACTIVE limit span replicas, and it is the value written into the shared
+ *    lease registry — never `keyId`, whose meaning differs per process. It is
+ *    `null` when shared capacity is disabled.
  *
  * No identity is ever logged, reflected, or returned to a client.
  */
@@ -65,6 +71,7 @@ export type AuthResult =
       readonly scopeId: string | null;
       readonly rateLimitScopeId: string | null;
       readonly reuseScopeId: string | null;
+      readonly capacityScopeId: string | null;
     }
   | { readonly ok: false };
 
@@ -128,11 +135,18 @@ export interface GatewayAuthenticatorOptions {
   /**
    * Derives the stable cross-replica OpenCode THREAD-REUSE scope for a
    * configured key. Supplied only when thread reuse is enabled, and independent
-   * of the other two derivers — all three produce different values for the same
-   * key. Precomputed once at construction for the same reason. Omitted means
+   * of the other derivers — each produces a different value for the same key.
+   * Precomputed once at construction for the same reason. Omitted means
    * `reuseScopeId` is always `null`.
    */
   readonly reuseScopeDeriver?: (rawGatewayKey: string) => string;
+  /**
+   * Derives the stable cross-replica CAPACITY scope for a configured key.
+   * Supplied only when shared capacity is enabled, and independent of the other
+   * three derivers. Precomputed once at construction for the same reason.
+   * Omitted means `capacityScopeId` is always `null`.
+   */
+  readonly capacityScopeDeriver?: (rawGatewayKey: string) => string;
 }
 
 /**
@@ -148,15 +162,17 @@ export function createGatewayAuthenticator(
   const compare = options.compare ?? timingSafeEqual;
   // Precompute one fixed-length digest per configured key.
   const digests = keys.map((key) => sha256(key));
-  // Precompute all three opaque cross-replica scopes per configured key so the
+  // Precompute all four opaque cross-replica scopes per configured key so the
   // raw key material is used exactly once, at construction, and never again per
   // request. They are derived under different HKDF domains, so a key's
-  // idempotency, rate-limit, and thread-reuse scopes are unrelated values.
+  // idempotency, rate-limit, thread-reuse, and capacity scopes are unrelated
+  // values.
   const derive = (deriver: ((key: string) => string) | undefined): (string | null)[] =>
     deriver === undefined ? keys.map(() => null) : keys.map((key) => deriver(key));
   const scopes = derive(options.scopeDeriver);
   const rateLimitScopes = derive(options.rateLimitScopeDeriver);
   const reuseScopes = derive(options.reuseScopeDeriver);
+  const capacityScopes = derive(options.capacityScopeDeriver);
 
   return {
     authenticate(header: string | undefined): AuthResult {
@@ -185,6 +201,7 @@ export function createGatewayAuthenticator(
         scopeId: scopes[matchedIndex] ?? null,
         rateLimitScopeId: rateLimitScopes[matchedIndex] ?? null,
         reuseScopeId: reuseScopes[matchedIndex] ?? null,
+        capacityScopeId: capacityScopes[matchedIndex] ?? null,
       };
     },
   };

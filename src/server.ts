@@ -18,6 +18,7 @@ import type { ChatCompletionService } from "./generation/chat-completion.js";
 import type { TitleBridge } from "./opencode/title-bridge.js";
 import { buildGatewayScopeDeriver, type IdempotencyCoordinator } from "./idempotency/index.js";
 import { buildRateLimitScopeDeriver, type RateLimiter } from "./rate-limit/index.js";
+import { buildCapacityScopeDeriver } from "./shared-capacity/index.js";
 import { buildThreadReuseScopeDeriver, type ThreadReuseCoordinator } from "./thread-reuse/index.js";
 import { createServerDefaultTelemetry, type Telemetry } from "./observability/telemetry.js";
 import type { AppConfig } from "./config/schema.js";
@@ -157,23 +158,30 @@ export function buildServer(options: BuildServerOptions): GatewayServer {
   // timestamp at construction and reuses it for every model object it serves.
   const now = options.now ?? (() => Math.floor(Date.now() / 1000));
   const catalog = options.catalog ?? createModelCatalog(config.models, now());
-  // All three scope derivers are pure HKDF/HMAC over already-validated config:
+  // All four scope derivers are pure HKDF/HMAC over already-validated config:
   // no socket, no Redis client, no I/O. Each is `null` (so the matching identity
   // is always `null`) when its feature is not configured, and they derive under
-  // different HKDF domains so a key's three scopes never coincide.
+  // different HKDF domains so a key's four scopes never coincide.
   const scopeDeriver = buildGatewayScopeDeriver(config);
   const rateLimitScopeDeriver = buildRateLimitScopeDeriver(config);
   const reuseScopeDeriver = buildThreadReuseScopeDeriver(config);
+  const capacityScopeDeriver = buildCapacityScopeDeriver(config);
   const authenticator =
     options.authenticator ??
     createGatewayAuthenticator(config.COLLECTIVIQ_GATEWAY_KEYS, {
       ...(scopeDeriver !== null ? { scopeDeriver } : {}),
       ...(rateLimitScopeDeriver !== null ? { rateLimitScopeDeriver } : {}),
       ...(reuseScopeDeriver !== null ? { reuseScopeDeriver } : {}),
+      ...(capacityScopeDeriver !== null ? { capacityScopeDeriver } : {}),
     });
 
   // A default completion runtime is built from config when none is injected
-  // (tests/smoke). Construction opens no socket and makes no CollectivIQ call.
+  // (tests/smoke). Construction opens no socket and makes no CollectivIQ call —
+  // which is also why no cross-replica capacity controller is built here: it
+  // rides the process-owned Redis connection. With `SHARED_CAPACITY_ENABLED=true`
+  // this default runtime is therefore deliberately enabled-but-unwired and fails
+  // closed with `503 capacity_unavailable`, rather than quietly reverting to
+  // per-replica limits. The process root injects the wired runtime.
   const completion: CompletionWiring =
     options.completion ??
     (() => {

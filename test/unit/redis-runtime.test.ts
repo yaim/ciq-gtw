@@ -49,6 +49,7 @@ function config(over: Partial<AppConfig> = {}): AppConfig {
     MAX_CONCURRENT_REQUESTS_PER_KEY: 2,
     MAX_QUEUED_REQUESTS: 20,
     MAX_QUEUE_WAIT_MS: 5_000,
+    SHARED_CAPACITY_ENABLED: false,
     SHUTDOWN_DRAIN_MS: 30_000,
     REDIS_URL: "redis://127.0.0.1:6379",
     IDEMPOTENCY_ENCRYPTION_KEY: MASTER_KEY,
@@ -133,14 +134,29 @@ describe("redis runtime composition", () => {
   it("creates EXACTLY ONE client with ALL features enabled", () => {
     const t = tracker();
     const runtime = createRedisRuntime(
-      config({ RATE_LIMIT_ENABLED: true, OPENCODE_THREAD_REUSE_ENABLED: true }),
+      config({
+        RATE_LIMIT_ENABLED: true,
+        OPENCODE_THREAD_REUSE_ENABLED: true,
+        SHARED_CAPACITY_ENABLED: true,
+      }),
       { createRedisClient: t.createRedisClient },
     );
-    // MUTATION GUARD: giving each feature its own connection would make this 3.
+    // MUTATION GUARD: giving each feature its own connection would make this 4.
     expect(t.configs).toHaveLength(1);
     expect(runtime?.idempotency).not.toBeNull();
     expect(runtime?.rateLimiter).not.toBeNull();
     expect(runtime?.threadReuse).not.toBeNull();
+    expect(runtime?.sharedCapacity).not.toBeNull();
+  });
+
+  it("leaves shared capacity off unless explicitly enabled", () => {
+    // Off means structurally absent, not an inert controller: with no shared
+    // coordinator, admission stays entirely with the process-local one.
+    const t = tracker();
+    const runtime = createRedisRuntime(config({ SHARED_CAPACITY_ENABLED: false }), {
+      createRedisClient: t.createRedisClient,
+    });
+    expect(runtime?.sharedCapacity).toBeNull();
   });
 
   it("opens no socket at construction and connects exactly once", () => {

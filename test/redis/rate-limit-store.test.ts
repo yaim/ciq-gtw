@@ -89,6 +89,7 @@ function appConfig(over: Partial<AppConfig> = {}): AppConfig {
     MAX_CONCURRENT_REQUESTS_PER_KEY: 2,
     MAX_QUEUED_REQUESTS: 20,
     MAX_QUEUE_WAIT_MS: 5_000,
+    SHARED_CAPACITY_ENABLED: false,
     SHUTDOWN_DRAIN_MS: 30_000,
     REDIS_URL: requireUrl(),
     IDEMPOTENCY_ENCRYPTION_KEY: MASTER_KEY,

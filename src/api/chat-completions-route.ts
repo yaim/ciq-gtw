@@ -33,9 +33,18 @@
  *   -> cross-replica rate limit                 -> 429 / 503 (§19.1)
  *   -> OpenCode thread-reuse lease              -> 409 / 503 (§5.1.1)
  *   -> idempotency claim, wait, or replay       -> 409 / 503 / cached result
- *   -> process-local capacity                   -> 429 gateway_capacity_exceeded
+ *   -> process-local FIFO queue + capacity      -> 429 gateway_capacity_exceeded
+ *      (optionally a shared active permit, §19.2) -> 503 capacity_unavailable
  *   -> upstream work
  * ```
+ *
+ * The capacity step is the same step in both capacity modes and stays inside
+ * `service.run`: with `SHARED_CAPACITY_ENABLED=false` it is purely process
+ * local, and with it enabled the local FIFO queue additionally acquires a
+ * cluster-wide active permit (specification §19.2). Nothing above the capacity
+ * port moves, so a streamed request still reaches it AFTER the SSE headers and
+ * the assistant-role opener — which is why a capacity failure on that transport
+ * is a safe SSE error record rather than an HTTP status.
  *
  * Thread reuse and idempotency are mutually exclusive by construction: an
  * eligible reuse request carrying an `Idempotency-Key` is rejected above, before
@@ -454,6 +463,10 @@ export function registerChatCompletionsRoute(
             request: normalized,
             model,
             keyId,
+            // Opaque cross-replica capacity scope (Phase 4D), or `null` when
+            // shared capacity is disabled. The capacity port is the only
+            // collaborator that interprets it.
+            capacityScopeId: request.gatewayCapacityScopeId,
             signal,
             // The compiled toolset (emulated mode only) lets `run` parse/vote over
             // upstream tool-call candidates; it is not part of the frozen request.

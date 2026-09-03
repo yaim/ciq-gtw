@@ -35,8 +35,12 @@ services:
       MODEL_CONFIG_PATH: "/app/config/models.yaml"
       LOG_LEVEL: "info"
       LOG_CONTENT: "false"
-      # Process-local capacity/backpressure and shutdown drain (defaults shown).
-      # Capacity is per-process, not shared across replicas.
+      # Capacity/backpressure and shutdown drain (defaults shown).
+      #
+      # By default all four capacity settings are per-process, not shared across
+      # replicas. With SHARED_CAPACITY_ENABLED=true (below) only the two ACTIVE
+      # limits become cluster-wide; MAX_QUEUED_REQUESTS and MAX_QUEUE_WAIT_MS
+      # stay per replica in both modes.
       MAX_CONCURRENT_REQUESTS: "${MAX_CONCURRENT_REQUESTS:-4}"
       MAX_CONCURRENT_REQUESTS_PER_KEY: "${MAX_CONCURRENT_REQUESTS_PER_KEY:-2}"
       MAX_QUEUED_REQUESTS: "${MAX_QUEUED_REQUESTS:-20}"
@@ -68,6 +72,22 @@ services:
       RATE_LIMIT_REQUESTS: "${RATE_LIMIT_REQUESTS:-60}"
       RATE_LIMIT_WINDOW_MS: "${RATE_LIMIT_WINDOW_MS:-60000}"
       RATE_LIMIT_BURST: "${RATE_LIMIT_BURST:-8}"
+      # OPTIONAL Redis-backed cross-replica ACTIVE-capacity accounting
+      # (Phase 4D). Disabled by default, in which case no capacity scope is
+      # derived and no Redis capacity operation runs at all. Enabling it REQUIRES
+      # REDIS_URL (and therefore IDEMPOTENCY_ENCRYPTION_KEY) above; it shares that
+      # one Redis connection under a separate `:capacity:` key category and adds
+      # no new secret and no tuning setting.
+      #
+      # It REINTERPRETS the two MAX_CONCURRENT_REQUESTS* limits above as
+      # CLUSTER-WIDE, leaving the queue settings per replica — so re-size those
+      # two limits before enabling it. It is fail-closed (503
+      # capacity_unavailable), requires `maxmemory-policy noeviction` on the Redis
+      # instance, and requires a COORDINATED DRAIN/RESTART to enable or to change
+      # either active limit: mixed local/shared rolling operation is unsupported.
+      # Its real-Redis contract suite has been run and passes against Redis
+      # 8.8.2 (see .env.example), which is not production readiness.
+      SHARED_CAPACITY_ENABLED: "${SHARED_CAPACITY_ENABLED:-false}"
       # OPTIONAL Redis-backed OpenCode thread reuse (Phase 5A, pulled forward).
       # Disabled by default, in which case every completion creates its own
       # CollectivIQ thread and no reuse Redis operation runs at all. Enabling it
@@ -100,9 +120,9 @@ services:
       # Provide your own model file (copied from config/models.example.yaml).
       - "./config/models.yaml:/app/config/models.yaml:ro"
 
-  # OPT-IN local Redis for idempotency, rate-limit, and thread-reuse development
-  # and manual testing. One Redis backs every enabled Redis-backed feature; the
-  # gateway opens ONE connection.
+  # OPT-IN local Redis for idempotency, rate-limit, shared-capacity, and
+  # thread-reuse development and manual testing. One Redis backs all four
+  # enabled Redis-backed features; the gateway opens ONE connection.
   #
   # The correct REDIS_URL depends on where the GATEWAY PROCESS runs, so the two
   # local setups must not be mixed:
@@ -120,9 +140,11 @@ services:
   # deployment must additionally provide: network isolation (private subnet or
   # equivalent), Redis ACL/authentication, TLS (`rediss://`) where the endpoint
   # is not on a trusted private link, the application-layer
-  # IDEMPOTENCY_ENCRYPTION_KEY, and an IDENTICAL REDIS_URL, encryption key,
-  # REDIS_KEY_PREFIX, COLLECTIVIQ_GATEWAY_KEYS set, and RATE_LIMIT_* settings
-  # across every replica.
+  # IDEMPOTENCY_ENCRYPTION_KEY, `maxmemory-policy noeviction` (set explicitly
+  # below for this local service), and an IDENTICAL REDIS_URL, encryption key,
+  # REDIS_KEY_PREFIX, COLLECTIVIQ_GATEWAY_KEYS set, RATE_LIMIT_* settings,
+  # SHARED_CAPACITY_ENABLED value, and MAX_CONCURRENT_REQUESTS* limits across
+  # every replica.
   redis:
     profiles: ["redis"]
     image: redis:8.8.2-alpine
@@ -130,17 +152,30 @@ services:
     # Published only to host loopback, exactly like the gateway.
     ports:
       - "127.0.0.1:6379:6379"
-    # Persistence is disabled on purpose: idempotency records are short-lived,
-    # encrypted cache state bounded by IDEMPOTENCY_TTL_MS. Losing them costs at
-    # most the replay protection for in-flight keys; it is never a data-loss
-    # event, so RDB snapshots and AOF are unnecessary (and would write
+    # Persistence is disabled on purpose. Every feature's state here is
+    # short-lived: idempotency records are encrypted cache state bounded by
+    # IDEMPOTENCY_TTL_MS, rate-limit entries are self-expiring timestamps, and
+    # the shared-capacity registry is transient occupancy state bounded by its
+    # own leases. Losing them costs at most the replay protection for in-flight
+    # keys, a refilled quota, or one bounded over-admission; it is never a
+    # data-loss event, so RDB snapshots and AOF are unnecessary (and would write
     # ciphertext to disk for no benefit).
+    #
+    # `maxmemory-policy noeviction` IS a requirement, not a preference, and is
+    # set explicitly so this local service matches it. Eviction is silent and
+    # undetectable by the gateway: an evicted idempotency record permits a
+    # duplicate upstream completion, an evicted rate-limit key refills a full
+    # burst, an evicted capacity registry key forgets live permits and can
+    # briefly over-admit, and an evicted thread-reuse mapping starts a new
+    # provider thread. A hosted Redis must set the same policy.
     command:
       - "redis-server"
       - "--save"
       - ""
       - "--appendonly"
       - "no"
+      - "--maxmemory-policy"
+      - "noeviction"
     # No password is configured here. This service is reachable only from the
     # Compose network and host loopback; a production deployment must use a
     # managed secret, never a password embedded in a committed file.

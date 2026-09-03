@@ -37,20 +37,24 @@ export const MAX_REQUEST_BODY_BYTES_MIN = 1024;
 export const MAX_REQUEST_BODY_BYTES_MAX = 67_108_864; // 64 MiB
 
 /**
- * Conservative, non-overridable bounds for the process-local capacity and
- * shutdown settings (specification sections 19, 31.3). These are initial
- * implementation safety limits; relaxing them is a configuration-contract
- * change, not a runtime override. Capacity is PROCESS-LOCAL — it does not span
- * replicas.
+ * Conservative, non-overridable bounds for the capacity and shutdown settings
+ * (specification sections 19, 19.2, 31.3). These are initial implementation
+ * safety limits; relaxing them is a configuration-contract change, not a runtime
+ * override.
+ *
+ * The two ACTIVE limits are per replica while `SHARED_CAPACITY_ENABLED=false`
+ * (the default) and CLUSTER-WIDE when it is `true` (Phase 4D, section 19.2). The
+ * queue length and queue wait are always per replica, and the bounds themselves
+ * are identical in both modes.
  */
 export const CAPACITY_LIMITS = {
-  /** Global active-request limit. */
+  /** Global active-request limit (per replica when local, cluster-wide when shared). */
   maxConcurrent: { min: 1, max: 1024 },
   /** Per-gateway-key active-request limit (must not exceed the global limit). */
   maxConcurrentPerKey: { min: 1, max: 1024 },
-  /** Bounded FIFO queue length (may be zero — no queueing). */
+  /** Bounded FIFO queue length, always PER REPLICA (may be zero — no queueing). */
   maxQueued: { min: 0, max: 100_000 },
-  /** Maximum time a request may wait in the admission queue, in ms. */
+  /** Maximum time a request may wait in the admission queue, in ms. Always PER REPLICA. */
   maxQueueWaitMs: { min: 1, max: 600_000 },
   /** Graceful-shutdown drain period before in-flight work is cancelled, in ms. */
   shutdownDrainMs: { min: 0, max: 600_000 },
@@ -124,6 +128,16 @@ export const THREAD_REUSE_LIMITS = {
    */
   ttlMs: { min: 300_000, max: 2_592_000_000 },
 } as const;
+
+// The OPTIONAL Redis-backed cross-replica capacity layer (Phase 4D;
+// specification section 19.2) deliberately has NO bounds object of its own, so
+// there is nothing to declare here. It introduces exactly ONE flag,
+// `SHARED_CAPACITY_ENABLED`, and no numeric setting: enabling it REINTERPRETS
+// `MAX_CONCURRENT_REQUESTS` and `MAX_CONCURRENT_REQUESTS_PER_KEY` as
+// cluster-wide active limits under the same `CAPACITY_LIMITS` bounds above. It
+// adds no secret and no dependency, and it requires a valid `REDIS_URL` (and
+// therefore `IDEMPOTENCY_ENCRYPTION_KEY`). Every bound that boundary enforces
+// internally is fixed in `src/shared-capacity/limits.ts`.
 
 /**
  * Conservative, non-overridable bounds for the OPTIONAL observability layer
@@ -203,6 +217,10 @@ export const ENV_DEFAULTS = {
   MAX_CONCURRENT_REQUESTS_PER_KEY: 2,
   MAX_QUEUED_REQUESTS: 20,
   MAX_QUEUE_WAIT_MS: 5_000,
+  // Optional Redis-backed cross-replica capacity (Phase 4D, specification
+  // section 19.2). OFF by default, in which case the two active limits above are
+  // per replica exactly as before and no capacity Redis operation ever runs.
+  SHARED_CAPACITY_ENABLED: false,
   SHUTDOWN_DRAIN_MS: 30_000,
   IDEMPOTENCY_TTL_MS: 600_000, // 10 minutes (specification section 18)
   REDIS_KEY_PREFIX: "collectiviq-gateway",
@@ -284,6 +302,10 @@ export const EnvConfigSchema = Type.Object(
       minimum: CAPACITY_LIMITS.maxQueueWaitMs.min,
       maximum: CAPACITY_LIMITS.maxQueueWaitMs.max,
     }),
+    // Optional Redis-backed cross-replica capacity (Phase 4D). Disabled by
+    // default; enabling it requires a valid REDIS_URL (enforced by the loader)
+    // and adds no numeric setting of its own.
+    SHARED_CAPACITY_ENABLED: Type.Boolean(),
     SHUTDOWN_DRAIN_MS: Type.Integer({
       minimum: CAPACITY_LIMITS.shutdownDrainMs.min,
       maximum: CAPACITY_LIMITS.shutdownDrainMs.max,

@@ -121,6 +121,7 @@ function makeConfig(over: Partial<AppConfig> = {}): AppConfig {
     MAX_CONCURRENT_REQUESTS_PER_KEY: 2,
     MAX_QUEUED_REQUESTS: 20,
     MAX_QUEUE_WAIT_MS: 5_000,
+    SHARED_CAPACITY_ENABLED: false,
     SHUTDOWN_DRAIN_MS: 30_000,
     // Present so `buildServer` derives REAL, non-null scopes. It never creates a
     // Redis client: every back end is injected below.
@@ -250,6 +251,7 @@ function build(
         policy: ctx.model,
         selectedLlms: ctx.model.selectedLlms,
         keyId: ctx.keyId,
+        capacityScopeId: null,
       };
     },
     run: async (prepared, signal, runOptions) => {

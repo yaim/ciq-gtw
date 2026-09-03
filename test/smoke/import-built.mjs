@@ -40,6 +40,7 @@ const config = {
   MAX_CONCURRENT_REQUESTS_PER_KEY: 2,
   MAX_QUEUED_REQUESTS: 20,
   MAX_QUEUE_WAIT_MS: 5_000,
+  SHARED_CAPACITY_ENABLED: false,
   SHUTDOWN_DRAIN_MS: 30_000,
   // Redis-backed idempotency AND rate limiting CONFIGURED but not wired:
   // `buildServer` must still open no socket. The Redis client is owned by the

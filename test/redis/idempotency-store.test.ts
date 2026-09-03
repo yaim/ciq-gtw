@@ -100,6 +100,7 @@ function appConfig(): AppConfig {
     MAX_CONCURRENT_REQUESTS_PER_KEY: 2,
     MAX_QUEUED_REQUESTS: 20,
     MAX_QUEUE_WAIT_MS: 5_000,
+    SHARED_CAPACITY_ENABLED: false,
     SHUTDOWN_DRAIN_MS: 30_000,
     REDIS_URL: requireUrl(),
     IDEMPOTENCY_ENCRYPTION_KEY: MASTER_KEY,
@@ -727,6 +728,7 @@ describe("real Redis: the full HTTP route against a real Redis", () => {
             policy: ctx.model,
             selectedLlms: ctx.model.selectedLlms,
             keyId: ctx.keyId,
+            capacityScopeId: null,
           }),
           run: async (_prepared, signal, hooks) => {
             runs += 1;

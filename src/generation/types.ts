@@ -36,7 +36,7 @@ export interface IdGenerator {
   completionId(): string;
 }
 
-// --- Capacity / backpressure (specification section 19) ----------------------
+// --- Capacity / backpressure (specification sections 19, 19.2) ---------------
 
 /** A single acquired capacity permit. `release()` must be idempotent. */
 export interface Permit {
@@ -44,32 +44,83 @@ export interface Permit {
 }
 
 /**
- * The outcome of a capacity acquisition. `capacity` covers both a full queue
- * and a queue-wait timeout and closed admission (all map to the public `429`).
- * `cancelled` means the caller's signal aborted while waiting (the orchestrator
- * decides whether that abort was the total deadline or a client/shutdown abort).
+ * Everything an admission decision may depend on, in one structured input.
+ *
+ * The process-local controller (specification section 19) reads only `keyId` and
+ * `signal`; the optional cross-replica controller (section 19.2) additionally
+ * needs the opaque shared scope and the request's own deadline, which bounds the
+ * lease its permit carries. Passing one value keeps both implementations behind
+ * the identical port.
+ */
+export interface CapacityRequest {
+  /**
+   * The PROCESS-LOCAL opaque gateway-key identity (`k<index>`). Ordering
+   * dependent and meaningless outside this process, so it is used only for local
+   * per-key accounting and is never written to shared state.
+   */
+  readonly keyId: string;
+  /**
+   * The CROSS-REPLICA opaque capacity scope for the matched gateway key, or
+   * `null` when shared capacity is disabled (or, defensively, when it is enabled
+   * but no scope was derived — which the shared controller must treat as an
+   * unavailable dependency rather than a silent downgrade to local accounting).
+   * The local controller ignores it.
+   */
+  readonly capacityScopeId: string | null;
+  /**
+   * The resolved model's total request deadline, in ms. The shared controller
+   * derives its permit lease from this plus a fixed margin, so a live request's
+   * permit cannot expire mid-completion. The local controller ignores it.
+   */
+  readonly requestTimeoutMs: number;
+  /** Combined client-disconnect + total-deadline + shutdown abort signal. */
+  readonly signal: AbortSignal;
+}
+
+/**
+ * The outcome of a capacity acquisition.
+ *
+ * `capacity` covers a full queue, a queue-wait timeout, and closed admission
+ * (all map to the public `429 gateway_capacity_exceeded`). `cancelled` means the
+ * caller's signal aborted while waiting (the orchestrator decides whether that
+ * abort was the total deadline or a client/shutdown abort). `unavailable` is
+ * reachable ONLY from the optional cross-replica controller and means the
+ * decision could not be made at all — an unusable Redis, corrupt or ambiguous
+ * shared state, or an enabled-but-unwired instance — which maps to the public
+ * `503 capacity_unavailable`. It is deliberately distinct from `capacity`: one
+ * says "the cluster is busy", the other says "the gateway cannot tell".
  */
 export type CapacityAcquisition =
   | { readonly ok: true; readonly permit: Permit }
-  | { readonly ok: false; readonly reason: "capacity" | "cancelled" };
+  | { readonly ok: false; readonly reason: "capacity" | "cancelled" | "unavailable" };
 
 /**
- * Process-local admission controller enforcing a global active limit, a per-key
- * active limit, and a bounded FIFO queue with a bounded wait. Capacity is NOT
- * shared across replicas.
+ * Admission controller enforcing a global active limit, a per-key active limit,
+ * and a bounded FIFO queue with a bounded wait.
+ *
+ * The default implementation (`capacity.ts`) is PROCESS-LOCAL: its limits and
+ * its queue apply to one replica. The optional Phase 4D implementation
+ * (`src/shared-capacity/`) makes the two ACTIVE limits cluster-wide while
+ * keeping the queue, the queue length, and the queue wait per replica; it is the
+ * only implementation that can answer `unavailable`.
  */
 export interface CapacityController {
   /**
-   * Acquire a permit for `keyId`, waiting in the bounded queue if necessary.
-   * Resolves with a permit, a `capacity` rejection (full/timed-out/closed), or
-   * a `cancelled` rejection when `signal` aborts first. Never throws.
+   * Acquire a permit, waiting in the bounded local queue if necessary. Resolves
+   * with a permit, a `capacity` rejection (full/timed-out/closed), a `cancelled`
+   * rejection when the request's signal aborts first, or an `unavailable`
+   * rejection when a shared decision could not be made. Never throws.
    */
-  acquire(keyId: string, signal: AbortSignal): Promise<CapacityAcquisition>;
+  acquire(request: CapacityRequest): Promise<CapacityAcquisition>;
   /** Stop admitting new work and reject everything currently queued. */
   closeAdmission(): void;
-  /** Current number of held permits (for readiness/metrics/tests). */
+  /**
+   * Permits currently HELD BY THIS REPLICA (for metrics/tests). Under shared
+   * capacity it counts confirmed shared permits this process holds, never
+   * cluster-wide occupancy — which no replica can observe locally.
+   */
   readonly activeCount: number;
-  /** Current number of queued waiters (for readiness/metrics/tests). */
+  /** THIS REPLICA's currently waiting requests (for metrics/tests). */
   readonly queuedCount: number;
 }
 
